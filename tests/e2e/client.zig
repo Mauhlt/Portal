@@ -94,6 +94,10 @@ pub const Viewer = struct {
     got_exit: bool = false,
     closed: bool = false,
     close_payload: [2]u8 = .{ 0, 0 },
+    /// Last {"t":"rejected",...} message (instruct-mode lines Portal refused).
+    rejected: [128]u8 = undefined,
+    rejected_len: usize = 0,
+    rejected_count: usize = 0,
     pongs: usize = 0,
     last_pong: [128]u8 = undefined,
     last_pong_len: usize = 0,
@@ -147,6 +151,11 @@ pub const Viewer = struct {
                     const n = @min(p.len, v.hello.len);
                     @memcpy(v.hello[0..n], p[0..n]);
                     v.hello_len = n;
+                } else if (std.mem.indexOf(u8, p, "\"rejected\"") != null) {
+                    const n = @min(p.len, v.rejected.len);
+                    @memcpy(v.rejected[0..n], p[0..n]);
+                    v.rejected_len = n;
+                    v.rejected_count += 1;
                 } else if (std.mem.indexOf(u8, p, "\"logout\"") != null) {
                     v.got_logout = true;
                 } else if (std.mem.indexOf(u8, p, "\"exit\"") != null) {

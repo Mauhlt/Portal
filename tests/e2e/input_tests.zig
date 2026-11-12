@@ -12,8 +12,13 @@ const cmd_child = [_][]const u8{ "--", "cmd.exe", "/k" };
 
 fn startShell(h: *proc.Harness, name: []const u8, port: u16, input: []const u8) !struct { inst: *proc.Instance, v: *client.Viewer } {
     const dir = try h.dataDir(name);
-    const args = [_][]const u8{ "--input", input } ++ cmd_child;
-    const inst = try proc.Instance.start(h, dir, port, &args);
+    // The child is a shell (cmd.exe), so typing modes need the explicit
+    // opt-in; keys/none don't.
+    const typing = std.mem.eql(u8, input, "text") or std.mem.eql(u8, input, "instruct");
+    const inst = if (typing)
+        try proc.Instance.start(h, dir, port, &([_][]const u8{ "--input", input, "--allow-remote-shell" } ++ cmd_child))
+    else
+        try proc.Instance.start(h, dir, port, &([_][]const u8{ "--input", input } ++ cmd_child));
     errdefer inst.kill();
     const creds = try client.pair(inst, "laptop");
     const v = try client.Viewer.open(inst, creds.sessionCookie());
@@ -173,6 +178,97 @@ pub fn runText(h: *proc.Harness, r: *Runner, port: u16) !void {
         v.send("k:esc");
         v.pump(500);
     }
+    // Shell-escape guard: a `!` a device types at the start of a line is
+    // dropped (the agent would treat it as "run in a shell").
+    _ = waitPrompt(v, 5000);
+    v.send("t:!");
+    v.send("t:!REM guarded");
+    _ = r.check("text mode: leading ! dropped at line start", waitEnds(v, "REM guarded", 5000) and std.mem.indexOfScalar(u8, v.cursorLine(), '!') == null, "'{s}'", .{v.cursorLine()});
+    v.send("t: !mid");
+    _ = r.check("text mode: ! after other text is ordinary", waitEnds(v, "REM guarded !mid", 5000), "'{s}'", .{v.cursorLine()});
+    v.send("k:esc");
+    _ = waitLine(v, "E2E>", 3000);
+
     _ = r.check("every frame decoded strictly", v.bad == null, "{?t}", .{v.bad});
     _ = r.ok("portal still running", s.inst.alive() and client.alive(s.inst));
+}
+
+/// `--input instruct`: answer keys plus whole lines that Portal validates.
+pub fn runInstruct(h: *proc.Harness, r: *Runner, port: u16) !void {
+    var dump_buf: [4096]u8 = undefined;
+
+    // Remote typing into a shell is refused unless explicitly allowed.
+    {
+        const dir = try h.dataDir("instruct-refused");
+        var port_buf: [32]u8 = undefined;
+        const listen = try std.fmt.bufPrint(&port_buf, "127.0.0.1:{d}", .{port + 1});
+        for ([_][]const u8{ "instruct", "text" }) |mode| {
+            const res = try proc.runCli(h, dir, &.{ "run", "--console", "--no-tls", "--listen", listen, "--input", mode, "--", "cmd.exe", "/k" });
+            _ = r.check(if (std.mem.eql(u8, mode, "text")) "text mode refused for a shell without --allow-remote-shell" else "instruct mode refused for a shell without --allow-remote-shell", res.code != 0 and res.has("remote shell"), "code={d} {s}", .{ res.code, res.out[0..@min(res.out.len, 200)] });
+        }
+    }
+
+    const s = try startShell(h, "instruct", port, "instruct");
+    defer s.inst.kill();
+    defer s.v.deinit();
+    const v = s.v;
+    _ = r.check("hello says instruct", std.mem.indexOf(u8, v.helloText(), "\"instruct\"") != null, "{s}", .{v.helloText()});
+    _ = r.check("cmd prompt visible", waitPrompt(v, 10_000), "{s}", .{v.dump(&dump_buf)});
+
+    // A plain instruction is typed and submitted.
+    v.send("l:  echo INS-%OS%-OK  ");
+    _ = r.check("instruction line typed and submitted", v.waitFor("INS-Windows_NT-OK", 5000), "{s}", .{v.dump(&dump_buf)});
+    _ = waitPrompt(v, 5000);
+
+    // Escapes and special prefixes are rejected, reported, and never typed.
+    const bad = [_]struct { msg: []const u8, reason: []const u8 }{
+        .{ .msg = "l:!echo SHELL-ESCAPE", .reason = "ShellEscape" },
+        .{ .msg = "l:   !echo SHELL-ESCAPE", .reason = "ShellEscape" },
+        .{ .msg = "l:\u{FF01}echo SHELL-ESCAPE", .reason = "ShellEscape" },
+        .{ .msg = "l:/permissions", .reason = "SlashCommand" },
+        .{ .msg = "l:# remember", .reason = "MemoryShortcut" },
+        .{ .msg = "l:echo ok\r!echo SHELL-ESCAPE", .reason = "ControlCharacter" },
+        .{ .msg = "l:echo ok\necho SHELL-ESCAPE", .reason = "ControlCharacter" },
+        .{ .msg = "l:echo \x1b[201~SHELL-ESCAPE", .reason = "ControlCharacter" },
+        .{ .msg = "l:   ", .reason = "Empty" },
+    };
+    for (bad) |b| {
+        const before = v.rejected_count;
+        v.send(b.msg);
+        const got = v.pumpUntil(3000, before, struct {
+            fn f(n: usize, vv: *client.Viewer) bool {
+                return vv.rejected_count > n;
+            }
+        }.f);
+        const text = v.rejected[0..v.rejected_len];
+        var name_buf: [96]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "rejected ({s})", .{b.reason}) catch "rejected";
+        _ = r.check(name, got and std.mem.indexOf(u8, text, b.reason) != null, "got={} '{s}'", .{ got, text });
+    }
+    v.pump(800);
+    _ = r.check("no rejected instruction reached the shell", v.g.find("SHELL-ESCAPE") == null and std.mem.eql(u8, v.cursorLine(), "E2E>"), "'{s}' {s}", .{ v.cursorLine(), v.dump(&dump_buf) });
+
+    // No raw typing or editing keys in instruct mode.
+    v.send("t:TYPED");
+    v.send("k:up");
+    v.send("k:ctrl-c");
+    v.pump(800);
+    _ = r.check("instruct mode: t: typing and editing keys dropped", std.mem.eql(u8, v.cursorLine(), "E2E>"), "'{s}'", .{v.cursorLine()});
+    // Answer keys still work.
+    v.send("k:4");
+    v.send("k:2");
+    _ = r.check("instruct mode: answer keys still work", waitLine(v, "E2E>42", 5000), "'{s}'", .{v.cursorLine()});
+    v.send("k:esc");
+    _ = r.ok("rejections logged on the desktop", s.inst.logHas("rejected: ShellEscape"));
+    _ = r.check("every frame decoded strictly", v.bad == null, "{?t}", .{v.bad});
+    _ = r.ok("portal still running", s.inst.alive() and client.alive(s.inst));
+}
+
+/// Waits until the cursor line ends with `want` (the prompt may have wrapped).
+fn waitEnds(v: *client.Viewer, want: []const u8, ms: u32) bool {
+    return v.pumpUntil(ms, want, struct {
+        fn f(w: []const u8, vv: *client.Viewer) bool {
+            return std.mem.endsWith(u8, vv.cursorLine(), w);
+        }
+    }.f);
 }

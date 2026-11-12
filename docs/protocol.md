@@ -73,9 +73,10 @@ frames must be masked; no fragmentation; no extensions.
 
 | `t` | fields | meaning |
 |---|---|---|
-| `hello` | `input`: `"none"`, `"keys"` or `"text"` | sent first; which input is accepted |
+| `hello` | `input`: `"none"`, `"keys"`, `"instruct"` or `"text"` | sent first; which input is accepted |
 | `exit` | `code` | the session's program exited; stream ends |
 | `logout` | | session revoked or expired; sign in again |
+| `rejected` | `reason` | an `l:` instruction line was refused (e.g. `ShellEscape`, `SlashCommand`, `MemoryShortcut`, `ControlCharacter`, `TooLong`, `Empty`); nothing was typed |
 
 **Binary frames**: grid updates, always starting with `'G'`, little-endian:
 
@@ -120,7 +121,8 @@ Text frames only, at most 4096 bytes.
 | frame | meaning |
 |---|---|
 | `k:<name>` | press a key |
-| `t:<utf8>` | type text (only when `input` is `"text"`) |
+| `t:<utf8>` | type text (only when `input` is `"text"`; a `!` typed at the start of a line is dropped) |
+| `l:<line>` | an instruction line (`"instruct"` and `"text"`): Portal rejects a leading `!` (shell), `/` (slash command) or `#` (memory), control characters, line breaks and bidi controls, max 2000 bytes; otherwise it types the line (as a bracketed paste when the program enabled it) and presses Enter |
 
 Key names. `keys` mode accepts only the first row; `text` mode accepts all:
 

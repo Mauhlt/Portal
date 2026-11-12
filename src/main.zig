@@ -70,13 +70,22 @@ const usage =
     \\                         Use your WireGuard address, e.g. 10.8.0.1:8420.
     \\                         Wildcard and public addresses are refused.
     \\      --host NAME[:PORT] Extra Host header value to accept (repeatable).
-    \\      --input MODE       none | keys | text   (default: keys)
+    \\      --input MODE       none | keys | instruct | text   (default: keys)
     \\                           none: view only
     \\                           keys: digits, y/n, Enter, single Esc
     \\                                 (enough to answer prompts)
+    \\                           instruct: keys, plus whole instruction
+    \\                                 lines that Portal checks first: no
+    \\                                 ! shell escape, no / slash commands,
+    \\                                 no # memory, no control characters
     \\                           text: FULL REMOTE CONTROL: new prompts,
-    \\                                 ! shell commands, slash commands,
-    \\                                 permission-mode changes, Ctrl+C exit
+    \\                                 slash commands, permission-mode
+    \\                                 changes, Ctrl+C exit (a leading ! a
+    \\                                 device types is still dropped)
+    \\      --allow-remote-shell  Allow instruct/text input when the session
+    \\                         program is itself a shell (cmd, PowerShell,
+    \\                         bash, wsl...). Refused by default: remote
+    \\                         typing into a shell is a remote shell.
     \\      --no-tls           Serve plain HTTP instead of HTTPS (tests and
     \\                         debugging only; WireGuard is then the only
     \\                         protection for cookies and keystrokes).
@@ -588,6 +597,8 @@ const RunOptions = struct {
     cwd: ?[]const u8 = null,
     /// Plain HTTP (tests/debugging). HTTPS is the default.
     no_tls: bool = false,
+    /// Allow instruct/text input when the session program is a shell.
+    allow_remote_shell: bool = false,
     command: []const []const u8 = &.{"claude"},
 };
 
@@ -612,7 +623,9 @@ fn parseRunArgs(gpa: Allocator, args: []const []const u8) !RunOptions {
             try o.hosts.append(gpa, args[i]);
         } else if (std.mem.eql(u8, a, "--input")) {
             i += 1;
-            o.policy = keymap.Policy.parse(args[i]) orelse fatal("--input must be none, keys or text", .{});
+            o.policy = keymap.Policy.parse(args[i]) orelse fatal("--input must be none, keys, instruct or text", .{});
+        } else if (std.mem.eql(u8, a, "--allow-remote-shell")) {
+            o.allow_remote_shell = true;
         } else if (std.mem.eql(u8, a, "--no-tls")) {
             o.no_tls = true;
         } else if (std.mem.eql(u8, a, "--https")) {
@@ -641,7 +654,36 @@ fn parseListen(text: []const u8) !std.Io.net.IpAddress {
 
 /// Suffix for the log line and banner when the remote side has full control.
 fn policyNote(policy: keymap.Policy) []const u8 {
-    return if (policy == .text) " (FULL REMOTE CONTROL)" else "";
+    return switch (policy) {
+        .text => " (FULL REMOTE CONTROL)",
+        .instruct => " (checked instruction lines)",
+        else => "",
+    };
+}
+
+/// True if `program` (argv[0], any path/extension/case) is an interactive
+/// shell. Remote typing into a shell would be a remote shell, so instruct
+/// and text input are refused for these unless --allow-remote-shell.
+pub fn isShellProgram(program: []const u8) bool {
+    const base = std.fs.path.basename(program);
+    const stem = if (std.ascii.endsWithIgnoreCase(base, ".exe") or std.ascii.endsWithIgnoreCase(base, ".com"))
+        base[0 .. base.len - 4]
+    else
+        base;
+    const shells = [_][]const u8{ "cmd", "powershell", "pwsh", "powershell_ise", "bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "wsl", "nu", "elvish", "xonsh", "conhost", "wt", "windowsterminal" };
+    for (shells) |sh| if (std.ascii.eqlIgnoreCase(stem, sh)) return true;
+    return false;
+}
+
+test "isShellProgram" {
+    try std.testing.expect(isShellProgram("cmd.exe"));
+    try std.testing.expect(isShellProgram("C:\\Windows\\System32\\CMD.EXE"));
+    try std.testing.expect(isShellProgram("pwsh"));
+    try std.testing.expect(isShellProgram("/usr/bin/bash"));
+    try std.testing.expect(isShellProgram("wsl.exe"));
+    try std.testing.expect(!isShellProgram("claude"));
+    try std.testing.expect(!isShellProgram("claude.cmd"));
+    try std.testing.expect(!isShellProgram("python.exe"));
 }
 
 const text_warning =
@@ -749,6 +791,10 @@ fn childCwd(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, data_di
 fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
     var opts = try parseRunArgs(gpa, args);
     defer opts.hosts.deinit(gpa);
+
+    // Remote typing into a shell is a remote shell: refuse unless explicit.
+    if ((opts.policy == .instruct or opts.policy == .text) and isShellProgram(opts.command[0]) and !opts.allow_remote_shell)
+        fatal("refusing --input {t} for a shell ({s}): remote typing would be a remote shell. Use --input keys, or pass --allow-remote-shell if you really mean it.", .{ opts.policy, opts.command[0] });
 
     const paths = devicePaths(gpa, io, env) catch |err| fatal("cannot create the data directory: {t}", .{err});
 

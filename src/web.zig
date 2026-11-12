@@ -1325,6 +1325,14 @@ pub const Server = struct {
                 switch (payload[0]) {
                     'k' => srv.session.writeWebKey(payload[2..], srv.nowMs()),
                     't' => srv.session.writeWebText(payload[2..]),
+                    'l' => srv.session.writeWebLine(payload[2..]) catch |err| {
+                        // Error names are Portal's own (keymap.LineError), so
+                        // {t} is safe here; nothing from the peer is echoed.
+                        srv.log.print("instruction from {s} rejected: {t}", .{ ws.conn.peer(), err });
+                        var msg: [96]u8 = undefined;
+                        const m = std.fmt.bufPrint(&msg, "{{\"t\":\"rejected\",\"reason\":\"{t}\"}}", .{err}) catch return true;
+                        return ws.send(srv, m, .text);
+                    },
                     else => {},
                 }
                 return true;

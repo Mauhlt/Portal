@@ -30,11 +30,21 @@ in the same executable.
   Backspace are deliberately excluded: at an empty prompt, Up+Enter would
   resubmit an older prompt from history.
 * `none`: view only.
+* `instruct`: answer keys **plus whole instruction lines**, which Portal checks before typing. A line is refused if it starts with `!` (the agent would run it in a shell), `/` (slash commands can change permissions or folders) or `#` (memory), or contains control characters or line breaks. The agent still asks permission before running anything; you answer with the buttons.
 * `text`: **full remote control of the program.** Typed text is an agent
-  prompt, `!` runs shell commands, slash commands and Shift+Tab change modes,
-  Ctrl+C exits. Anyone holding a logged-in browser session could start new
-  work. This contradicts "no new projects from the laptop", so it is opt-in
-  and Portal warns loudly when you use it.
+  prompt, slash commands and Shift+Tab change modes, Ctrl+C exits. A `!`
+  typed by a device at the start of a line is dropped (best effort, because
+  Portal can't see the agent's input box). Anyone holding a logged-in browser
+  session could start new work. This contradicts "no new projects from the
+  laptop", so it is opt-in and Portal warns loudly when you use it.
+
+**No breaking out to a shell.** Portal runs the agent directly, not inside a
+shell, so if the agent exits the session ends instead of dropping anyone at a
+prompt. If the session program *is* a shell (cmd, PowerShell, pwsh, bash,
+wsl…), `instruct` and `text` are refused at startup, because remote typing
+into a shell is a remote shell. Only `keys`/`none` are allowed there, unless
+you pass `--allow-remote-shell` deliberately. Devices never send raw bytes,
+so escape sequences can't come from them either.
 
 The Portal window shows `N REMOTE VIEWER(S) WATCHING` as an amber badge (and
 `— N REMOTE VIEWER(S)` in its title bar) while anyone is watching

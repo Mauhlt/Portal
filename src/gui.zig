@@ -175,6 +175,7 @@ pub const LocalHost = struct {
         const remote_input: []const u8 = switch (h.opts.policy) {
             .none => "remote: view only",
             .keys => "remote: answer keys only",
+            .instruct => "remote: answer keys + checked instructions",
             .text => "remote: FULL CONTROL",
         };
         return .{

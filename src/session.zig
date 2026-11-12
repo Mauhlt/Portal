@@ -47,6 +47,8 @@ pub const Session = struct {
     /// Guarded by input_mutex. Keys mode lets through at most one Esc per
     /// second, so a viewer can't send Esc Esc (the agent's rewind menu).
     last_web_esc_ms: i64 = std.math.minInt(i64),
+    /// Guarded by input_mutex. Text mode's leading-`!` filter.
+    text_guard: keymap.TextGuard = .{},
     /// Guarded by input_mutex. False once shutdown has begun; no write may
     /// touch the PTY input pipe after that, since it is about to be closed.
     input_open: bool = true,
@@ -70,15 +72,17 @@ pub const Session = struct {
         s.input_mutex.lockUncancelable(s.io);
         defer s.input_mutex.unlock(s.io);
         if (!s.input_open) return;
-        if (s.policy == .keys and std.mem.eql(u8, name, "esc")) {
+        if ((s.policy == .keys or s.policy == .instruct) and std.mem.eql(u8, name, "esc")) {
             if (withinWindow(now_ms, s.last_web_esc_ms, 1000)) return;
             s.last_web_esc_ms = now_ms;
         }
+        s.text_guard.onKey(name);
         s.pty.write(bytes) catch {};
     }
 
     /// Text typed in a web viewer (text mode only), reduced to printable
-    /// characters (keymap.sanitizeText).
+    /// characters (keymap.sanitizeText), with a leading `!` per line dropped
+    /// (keymap.TextGuard) so a device can't flip the agent into shell mode.
     pub fn writeWebText(s: *Session, text: []const u8) void {
         if (text.len == 0 or text.len > 4096) return;
         var buf: [4096]u8 = undefined;
@@ -87,7 +91,29 @@ pub const Session = struct {
         s.input_mutex.lockUncancelable(s.io);
         defer s.input_mutex.unlock(s.io);
         if (!s.input_open) return;
-        s.pty.write(clean) catch {};
+        const allowed = s.text_guard.filter(clean);
+        if (allowed.len > 0) s.pty.write(allowed) catch {};
+    }
+
+    /// A whole instruction line from a web viewer (instruct and text modes).
+    /// Validated by keymap.validateLine (no `!`/`/`/`#` prefix, no control
+    /// characters), then typed and submitted. When the program has enabled
+    /// bracketed paste it is sent as a paste, so characters such as `?` are
+    /// not taken as keyboard shortcuts. Returns why it was rejected, if it was.
+    pub fn writeWebLine(s: *Session, line: []const u8) keymap.LineError!void {
+        if (s.policy != .instruct and s.policy != .text) return error.Empty;
+        const text = try keymap.validateLine(line);
+        s.mutex.lockUncancelable(s.io);
+        const paste = s.term.bracketedPaste();
+        s.mutex.unlock(s.io);
+        s.input_mutex.lockUncancelable(s.io);
+        defer s.input_mutex.unlock(s.io);
+        if (!s.input_open) return;
+        if (paste) s.pty.write("\x1b[200~") catch return;
+        s.pty.write(text) catch return;
+        if (paste) s.pty.write("\x1b[201~") catch return;
+        s.pty.write("\r") catch return;
+        s.text_guard.at_line_start = true;
     }
 
     /// Keystrokes from the desktop's own console or window: unfiltered.
