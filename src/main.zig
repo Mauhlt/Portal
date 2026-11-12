@@ -728,18 +728,30 @@ const Threads = struct {
         }
     }
 
+    /// Console mode: one thread blocks on the console input handle and wakes
+    /// only for keystrokes or window size/focus changes (no resize polling).
+    /// After a resize event it re-reads the size once more when a single
+    /// 150 ms deadline passes: the classic console host can report a buffer
+    /// change before the window has finished growing, and growing the
+    /// window alone sends no event. With nothing happening it waits forever.
     fn consoleInput(session: *Session, console: *Console) void {
         var buf: [4 * 1024]u8 = undefined;
+        session.setSize(console.size());
+        var settle_pending = false;
         while (true) {
-            const n = console.readInput(&buf) catch return;
-            session.writeInput(buf[0..n]);
-        }
-    }
-
-    fn resizePoller(session: *Session, console: *Console, io: Io) void {
-        while (true) {
-            io.sleep(.fromMilliseconds(250), .awake) catch return;
-            session.setSize(console.size());
+            const timeout: u32 = if (settle_pending) 150 else std.math.maxInt(u32);
+            if (!console.waitInput(timeout)) {
+                // Deadline passed with no input: the one follow-up check.
+                settle_pending = false;
+                session.setSize(console.size());
+                continue;
+            }
+            const e = console.readEvents(&buf) catch return;
+            if (e.n > 0) session.writeInput(buf[0..e.n]);
+            if (e.resized) {
+                session.setSize(console.size());
+                settle_pending = true;
+            }
         }
     }
 
@@ -974,10 +986,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     if (opts.console) {
         const in_thread = std.Thread.spawn(.{}, Threads.consoleInput, .{ &session, &console }) catch |err|
             fatal("cannot start input thread: {t}", .{err});
-        in_thread.detach(); // parked in ReadConsoleW; ends with the process
-        const resize_thread = std.Thread.spawn(.{}, Threads.resizePoller, .{ &session, &console, io }) catch |err|
-            fatal("cannot start resize thread: {t}", .{err});
-        resize_thread.detach();
+        in_thread.detach(); // parked in ReadConsoleInputW; ends with the process
     }
     const accept_thread = std.Thread.spawn(.{}, web.Server.run, .{&server}) catch |err|
         fatal("cannot start web server thread: {t}", .{err});

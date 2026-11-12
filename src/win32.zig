@@ -165,7 +165,6 @@ pub extern "kernel32" fn GetStdHandle(which: DWORD) callconv(.winapi) ?HANDLE;
 pub extern "kernel32" fn GetConsoleMode(h: HANDLE, mode: *DWORD) callconv(.winapi) BOOL;
 pub extern "kernel32" fn SetConsoleMode(h: HANDLE, mode: DWORD) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GetConsoleScreenBufferInfo(h: HANDLE, info: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) BOOL;
-pub extern "kernel32" fn ReadConsoleW(h: HANDLE, buf: [*]u16, len: DWORD, read: *DWORD, control: ?*anyopaque) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GetConsoleCP() callconv(.winapi) u32;
 pub extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) u32;
 pub extern "kernel32" fn SetConsoleCP(cp: u32) callconv(.winapi) BOOL;
@@ -199,3 +198,38 @@ pub extern "kernel32" fn MoveFileExW(from: [*:0]const u16, to: [*:0]const u16, f
 
 pub const GENERIC_WRITE: DWORD = 0x40000000;
 pub const MOVEFILE_WRITE_THROUGH: DWORD = 0x8;
+
+// Console input records (ReadConsoleInputW): keystrokes and window-size
+// changes arrive through the same blocking wait, so console mode needs no
+// resize polling.
+pub const KEY_EVENT: WORD = 0x0001;
+pub const MOUSE_EVENT: WORD = 0x0002;
+pub const WINDOW_BUFFER_SIZE_EVENT: WORD = 0x0004;
+pub const MENU_EVENT: WORD = 0x0008;
+pub const FOCUS_EVENT: WORD = 0x0010;
+
+pub const KEY_EVENT_RECORD = extern struct {
+    bKeyDown: BOOL,
+    wRepeatCount: WORD,
+    wVirtualKeyCode: WORD,
+    wVirtualScanCode: WORD,
+    /// union { WCHAR UnicodeChar; CHAR AsciiChar; } — we use the W API.
+    UnicodeChar: u16,
+    dwControlKeyState: DWORD,
+};
+
+pub const INPUT_RECORD = extern struct {
+    EventType: WORD,
+    Event: extern union {
+        KeyEvent: KEY_EVENT_RECORD,
+        WindowBufferSizeEvent: extern struct { dwSize: COORD },
+        raw: [16]u8,
+    },
+};
+
+comptime {
+    // Layout from wincon.h: 4-byte aligned union after the WORD tag.
+    if (@sizeOf(KEY_EVENT_RECORD) != 16 or @sizeOf(INPUT_RECORD) != 20) @compileError("INPUT_RECORD layout");
+}
+
+pub extern "kernel32" fn ReadConsoleInputW(h: HANDLE, buf: [*]INPUT_RECORD, len: DWORD, read: *DWORD) callconv(.winapi) BOOL;

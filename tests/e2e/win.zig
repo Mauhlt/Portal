@@ -189,3 +189,40 @@ pub const Mutex = struct {
 };
 
 pub extern "kernel32" fn GetFullPathNameW(name: [*:0]const u16, len: DWORD, buf: [*]u16, file_part: ?*?[*:0]u16) callconv(.winapi) DWORD;
+
+// Console injection (tests/e2e/console_tests.zig): a detached helper attaches
+// to a portal --console instance and resizes / types into its console.
+pub const COORD = extern struct { X: i16, Y: i16 };
+pub const SMALL_RECT = extern struct { Left: i16, Top: i16, Right: i16, Bottom: i16 };
+pub const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
+    dwSize: COORD,
+    dwCursorPosition: COORD,
+    wAttributes: WORD,
+    srWindow: SMALL_RECT,
+    dwMaximumWindowSize: COORD,
+};
+pub const KEY_EVENT_RECORD = extern struct {
+    bKeyDown: BOOL,
+    wRepeatCount: WORD,
+    wVirtualKeyCode: WORD,
+    wVirtualScanCode: WORD,
+    UnicodeChar: u16,
+    dwControlKeyState: DWORD,
+};
+pub const INPUT_RECORD = extern struct {
+    EventType: WORD,
+    Event: extern union { KeyEvent: KEY_EVENT_RECORD, raw: [16]u8 },
+};
+pub const DETACHED_PROCESS: DWORD = 0x00000008;
+pub const GENERIC_READ_WRITE: DWORD = 0x80000000 | 0x40000000;
+pub const FILE_SHARE_RW: DWORD = 0x1 | 0x2;
+pub const OPEN_EXISTING_: DWORD = 3;
+pub extern "kernel32" fn AttachConsole(pid: DWORD) callconv(.winapi) BOOL;
+pub extern "kernel32" fn FreeConsole() callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetProcessId(h: HANDLE) callconv(.winapi) DWORD;
+pub extern "kernel32" fn GetModuleFileNameW(module: ?HANDLE, buf: [*]u16, len: DWORD) callconv(.winapi) DWORD;
+pub extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: DWORD, share: DWORD, sa: ?*anyopaque, disposition: DWORD, flags: DWORD, template: ?HANDLE) callconv(.winapi) HANDLE;
+pub extern "kernel32" fn GetConsoleScreenBufferInfo(h: HANDLE, info: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) BOOL;
+pub extern "kernel32" fn SetConsoleScreenBufferSize(h: HANDLE, size: COORD) callconv(.winapi) BOOL;
+pub extern "kernel32" fn SetConsoleWindowInfo(h: HANDLE, absolute: BOOL, rect: *const SMALL_RECT) callconv(.winapi) BOOL;
+pub extern "kernel32" fn WriteConsoleInputW(h: HANDLE, recs: [*]const INPUT_RECORD, n: DWORD, written: *DWORD) callconv(.winapi) BOOL;

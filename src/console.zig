@@ -12,7 +12,7 @@ pub const Console = struct {
     saved_out_mode: w.DWORD,
     saved_in_cp: u32,
     saved_out_cp: u32,
-    /// High surrogate carried across ReadConsoleW calls.
+    /// High surrogate carried across ReadConsoleInputW calls.
     pending_high: ?u16 = null,
     /// True for `detached()`: every method is a no-op (GUI mode, where
     /// Portal has freed its console).
@@ -56,8 +56,10 @@ pub const Console = struct {
         // the child rather than killing Portal.
         var in_mode = c.saved_in_mode;
         in_mode &= ~(w.ENABLE_PROCESSED_INPUT | w.ENABLE_LINE_INPUT | w.ENABLE_ECHO_INPUT |
-            w.ENABLE_WINDOW_INPUT | w.ENABLE_MOUSE_INPUT | w.ENABLE_QUICK_EDIT_MODE);
-        in_mode |= w.ENABLE_VIRTUAL_TERMINAL_INPUT | w.ENABLE_EXTENDED_FLAGS;
+            w.ENABLE_MOUSE_INPUT | w.ENABLE_QUICK_EDIT_MODE);
+        // ENABLE_WINDOW_INPUT: size changes arrive as input records, so the
+        // input thread wakes on resizes (no polling).
+        in_mode |= w.ENABLE_VIRTUAL_TERMINAL_INPUT | w.ENABLE_EXTENDED_FLAGS | w.ENABLE_WINDOW_INPUT;
         if (w.SetConsoleMode(c.in, in_mode) == 0) return error.ConsoleModeFailed;
 
         const out_mode = c.saved_out_mode | w.ENABLE_PROCESSED_OUTPUT |
@@ -87,26 +89,69 @@ pub const Console = struct {
         };
     }
 
-    /// Blocking read of local keystrokes as UTF-8. `out` must hold at least
-    /// 4 * 512 bytes.
-    pub fn readInput(c: *Console, out: []u8) !usize {
+    pub const Events = struct {
+        /// UTF-8 keystroke bytes written to `out`.
+        n: usize,
+        /// The console window may have changed size: re-check `size()`.
+        resized: bool,
+    };
+
+    /// Blocking, event-driven read of local console input: returns when the
+    /// user types, or when the console reports a window-size, focus or menu
+    /// change. No timer is involved. `out` must hold at least 4 * 512 bytes.
+    ///
+    /// Windows Terminal reports every resize as WINDOW_BUFFER_SIZE_EVENT. The
+    /// classic console host only reports buffer changes, so with scrollback a
+    /// height-only change may not arrive until the next focus change or
+    /// keystroke, which also re-check the size.
+    pub fn readEvents(c: *Console, out: []u8) !Events {
         if (c.is_detached) return error.ReadFailed;
         std.debug.assert(out.len >= 4 * 512);
-        var wbuf: [512]u16 = undefined;
-        var start: usize = 0;
+        var recs: [128]w.INPUT_RECORD = undefined;
+        var got: w.DWORD = 0;
+        if (w.ReadConsoleInputW(c.in, &recs, recs.len, &got) == 0) return error.ReadFailed;
+        return c.decodeRecords(recs[0..@min(got, recs.len)], out);
+    }
+
+    /// Waits until console input is available or `timeout_ms` passes
+    /// (std.math.maxInt(u32) = forever). Returns true if input is ready.
+    pub fn waitInput(c: *Console, timeout_ms: u32) bool {
+        if (c.is_detached) return false;
+        return w.WaitForSingleObject(c.in, timeout_ms) == w.WAIT_OBJECT_0;
+    }
+
+    /// Pure part of readEvents (unit-tested): key-down characters become
+    /// UTF-8 (surrogate pairs may span calls), and size/focus/menu events
+    /// set `resized`.
+    fn decodeRecords(c: *Console, recs: []const w.INPUT_RECORD, out: []u8) Events {
+        var units: [512 + 1]u16 = undefined;
+        var nu: usize = 0;
         if (c.pending_high) |h| {
-            wbuf[0] = h;
-            start = 1;
+            units[0] = h;
+            nu = 1;
             c.pending_high = null;
         }
-        var n: w.DWORD = 0;
-        if (w.ReadConsoleW(c.in, wbuf[start..].ptr, @intCast(wbuf.len - start), &n, null) == 0) return error.ReadFailed;
-        var units = wbuf[0 .. start + n];
-        if (units.len > 0 and std.unicode.utf16IsHighSurrogate(units[units.len - 1])) {
-            c.pending_high = units[units.len - 1];
-            units = units[0 .. units.len - 1];
+        var resized = false;
+        for (recs) |r| switch (r.EventType) {
+            w.KEY_EVENT => {
+                const k = r.Event.KeyEvent;
+                if (k.bKeyDown == 0 or k.UnicodeChar == 0) continue;
+                var rep: usize = @max(1, @min(k.wRepeatCount, 32));
+                while (rep > 0 and nu < units.len) : (rep -= 1) {
+                    units[nu] = k.UnicodeChar;
+                    nu += 1;
+                }
+            },
+            w.WINDOW_BUFFER_SIZE_EVENT, w.FOCUS_EVENT, w.MENU_EVENT => resized = true,
+            else => {},
+        };
+        var slice = units[0..nu];
+        if (slice.len > 0 and std.unicode.utf16IsHighSurrogate(slice[slice.len - 1])) {
+            c.pending_high = slice[slice.len - 1];
+            slice = slice[0 .. slice.len - 1];
         }
-        return utf16ToUtf8Lossy(units, out);
+        // 513 units * 3 bytes <= 4 * 512 is guaranteed by the assert in readEvents.
+        return .{ .n = utf16ToUtf8Lossy(slice, out), .resized = resized };
     }
 
     pub fn write(c: *Console, data: []const u8) void {
@@ -175,4 +220,55 @@ test "utf16 to utf8 lossy" {
     try std.testing.expectEqualStrings("\u{1F600}", out[0..utf16ToUtf8Lossy(&emoji, &out)]);
     const lone = [_]u16{0xDE00};
     try std.testing.expectEqualStrings("\u{FFFD}", out[0..utf16ToUtf8Lossy(&lone, &out)]);
+}
+
+fn keyRec(ch: u16, down: bool, rep: u16) w.INPUT_RECORD {
+    return .{ .EventType = w.KEY_EVENT, .Event = .{ .KeyEvent = .{
+        .bKeyDown = @intFromBool(down),
+        .wRepeatCount = rep,
+        .wVirtualKeyCode = 0,
+        .wVirtualScanCode = 0,
+        .UnicodeChar = ch,
+        .dwControlKeyState = 0,
+    } } };
+}
+
+test "decodeRecords: keys, repeats, key-ups, resize" {
+    var c: Console = Console.detached();
+    var out: [4 * 512]u8 = undefined;
+    const recs = [_]w.INPUT_RECORD{
+        keyRec('h', true, 1),
+        keyRec('h', false, 1), // key-up: ignored
+        keyRec('i', true, 2), // repeat count
+        .{ .EventType = w.WINDOW_BUFFER_SIZE_EVENT, .Event = .{ .WindowBufferSizeEvent = .{ .dwSize = .{ .X = 100, .Y = 40 } } } },
+        keyRec(0, true, 1), // no character (e.g. Shift alone)
+        keyRec(0x1b, true, 1), // ESC from a VT sequence
+        keyRec('[', true, 1),
+        keyRec('A', true, 1),
+    };
+    const e = c.decodeRecords(&recs, &out);
+    try std.testing.expectEqualStrings("hii\x1b[A", out[0..e.n]);
+    try std.testing.expect(e.resized);
+}
+
+test "decodeRecords: surrogate pair split across reads; focus counts as resize check" {
+    var c: Console = Console.detached();
+    var out: [4 * 512]u8 = undefined;
+    const a = [_]w.INPUT_RECORD{keyRec(0xD83D, true, 1)};
+    const e1 = c.decodeRecords(&a, &out);
+    try std.testing.expectEqual(@as(usize, 0), e1.n);
+    try std.testing.expect(!e1.resized);
+    const b = [_]w.INPUT_RECORD{ keyRec(0xDE00, true, 1), .{ .EventType = w.FOCUS_EVENT, .Event = .{ .raw = @splat(0) } } };
+    const e2 = c.decodeRecords(&b, &out);
+    try std.testing.expectEqualStrings("\u{1F600}", out[0..e2.n]);
+    try std.testing.expect(e2.resized);
+}
+
+test "decodeRecords: never overflows the output buffer" {
+    var c: Console = Console.detached();
+    var out: [4 * 512]u8 = undefined;
+    var recs: [128]w.INPUT_RECORD = undefined;
+    for (&recs) |*r| r.* = keyRec(0x4E2D, true, 32); // 3-byte char, max repeat
+    const e = c.decodeRecords(&recs, &out);
+    try std.testing.expect(e.n <= out.len);
 }

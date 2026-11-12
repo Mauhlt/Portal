@@ -7,7 +7,8 @@
 //!
 //!   e2e <path-to-portal.exe> [group...]
 //!
-//! Groups: pairing, grid, keys, text, transport, privacy, instruct (default: all).
+//! Groups: pairing, grid, keys, text, transport, privacy, instruct, console
+//! (default: all).
 
 const std = @import("std");
 const net = @import("net.zig");
@@ -19,6 +20,7 @@ const grid_tests = @import("grid_tests.zig");
 const input_tests = @import("input_tests.zig");
 const transport = @import("transport.zig");
 const privacy = @import("privacy.zig");
+const console_tests = @import("console_tests.zig");
 
 pub const base_port: u16 = 18420;
 
@@ -37,6 +39,7 @@ const groups = [_]Group{
     .{ .name = "transport", .run = transport.run, .port_offset = 40 },
     .{ .name = "privacy", .run = privacy.run, .port_offset = 50 },
     .{ .name = "instruct", .run = input_tests.runInstruct, .port_offset = 70 },
+    .{ .name = "console", .run = console_tests.run, .port_offset = 80 },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -47,6 +50,9 @@ pub fn main(init: std.process.Init) !void {
     var it: std.process.Args.Iterator = try .initAllocator(init.minimal.args, gpa);
     _ = it.next();
     while (it.next()) |a| try args.append(gpa, try gpa.dupe(u8, a));
+    // Helper mode for the console group (see console_tests.inject).
+    if (args.items.len >= 1 and std.mem.eql(u8, args.items[0], "--inject"))
+        @import("win.zig").ExitProcess(console_tests.injectMain(args.items[1..]));
     if (args.items.len < 1) {
         std.debug.print("usage: e2e <portal.exe> [group...]\n", .{});
         std.process.exit(2);
