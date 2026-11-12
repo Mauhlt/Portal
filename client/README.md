@@ -5,16 +5,63 @@ owner's Vulkan Renderer. Implements `docs/protocol.md`: device pairing,
 rotating sign-in, the WebSocket grid stream and key-name input.
 
 ```
-portal-client --server 10.8.0.1:8420          # connect; pair on first use
-portal-client --server 10.8.0.1:8420 --forget # delete this device's credential
+portal-client --server 10.8.0.1:8420 --ca portal-ca.pem   # first run: pin the server's CA
+portal-client --server 10.8.0.1:8420 --ca-sha256 AB:CD:.. # or: fetch it while `portal pair` is open
+portal-client --server 10.8.0.1:8420                      # later runs (CA pinned)
+portal-client --server 10.8.0.1:8420 --forget             # delete credentials + pinned CA
+portal-client --server 127.0.0.1:8420 --insecure-plain-http  # only for `portal run --no-tls`
 ```
 
 On Windows the same viewer is built into Portal itself as `portal connect`
 (same arguments): `src/connect.zig` is shared by both.
 
-First run: at the desktop run `portal pair <name>`, then click **Pair** (or
-press P) in the client within 2 minutes. After that the client signs in by
-itself on every launch and reconnect.
+First run: at the desktop run `portal ca export` (it writes portal-ca.pem /
+portal-ca.cer and prints the CA's SHA-256 fingerprint) and `portal pair
+<name>`. Here, either copy portal-ca.pem over and pass `--ca portal-ca.pem`,
+or pass `--ca-sha256 <fingerprint>` while the pairing window is open: the
+client then downloads `/ca.cer` from the desktop's pairing-time page
+(http://IP:PORT+1/), and pins it only if its SHA-256 matches. Then click
+**Pair** (or press P) within 2 minutes. After that the client signs in by
+itself on every launch and reconnect, with just `--server`.
+
+## TLS
+
+Portal serves HTTPS/WSS by default with a private CA name-constrained to the
+tunnel addresses. The client pins that CA per server:
+
+* The CA (public, not secret) is stored in the per-user config directory:
+  `%APPDATA%\Portal\servers\<ip>_<port>.pem` (Windows),
+  `~/Library/Application Support/Portal/servers/` (macOS),
+  `$XDG_CONFIG_HOME/portal/servers/` or `~/.config/portal/servers/` (Linux).
+  It is only ever written from an explicit `--ca FILE` (which must be a
+  self-signed CA; `--ca-sha256` with it must match) or a download that
+  matches `--ca-sha256`. Without a pin the client refuses to start: there is
+  no trust on first use. A `--ca` with a different CA replaces the pin and
+  says so. The pinned fingerprint is printed on every start.
+* `std.crypto.tls.Client` (TLS 1.3) runs with `.host = .{ .explicit =
+  "<bare IP>" }` and a CA bundle holding only the pinned CA. In front of it
+  `src/net/tlsconn.zig` holds back the server's encrypted handshake flight
+  until it has checked the certificate itself with bounds-checked code
+  (`src/net/x509check.zig`): signed by exactly the pinned CA, valid now,
+  subjectAltName = the server IP, ECDSA P-256. This closes two std gaps: on
+  Windows std falls back to the OS root store when the pinned bundle has no
+  issuer (so any Windows-trusted certificate, e.g. another Portal's CA a
+  browser trusts, would pass), and std's certificate parser is not
+  bounds-checked (a malformed certificate from an unauthenticated server
+  could crash it). Only TLS_AES_128_GCM_SHA256 and
+  TLS_CHACHA20_POLY1305_SHA256 are accepted (what Portal's server offers).
+* Over HTTPS the client uses Origin `https://IP:PORT` and the `__Host-portal`
+  / `__Host-portal_device` cookie names. A credential stored by an older
+  client is sent only over HTTPS (under the `__Host-` name), never in
+  cleartext.
+* `--insecure-plain-http` (loud warning, never the default) talks plain HTTP
+  to a `portal run --no-tls` server. It uses a separate credential
+  (`Portal-plain/<host>`), so a credential obtained over TLS is never sent
+  in cleartext.
+* Liveness: connect + handshake 15 s, each request 15 s, and the stream is
+  dropped after 60 s without data; a WebSocket ping goes out after 20 s of
+  silence. Steps run as `std.Io` concurrent tasks that a watchdog cancels
+  (`src/net/watchdog.zig`), since std cannot time out connects or reads.
 
 ## Build
 
@@ -38,7 +85,7 @@ branch `portal-client`). After that branch is merged, change it to
 | `src/gframe.zig` | 'G' frame decoder into `view.grid.Grid` (remote grid source). |
 | `src/keys.zig` | Protocol key names per `hello.input` mode. |
 | `src/remote.zig` | `RemoteSink` (InputSink → protocol frames) and the overlay (pairing screen, status). |
-| `src/net/` | `http.zig` (requests, strict response/Set-Cookie parsing), `ws.zig` (masked client frames, server frame parser), `client.zig` (connection thread). |
+| `src/net/` | `http.zig` (requests, strict response/Set-Cookie parsing), `ws.zig` (masked client frames, server frame parser), `client.zig` (connection thread), `tlsconn.zig` (TCP/TLS connection, certificate gate), `x509check.zig` (bounds-checked certificate checks, PEM, fingerprints), `pin.zig` (per-server pinned CA files), `watchdog.zig` (deadlines). |
 | `src/credstore.zig` | OS credential store: Windows Credential Manager; macOS Keychain and Linux Secret Service (libsecret) via dlopen. |
 | `tools/mock_server.zig` | Mock Portal server for end-to-end tests. |
 
@@ -50,7 +97,8 @@ makes `InputSink.resized` report the cols/rows for the PTY.
 ## Security
 
 * The device credential is stored only in the OS credential store under
-  `Portal/<server host>`; the rotated value is saved before anything else is
+  `Portal/<server host>` (`Portal-plain/<server host>` for
+  `--insecure-plain-http`); the rotated value is saved before anything else is
   done with the response. The session cookie stays in memory. Nothing secret
   is accepted on the command line, written to files, or logged. A 401 from
   `/auth/refresh` deletes the stored credential.
@@ -74,15 +122,21 @@ attributes, wide characters, a resize), and logs every client frame:
 
 ```
 zig-out/bin/portal-mock-server --input keys --pair-window 120 --resize-after 8 --revoke-after 0
-zig-out/bin/portal-client --server 127.0.0.1:18420
+zig-out/bin/portal-client --server 127.0.0.1:18420 --insecure-plain-http
 ```
+
+The mock server speaks plain HTTP only. TLS is tested against the real
+server (`portal run`, `portal ca export`, `portal pair`) and by unit tests
+with certificates Portal made (`src/net/testdata/`).
 
 ## Status
 
 Tested on Windows 11 (NVIDIA): pairing, refresh/rotation across restarts,
 revocation and logout back to the pairing screen, keys/text/answer-bar
 input, grid resize, window resize, against both the mock server and the real
-Portal server (`portal run` + `portal pair`).
+Portal server (`portal run` + `portal pair`), over HTTPS/WSS with a pinned CA
+(pin by file and by downloaded fingerprint, wrong CA refused, plain-HTTP
+server refused without --insecure-plain-http, 80 s idle kept alive by pings).
 
 Not yet tested:
 
@@ -91,6 +145,7 @@ Not yet tested:
 * Zoom keys (Ctrl+= / Ctrl+- / Ctrl+0) and HiDPI scaling > 100% were not
   exercised by the automated run.
 * No IME/compose input on X11; no Wayland backend; macOS needs arm64.
-* Connect timeouts: std's Io.Threaded panics on connect timeouts in this Zig
-  version, so the OS default applies (about 21 s on Windows). No WebSocket
-  keepalive ping: a silently dead peer is detected only by TCP.
+* std's TLS client changes its write keys from the reading thread when a
+  server sends KeyUpdate(update_requested) (Portal's server never does);
+  a malicious, already-authenticated server could only break its own
+  connection that way.

@@ -14,7 +14,8 @@ pub const max_cookie_value = 200;
 pub const CookieKind = enum { session, device };
 
 const CookieName = struct { name: []const u8, kind: CookieKind };
-/// `__Host-` variants are used when the server runs with --https.
+/// `__Host-` variants are what the server uses over HTTPS (its default);
+/// the plain names only with `portal run --no-tls`.
 pub const cookie_names = [_]CookieName{
     .{ .name = "portal_session", .kind = .session },
     .{ .name = "__Host-portal", .kind = .session },
@@ -43,13 +44,32 @@ pub const Cookie = struct {
         c.value_len = 0;
     }
     /// Builds a cookie from a stored value; null if the value is not valid.
-    pub fn fromValue(k: CookieKind, v: []const u8) ?Cookie {
+    /// `secure` selects the `__Host-` name (HTTPS).
+    pub fn fromValue(k: CookieKind, v: []const u8, secure: bool) ?Cookie {
         if (!validValue(k, v)) return null;
-        var c: Cookie = .{ .name_index = if (k == .session) 0 else 2, .value_len = @intCast(v.len) };
+        var c: Cookie = .{ .name_index = nameIndex(k, secure), .value_len = @intCast(v.len) };
         @memcpy(c.value_buf[0..v.len], v);
         return c;
     }
 };
+
+fn nameIndex(k: CookieKind, secure: bool) u8 {
+    return switch (k) {
+        .session => if (secure) 1 else 0,
+        .device => if (secure) 3 else 2,
+    };
+}
+
+/// The name the server expects for `k`: `__Host-portal` /
+/// `__Host-portal_device` over HTTPS, `portal_session` / `portal_device`
+/// over plain HTTP.
+pub fn cookieName(k: CookieKind, secure: bool) []const u8 {
+    return cookie_names[nameIndex(k, secure)].name;
+}
+
+fn scheme(secure: bool) []const u8 {
+    return if (secure) "https" else "http";
+}
 
 fn validValue(k: CookieKind, v: []const u8) bool {
     if (v.len == 0 or v.len > max_cookie_value) return false;
@@ -60,22 +80,30 @@ fn validValue(k: CookieKind, v: []const u8) bool {
     return true;
 }
 
-/// Writes `POST /pair`. `host` must already be canonical (see canonicalHost).
-pub fn writePairRequest(w: *std.Io.Writer, host: []const u8) !void {
-    try w.print("POST /pair HTTP/1.1\r\nHost: {s}\r\nOrigin: http://{s}\r\n" ++
-        "Content-Length: 0\r\nConnection: close\r\n\r\n", .{ host, host });
+/// Writes `POST /pair`. `host` must already be canonical (see canonicalHost);
+/// `secure` is true over HTTPS (Origin scheme, cookie names).
+pub fn writePairRequest(w: *std.Io.Writer, host: []const u8, secure: bool) !void {
+    try w.print("POST /pair HTTP/1.1\r\nHost: {s}\r\nOrigin: {s}://{s}\r\n" ++
+        "Content-Length: 0\r\nConnection: close\r\n\r\n", .{ host, scheme(secure), host });
 }
 
-/// Writes `POST /auth/refresh` with the stored device cookie.
-pub fn writeRefreshRequest(w: *std.Io.Writer, host: []const u8, device: *const Cookie) !void {
-    try w.print("POST /auth/refresh HTTP/1.1\r\nHost: {s}\r\nOrigin: http://{s}\r\nCookie: {s}={s}\r\n" ++
-        "Content-Length: 0\r\nConnection: close\r\n\r\n", .{ host, host, device.name(), device.value() });
+/// Writes `POST /auth/refresh` with the stored device cookie, under the
+/// name for the scheme (whatever name it was received under).
+pub fn writeRefreshRequest(w: *std.Io.Writer, host: []const u8, secure: bool, device: *const Cookie) !void {
+    try w.print("POST /auth/refresh HTTP/1.1\r\nHost: {s}\r\nOrigin: {s}://{s}\r\nCookie: {s}={s}\r\n" ++
+        "Content-Length: 0\r\nConnection: close\r\n\r\n", .{ host, scheme(secure), host, cookieName(.device, secure), device.value() });
 }
 
-pub fn writeUpgradeRequest(w: *std.Io.Writer, host: []const u8, session: *const Cookie, key: []const u8) !void {
-    try w.print("GET /ws HTTP/1.1\r\nHost: {s}\r\nOrigin: http://{s}\r\nCookie: {s}={s}\r\n" ++
+pub fn writeUpgradeRequest(w: *std.Io.Writer, host: []const u8, secure: bool, session: *const Cookie, key: []const u8) !void {
+    try w.print("GET /ws HTTP/1.1\r\nHost: {s}\r\nOrigin: {s}://{s}\r\nCookie: {s}={s}\r\n" ++
         "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {s}\r\n" ++
-        "Sec-WebSocket-Version: 13\r\n\r\n", .{ host, host, session.name(), session.value(), key });
+        "Sec-WebSocket-Version: 13\r\n\r\n", .{ host, scheme(secure), host, cookieName(.session, secure), session.value(), key });
+}
+
+/// `GET /ca.cer` on the pairing-time certificate download listener (plain
+/// HTTP, server port + 1). Only used together with an expected fingerprint.
+pub fn writeCaRequest(w: *std.Io.Writer, host: []const u8) !void {
+    try w.print("GET /ca.cer HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{host});
 }
 
 /// "IP:PORT" (IPv4) or "[IPv6]:PORT", normalised. Only literal addresses are
@@ -102,6 +130,7 @@ pub const Response = struct {
     upgrade_websocket: bool = false,
     connection_upgrade: bool = false,
     accept: ?[]const u8 = null,
+    content_length: ?usize = null,
 };
 
 pub const ParseError = error{ BadStatusLine, BadHeader, TooManyHeaders };
@@ -146,6 +175,9 @@ pub fn parseResponseHead(head: []const u8) ParseError!Response {
             }
         } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-accept")) {
             resp.accept = val;
+        } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            if (resp.content_length != null) return error.BadHeader;
+            resp.content_length = std.fmt.parseInt(usize, val, 10) catch return error.BadHeader;
         }
     }
     return resp;
@@ -227,9 +259,12 @@ test "set-cookie parsing" {
     try testing.expect(parseSetCookie("portal_session") == .other);
     try testing.expect(parseSetCookie("portal_device=" ++ &@as([201]u8, @splat('a'))) == .other);
     try testing.expect(parseSetCookie("") == .other);
-    try testing.expect(Cookie.fromValue(.device, "dev.abc") != null);
-    try testing.expect(Cookie.fromValue(.device, "dev abc") == null);
-    try testing.expect(Cookie.fromValue(.device, "") == null);
+    try testing.expect(Cookie.fromValue(.device, "dev.abc", true) != null);
+    try testing.expect(Cookie.fromValue(.device, "dev abc", true) == null);
+    try testing.expect(Cookie.fromValue(.device, "", false) == null);
+    try testing.expectEqualStrings("__Host-portal_device", Cookie.fromValue(.device, "dev.abc", true).?.name());
+    try testing.expectEqualStrings("portal_device", Cookie.fromValue(.device, "dev.abc", false).?.name());
+    try testing.expectEqualStrings("__Host-portal", Cookie.fromValue(.session, "abc", true).?.name());
 }
 
 test "pair and refresh responses" {
@@ -286,19 +321,36 @@ test "fuzz: response parser never panics" {
 test "request building" {
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writePairRequest(&w, "10.8.0.1:8420");
-    try testing.expectEqualStrings("POST /pair HTTP/1.1\r\nHost: 10.8.0.1:8420\r\nOrigin: http://10.8.0.1:8420\r\n" ++
+    try writePairRequest(&w, "10.8.0.1:8420", true);
+    try testing.expectEqualStrings("POST /pair HTTP/1.1\r\nHost: 10.8.0.1:8420\r\nOrigin: https://10.8.0.1:8420\r\n" ++
         "Content-Length: 0\r\nConnection: close\r\n\r\n", w.buffered());
     w = .fixed(&buf);
-    const dev = Cookie.fromValue(.device, "lap.secret").?;
-    try writeRefreshRequest(&w, "10.8.0.1:8420", &dev);
-    try testing.expect(std.mem.startsWith(u8, w.buffered(), "POST /auth/refresh HTTP/1.1\r\n"));
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nCookie: portal_device=lap.secret\r\n") != null);
+    try writePairRequest(&w, "10.8.0.1:8420", false);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nOrigin: http://10.8.0.1:8420\r\n") != null);
+    // A credential from before TLS (plain name) goes out under the
+    // __Host- name over HTTPS.
+    const dev = Cookie.fromValue(.device, "lap.secret", false).?;
     w = .fixed(&buf);
-    const ses = Cookie.fromValue(.session, "sess").?;
-    try writeUpgradeRequest(&w, "10.8.0.1:8420", &ses, "dGhlIHNhbXBsZSBub25jZQ==");
+    try writeRefreshRequest(&w, "10.8.0.1:8420", true, &dev);
+    try testing.expect(std.mem.startsWith(u8, w.buffered(), "POST /auth/refresh HTTP/1.1\r\n"));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nCookie: __Host-portal_device=lap.secret\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nOrigin: https://10.8.0.1:8420\r\n") != null);
+    w = .fixed(&buf);
+    try writeRefreshRequest(&w, "10.8.0.1:8420", false, &dev);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nCookie: portal_device=lap.secret\r\n") != null);
+    w = .fixed(&buf);
+    const ses = parseSetCookie("__Host-portal=sess; Path=/; Secure; HttpOnly").set;
+    try writeUpgradeRequest(&w, "10.8.0.1:8420", true, &ses, "dGhlIHNhbXBsZSBub25jZQ==");
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nCookie: __Host-portal=sess\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nOrigin: https://10.8.0.1:8420\r\n") != null);
+    w = .fixed(&buf);
+    try writeUpgradeRequest(&w, "10.8.0.1:8420", false, &ses, "dGhlIHNhbXBsZSBub25jZQ==");
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nCookie: portal_session=sess\r\n") != null);
+
+    const cl = try parseResponseHead("HTTP/1.1 200 OK\r\nContent-Length: 485\r\n\r\n");
+    try testing.expectEqual(@as(?usize, 485), cl.content_length);
+    try testing.expectError(error.BadHeader, parseResponseHead("HTTP/1.1 200 OK\r\nContent-Length: x\r\n\r\n"));
+    try testing.expectError(error.BadHeader, parseResponseHead("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n"));
 
     var cbuf: [64]u8 = undefined;
     try testing.expectEqualStrings("10.8.0.1:8420", try canonicalHost("10.8.0.1:8420", &cbuf));
