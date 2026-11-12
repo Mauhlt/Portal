@@ -115,6 +115,21 @@ From then on, opening `http://10.8.0.1:8420/` from anywhere with the tunnel on
 just works. `portal devices` lists paired devices; `portal unpair <name>`
 revokes one.
 
+## The browser viewer (Zig → WebAssembly)
+
+The page a browser (including iPhone Safari) shows is written in Zig and
+compiled to `wasm32-freestanding` (`src/wasm/`): protocol decoding, layout
+and fit-to-width, a TrueType parser and antialiasing rasteriser, drawing into
+an RGBA framebuffer, the answer bar and its tap targets, key mapping and
+reconnect logic. It embeds DejaVu Sans Mono (`src/web/fonts/`, Bitstream Vera
+licence), because a phone page cannot use system fonts. `zig build` compiles
+it and embeds the `.wasm` in `portal.exe`, served at `/static/app.wasm`.
+
+Browsers can only start WebAssembly from JavaScript, so `src/web/app.js` is a
+small bridge with no application logic: it instantiates the module, forwards
+events to it and wraps a handful of browser APIs (WebSocket, putImageData,
+timers). The CSP allows `'wasm-unsafe-eval'` for exactly this; see `web.zig`.
+
 ## Upgrading Zig safely
 
 Each release lives in its own folder, outside the repo so `git clean` can't

@@ -43,6 +43,9 @@ const index_html = @embedFile("web/index.html");
 const pair_html = @embedFile("web/pair.html");
 const app_js = @embedFile("web/app.js");
 const app_css = @embedFile("web/app.css");
+/// The browser client (src/wasm), built by build.zig for wasm32-freestanding
+/// with the bundled font inside it.
+const app_wasm = @embedFile("app_wasm");
 
 /// Hard cap on simultaneous connections (each costs a supervisor thread and
 /// a worker thread, a WebSocket one more).
@@ -565,6 +568,7 @@ pub const Server = struct {
             .GET => {
                 if (std.mem.eql(u8, path, "/static/app.js")) return srv.asset(conn, w, req, app_js, "text/javascript; charset=utf-8");
                 if (std.mem.eql(u8, path, "/static/app.css")) return srv.asset(conn, w, req, app_css, "text/css; charset=utf-8");
+                if (std.mem.eql(u8, path, "/static/app.wasm")) return srv.asset(conn, w, req, app_wasm, "application/wasm");
                 if (std.mem.eql(u8, path, "/pair")) return srv.pairPage(conn, w, req);
                 if (std.mem.eql(u8, path, "/login")) return srv.redirect(conn, w, req, "/pair", &.{});
                 if (std.mem.eql(u8, path, "/")) {
@@ -598,7 +602,12 @@ pub const Server = struct {
 
     // ---------------------------------------------------------- responses
 
-    const csp = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; " ++
+    // 'wasm-unsafe-eval': with any CSP set, browsers (Safari, Chrome, Firefox)
+    // refuse WebAssembly.instantiate unless script-src allows it. It permits
+    // compiling WebAssembly only; it does not re-enable eval(), new Function()
+    // or inline script, and scripts still load only from 'self'. The only
+    // wasm the page ever loads is /static/app.wasm, compiled into this exe.
+    const csp = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; " ++
         "connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; " ++
         "form-action 'self'; frame-ancestors 'none'";
 
@@ -1262,4 +1271,118 @@ test "ip key" {
     const c = try net.IpAddress.parse("10.8.0.3", 1);
     try testing.expectEqualSlices(u8, &ipKey(a), &ipKey(b));
     try testing.expect(!std.mem.eql(u8, &ipKey(a), &ipKey(c)));
+}
+
+// ------------------------------------------------------- browser client
+
+/// Everything the bridge (src/web/app.js) provides to the wasm client.
+const bridge_imports = [_][]const u8{
+    "log",           "get_origin", "ws_open",       "ws_send",
+    "ws_close",      "canvas_size", "present",      "request_frame",
+    "set_timer",     "check_session", "navigate_pair", "set_text",
+};
+/// Every export the bridge calls.
+const client_exports = [_][]const u8{
+    "memory",     "init",     "in_alloc", "resize",   "frame",    "on_ws_open", "on_ws_close",
+    "on_ws_message", "on_timer", "on_check", "on_key", "on_pointer", "on_wheel", "on_cmd",
+};
+
+const WasmReader = struct {
+    b: []const u8,
+    p: usize = 0,
+    fn byte(r: *WasmReader) !u8 {
+        if (r.p >= r.b.len) return error.Truncated;
+        r.p += 1;
+        return r.b[r.p - 1];
+    }
+    fn leb(r: *WasmReader) !u32 {
+        var v: u32 = 0;
+        var shift: u5 = 0;
+        while (true) {
+            const c = try r.byte();
+            v |= @as(u32, c & 0x7f) << shift;
+            if (c & 0x80 == 0) return v;
+            if (shift >= 28) return error.BadLeb;
+            shift += 7;
+        }
+    }
+    fn name(r: *WasmReader) ![]const u8 {
+        const n = try r.leb();
+        if (n > r.b.len - r.p) return error.Truncated;
+        r.p += n;
+        return r.b[r.p - n .. r.p];
+    }
+    fn limits(r: *WasmReader) !void {
+        const flags = try r.byte();
+        _ = try r.leb();
+        if (flags & 1 != 0) _ = try r.leb();
+    }
+};
+
+fn inList(list: []const []const u8, s: []const u8) bool {
+    for (list) |x| if (std.mem.eql(u8, x, s)) return true;
+    return false;
+}
+
+test "app.wasm imports only the bridge's host functions and exports what it calls" {
+    const b = app_wasm;
+    try std.testing.expectEqualStrings("\x00asm\x01\x00\x00\x00", b[0..8]);
+    var r: WasmReader = .{ .b = b, .p = 8 };
+    var imports: usize = 0;
+    var exports_found: usize = 0;
+    while (r.p < b.len) {
+        const id = try r.byte();
+        const size = try r.leb();
+        const end = r.p + size;
+        try std.testing.expect(end <= b.len);
+        if (id == 2) { // imports
+            var n = try r.leb();
+            while (n > 0) : (n -= 1) {
+                const module = try r.name();
+                const field = try r.name();
+                const kind = try r.byte();
+                // Only functions from "env": no WASI, no imported memory.
+                try std.testing.expectEqualStrings("env", module);
+                try std.testing.expectEqual(@as(u8, 0), kind);
+                _ = try r.leb();
+                if (!inList(&bridge_imports, field)) {
+                    std.debug.print("unexpected wasm import: {s}\n", .{field});
+                    return error.UnexpectedImport;
+                }
+                imports += 1;
+            }
+        } else if (id == 7) { // exports
+            var n = try r.leb();
+            while (n > 0) : (n -= 1) {
+                const field = try r.name();
+                _ = try r.byte();
+                _ = try r.leb();
+                if (inList(&client_exports, field)) exports_found += 1;
+            }
+        }
+        r.p = end;
+    }
+    try std.testing.expectEqual(bridge_imports.len, imports);
+    try std.testing.expectEqual(client_exports.len, exports_found);
+    // The bridge defines each import and calls each export.
+    for (bridge_imports) |f| {
+        var buf: [64]u8 = undefined;
+        const decl = try std.fmt.bufPrint(&buf, "\n    {s}: ", .{f});
+        if (std.mem.indexOf(u8, app_js, decl) == null) {
+            std.debug.print("app.js does not define host function {s}\n", .{f});
+            return error.MissingHostFunction;
+        }
+    }
+    for (client_exports[1..]) |f| {
+        var buf: [64]u8 = undefined;
+        const call = try std.fmt.bufPrint(&buf, "X.{s}(", .{f});
+        try std.testing.expect(std.mem.indexOf(u8, app_js, call) != null);
+    }
+    // The bridge stays small: it is glue, not an application.
+    try std.testing.expect(std.mem.count(u8, app_js, "\n") <= 90);
+}
+
+test "csp allows wasm compilation but no eval or inline script" {
+    try std.testing.expect(std.mem.indexOf(u8, Server.csp, "script-src 'self' 'wasm-unsafe-eval';") != null);
+    try std.testing.expect(std.mem.indexOf(u8, Server.csp, "'unsafe-eval'") == null);
 }
