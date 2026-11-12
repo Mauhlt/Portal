@@ -7,7 +7,7 @@
 //!
 //!   e2e <path-to-portal.exe> [group...]
 //!
-//! Groups: pairing, grid, keys, text, transport, privacy (default: all).
+//! Groups: pairing, grid, keys, text, transport, privacy, images (default: all).
 
 const std = @import("std");
 const net = @import("net.zig");
@@ -19,6 +19,7 @@ const grid_tests = @import("grid_tests.zig");
 const input_tests = @import("input_tests.zig");
 const transport = @import("transport.zig");
 const privacy = @import("privacy.zig");
+const images = @import("images.zig");
 
 pub const base_port: u16 = 18420;
 
@@ -36,6 +37,7 @@ const groups = [_]Group{
     .{ .name = "text", .run = input_tests.runText, .port_offset = 30 },
     .{ .name = "transport", .run = transport.run, .port_offset = 40 },
     .{ .name = "privacy", .run = privacy.run, .port_offset = 50 },
+    .{ .name = "images", .run = images.run, .port_offset = 60 },
 };
 
 pub fn main(init: std.process.Init) !void {

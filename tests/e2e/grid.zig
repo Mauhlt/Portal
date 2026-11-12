@@ -32,7 +32,16 @@ pub const DecodeError = error{
     RowTooWide,
     NotFullSnapshot,
     OutOfMemory,
+    // Inline images ('I' / 'P' frames)
+    BadBlob,
+    DuplicateBlob,
+    BadPlacement,
+    UnknownImage,
 };
+
+/// An image blob as received ('I'), kept for checks.
+pub const Blob = struct { id: u32, png: []u8 };
+pub const Placement = struct { id: u32, col: u16, row: i16, cols: u16, rows: u16 };
 
 const Reader = struct {
     d: []const u8,
@@ -99,6 +108,13 @@ pub const Grid = struct {
     frames: usize = 0,
     full_frames: usize = 0,
     diff_frames: usize = 0,
+    /// Image blobs held (the cache rule: only those in the latest 'P').
+    blobs: std.ArrayList(Blob) = .empty,
+    placements: std.ArrayList(Placement) = .empty,
+    blob_frames: usize = 0,
+    placement_frames: usize = 0,
+    /// Image frames that arrived before the first grid frame (must be 0).
+    early_image_frames: usize = 0,
 
     pub fn init(gpa: Allocator) Grid {
         return .{ .gpa = gpa };
@@ -107,11 +123,84 @@ pub const Grid = struct {
     pub fn deinit(g: *Grid) void {
         for (g.lines.items) |*r| r.deinit(g.gpa);
         g.lines.deinit(g.gpa);
+        for (g.blobs.items) |b| g.gpa.free(b.png);
+        g.blobs.deinit(g.gpa);
+        g.placements.deinit(g.gpa);
     }
 
-    /// Decodes and applies one frame. The first frame, and any frame that
-    /// changes the size, must be a full snapshot.
+    pub fn blob(g: *const Grid, id: u32) ?[]const u8 {
+        for (g.blobs.items) |b| if (b.id == id) return b.png;
+        return null;
+    }
+
+    /// Decodes and applies one binary frame of any known type.
     pub fn apply(g: *Grid, d: []const u8) DecodeError!Applied {
+        if (d.len > 0 and (d[0] == 'I' or d[0] == 'P')) {
+            if (g.frames == 0) g.early_image_frames += 1;
+            if (d[0] == 'I') try g.applyBlob(d) else try g.applyPlacements(d);
+            return .{ .n_rows = 0, .full = false };
+        }
+        return g.applyGrid(d);
+    }
+
+    /// 'I': u8, u32 id, u32 len, a PNG. Sent once per image per viewer
+    /// while held (docs/protocol.md).
+    fn applyBlob(g: *Grid, d: []const u8) DecodeError!void {
+        var r: Reader = .{ .d = d };
+        _ = try r.bytes(1);
+        const id = try r.int(u32);
+        const len = try r.int(u32);
+        if (len != d.len - 9 or len > 6 << 20 or len < 8) return error.BadBlob;
+        const png = try r.bytes(len);
+        if (!std.mem.eql(u8, png[0..8], "\x89PNG\r\n\x1a\n")) return error.BadBlob;
+        if (g.blob(id) != null) return error.DuplicateBlob;
+        try g.blobs.append(g.gpa, .{ .id = id, .png = try g.gpa.dupe(u8, png) });
+        g.blob_frames += 1;
+    }
+
+    /// 'P': u8, u16 n, n x {u32 id, u16 col, i16 row, u16 cols, u16 rows,
+    /// u16 0}. Every id must have been received; then blobs not listed are
+    /// dropped (the server assumes so too).
+    fn applyPlacements(g: *Grid, d: []const u8) DecodeError!void {
+        var r: Reader = .{ .d = d };
+        _ = try r.bytes(1);
+        const n = try r.int(u16);
+        if (d.len != 3 + @as(usize, n) * 14) return error.BadPlacement;
+        var list: std.ArrayList(Placement) = .empty;
+        errdefer list.deinit(g.gpa);
+        for (0..n) |_| {
+            const p: Placement = .{
+                .id = try r.int(u32),
+                .col = try r.int(u16),
+                .row = try r.int(i16),
+                .cols = try r.int(u16),
+                .rows = try r.int(u16),
+            };
+            if (try r.int(u16) != 0) return error.BadPlacement;
+            if (p.cols == 0 or p.rows == 0) return error.BadPlacement;
+            if (g.frames > 0 and (p.col >= g.cols or p.row >= g.rows or p.row + @as(i32, p.rows) <= 0)) return error.BadPlacement;
+            if (g.blob(p.id) == null) return error.UnknownImage;
+            try list.append(g.gpa, p);
+        }
+        g.placements.deinit(g.gpa);
+        g.placements = list;
+        var k: usize = 0;
+        while (k < g.blobs.items.len) {
+            var used = false;
+            for (g.placements.items) |p| {
+                if (p.id == g.blobs.items[k].id) used = true;
+            }
+            if (used) k += 1 else {
+                g.gpa.free(g.blobs.items[k].png);
+                _ = g.blobs.orderedRemove(k);
+            }
+        }
+        g.placement_frames += 1;
+    }
+
+    /// Decodes and applies one grid frame. The first frame, and any frame
+    /// that changes the size, must be a full snapshot.
+    fn applyGrid(g: *Grid, d: []const u8) DecodeError!Applied {
         var r: Reader = .{ .d = d };
         const magic = try r.bytes(1);
         if (magic[0] != 'G') return error.BadMagic;
@@ -296,4 +385,43 @@ test "decode snapshot then diff; reject malformed" {
     f.items[f.items.len - 5] = 0x1b;
     try std.testing.expectError(error.ControlChar, g.apply(f.items));
     try std.testing.expectEqualStrings("abc", g.rowText(0));
+}
+
+test "image frames: strict blobs and placements, cache rule, fuzz" {
+    const gpa = std.testing.allocator;
+    var g: Grid = .init(gpa);
+    defer g.deinit();
+    const png = "\x89PNG\r\n\x1a\nrest";
+    var f: std.ArrayList(u8) = .empty;
+    defer f.deinit(gpa);
+    try f.append(gpa, 'I');
+    try put32(&f, gpa, 5);
+    try put32(&f, gpa, png.len);
+    try f.appendSlice(gpa, png);
+    _ = try g.apply(f.items);
+    try std.testing.expectEqualStrings(png, g.blob(5).?);
+    try std.testing.expectError(error.DuplicateBlob, g.apply(f.items));
+    for (0..f.items.len) |n| try std.testing.expect(std.meta.isError(g.apply(f.items[0..n])));
+
+    // 'P' with id 5 at (0, -1) 2x3.
+    const p_ok = "P\x01\x00\x05\x00\x00\x00\x00\x00\xff\xff\x02\x00\x03\x00\x00\x00";
+    _ = try g.apply(p_ok);
+    try std.testing.expectEqual(@as(usize, 1), g.placements.items.len);
+    try std.testing.expectError(error.UnknownImage, g.apply("P\x01\x00\x09\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01\x00\x00\x00"));
+    try std.testing.expectError(error.BadPlacement, g.apply("P\x01\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00"));
+    try std.testing.expectError(error.BadPlacement, g.apply("P\x02\x00"));
+    // Empty list drops the blob; it may then be sent again.
+    _ = try g.apply("P\x00\x00");
+    try std.testing.expect(g.blob(5) == null);
+    _ = try g.apply(f.items);
+
+    var prng: std.Random.DefaultPrng = .init(3);
+    const rand = prng.random();
+    var buf: [300]u8 = undefined;
+    for (0..20000) |_| {
+        const n = rand.uintAtMost(usize, buf.len);
+        rand.bytes(buf[0..n]);
+        if (n > 0) buf[0] = "IPG"[rand.uintLessThan(usize, 3)];
+        _ = g.apply(buf[0..n]) catch {};
+    }
 }
