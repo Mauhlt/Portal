@@ -125,7 +125,8 @@ fn toneColor(t: Tone) Rgb {
 
 gpa: std.mem.Allocator,
 window: *platform.Window,
-renderer: *Instanced2D,
+/// Null after releaseGpu().
+renderer: ?*Instanced2D,
 fonts: fontset.FontSet,
 atlas: Atlas,
 theme: grid_mod.Theme,
@@ -145,6 +146,9 @@ live_ctx: ?*anyopaque = null,
 live_fn: ?platform.LiveFn = null,
 /// Inline images (decode, scale, pack into the texture's image region).
 img: images.Layer,
+/// Host events (keys, text, mouse, close) that arrived during a modal
+/// move/size loop, kept for the next pollEvents instead of being dropped.
+deferred: platform.Queue = .{},
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*TermView {
     const self = try gpa.create(TermView);
@@ -177,7 +181,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*TermView {
 }
 
 pub fn deinit(tv: *TermView) void {
-    tv.renderer.deinit();
+    tv.releaseGpu();
     tv.window.deinit();
     tv.atlas.deinit();
     tv.img.deinit();
@@ -195,8 +199,21 @@ pub fn setLiveRedraw(tv: *TermView, ctx: *anyopaque, f: platform.LiveFn) void {
 
 fn liveThunk(ctx: *anyopaque) void {
     const tv: *TermView = @ptrCast(@alignCast(ctx));
-    while (tv.window.pollQueued()) |e| tv.handleViewEvent(e);
+    while (tv.window.pollQueued()) |e| tv.liveEvent(e);
     if (tv.live_fn) |f| f(tv.live_ctx.?);
+}
+
+/// Inside a modal loop: apply view events now, keep host events for later.
+fn liveEvent(tv: *TermView, e: input.Event) void {
+    switch (e) {
+        .resize, .scale, .expose, .zoom => tv.handleViewEvent(e),
+        .close, .key, .char, .mouse_down, .mouse_move, .mouse_up => tv.deferred.push(e),
+    }
+}
+
+/// Next event: those deferred from a modal loop first, then the window's.
+fn nextEvent(tv: *TermView) ?input.Event {
+    return tv.deferred.pop() orelse tv.window.pollEvent();
 }
 
 /// Thread-safe: wakes a waitEvents (e.g. after new data arrived).
@@ -204,8 +221,21 @@ pub fn wake(tv: *TermView) void {
     tv.window.wake();
 }
 
+/// waitEvents timeout meaning "until an event or wake()" (no idle polling).
+pub const forever = platform.forever;
+
+/// Sleeps until window input, a wake() from any thread, or the timeout
+/// (`forever`: no timeout). Returns at once if a redraw is pending.
 pub fn waitEvents(tv: *TermView, timeout_ms: u32) void {
     tv.window.waitEvents(if (tv.dirty) 0 else timeout_ms);
+}
+
+/// Tears down the swapchain and GPU device cleanly (waits for the GPU to go
+/// idle) while the window stays valid; present() is a no-op afterwards.
+/// For hosts about to exit the process. Main thread only.
+pub fn releaseGpu(tv: *TermView) void {
+    if (tv.renderer) |r| r.deinit();
+    tv.renderer = null;
 }
 
 pub fn setTitle(tv: *TermView, title: []const u8) void {
@@ -220,7 +250,7 @@ pub fn needsRedraw(tv: *const TermView) bool {
 /// Pumps window events. Returns false once the user closed the window.
 pub fn pollEvents(tv: *TermView, sink: input.InputSink) bool {
     var open = true;
-    while (tv.window.pollEvent()) |e| {
+    while (tv.nextEvent()) |e| {
         switch (e) {
             .close => open = false,
             .key => |k| sink.key(k.key, k.mods),
@@ -320,7 +350,7 @@ test "selection contains" {
 fn handleViewEvent(tv: *TermView, e: input.Event) void {
     tv.dirty = true;
     switch (e) {
-        .resize => |r| tv.renderer.resize(r.width, r.height),
+        .resize => |r| if (tv.renderer) |ren| ren.resize(r.width, r.height),
         .zoom => |z| tv.zoom_steps = switch (z) {
             .in => @min(tv.zoom_steps + 1, 20),
             .out => @max(tv.zoom_steps - 1, -10),
@@ -405,15 +435,16 @@ pub fn build(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
 
 /// Uploads new glyphs and presents the last built frame.
 pub fn present(tv: *TermView) void {
+    const renderer = tv.renderer orelse return;
     if (tv.atlas.takeDirty()) |d| {
-        tv.renderer.updateTexture(d.x, d.y, d.w, d.h, d.bytes) catch |err| std.log.warn("atlas upload failed: {t}", .{err});
+        renderer.updateTexture(d.x, d.y, d.w, d.h, d.bytes) catch |err| std.log.warn("atlas upload failed: {t}", .{err});
     }
     for (tv.img.uploads.items) |u| {
-        tv.renderer.updateTexture(u.x, images.region_y + u.y, u.w, u.h, u.px) catch |err| std.log.warn("image upload failed: {t}", .{err});
+        renderer.updateTexture(u.x, images.region_y + u.y, u.w, u.h, u.px) catch |err| std.log.warn("image upload failed: {t}", .{err});
     }
     tv.img.clearUploads();
     const bg = tv.theme.bg;
-    tv.renderer.drawFrame(.{
+    renderer.drawFrame(.{
         @as(f32, @floatFromInt(bg[0])) / 255,
         @as(f32, @floatFromInt(bg[1])) / 255,
         @as(f32, @floatFromInt(bg[2])) / 255,

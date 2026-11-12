@@ -11,6 +11,13 @@ pub const WORD = u16;
 pub const INFINITE: DWORD = 0xFFFFFFFF;
 pub const WAIT_FAILED: DWORD = 0xFFFFFFFF;
 
+pub const INVALID_HANDLE_VALUE: usize = @bitCast(@as(isize, -1));
+pub const GENERIC_READ: DWORD = 0x80000000;
+pub const GENERIC_WRITE: DWORD = 0x40000000;
+pub const OPEN_ALWAYS: DWORD = 4;
+pub const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
+pub const FILE_FLAG_DELETE_ON_CLOSE: DWORD = 0x04000000;
+
 pub const MOVEFILE_REPLACE_EXISTING: DWORD = 0x1;
 pub const MOVEFILE_WRITE_THROUGH: DWORD = 0x8;
 
@@ -57,6 +64,7 @@ pub const PROCESS_INFORMATION = extern struct {
 pub const HandlerRoutine = *const fn (ctrl_type: DWORD) callconv(.winapi) BOOL;
 
 pub extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
+pub extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: DWORD, share: DWORD, sa: ?*anyopaque, disposition: DWORD, flags: DWORD, template: ?HANDLE) callconv(.winapi) HANDLE;
 pub extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn ExitProcess(code: u32) callconv(.winapi) noreturn;
 pub extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]u16;

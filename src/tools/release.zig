@@ -19,7 +19,9 @@
 //!     %LOCALAPPDATA%\Portal\bin\portal.exe   the launcher (put bin on PATH)
 //!
 //! PORTAL_RELEASES_DIR (absolute path) overrides the releases directory, for
-//! testing; the launcher is then installed to its sibling `bin` directory.
+//! testing, when PORTAL_TESTING=1 is also set; the launcher is then
+//! installed to its sibling `bin` directory. `release` holds
+//! <releases>\release.lock for its whole run (one release at a time).
 //!
 //! Only a build that passes `zig build test` (unit tests + full exe compile
 //! in Debug and ReleaseSafe) is promoted. A running portal.exe is never
@@ -51,7 +53,7 @@ const usage =
     \\      Show current, known-good, history and releases on disk.
     \\
     \\Releases: %LOCALAPPDATA%\Portal\releases, or PORTAL_RELEASES_DIR
-    \\(absolute path; for testing only).
+    \\(absolute path; for testing only: honoured only with PORTAL_TESTING=1).
     \\
 ;
 
@@ -85,15 +87,22 @@ pub fn main(init: std.process.Init) !void {
     }
     const cmd = args[0];
 
-    const override = env.get("PORTAL_RELEASES_DIR");
+    const override: ?[]const u8 = switch (lib.releasesOverride(env.get(lib.override_env), env.get(lib.testing_env))) {
+        .none => null,
+        .ignored => |o| blk: {
+            std.debug.print("{s}: warning: ignoring PORTAL_RELEASES_DIR={s} (set PORTAL_TESTING=1 to use it)\n", .{ cmd, o });
+            break :blk null;
+        },
+        .active => |o| o,
+    };
     const releases = lib.releasesRoot(gpa, override, env.get("LOCALAPPDATA")) catch |err| switch (err) {
         error.NoLocalAppData => fatal(cmd, "LOCALAPPDATA is not set", .{}),
         error.RelativeOverride => fatal(cmd, "PORTAL_RELEASES_DIR must be an absolute path", .{}),
         error.OutOfMemory => return err,
     };
     defer gpa.free(releases);
-    if (override != null and override.?.len > 0)
-        std.debug.print("{s}: note: PORTAL_RELEASES_DIR override in effect: {s}\n", .{ cmd, releases });
+    if (override != null)
+        std.debug.print("{s}: warning: TESTING override PORTAL_RELEASES_DIR in effect: {s}\n", .{ cmd, releases });
     Io.Dir.cwd().createDirPath(io, releases) catch |err|
         fatal(cmd, "cannot create {s}: {t}", .{ releases, err });
 
@@ -156,6 +165,35 @@ fn readPointer(ctx: Ctx, name: []const u8) ?[]u8 {
     defer ctx.gpa.free(contents);
     const id = lib.parsePointer(contents) orelse return null;
     return ctx.gpa.dupe(u8, id) catch null;
+}
+
+/// Like readPointer, but tells a missing file apart from one that exists
+/// and cannot be read. Owned contents (unvalidated) on success.
+fn readPointerRaw(ctx: Ctx, name: []const u8) lib.PointerRead {
+    const p = ctx.path(name) catch return .unreadable;
+    defer ctx.gpa.free(p);
+    const contents = Io.Dir.cwd().readFileAlloc(ctx.io, p, ctx.gpa, .limited(lib.max_pointer_bytes)) catch |err| return switch (err) {
+        error.FileNotFound => .missing,
+        else => .unreadable,
+    };
+    return .{ .contents = contents };
+}
+
+/// Holds `<releases>\release.lock` open with no sharing (and delete-on-
+/// close) until the process exits, so two `release` runs cannot share
+/// _staging or race on the pointers. Fails the release if another holds it.
+fn lockReleases(ctx: Ctx) void {
+    const p = ctx.path(lib.lock_file) catch failRelease("out of memory", .{});
+    defer ctx.gpa.free(p);
+    const p_w = std.unicode.wtf8ToWtf16LeAllocZ(ctx.gpa, p) catch failRelease("out of memory", .{});
+    defer ctx.gpa.free(p_w);
+    const h = w.CreateFileW(p_w.ptr, w.GENERIC_READ | w.GENERIC_WRITE, 0, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL | w.FILE_FLAG_DELETE_ON_CLOSE, null);
+    if (@intFromPtr(h) == w.INVALID_HANDLE_VALUE) {
+        const e = w.GetLastError();
+        if (e == 32) failRelease("another `portal-release release` is running ({s} is in use)", .{p});
+        failRelease("cannot create lock file {s} (error {d})", .{ p, e });
+    }
+    // Never closed: the handle (and lock) lasts until the process exits.
 }
 
 /// Atomic pointer update: write and flush a temp file, then
@@ -325,6 +363,7 @@ const Now = struct {
 fn cmdRelease(ctx: Ctx, zig_arg: ?[]const u8, repo_arg: ?[]const u8) !void {
     const gpa = ctx.gpa;
     const io = ctx.io;
+    lockReleases(ctx);
 
     const repo = Io.Dir.cwd().realPathFileAlloc(io, repo_arg orelse ".", gpa) catch |err|
         failRelease("cannot resolve repo directory '{s}': {t}", .{ repo_arg orelse ".", err });
@@ -422,13 +461,27 @@ fn cmdRelease(ctx: Ctx, zig_arg: ?[]const u8, repo_arg: ?[]const u8) !void {
     installLauncher(ctx, stage, bin_dir, now.stamp);
     Io.Dir.cwd().deleteTree(io, stage) catch |err| warn("could not remove {s}: {t}", .{ stage, err });
 
-    const kg = readPointer(ctx, lib.known_good_file);
-    defer if (kg) |k| gpa.free(k);
-    prune(ctx, id, kg);
+    // Prune only when the known-good release is certain: if known-good.txt
+    // exists but cannot be read or validated, deleting old releases could
+    // delete the very release it names.
+    const kg_read = readPointerRaw(ctx, lib.known_good_file);
+    defer if (kg_read == .contents) gpa.free(kg_read.contents);
+    const kg: ?[]const u8 = switch (lib.pruneGuard(kg_read)) {
+        .skip => blk: {
+            warn("{s} exists but could not be read or is invalid: pruning skipped", .{lib.known_good_file});
+            break :blk null;
+        },
+        .prune => |k| blk: {
+            prune(ctx, id, k);
+            break :blk k;
+        },
+    };
 
     std.debug.print("release: promoted {s}\n", .{id});
     if (kg) |k| {
         std.debug.print("release: known-good fallback is {s}\n", .{k});
+    } else if (kg_read != .missing) {
+        std.debug.print("release: check {s} (unreadable or invalid); `zig build mark-good` rewrites it\n", .{lib.known_good_file});
     } else {
         std.debug.print("release: no known-good release yet. After confirming this one works end to end, run `zig build mark-good`\n", .{});
     }

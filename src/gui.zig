@@ -26,14 +26,54 @@ pub const font_em: f32 = 15;
 const max_paste_units = 256 * 1024;
 
 pub const Options = struct {
-    /// Shown while the program has not set a title (e.g. "claude").
+    /// The session program's name (e.g. the agent CLI). Not shown in the window.
     command_name: []const u8,
+    /// `--project NAME` (checked with validProject), shown as
+    /// "Portal — NAME". Null: "Portal — No project". (Tabs will supply
+    /// per-project names later.)
+    project: ?[]const u8 = null,
     /// e.g. "127.0.0.1:8420", shown in the status line.
     listen_host: []const u8,
     policy: keymap.Policy,
 };
 
 pub const Ended = enum { window_closed, child_exited };
+
+/// Longest `--project` name, in bytes.
+pub const max_project_bytes = 64;
+
+/// True if `s` may be shown as the project name: 1..max_project_bytes bytes
+/// of valid UTF-8 on a single line, with no control characters (C0, DEL,
+/// C1), line/paragraph separators or bidi overrides (which could make the
+/// title read differently from what it is).
+pub fn validProject(s: []const u8) bool {
+    if (s.len == 0 or s.len > max_project_bytes) return false;
+    const v = std.unicode.Utf8View.init(s) catch return false;
+    var it = v.iterator();
+    while (it.nextCodepoint()) |cp| switch (cp) {
+        0x00...0x1F, 0x7F...0x9F, 0x2028, 0x2029, 0x202A...0x202E, 0x2066...0x2069, 0x200E, 0x200F, 0x061C, 0xFEFF => return false,
+        else => {},
+    };
+    return std.mem.trim(u8, s, " ").len > 0;
+}
+
+/// "Portal — <project>" or "Portal — No project". Program-set titles (OSC
+/// 0/2) are never shown: they leak paths such as
+/// "Administrator: C:\Windows\system32\cmd.exe". Not derived from the
+/// working directory either (by default the home folder: the user name).
+pub fn windowLabel(project: ?[]const u8, buf: []u8) []const u8 {
+    const p = project orelse "No project";
+    return std.fmt.bufPrint(buf, "Portal \u{2014} {s}", .{p}) catch "Portal";
+}
+
+/// The window title: the label, plus " — N REMOTE VIEWER(S)" while anyone
+/// watches.
+pub fn windowTitle(project: ?[]const u8, viewers: u32, buf: []u8) []const u8 {
+    var lbuf: [max_project_bytes + 16]u8 = undefined;
+    const label = windowLabel(project, &lbuf);
+    if (viewers == 0) return std.fmt.bufPrint(buf, "{s}", .{label}) catch "Portal";
+    return std.fmt.bufPrint(buf, "{s} \u{2014} {d} REMOTE VIEWER{s}", .{ label, viewers, if (viewers == 1) "" else "S" }) catch "Portal";
+}
 
 /// Cell selection being made with the mouse (anchor = where the drag began).
 const Select = struct {
@@ -72,12 +112,17 @@ pub const LocalHost = struct {
     drawn_viewers: u32 = std.math.maxInt(u32),
     /// Coalesces wake-ups from other threads (Session.notify_fn).
     wake_pending: std.atomic.Value(bool) = .init(false),
-    title_buf: [vt_title_max + 64]u8 = undefined,
+    title_buf: [title_max]u8 = undefined,
     title_len: usize = 0,
+    label_buf: [max_project_bytes + 16]u8 = undefined,
+    /// Times the message loop woke up (idle should stay near zero: the
+    /// loop is event-driven), and frames presented. Logged at shutdown.
+    wakeups: u64 = 0,
+    presents: u64 = 0,
     /// Set by the child-exit waiter thread.
     child_done: *const std.atomic.Value(bool),
 
-    const vt_title_max = @import("vt.zig").max_title_bytes;
+    const title_max = max_project_bytes + 64;
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options, child_done: *const std.atomic.Value(bool)) !*LocalHost {
         const tv = try TermView.init(gpa, io, .{
@@ -116,19 +161,36 @@ pub const LocalHost = struct {
     }
 
     /// The message loop. Returns when the window is closed or the child
-    /// exited (the caller then runs the common shutdown).
+    /// exited (the caller then runs the common shutdown, which can take
+    /// seconds without pumping messages: so the window is hidden and its
+    /// swapchain torn down first, rather than left showing "Not
+    /// responding" and exiting the process under a live swapchain).
+    ///
+    /// Purely event-driven: it sleeps until window input or a wake()
+    /// (session output, viewer count changes and child exit all call
+    /// notifyThunk), never on a timer.
     pub fn run(h: *LocalHost) Ended {
         h.updateTitle();
-        while (true) {
-            if (!h.tv.pollEvents(h.sink())) return .window_closed;
-            if (h.child_done.load(.acquire)) return .child_exited;
+        const ended: Ended = while (true) {
+            if (!h.tv.pollEvents(h.sink())) break .window_closed;
+            if (h.child_done.load(.acquire)) break .child_exited;
             h.frame(false);
-            h.tv.waitEvents(250);
-        }
+            h.tv.waitEvents(TermView.forever);
+            h.wakeups += 1;
+        };
+        h.hide();
+        h.tv.releaseGpu();
+        return ended;
+    }
+
+    /// Any thread: the child exited (child_done is set); ends the wait in
+    /// run().
+    pub fn wakeChildExited(h: *LocalHost) void {
+        notifyThunk(h);
     }
 
     /// Hides the window (shutdown can take a moment; the user already
-    /// asked to close).
+    /// asked to close, or the program ended).
     pub fn hide(h: *LocalHost) void {
         _ = ShowWindow(@ptrCast(h.tv.window.hwnd), 0);
     }
@@ -158,11 +220,7 @@ pub const LocalHost = struct {
         var status_buf: [96]u8 = undefined;
         h.tv.build(&h.grid, h.overlay(&right_buf, &status_buf));
         h.tv.present();
-    }
-
-    fn displayTitle(h: *const LocalHost) []const u8 {
-        const t = h.sync.title();
-        return if (t.len > 0) t else h.opts.command_name;
+        h.presents += 1;
     }
 
     fn viewerText(n: u32, buf: []u8) []const u8 {
@@ -170,7 +228,7 @@ pub const LocalHost = struct {
         return std.fmt.bufPrint(buf, "{d} REMOTE VIEWER{s} WATCHING", .{ n, if (n == 1) "" else "S" }) catch "REMOTE VIEWERS WATCHING";
     }
 
-    fn overlay(h: *const LocalHost, right_buf: []u8, status_buf: []u8) TermView.Overlay {
+    fn overlay(h: *LocalHost, right_buf: []u8, status_buf: []u8) TermView.Overlay {
         const watching = h.viewers > 0;
         const remote_input: []const u8 = switch (h.opts.policy) {
             .none => "remote: view only",
@@ -180,7 +238,7 @@ pub const LocalHost = struct {
         };
         return .{
             .top_bar = .{
-                .title = h.displayTitle(),
+                .title = windowLabel(h.opts.project, &h.label_buf),
                 .right = viewerText(h.viewers, right_buf),
                 .right_tone = if (watching) .warn else .muted,
                 .right_badge = watching,
@@ -196,14 +254,10 @@ pub const LocalHost = struct {
         };
     }
 
-    /// The one place the window title is set: "<program title> — N REMOTE
-    /// VIEWER(S)" while anyone watches, "<program title> — Portal" otherwise.
+    /// The one place the window title is set (see windowTitle).
     fn updateTitle(h: *LocalHost) void {
-        var buf: [vt_title_max + 64]u8 = undefined;
-        const t = if (h.viewers > 0)
-            std.fmt.bufPrint(&buf, "{s} \u{2014} {d} REMOTE VIEWER{s}", .{ h.displayTitle(), h.viewers, if (h.viewers == 1) "" else "S" }) catch "Portal"
-        else
-            std.fmt.bufPrint(&buf, "{s} \u{2014} Portal", .{h.displayTitle()}) catch "Portal";
+        var buf: [title_max]u8 = undefined;
+        const t = windowTitle(h.opts.project, h.viewers, &buf);
         if (std.mem.eql(u8, t, h.title_buf[0..h.title_len])) return;
         @memcpy(h.title_buf[0..t.len], t);
         h.title_len = t.len;
@@ -341,6 +395,41 @@ test "selection range normalises drag direction" {
     try std.testing.expectEqual(@as(u16, 3), r.end_row);
     s.active = false;
     try std.testing.expect(s.range() == null);
+}
+
+test "window title never shows the program's title" {
+    var buf: [LocalHost.title_max]u8 = undefined;
+    try std.testing.expectEqualStrings("Portal \u{2014} No project", windowTitle(null, 0, &buf));
+    try std.testing.expectEqualStrings("Portal \u{2014} acme-api", windowTitle("acme-api", 0, &buf));
+    try std.testing.expectEqualStrings("Portal \u{2014} acme-api \u{2014} 1 REMOTE VIEWER", windowTitle("acme-api", 1, &buf));
+    try std.testing.expectEqualStrings("Portal \u{2014} No project \u{2014} 3 REMOTE VIEWERS", windowTitle(null, 3, &buf));
+    // The longest valid project with a huge viewer count still fits.
+    const long: [max_project_bytes]u8 = @splat('p');
+    try std.testing.expect(std.mem.endsWith(u8, windowTitle(&long, std.math.maxInt(u32), &buf), "4294967295 REMOTE VIEWERS"));
+    var lbuf: [max_project_bytes + 16]u8 = undefined;
+    try std.testing.expectEqualStrings("Portal \u{2014} No project", windowLabel(null, &lbuf));
+    try std.testing.expectEqualStrings("Portal \u{2014} " ++ long, windowLabel(&long, &lbuf));
+}
+
+test "validProject" {
+    try std.testing.expect(validProject("acme-api"));
+    try std.testing.expect(validProject("Kundenportal \u{e9}t\u{e9} 2"));
+    const max: [max_project_bytes]u8 = @splat('p');
+    const over: [max_project_bytes + 1]u8 = @splat('p');
+    try std.testing.expect(validProject(&max));
+    try std.testing.expect(!validProject(&over));
+    try std.testing.expect(!validProject(""));
+    try std.testing.expect(!validProject("   "));
+    try std.testing.expect(!validProject("a\nb"));
+    try std.testing.expect(!validProject("a\rb"));
+    try std.testing.expect(!validProject("a\tb"));
+    try std.testing.expect(!validProject("a\x1b]0;x\x07"));
+    try std.testing.expect(!validProject("a\x7f"));
+    try std.testing.expect(!validProject("a\u{85}b")); // C1 NEL
+    try std.testing.expect(!validProject("a\u{2028}b"));
+    try std.testing.expect(!validProject("abc\u{202e}gpj.exe")); // RLO
+    try std.testing.expect(!validProject("a\u{2067}b"));
+    try std.testing.expect(!validProject("bad\xff"));
 }
 
 test "viewer text" {

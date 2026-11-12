@@ -28,6 +28,7 @@ test {
     _ = TermView;
     _ = grid;
     _ = images;
+    _ = platform;
     _ = wcwidth;
     _ = font.ttf;
     _ = font.raster;

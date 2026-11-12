@@ -9,7 +9,8 @@
 //!   4. exits with the child's full 32-bit exit code.
 //!
 //! <releases> is %LOCALAPPDATA%\Portal\releases, or PORTAL_RELEASES_DIR (an
-//! absolute path, for testing).
+//! absolute path, for testing; honoured only when PORTAL_TESTING=1 is also
+//! set, with a warning).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,15 +25,24 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const env = init.environ_map;
 
-    const override = env.get("PORTAL_RELEASES_DIR");
+    // PORTAL_RELEASES_DIR picks which portal.exe runs, so it is honoured
+    // only together with PORTAL_TESTING=1, and always announced.
+    const override: ?[]const u8 = switch (lib.releasesOverride(env.get(lib.override_env), env.get(lib.testing_env))) {
+        .none => null,
+        .ignored => |o| blk: {
+            std.debug.print("portal: warning: ignoring PORTAL_RELEASES_DIR={s} (it is honoured only with PORTAL_TESTING=1)\n", .{o});
+            break :blk null;
+        },
+        .active => |o| o,
+    };
     const releases = lib.releasesRoot(gpa, override, env.get("LOCALAPPDATA")) catch |err| switch (err) {
         error.NoLocalAppData => fail("LOCALAPPDATA is not set.", .{}),
         error.RelativeOverride => fail("PORTAL_RELEASES_DIR must be an absolute path.", .{}),
         error.OutOfMemory => return err,
     };
     defer gpa.free(releases);
-    if (override != null and override.?.len > 0)
-        std.debug.print("portal: note: PORTAL_RELEASES_DIR override in effect: {s}\n", .{releases});
+    if (override != null)
+        std.debug.print("portal: warning: TESTING override PORTAL_RELEASES_DIR in effect, running releases from {s}\n", .{releases});
 
     const id = readCurrent(gpa, io, releases) orelse fail(
         "{s}\\{s} is missing or invalid. In the Portal repo run `zig build release` (or `zig build rollback`).",
@@ -73,6 +83,7 @@ fn ignoreCtrl(ctrl_type: w.DWORD) callconv(.winapi) w.BOOL {
 }
 
 extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) w.BOOL;
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) w.DWORD;
 
 fn run(gpa: Allocator, exe: []const u8) !u32 {
     const exe_w = try std.unicode.wtf8ToWtf16LeAllocZ(gpa, exe);
@@ -96,8 +107,11 @@ fn run(gpa: Allocator, exe: []const u8) !u32 {
     _ = w.SetConsoleCtrlHandler(ignoreCtrl, 1);
     // Tells portal.exe that the launcher (not a terminal) shares its
     // console, so a double-clicked launcher still counts as "no terminal"
-    // for the default working directory (src/workdir.zig).
-    _ = SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("PORTAL_VIA_LAUNCHER"), std.unicode.utf8ToUtf16LeStringLiteral("1"));
+    // for the default working directory (src/workdir.zig). The value is our
+    // pid: portal.exe trusts it only if we are its parent, then deletes it
+    // from its own environment so its session child does not inherit it.
+    var pid_buf: [16]u16 = undefined;
+    _ = SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("PORTAL_VIA_LAUNCHER"), lib.pidWide(GetCurrentProcessId(), &pid_buf));
 
     var si: w.STARTUPINFOW = .{ .cb = @sizeOf(w.STARTUPINFOW) };
     var pi: w.PROCESS_INFORMATION = undefined;
