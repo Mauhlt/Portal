@@ -50,6 +50,8 @@ const tls_server = @import("tls/server.zig");
 const x509 = @import("tls/x509.zig");
 const pki = @import("tls/pki.zig");
 const settings = @import("settings.zig");
+const sync = @import("sync.zig");
+const sync_cli = @import("sync_cli.zig");
 
 /// True in portal.exe (the window), false in portalctl.exe (build.zig).
 pub const gui_app = @import("build_options").gui;
@@ -159,6 +161,28 @@ const usage =
     \\      graphics). Inside a Portal session the image appears in the window
     \\      and for remote viewers. Reads only the file named.
     \\
+    \\  portalctl sync key [show | init [--force]]
+    \\      The release key (Ed25519, DPAPI-protected, separate from the CA)
+    \\      that signs packages for your devices. Devices pin it when they
+    \\      pair; replacing it (--force) means pairing each device again.
+    \\  portalctl publish <package> <folder> --kind data|executable
+    \\                    [--version V] [--min-client V]
+    \\      Hash, sign and publish a folder as a new version of <package>
+    \\      (e.g. stt-model, stt-adapter, stt-local, npu-probe). Data installs
+    \\      on subscribed devices by itself; executables need approval on
+    \\      the device, every version. Nothing is ever run automatically.
+    \\  portalctl publish --list
+    \\  portalctl unpublish <package> <version>
+    \\  portalctl sync subscribe|unsubscribe <device> <package>
+    \\  portalctl sync subscriptions
+    \\      Which device receives which package.
+    \\  portalctl sync-device --server IP:PORT --ca FILE [--pair] [--approve]
+    \\                    [--wait-updates S] [--only PKG]
+    \\      Headless device side (tests): pair, then fetch, verify and
+    \\      install what the desktop offers. --approve stands for the
+    \\      approval click in the app. Also --status, --rollback PKG and
+    \\      --server IP:PORT --forget.
+    \\
     \\  portalctl version
     \\
 ;
@@ -208,6 +232,14 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "connect")) fatal("the remote viewer is a window: run `portal connect` (portal.exe)", .{});
     if (std.mem.eql(u8, cmd, "ca")) return cmdCa(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "show")) std.process.exit(@import("show.zig").main(gpa, io, args[1..]));
+    if (std.mem.eql(u8, cmd, "sync") or std.mem.eql(u8, cmd, "publish") or std.mem.eql(u8, cmd, "unpublish")) {
+        const paths = try devicePaths(gpa, io, init.environ_map);
+        const sp: sync.Paths = .{ .dir = paths.dir };
+        if (cmd[0] == 's') return sync_cli.cmdSync(gpa, io, sp, args[1..]);
+        if (cmd[0] == 'p') return sync_cli.cmdPublish(gpa, io, sp, args[1..]);
+        return sync_cli.cmdUnpublish(gpa, io, sp, args[1..]);
+    }
+    if (std.mem.eql(u8, cmd, "sync-device")) return sync_cli.cmdSyncDevice(gpa, io, args[1..], portal_version);
     if (std.mem.eql(u8, cmd, "version")) {
         std.debug.print("portal {s} (built with zig {s})\n", .{ portal_version, builtin.zig_version_string });
         return;
@@ -1115,6 +1147,78 @@ const PairWatch = struct {
     }
 };
 
+/// Portal sync, event-driven like PairWatch: sleeps until a file is
+/// created, renamed or deleted in the data directory (the subscriptions
+/// and device lists are replaced by rename) or anywhere under publish\
+/// (a publish ends in a folder rename). On each wake it hashes every
+/// subscribed device's GET /sync/index and hands the digests to the
+/// server, whose WebSocket writers send {"t":"updates"} to the devices
+/// whose index changed. Nothing polls.
+const SyncWatch = struct {
+    srv: *web.Server,
+    paths: sync.Paths,
+    io: Io,
+    gpa: Allocator,
+
+    const FILE_NOTIFY_CHANGE_FILE_NAME: w.DWORD = 0x1;
+    const FILE_NOTIFY_CHANGE_DIR_NAME: w.DWORD = 0x2;
+    extern "kernel32" fn FindFirstChangeNotificationW(path: [*:0]const u16, subtree: w.BOOL, filter: w.DWORD) callconv(.winapi) ?w.HANDLE;
+    extern "kernel32" fn FindNextChangeNotification(h: w.HANDLE) callconv(.winapi) w.BOOL;
+
+    fn open(sw: *SyncWatch, dir: []const u8, subtree: bool) ?w.HANDLE {
+        const dw = std.unicode.wtf8ToWtf16LeAllocZ(sw.gpa, dir) catch return null;
+        defer sw.gpa.free(dw);
+        return w.validHandle(FindFirstChangeNotificationW(dw.ptr, @intFromBool(subtree), FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME));
+    }
+
+    fn refresh(sw: *SyncWatch) void {
+        const subs = sync.readSubs(sw.gpa, sw.io, sw.paths) catch |err| {
+            sw.srv.log.print("sync: subscriptions unreadable ({t}); keeping the last state", .{err});
+            return;
+        };
+        var list: [devices.max_devices]web.SyncDigest = undefined;
+        var n: usize = 0;
+        for (subs.items[0..subs.n]) |x| {
+            const dev = x.device.get();
+            var seen = false;
+            for (list[0..n]) |d| seen = seen or std.mem.eql(u8, d.device.get(), dev);
+            if (seen or n == list.len) continue;
+            const idx = sync.buildIndex(sw.gpa, sw.io, sw.paths, dev) catch continue;
+            defer sw.gpa.free(idx);
+            list[n] = .{};
+            list[n].device.set(dev);
+            std.crypto.hash.sha2.Sha256.hash(idx, &list[n].digest, .{});
+            n += 1;
+        }
+        sw.srv.setSyncDigests(list[0..n]);
+    }
+
+    fn watch(sw: *SyncWatch) void {
+        var pb: [1024]u8 = undefined;
+        const publish_dir = std.fmt.bufPrint(&pb, "{s}\\publish", .{sw.paths.dir}) catch return;
+        Io.Dir.cwd().createDirPath(sw.io, publish_dir) catch {};
+        var handles: [2]w.HANDLE = undefined;
+        var n: w.DWORD = 0;
+        if (sw.open(sw.paths.dir, false)) |h| {
+            handles[n] = h;
+            n += 1;
+        }
+        if (sw.open(publish_dir, true)) |h| {
+            handles[n] = h;
+            n += 1;
+        }
+        if (n < 2) sw.srv.log.print("sync: cannot watch {s} for changes; devices learn about new packages when they reconnect", .{sw.paths.dir});
+        sw.refresh();
+        while (n > 0) {
+            const r = devices.WaitForMultipleObjects(n, &handles, 0, w.INFINITE);
+            if (r >= devices.WAIT_OBJECT_0 + n) return;
+            // Re-arm before re-reading, so a change made meanwhile signals again.
+            if (FindNextChangeNotification(handles[r - devices.WAIT_OBJECT_0]) == 0) return;
+            sw.refresh();
+        }
+    }
+};
+
 const no_tls_warning =
     \\
     \\  *****************************************************************
@@ -1531,6 +1635,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     }
 
     const paths = devicePaths(gpa, io, env) catch |err| fatal("cannot create the data directory: {t}", .{err});
+    // Portal sync: the release key devices pin at pairing (created on
+    // first use, like the CA). Without it the /sync routes are off.
+    const sync_key: ?[32]u8 = sync.ensureKey(gpa, io, .{ .dir = paths.dir }) catch null;
     const dir = paths.dir;
     const log_path = try std.fs.path.join(gpa, &.{ dir, "portal.log" });
     defer gpa.free(log_path);
@@ -1696,6 +1803,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .devices = paths,
             .tls = if (opts.no_tls) null else &tls_creds,
             .ca_fingerprint = if (opts.no_tls) null else ca_download.fingerprint,
+            .sync_key = sync_key,
         },
     };
 
@@ -1780,6 +1888,12 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         fatal("cannot start web server thread: {t}", .{err});
     accept_thread.detach();
     {
+        const sw = gpa.create(SyncWatch) catch fatal("out of memory", .{});
+        sw.* = .{ .srv = &server, .paths = .{ .dir = paths.dir }, .io = io, .gpa = gpa };
+        if (sync_key == null) log.print("sync: no release key (DPAPI unavailable?); package delivery is off", .{});
+        const st = std.Thread.spawn(.{}, SyncWatch.watch, .{sw}) catch |err|
+            fatal("cannot start the sync watcher thread: {t}", .{err});
+        st.detach();
         const t = std.Thread.spawn(.{}, PairWatch.watch, .{&pair_watch}) catch |err|
             fatal("cannot start the pairing watcher thread: {t}", .{err});
         t.detach();
@@ -1871,6 +1985,8 @@ test {
     _ = @import("tls/der.zig");
     _ = @import("tls/dpapi.zig");
     _ = @import("tls/pki.zig");
+    _ = @import("sync.zig");
+    _ = @import("sync_cli.zig");
 }
 
 test "isYes" {

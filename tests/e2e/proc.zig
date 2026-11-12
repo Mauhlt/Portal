@@ -80,6 +80,10 @@ pub const Harness = struct {
         defer m.deinit();
         _ = m.swapRemove("ZIG_PROGRESS");
         try m.put("LOCALAPPDATA", local_app_data);
+        // Per-user config (pinned CAs and release keys of `portal
+        // connect` / `portalctl sync-device`) stays in the scratch tree too.
+        const roaming = try std.fmt.allocPrint(h.gpa, "{s}\\Roaming", .{local_app_data});
+        try m.put("APPDATA", roaming);
         try m.put("PROMPT", "E2E$G");
         const block = try m.createWindowsBlock(h.gpa, .{});
         return block.slice;

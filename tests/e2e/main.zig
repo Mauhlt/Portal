@@ -10,7 +10,7 @@
 //! portal-show.exe must sit next to portalctl.exe (the build arranges it).
 //!
 //! Groups: pairing, grid, keys, text, transport, privacy, images, instruct,
-//! console, idle, tls, webinput (default: all).
+//! console, idle, tls, sync, webinput (default: all).
 
 const std = @import("std");
 const net = @import("net.zig");
@@ -27,6 +27,7 @@ const images = @import("images.zig");
 const idle = @import("idle.zig");
 const tls_tests = @import("tls_tests.zig");
 const webinput = @import("webinput.zig");
+const sync_tests = @import("sync_tests.zig");
 
 pub const base_port: u16 = 18420;
 
@@ -49,6 +50,7 @@ const groups = [_]Group{
     .{ .name = "images", .run = images.run, .port_offset = 60 },
     .{ .name = "idle", .run = idle.run, .port_offset = 90 },
     .{ .name = "tls", .run = tls_tests.run, .port_offset = 100 },
+    .{ .name = "sync", .run = sync_tests.run, .port_offset = 110 },
     .{ .name = "webinput", .run = webinput.run, .port_offset = 120 },
 };
 

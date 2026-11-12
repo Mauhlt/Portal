@@ -37,6 +37,9 @@ const Grid = @import("view").grid.Grid;
 const gframe = @import("../gframe.zig");
 const keys = @import("../keys.zig");
 const credstore = @import("../credstore.zig");
+const sync_engine = @import("../sync/engine.zig");
+const keypin = @import("../sync/keypin.zig");
+const sync_manifest = @import("../sync/manifest.zig");
 
 pub const max_frame_payload = 8 << 20;
 
@@ -85,6 +88,16 @@ pub const Shared = struct {
     last_error: ?anyerror = null,
     wake_ctx: ?*anyopaque = null,
     wake_fn: ?*const fn (*anyopaque) void = null,
+    /// The live session (guarded by `mutex`), for the sync worker's
+    /// requests; null while signed out. Memory only.
+    session: ?http.Cookie = null,
+    /// Bumped on every stream (re)connect and every {"t":"updates"}: the
+    /// sync worker runs a pass when it changes (docs/sync-design.md).
+    sync_gen: std.atomic.Value(u64) = .init(0),
+    /// Set with sync_gen, for a worker waiting on it.
+    sync_wake: Io.Event = .unset,
+    /// Pairing just completed (the app offers voice packages then).
+    just_paired: std.atomic.Value(bool) = .init(false),
 
     pub fn detail(s: *const Shared) []const u8 {
         return s.detail_buf[0..s.detail_len];
@@ -237,6 +250,7 @@ pub const Client = struct {
             if (session == null) {
                 session = c.authenticate(&backoff);
                 if (session == null) continue;
+                c.publishSession(&session.?);
             }
             c.setStatus(.connecting, "opening stream", .{});
             const result = c.runStream(&session.?, &backoff);
@@ -244,6 +258,7 @@ pub const Client = struct {
                 .unauthorized, .logout => {
                     session.?.wipe();
                     session = null; // refresh (or re-pair) next
+                    c.publishSession(null);
                 },
                 .exited => |code| {
                     c.shared.mutex.lockUncancelable(c.io);
@@ -257,6 +272,63 @@ pub const Client = struct {
                     c.retryWait(&backoff, why);
                 },
             }
+        }
+    }
+
+    /// Shares the session with the sync worker (or clears it).
+    fn publishSession(c: *Client, session: ?*const http.Cookie) void {
+        c.shared.mutex.lockUncancelable(c.io);
+        defer c.shared.mutex.unlock(c.io);
+        if (c.shared.session) |*old| old.wipe();
+        c.shared.session = if (session) |x| x.* else null;
+    }
+
+    fn signalSync(c: *Client) void {
+        _ = c.shared.sync_gen.fetchAdd(1, .release);
+        c.shared.sync_wake.set(c.io);
+    }
+
+    /// How the sync engine reaches the server with `session`.
+    pub fn syncRemote(c: *const Client, session: []const u8) sync_engine.Remote {
+        return .{ .gpa = c.gpa, .io = c.io, .addr = c.addr, .security = c.security(), .host = c.host(), .session = session };
+    }
+
+    /// Right after pairing: asks the server, over this freshly paired and
+    /// CA-pinned session, for its release key and pins it for this server
+    /// (docs/sync-design.md, "Trust"). Replaces any earlier pin: pairing
+    /// is the only way a pin changes.
+    pub fn pinReleaseKey(c: *Client, session: *const http.Cookie) !keypin.Key {
+        const remote = c.syncRemote(session.value());
+        const key = try sync_engine.fetchKey(&remote);
+        try keypin.save(c.io, c.host(), key);
+        var fp: [95]u8 = undefined;
+        std.debug.print("portal connect: release key for {s} pinned: SHA-256 {s}\n", .{ c.host(), sync_manifest.formatFingerprint(sync_manifest.fingerprint(key), &fp) });
+        return key;
+    }
+
+    /// Signs in with the stored device credential (rotating it) and returns
+    /// a session; for headless use (portalctl sync-device).
+    pub fn signIn(c: *Client) !http.Cookie {
+        var buf: [credstore.max_secret]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buf);
+        const stored = (try credstore.load(c.target(), &buf)) orelse return error.NotPaired;
+        var device = http.Cookie.fromValue(.device, stored, c.secure()) orelse return error.NotPaired;
+        defer device.wipe();
+        var resp_buf: [http.max_head_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &resp_buf);
+        var req_buf: [768]u8 = undefined;
+        defer std.crypto.secureZero(u8, &req_buf);
+        var w: Io.Writer = .fixed(&req_buf);
+        try http.writeRefreshRequest(&w, c.host(), c.secure(), &device);
+        var r = try c.roundTrip(w.buffered(), &resp_buf);
+        defer if (r.device) |*d| d.wipe();
+        switch (http.refreshOutcome(&r)) {
+            .ok => {
+                try credstore.save(c.target(), r.device.?.value());
+                return r.session.?;
+            },
+            .revoked => return error.NotPaired,
+            .unexpected => return error.SignInFailed,
         }
     }
 
@@ -309,6 +381,9 @@ pub const Client = struct {
                     c.setStatus(.store_unavailable, "could not save the device credential ({t})", .{err});
                     return null;
                 };
+                if (!c.plain) _ = c.pinReleaseKey(&p.session) catch |err|
+                    std.debug.print("portal connect: no release key pinned ({t}); sync stays off until this device is paired again\n", .{err});
+                c.shared.just_paired.store(true, .release);
                 return p.session;
             },
             .failed => |why| {
@@ -626,6 +701,9 @@ pub const Client = struct {
                     c.shared.mutex.unlock(c.io);
                     backoff.* = 1000;
                     c.notify();
+                    c.signalSync(); // look for updates on every (re)connect
+                } else if (std.mem.eql(u8, m.t, "updates")) {
+                    c.signalSync();
                 } else if (std.mem.eql(u8, m.t, "exit")) {
                     return .{ .exited = m.code orelse 0 };
                 } else if (std.mem.eql(u8, m.t, "logout")) {

@@ -19,7 +19,7 @@ pub const max_path = 1024;
 
 pub const Error = error{ NoConfigDir, PathTooLong };
 
-fn envVar(comptime name: []const u8, buf: []u8) ?[]const u8 {
+pub fn envVar(comptime name: []const u8, buf: []u8) ?[]const u8 {
     if (builtin.os.tag == .windows) {
         const env: std.process.Environ = .{ .block = .global };
         const w = env.getWindows(std.unicode.utf8ToUtf16LeStringLiteral(name)) orelse return null;

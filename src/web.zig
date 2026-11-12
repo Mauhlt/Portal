@@ -57,6 +57,9 @@ const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
 const tls = @import("tls/server.zig");
 const web_images = @import("web_images.zig");
+const sync = @import("sync.zig");
+const sync_manifest = @import("client").sync.manifest;
+const sync_keypin = @import("client").sync.keypin;
 const keymap = @import("keymap.zig");
 
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
@@ -125,6 +128,16 @@ pub const Config = struct {
     /// "AB:CD:..." SHA-256 of the Portal CA, shown on the pairing pages
     /// while a window is open (null without TLS).
     ca_fingerprint: ?[]const u8 = null,
+    /// The sync release public key (docs/sync-design.md); null: the
+    /// /sync routes answer 404.
+    sync_key: ?[32]u8 = null,
+};
+
+/// What a device's GET /sync/index currently hashes to (main.zig's sync
+/// watcher keeps these; a change sends that device {"t":"updates"}).
+pub const SyncDigest = struct {
+    device: devices.Text = .{},
+    digest: [32]u8 = @splat(0),
 };
 
 /// What the pairing-time certificate download listener serves.
@@ -376,6 +389,7 @@ pub const Server = struct {
     store_log: LogLimiter = .{},
     input_log: LogLimiter = .{},
     thread_log: LogLimiter = .{},
+    sync_log: LogLimiter = .{},
 
     /// The pairing window as last read from the device store, by the
     /// pairing watcher or by a handler that just changed it. Requests
@@ -393,6 +407,13 @@ pub const Server = struct {
     /// thread starts.
     pairing_notify_ctx: ?*anyopaque = null,
     pairing_notify_fn: ?*const fn (ctx: *anyopaque) void = null,
+
+    /// Per-device sync index digests, and a generation bumped whenever
+    /// they are replaced (setSyncDigests).
+    sync_mutex: Io.Mutex = .init,
+    sync_digests: [devices.max_devices]SyncDigest = @splat(.{}),
+    sync_n: usize = 0,
+    sync_gen: std.atomic.Value(u64) = .init(0),
 
     /// Makes `run` return (the pairing-time download listener is stopped
     /// this way, together with cancelling its accept).
@@ -586,6 +607,123 @@ pub const Server = struct {
     /// limited), revoke nothing, keep the last known window.
     pub fn noteStoreError(srv: *Server, err: anyerror) void {
         srv.notePreAuth(&srv.store_log, "device store unreadable ({t}): {s}", .{ err, devices.describeError(err) });
+    }
+
+    // ------------------------------------------------------------ sync
+
+    /// Replaces the per-device sync digests and wakes every WebSocket
+    /// writer; each sends {"t":"updates"} if its device's digest changed.
+    pub fn setSyncDigests(srv: *Server, list: []const SyncDigest) void {
+        srv.sync_mutex.lockUncancelable(srv.io);
+        const n = @min(list.len, srv.sync_digests.len);
+        @memcpy(srv.sync_digests[0..n], list[0..n]);
+        srv.sync_n = n;
+        srv.sync_mutex.unlock(srv.io);
+        _ = srv.sync_gen.fetchAdd(1, .release);
+        const s = srv.session;
+        s.mutex.lockUncancelable(srv.io);
+        s.mutex.unlock(srv.io);
+        s.cond.broadcast(srv.io);
+    }
+
+    fn syncDigestFor(srv: *Server, device: []const u8) [32]u8 {
+        srv.sync_mutex.lockUncancelable(srv.io);
+        defer srv.sync_mutex.unlock(srv.io);
+        for (srv.sync_digests[0..srv.sync_n]) |d| if (std.mem.eql(u8, d.device.get(), device)) return d.digest;
+        return @splat(0);
+    }
+
+    /// GET /sync/...: only with a live session, and only for the session's
+    /// own device and its subscriptions. Unknown and unsubscribed packages
+    /// look the same (404).
+    fn syncRoute(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, h: Headers) !bool {
+        const cookie = h.cookie orelse return srv.fail(conn, w, .unauthorized, "login required\n");
+        var tag_buf: [auth.Sessions.max_tag]u8 = undefined;
+        const device = blk: {
+            srv.auth_mutex.lockUncancelable(srv.io);
+            defer srv.auth_mutex.unlock(srv.io);
+            break :blk srv.sessions.liveTag(cookie, srv.realMs(), true, &tag_buf);
+        } orelse return srv.fail(conn, w, .unauthorized, "login required\n");
+        if (!devices.validName(device)) return srv.fail(conn, w, .forbidden, "not a paired device\n");
+        const key = srv.cfg.sync_key orelse return srv.fail(conn, w, .not_found, "not found\n");
+        const paths: sync.Paths = .{ .dir = srv.cfg.devices.dir };
+        const path = req.path;
+        const keep = !req.connection_close;
+
+        if (std.mem.eql(u8, path, "/sync/key")) {
+            var kb: [sync_keypin.header.len + 66]u8 = undefined;
+            var fp_buf: [95]u8 = undefined;
+            const fp = sync_manifest.formatFingerprint(sync_manifest.fingerprint(key), &fp_buf);
+            try srv.respond(conn, w, .ok, sync_keypin.format(key, &kb), "text/plain; charset=utf-8", &.{.{ .name = "x-portal-sync-key-fingerprint", .value = fp }}, keep);
+            return keep;
+        }
+        if (std.mem.eql(u8, path, "/sync/index")) {
+            const body = sync.buildIndex(srv.gpa, srv.io, paths, device) catch |err| {
+                srv.log.print("sync: index for '{s}' failed: {t}", .{ device, err });
+                return srv.fail(conn, w, .internal_server_error, "sync store unavailable\n");
+            };
+            defer srv.gpa.free(body);
+            try srv.respond(conn, w, .ok, body, "text/plain; charset=utf-8", &.{}, keep);
+            return keep;
+        }
+        const prefix = "/sync/pkg/";
+        if (!std.mem.startsWith(u8, path, prefix)) return srv.fail(conn, w, .not_found, "not found\n");
+        // <pkg>/<ver>/manifest  or  <pkg>/<ver>/file/<n>
+        var it = std.mem.splitScalar(u8, path[prefix.len..], '/');
+        const pkg = it.next() orelse "";
+        const ver = it.next() orelse "";
+        const what = it.next() orelse "";
+        const arg = it.next();
+        if (it.next() != null or !sync_manifest.validPackageId(pkg) or !sync_manifest.validVersion(ver))
+            return srv.fail(conn, w, .not_found, "not found\n");
+        const subs = sync.readSubs(srv.gpa, srv.io, paths) catch return srv.fail(conn, w, .internal_server_error, "sync store unavailable\n");
+        if (!subs.has(device, pkg)) {
+            srv.notePreAuth(&srv.sync_log, "sync: '{s}' asked for '{s}', which it is not subscribed to", .{ device, pkg });
+            return srv.fail(conn, w, .not_found, "not found\n");
+        }
+        var v = sync.readVersion(srv.gpa, srv.io, paths, pkg, ver) catch return srv.fail(conn, w, .not_found, "not found\n");
+        defer v.deinit(srv.gpa);
+        if (std.mem.eql(u8, what, "manifest") and arg == null) {
+            srv.log.print("sync: '{s}' fetched the manifest of {s} {s}", .{ device, pkg, ver });
+            try srv.respond(conn, w, .ok, v.manifest_bytes, "text/plain; charset=utf-8", &.{.{ .name = "x-portal-signature", .value = &v.sig_hex }}, keep);
+            return keep;
+        }
+        if (!std.mem.eql(u8, what, "file")) return srv.fail(conn, w, .not_found, "not found\n");
+        const ntext = arg orelse return srv.fail(conn, w, .not_found, "not found\n");
+        if (ntext.len == 0 or ntext.len > 4 or (ntext.len > 1 and ntext[0] == '0')) return srv.fail(conn, w, .not_found, "not found\n");
+        const n = std.fmt.parseInt(usize, ntext, 10) catch return srv.fail(conn, w, .not_found, "not found\n");
+        if (n >= v.m.files.len) return srv.fail(conn, w, .not_found, "not found\n");
+        return srv.syncFile(conn, w, paths, pkg, ver, n, v.m.files[n].size, keep);
+    }
+
+    /// Streams stored file `n`: exactly the size its manifest promises,
+    /// in bounded chunks, each under the send deadline.
+    fn syncFile(srv: *Server, conn: *Conn, w: *Io.Writer, paths: sync.Paths, pkg: []const u8, ver: []const u8, n: usize, size: u64, keep: bool) !bool {
+        var pb: [1024]u8 = undefined;
+        const fpath = sync.filePath(paths, &pb, pkg, ver, n) catch return srv.fail(conn, w, .not_found, "not found\n");
+        const f = Io.Dir.cwd().openFile(srv.io, fpath, .{}) catch return srv.fail(conn, w, .not_found, "not found\n");
+        defer f.close(srv.io);
+        const st = f.stat(srv.io) catch return srv.fail(conn, w, .internal_server_error, "sync store unavailable\n");
+        if (st.size != size) {
+            srv.log.print("sync: stored file {d} of {s} {s} has the wrong size; not served", .{ n, pkg, ver });
+            return srv.fail(conn, w, .internal_server_error, "sync store damaged\n");
+        }
+        conn.setDeadline(srv.nowMs() +| send_timeout_ms);
+        try w.print("HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\nx-content-type-options: nosniff\r\n" ++
+            "cache-control: no-store\r\ncross-origin-resource-policy: same-origin\r\ncontent-length: {d}\r\nconnection: {s}\r\n\r\n", .{ size, if (keep) "keep-alive" else "close" });
+        var buf: [32 * 1024]u8 = undefined;
+        var sent: u64 = 0;
+        while (sent < size) {
+            const got = try f.readPositional(srv.io, &.{buf[0..@intCast(@min(buf.len, size - sent))]}, sent);
+            if (got == 0) return error.SyncFileShrank; // ends the connection mid-body
+            try w.writeAll(buf[0..got]);
+            try w.flush();
+            sent += got;
+            conn.setDeadline(srv.nowMs() +| send_timeout_ms);
+        }
+        try w.flush();
+        conn.setDeadline(no_deadline);
+        return keep;
     }
 
     /// Accept loop. Runs on its own thread for the life of the process.
@@ -987,6 +1125,7 @@ pub const Server = struct {
                     if (h.device) |d| return srv.deviceSignIn(conn, w, req, d, .page);
                     return srv.redirect(conn, w, req, "/pair", &.{});
                 }
+                if (std.mem.startsWith(u8, path, "/sync/")) return srv.syncRoute(conn, w, req, h);
                 if (std.mem.eql(u8, path, "/ws")) {
                     try srv.webSocket(conn, w, req, h, leftover);
                     return false;
@@ -1708,6 +1847,11 @@ pub const Server = struct {
         var hello_buf: [256]u8 = undefined;
         const hello = helloMessage(&hello_buf, s.policy, s.project) catch return;
         if (!ws.send(srv, hello, .text)) return;
+        // Sync announcements: {"t":"updates"} when this device's index
+        // changes (devices also look on every connect).
+        const ws_device = ws.device[0..ws.device_len];
+        var sync_seen = srv.sync_gen.load(.acquire);
+        var sync_digest = srv.syncDigestFor(ws_device);
 
         // Generation of the emulator state last sent; 0 plus `full` forces a
         // complete snapshot first (docs/protocol.md section 3).
@@ -1722,7 +1866,9 @@ pub const Server = struct {
             // the session would expire. No periodic recheck.
             const expires_in = srv.sessionExpiresIn(&ws.cookie) orelse 0;
             s.mutex.lockUncancelable(srv.io);
-            if (!s.closed and !full and s.term.gen == sent_gen and !ws.dead.load(.acquire) and expires_in > 0) {
+            if (!s.closed and !full and s.term.gen == sent_gen and !ws.dead.load(.acquire) and expires_in > 0 and
+                srv.sync_gen.load(.acquire) == sync_seen)
+            {
                 s.cond.waitTimeout(srv.io, &s.mutex, .{ .duration = .{
                     // Until the session expires, or sooner while an image
                     // blob is waiting for this viewer's byte budget.
@@ -1779,6 +1925,15 @@ pub const Server = struct {
             }
             var image_frames = images.frames();
             while (image_frames.next()) |f| if (!ws.send(srv, f, .binary)) return;
+            const gen_now = srv.sync_gen.load(.acquire);
+            if (gen_now != sync_seen) {
+                sync_seen = gen_now;
+                const d = srv.syncDigestFor(ws_device);
+                if (!std.mem.eql(u8, &d, &sync_digest)) {
+                    sync_digest = d;
+                    if (!ws.send(srv, "{\"t\":\"updates\"}", .text)) return;
+                }
+            }
             if (!changed and closed) {
                 const m = std.fmt.bufPrint(&msg, "{{\"t\":\"exit\",\"code\":{d}}}", .{exit_code}) catch return;
                 _ = ws.send(srv, m, .text);

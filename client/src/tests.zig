@@ -13,4 +13,5 @@ test {
     _ = @import("net/client.zig");
     _ = @import("remote.zig");
     _ = @import("setup.zig");
+    _ = @import("sync/root.zig");
 }
