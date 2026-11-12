@@ -16,6 +16,7 @@ pub const INVALID_HANDLE_VALUE: usize = @bitCast(@as(isize, -1));
 pub const INFINITE: DWORD = 0xFFFFFFFF;
 pub const WAIT_OBJECT_0: DWORD = 0;
 
+pub const STARTF_USESTDHANDLES: DWORD = 0x00000100;
 pub const STD_INPUT_HANDLE: DWORD = @bitCast(@as(i32, -10));
 pub const STD_OUTPUT_HANDLE: DWORD = @bitCast(@as(i32, -11));
 pub const STD_ERROR_HANDLE: DWORD = @bitCast(@as(i32, -12));

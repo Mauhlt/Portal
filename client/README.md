@@ -9,6 +9,9 @@ portal-client --server 10.8.0.1:8420          # connect; pair on first use
 portal-client --server 10.8.0.1:8420 --forget # delete this device's credential
 ```
 
+On Windows the same viewer is built into Portal itself as `portal connect`
+(same arguments): `src/connect.zig` is shared by both.
+
 First run: at the desktop run `portal pair <name>`, then click **Pair** (or
 press P) in the client within 2 minutes. After that the client signs in by
 itself on every launch and reconnect.
@@ -31,6 +34,7 @@ branch `portal-client`). After that branch is merged, change it to
 | Path | What |
 |---|---|
 | `src/view/` | **Module `view`**: reusable, no networking. `TermView` (window, Instanced2D drawing, fit/zoom, cursor, answer bar, status line), `grid.zig` (cell snapshot model mirroring `src/vt.zig`), `input.zig` (Key/Mods/Event, `InputSink`), `platform/` (Win32, X11, Cocoa), `font/` (TrueType parser, rasteriser, system fonts, atlas), `wcwidth.zig` (copy of `src/vt_width.zig`). Imports only `std` and `Renderer`. |
+| `src/connect.zig` | The viewer's main loop; module "client" in Portal's root build (`portal connect`), wrapped by `src/main.zig` here. |
 | `src/gframe.zig` | 'G' frame decoder into `view.grid.Grid` (remote grid source). |
 | `src/keys.zig` | Protocol key names per `hello.input` mode. |
 | `src/remote.zig` | `RemoteSink` (InputSink → protocol frames) and the overlay (pairing screen, status). |
@@ -38,10 +42,10 @@ branch `portal-client`). After that branch is merged, change it to
 | `src/credstore.zig` | OS credential store: Windows Credential Manager; macOS Keychain and Linux Secret Service (libsecret) via dlopen. |
 | `tools/mock_server.zig` | Mock Portal server for end-to-end tests. |
 
-For `portal run`'s future local GUI: import `view`, fill a `Grid` from
-`vt.Terminal` (same `Kind`/attrs/colour sentinels), implement an
-`InputSink` that writes VT bytes to the PTY, and use `.sizing = .fixed_em`
-so `InputSink.resized` reports the cols/rows to give the PTY.
+`portal run`'s local window (Portal's `src/gui.zig`) uses `view` too: it
+fills a `Grid` from `vt.Terminal` (`src/localgrid.zig`), its `InputSink`
+writes VT bytes to the PTY (`src/localinput.zig`), and `.sizing = .fixed_em`
+makes `InputSink.resized` report the cols/rows for the PTY.
 
 ## Security
 

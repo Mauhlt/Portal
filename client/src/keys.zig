@@ -63,6 +63,8 @@ pub fn keyFrame(mode: Mode, key: Key, mods: Mods) ?[]const u8 {
                 .page_up => "k:pageup",
                 .page_down => "k:pagedown",
                 .delete => "k:delete",
+                // Not in the protocol (docs/protocol.md section 4).
+                .insert, .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f8, .f9, .f10, .f11, .f12 => null,
             };
         },
     }

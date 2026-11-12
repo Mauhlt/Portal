@@ -65,8 +65,12 @@ pub const Pty = struct {
         if (w.SetInformationJobObject(job, w.JobObjectExtendedLimitInformation, &limits, @sizeOf(@TypeOf(limits))) == 0)
             return error.JobObjectFailed;
 
+        // STARTF_USESTDHANDLES with null handles: the child must use the
+        // pseudo console for stdin/stdout/stderr. Without it, a child of a
+        // Portal with no console (the GUI) or with redirected std handles
+        // inherits those handles instead and exits or writes past the PTY.
         var si: w.STARTUPINFOEXW = .{
-            .StartupInfo = .{ .cb = @sizeOf(w.STARTUPINFOEXW) },
+            .StartupInfo = .{ .cb = @sizeOf(w.STARTUPINFOEXW), .dwFlags = w.STARTF_USESTDHANDLES },
             .lpAttributeList = attr_list,
         };
         var pi: w.PROCESS_INFORMATION = undefined;

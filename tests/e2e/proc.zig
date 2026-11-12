@@ -255,7 +255,8 @@ pub const Instance = struct {
 
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(h.gpa);
-        try argv.appendSlice(h.gpa, &.{ "run", "--listen", inst.host });
+        // --console: the e2e suite tests the server, not the GUI window.
+        try argv.appendSlice(h.gpa, &.{ "run", "--console", "--listen", inst.host });
         try argv.appendSlice(h.gpa, run_args);
         const pi = try spawn(h, argv.items, data_dir, .console);
         inst.process = pi.hProcess;

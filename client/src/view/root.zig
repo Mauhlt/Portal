@@ -24,6 +24,7 @@ pub const font = struct {
 };
 
 test {
+    _ = TermView;
     _ = grid;
     _ = wcwidth;
     _ = font.ttf;

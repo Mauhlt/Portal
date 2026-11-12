@@ -72,6 +72,8 @@ fn ignoreCtrl(ctrl_type: w.DWORD) callconv(.winapi) w.BOOL {
     return @intFromBool(ctrl_type == w.CTRL_C_EVENT or ctrl_type == w.CTRL_BREAK_EVENT);
 }
 
+extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) w.BOOL;
+
 fn run(gpa: Allocator, exe: []const u8) !u32 {
     const exe_w = try std.unicode.wtf8ToWtf16LeAllocZ(gpa, exe);
     defer gpa.free(exe_w);
@@ -92,6 +94,10 @@ fn run(gpa: Allocator, exe: []const u8) !u32 {
     defer gpa.free(cmd_z);
 
     _ = w.SetConsoleCtrlHandler(ignoreCtrl, 1);
+    // Tells portal.exe that the launcher (not a terminal) shares its
+    // console, so a double-clicked launcher still counts as "no terminal"
+    // for the default working directory (src/workdir.zig).
+    _ = SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("PORTAL_VIA_LAUNCHER"), std.unicode.utf8ToUtf16LeStringLiteral("1"));
 
     var si: w.STARTUPINFOW = .{ .cb = @sizeOf(w.STARTUPINFOW) };
     var pi: w.PROCESS_INFORMATION = undefined;

@@ -14,6 +14,23 @@ pub const Console = struct {
     saved_out_cp: u32,
     /// High surrogate carried across ReadConsoleW calls.
     pending_high: ?u16 = null,
+    /// True for `detached()`: every method is a no-op (GUI mode, where
+    /// Portal has freed its console).
+    is_detached: bool = false,
+
+    /// A stand-in for the GUI: no handles, every method does nothing.
+    pub fn detached() Console {
+        const invalid: w.HANDLE = @ptrFromInt(w.INVALID_HANDLE_VALUE);
+        return .{
+            .in = invalid,
+            .out = invalid,
+            .saved_in_mode = 0,
+            .saved_out_mode = 0,
+            .saved_in_cp = 0,
+            .saved_out_cp = 0,
+            .is_detached = true,
+        };
+    }
 
     pub fn init() !Console {
         const in = w.validHandle(w.GetStdHandle(w.STD_INPUT_HANDLE)) orelse return error.NoConsole;
@@ -34,6 +51,7 @@ pub const Console = struct {
     }
 
     pub fn enableRaw(c: *Console) !void {
+        if (c.is_detached) return;
         // Keys arrive as VT sequences; Ctrl+C arrives as 0x03 and is passed to
         // the child rather than killing Portal.
         var in_mode = c.saved_in_mode;
@@ -50,6 +68,7 @@ pub const Console = struct {
     }
 
     pub fn restore(c: *Console) void {
+        if (c.is_detached) return;
         _ = w.SetConsoleMode(c.in, c.saved_in_mode);
         _ = w.SetConsoleMode(c.out, c.saved_out_mode);
         _ = w.SetConsoleCP(c.saved_in_cp);
@@ -57,6 +76,7 @@ pub const Console = struct {
     }
 
     pub fn size(c: *Console) Size {
+        if (c.is_detached) return .{ .cols = 120, .rows = 30 };
         var info: w.CONSOLE_SCREEN_BUFFER_INFO = undefined;
         if (w.GetConsoleScreenBufferInfo(c.out, &info) == 0) return .{ .cols = 120, .rows = 30 };
         const cols = @as(i32, info.srWindow.Right) - info.srWindow.Left + 1;
@@ -70,6 +90,7 @@ pub const Console = struct {
     /// Blocking read of local keystrokes as UTF-8. `out` must hold at least
     /// 4 * 512 bytes.
     pub fn readInput(c: *Console, out: []u8) !usize {
+        if (c.is_detached) return error.ReadFailed;
         std.debug.assert(out.len >= 4 * 512);
         var wbuf: [512]u16 = undefined;
         var start: usize = 0;
@@ -89,6 +110,7 @@ pub const Console = struct {
     }
 
     pub fn write(c: *Console, data: []const u8) void {
+        if (c.is_detached) return;
         var rest = data;
         while (rest.len > 0) {
             var n: w.DWORD = 0;
@@ -99,7 +121,7 @@ pub const Console = struct {
     }
 
     pub fn setTitle(c: *Console, title: []const u8) void {
-        _ = c;
+        if (c.is_detached) return;
         var buf: [256]u16 = undefined;
         var i: usize = 0;
         for (title) |ch| {

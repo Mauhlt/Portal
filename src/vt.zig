@@ -337,6 +337,8 @@ pub const Terminal = struct {
     autowrap: bool = true,
     cursor_visible: bool = true,
     app_cursor: bool = false,
+    /// DECSET 2004: the application wants pasted text bracketed.
+    bracketed_paste: bool = false,
     /// Last printed graphic character, for REP; null after anything else.
     last_cp: ?u21 = null,
     parser: Parser = .{},
@@ -390,6 +392,62 @@ pub const Terminal = struct {
 
     pub fn title(t: *const Terminal) []const u8 {
         return t.title_buf[0..t.title_len];
+    }
+
+    /// DECCKM (CSI ? 1 h): cursor keys send SS3 instead of CSI.
+    pub fn appCursor(t: *const Terminal) bool {
+        return t.app_cursor;
+    }
+
+    /// CSI ? 2004 h: pasted text should be wrapped in ESC[200~ / ESC[201~.
+    pub fn bracketedPaste(t: *const Terminal) bool {
+        return t.bracketed_paste;
+    }
+
+    pub const VisibleWide = enum(u2) { narrow, lead, cont };
+
+    /// One cell as a viewer should draw it: the same resolution as
+    /// `encodeRows` (inverse applied, hidden shown as a space, controls as
+    /// U+FFFD, broken wide pairs as spaces, wire attribute bits only).
+    pub const VisibleCell = struct {
+        cp: u21 = ' ',
+        wide: VisibleWide = .narrow,
+        attrs: u8 = 0,
+        fg: u32 = color_default,
+        bg: u32 = color_default,
+    };
+
+    /// Fills `out` with row `y` (as many cells as fit) and returns the
+    /// count. Out-of-range rows give 0. Never panics.
+    pub fn visibleRow(t: *const Terminal, y: u16, out: []VisibleCell) usize {
+        if (y >= t.rows) return 0;
+        const row = t.screenConst().line(t.cols, y);
+        const n = @min(row.len, out.len);
+        for (row[0..n], out[0..n], 0..) |cell, *o, x| {
+            var cp = cell.cp;
+            var wide: VisibleWide = .narrow;
+            switch (cell.wide) {
+                .narrow => {},
+                .lead => {
+                    if (x + 1 < row.len and row[x + 1].wide == .cont) wide = .lead else cp = ' ';
+                },
+                .cont => {
+                    if (x > 0 and row[x - 1].wide == .lead) wide = .cont;
+                    cp = ' ';
+                },
+            }
+            var fg = cell.fg;
+            var bg = cell.bg;
+            if (cell.attrs & attr_inverse != 0) {
+                fg = if (cell.bg == color_default) color_default_bg_as_fg else cell.bg;
+                bg = if (cell.fg == color_default) color_default_fg_as_bg else cell.fg;
+            }
+            if (cell.attrs & attr_hidden != 0) {
+                cp = ' ';
+            } else if (isControl(cp)) cp = 0xFFFD;
+            o.* = .{ .cp = cp, .wide = wide, .attrs = cell.attrs & attr_wire_mask, .fg = fg, .bg = bg };
+        }
+        return n;
     }
 
     /// Feed raw PTY output. Sequences and UTF-8 may be split across calls.
@@ -890,6 +948,7 @@ pub const Terminal = struct {
         t.autowrap = true;
         t.cursor_visible = true;
         t.app_cursor = false;
+        t.bracketed_paste = false;
         t.last_cp = null;
         t.markAll();
     }
@@ -1187,7 +1246,8 @@ pub const Terminal = struct {
                 t.switchScreen(false);
                 t.restoreCursor();
             },
-            else => {}, // 2004 bracketed paste, 1004 focus, 9001 win32-input, mouse...
+            2004 => t.bracketed_paste = on,
+            else => {}, // 1004 focus, 9001 win32-input, mouse...
         }
     }
 
@@ -1936,6 +1996,33 @@ test "save and restore cursor" {
     t.feed("\x1b[?25h\x1b[?1h\x1b[?2004h\x1b[?9001h\x1b[?1004h");
     try testing.expect(t.cursor().visible);
     try testing.expect(t.app_cursor);
+}
+
+test "mode accessors and visibleRow" {
+    var t = try newTerm(6, 2);
+    defer t.deinit();
+    try testing.expect(!t.appCursor());
+    try testing.expect(!t.bracketedPaste());
+    t.feed("\x1b[?1h\x1b[?2004h");
+    try testing.expect(t.appCursor());
+    try testing.expect(t.bracketedPaste());
+    t.feed("\x1bc");
+    try testing.expect(!t.appCursor());
+    try testing.expect(!t.bracketedPaste());
+
+    t.feed("\x1b[7ma\x1b[m\x1b[8mb\x1b[m\u{4E2D}");
+    var row: [8]Terminal.VisibleCell = undefined;
+    try testing.expectEqual(@as(usize, 6), t.visibleRow(0, &row));
+    try testing.expectEqual(@as(u21, 'a'), row[0].cp);
+    try testing.expectEqual(color_default_bg_as_fg, row[0].fg);
+    try testing.expectEqual(color_default_fg_as_bg, row[0].bg);
+    try testing.expectEqual(@as(u21, ' '), row[1].cp); // hidden
+    try testing.expectEqual(@as(u21, 0x4E2D), row[2].cp);
+    try testing.expectEqual(Terminal.VisibleWide.lead, row[2].wide);
+    try testing.expectEqual(Terminal.VisibleWide.cont, row[3].wide);
+    try testing.expectEqual(@as(usize, 0), t.visibleRow(5, &row));
+    var short: [2]Terminal.VisibleCell = undefined;
+    try testing.expectEqual(@as(usize, 2), t.visibleRow(1, &short));
 }
 
 test "DEC special graphics" {
