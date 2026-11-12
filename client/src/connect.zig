@@ -42,7 +42,6 @@ pub const net_client = client_mod;
 pub const net_http = http;
 pub const net_ws = @import("shared").ws;
 pub const tlsconn = @import("net/tlsconn.zig");
-pub const inputline = @import("inputline.zig");
 pub const watchdog = @import("net/watchdog.zig");
 pub const credstore_mod = credstore;
 pub const pin = pin_mod;
