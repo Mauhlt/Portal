@@ -83,7 +83,8 @@ const usage =
     \\                         --listen 10.8.0.1:8420. Wildcard and public
     \\                         addresses are refused.
     \\      --host NAME[:PORT] Extra Host header value to accept (repeatable).
-    \\      --input MODE       none | keys | instruct | text   (default: keys)
+    \\      --input MODE       none | keys | instruct | text   (default:
+    \\                         instruct; keys when the program is a shell)
     \\                           none: view only
     \\                           keys: digits, y/n, Enter, single Esc
     \\                                 (enough to answer prompts). At an
@@ -95,7 +96,9 @@ const usage =
     \\                           instruct: keys, plus whole instruction
     \\                                 lines that Portal checks first: no
     \\                                 ! shell escape, no / slash commands,
-    \\                                 no # memory, no control characters
+    \\                                 no # memory, no control characters.
+    \\                                 The browser's input box (typing or
+    \\                                 dictation) sends these lines
     \\                           text: FULL REMOTE CONTROL: new prompts,
     \\                                 slash commands, permission-mode
     \\                                 changes, Ctrl+C exit (a leading ! a
@@ -1042,9 +1045,13 @@ const no_tls_warning =
 const RunOptions = struct {
     listen: []const u8 = default_listen,
     hosts: std.ArrayList([]const u8) = .empty,
-    /// `keys` by default: a remote viewer can answer prompts but cannot
-    /// start new work. `text` (full remote control) must be chosen explicitly.
-    policy: keymap.Policy = .keys,
+    /// `instruct` by default: a paired device answers prompts and sends
+    /// checked instruction lines (no shell escape, slash commands or memory
+    /// shortcut). `keys` and `none` are stricter; `text` (full remote
+    /// control) must be chosen explicitly. See `effectivePolicy` for shells.
+    policy: keymap.Policy = .instruct,
+    /// `--input` was given (the default is not applied to shells).
+    policy_set: bool = false,
     /// `--console`: the pre-GUI mode, drawn by this process's console.
     console: bool = false,
     /// `--cwd`: the child's working directory (see workdir.zig for the default).
@@ -1082,6 +1089,7 @@ fn parseRunArgs(gpa: Allocator, args: []const []const u8) !RunOptions {
         } else if (std.mem.eql(u8, a, "--input")) {
             i += 1;
             o.policy = keymap.Policy.parse(args[i]) orelse fatal("--input must be none, keys, instruct or text", .{});
+            o.policy_set = true;
         } else if (std.mem.eql(u8, a, "--allow-remote-shell")) {
             o.allow_remote_shell = true;
         } else if (std.mem.eql(u8, a, "--allow-elevated")) {
@@ -1125,6 +1133,16 @@ fn policyNote(policy: keymap.Policy) []const u8 {
     };
 }
 
+/// The input policy to run with. The default (`instruct`) is remote
+/// typing, so for a shell it falls back to `keys` unless
+/// --allow-remote-shell; an explicit --input is kept (and refused for a
+/// shell by cmdRun). `fell_back` says the default was lowered.
+fn effectivePolicy(o: RunOptions) struct { policy: keymap.Policy, fell_back: bool } {
+    if (!o.policy_set and o.policy == .instruct and isShellProgram(o.command[0]) and !o.allow_remote_shell)
+        return .{ .policy = .keys, .fell_back = true };
+    return .{ .policy = o.policy, .fell_back = false };
+}
+
 /// True if `program` (argv[0], any path/extension/case) is an interactive
 /// shell. Remote typing into a shell would be a remote shell, so instruct
 /// and text input are refused for these unless --allow-remote-shell.
@@ -1156,7 +1174,7 @@ const text_warning =
     \\  *  WARNING: --input text gives anyone logged in to the web page *
     \\  *  FULL REMOTE CONTROL of this session: new prompts, ! shell    *
     \\  *  commands, slash commands, permission-mode changes, Ctrl+C    *
-    \\  *  exit. Use --input keys (the default) to only answer prompts. *
+    \\  *  exit. Use --input keys to only answer prompts.              *
     \\  *****************************************************************
     \\
     \\
@@ -1281,7 +1299,11 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         fatal("Portal is running as administrator, so the session program and everything a paired device types would run as administrator. Run Portal from a normal (non-admin) terminal, or pass --allow-elevated if you really mean it.", .{});
     }
 
-    // Remote typing into a shell is a remote shell: refuse unless explicit.
+    // Remote typing into a shell is a remote shell: the default drops to
+    // keys for one, and an explicit typing mode is refused unless allowed.
+    const effective = effectivePolicy(opts);
+    opts.policy = effective.policy;
+    const fallback_note: []const u8 = if (effective.fell_back) " (instruct is the default, but not for a shell without --allow-remote-shell)" else "";
     if ((opts.policy == .instruct or opts.policy == .text) and isShellProgram(opts.command[0]) and !opts.allow_remote_shell)
         fatal("refusing --input {t} for a shell ({s}): remote typing would be a remote shell. Use --input keys, or pass --allow-remote-shell if you really mean it.", .{ opts.policy, opts.command[0] });
 
@@ -1349,8 +1371,8 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     defer if (cwd_w) |c| gpa.free(c);
 
     if (opts.policy == .text) std.debug.print(text_warning, .{});
-    std.debug.print("portal: sharing '{s}' on {s}://{s}/  (input: {t}{s})\n", .{
-        opts.command[0], if (opts.no_tls) "http" else "https", listen_host, opts.policy, policyNote(opts.policy),
+    std.debug.print("portal: sharing '{s}' on {s}://{s}/  (input: {t}{s}{s})\n", .{
+        opts.command[0], if (opts.no_tls) "http" else "https", listen_host, opts.policy, policyNote(opts.policy), fallback_note,
     });
 
     // ---- GUI / console split (see gui.zig) ----------------------------
@@ -1454,8 +1476,8 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .gpa = gpa,
     };
 
-    log.print("start: v{s} zig {s}, listening on {s}, input={t}{s}, command={s}", .{
-        portal_version, builtin.zig_version_string, opts.listen, opts.policy, policyNote(opts.policy), opts.command[0],
+    log.print("start: v{s} zig {s}, listening on {s}, input={t}{s}{s}, command={s}", .{
+        portal_version, builtin.zig_version_string, opts.listen, opts.policy, policyNote(opts.policy), fallback_note, opts.command[0],
     });
 
 
@@ -1626,10 +1648,28 @@ test "withPort and host splitting" {
     try std.testing.expectEqualStrings("desk", hostOnly("desk"));
 }
 
-test "run defaults to keys input" {
+test "run defaults to instruct input; keys for a shell" {
     var o = try parseRunArgs(std.testing.allocator, &.{});
     defer o.hosts.deinit(std.testing.allocator);
-    try std.testing.expectEqual(keymap.Policy.keys, o.policy);
+    try std.testing.expectEqual(keymap.Policy.instruct, o.policy);
+    try std.testing.expectEqual(keymap.Policy.instruct, effectivePolicy(o).policy);
+    try std.testing.expect(!effectivePolicy(o).fell_back);
+    {
+        var sh = try parseRunArgs(std.testing.allocator, &.{ "--", "cmd.exe", "/k" });
+        defer sh.hosts.deinit(std.testing.allocator);
+        try std.testing.expectEqual(keymap.Policy.keys, effectivePolicy(sh).policy);
+        try std.testing.expect(effectivePolicy(sh).fell_back);
+        var ok = try parseRunArgs(std.testing.allocator, &.{ "--allow-remote-shell", "--", "pwsh" });
+        defer ok.hosts.deinit(std.testing.allocator);
+        try std.testing.expectEqual(keymap.Policy.instruct, effectivePolicy(ok).policy);
+        // An explicit mode is never changed (cmdRun refuses it for a shell).
+        var ex = try parseRunArgs(std.testing.allocator, &.{ "--input", "instruct", "--", "cmd.exe" });
+        defer ex.hosts.deinit(std.testing.allocator);
+        try std.testing.expectEqual(keymap.Policy.instruct, effectivePolicy(ex).policy);
+        var k = try parseRunArgs(std.testing.allocator, &.{ "--input", "keys" });
+        defer k.hosts.deinit(std.testing.allocator);
+        try std.testing.expectEqual(keymap.Policy.keys, effectivePolicy(k).policy);
+    }
     try std.testing.expect(!o.console);
     var c = try parseRunArgs(std.testing.allocator, &.{ "--console", "--", "cmd.exe" });
     defer c.hosts.deinit(std.testing.allocator);

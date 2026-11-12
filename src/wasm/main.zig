@@ -1,11 +1,14 @@
 //! Portal's browser client, compiled to wasm32-freestanding.
 //!
 //! The whole viewer lives here: protocol decoding (proto.zig), connection
-//! and reconnect policy (conn.zig), layout and hit testing (layout.zig),
-//! key mapping (keys.zig), glyph rasterisation (glyphs.zig + font/) and
-//! drawing (render.zig). src/web/app.js is only the unavoidable browser
-//! glue: it instantiates this module, forwards DOM events to the exports
-//! below and implements the `host` imports as one-line browser API calls.
+//! and reconnect policy (conn.zig), the page's panes (panes.zig: terminal,
+//! input box, button row, following the on-screen keyboard), the canvas
+//! layout (layout.zig), key mapping (keys.zig), what Send does with the
+//! input box's text (inputbox.zig), glyph rasterisation (glyphs.zig +
+//! font/) and drawing (render.zig). src/web/app.js is only the unavoidable
+//! browser glue: it instantiates this module, forwards DOM events and
+//! values to the exports below and implements the `host` imports as
+//! one-line browser API calls.
 //!
 //! Data in: the bridge asks `in_alloc(n)` for a buffer, copies the bytes
 //! (a WebSocket message, a key name, a URL path) there, then calls the
@@ -19,6 +22,8 @@ const layout = @import("layout.zig");
 const keys = @import("keys.zig");
 const glyphs = @import("glyphs.zig");
 const render = @import("render.zig");
+const panes = @import("panes.zig");
+const inputbox = @import("inputbox.zig");
 
 /// Host functions provided by src/web/app.js. This list is the entire
 /// surface between the page and the client; web.zig's tests check the
@@ -38,8 +43,17 @@ const host = struct {
     /// GET / (following redirects); answers with on_check.
     extern "env" fn check_session() void;
     extern "env" fn navigate_pair() void;
-    /// slot 0 = status, 1 = mode; cls 0 neutral, 1 ok, 2 bad.
+    /// slot 0 = status, 1 = mode, 2 = the note under the input box;
+    /// cls 0 neutral, 1 ok, 2 bad.
     extern "env" fn set_text(slot: u32, p: [*]const u8, n: usize, cls: u32) void;
+    /// The page's CSS variables (body style) and classes (body className).
+    extern "env" fn set_layout(p: [*]const u8, n: usize) void;
+    extern "env" fn set_class(p: [*]const u8, n: usize) void;
+    /// Writes the input box's text (UTF-8) into p[0..cap]; returns the length.
+    extern "env" fn box_read(p: [*]u8, cap: usize) usize;
+    /// Replaces the input box's text; sets its placeholder.
+    extern "env" fn box_write(p: [*]const u8, n: usize) void;
+    extern "env" fn box_hint(p: [*]const u8, n: usize) void;
 };
 
 pub const panic = std.debug.FullPanic(struct {
@@ -54,6 +68,11 @@ const gpa = std.heap.wasm_allocator;
 /// Largest message the bridge may hand over (a full 1000x1000 grid frame
 /// is well under this).
 const max_input = 32 << 20;
+
+/// Most of the input box read per Send. Instruction lines are at most
+/// 2000 bytes and text-mode frames 4096, so anything this long is refused
+/// as too long whether or not it was cut off.
+const box_cap = inputbox.max_frame + 4;
 
 const Drag = struct { x: i32, y: i32, pan: [2]i32 };
 
@@ -70,21 +89,28 @@ const App = struct {
     l: layout.Layout = .{},
     pan: [2]i32 = .{ 0, 0 },
     term: glyphs.Glyphs,
-    ui: glyphs.Glyphs,
     r: render.Renderer = .{},
     /// Everything must be redrawn (layout, pan or mode changed).
     full: bool = true,
-    bar_dirty: bool = true,
     frame_pending: bool = false,
-    pressed: ?usize = null,
     drag: ?Drag = null,
     in_buf: []u8 = &.{},
     canvas_w: u32 = 0,
     canvas_h: u32 = 0,
+    /// Last viewport report (on_viewport) and what was sent to the page.
+    vp: ?panes.Input = null,
+    panes: ?panes.Panes = null,
+    class_buf: [128]u8 = undefined,
+    class_len: usize = 0,
+    /// The last instruction line sent: put back if the server rejects it
+    /// while the box is still empty.
+    last_line: [inputbox.max_frame]u8 = undefined,
+    last_line_len: usize = 0,
 };
 
 var app: App = undefined;
 var ready = false;
+var box_buf: [box_cap]u8 = undefined;
 
 fn logMsg(comptime fmt: []const u8, args: anytype) void {
     var buf: [256]u8 = undefined;
@@ -114,8 +140,6 @@ fn relayout() void {
         .css_w = app.css_w,
         .css_h = app.css_h,
         .dpr = app.dpr,
-        .touch = app.touch,
-        .show_bar = app.policy != .none,
         .cols = app.grid.cols,
         .rows = app.grid.rows,
         .zoom = app.zoom,
@@ -133,11 +157,115 @@ fn relayout() void {
         host.canvas_size(app.l.w, app.l.h);
     }
     app.term.setSize(app.l.cw, app.l.ch, app.l.em);
-    app.ui.setEm(app.l.label_em);
     app.pan = app.l.clampPan(app.pan);
     app.full = true;
-    app.bar_dirty = true;
     schedule();
+}
+
+/// Re-derives the panes from the last viewport report and the input mode,
+/// and tells the page only what changed. The canvas's ResizeObserver then
+/// reports the terminal pane's new size through `resize`.
+fn relayoutPanes() void {
+    var in = app.vp orelse return;
+    in.touch = app.touch;
+    in.input = app.policy != .none;
+    const p = panes.compute(in);
+    if (app.panes == null or !app.panes.?.eql(p)) {
+        app.panes = p;
+        var buf: [512]u8 = undefined;
+        const s = panes.css(p, &buf);
+        host.set_layout(s.ptr, s.len);
+    }
+    var buf: [128]u8 = undefined;
+    const cls = std.fmt.bufPrint(&buf, "viewer mode-{t}{s}{s}{s}", .{
+        app.policy,
+        if (app.touch) " touch" else "",
+        if (p.keyboard) " kb" else "",
+        if (p.no_head) " nohead" else "",
+    }) catch return;
+    if (!std.mem.eql(u8, cls, app.class_buf[0..app.class_len])) {
+        @memcpy(app.class_buf[0..cls.len], cls);
+        app.class_len = cls.len;
+        host.set_class(cls.ptr, cls.len);
+    }
+}
+
+fn note(text: []const u8, tone: inputbox.Tone) void {
+    host.set_text(2, text.ptr, text.len, @intFromEnum(tone));
+}
+
+fn readBox() []const u8 {
+    const n = host.box_read(&box_buf, box_buf.len);
+    return box_buf[0..@min(n, box_buf.len)];
+}
+
+fn writeBox(text: []const u8) void {
+    host.box_write(text.ptr, text.len);
+}
+
+/// Shows what Send would do with the box's current text.
+fn showPreview() void {
+    var buf: [128]u8 = undefined;
+    const n = inputbox.preview(app.policy, readBox(), app.touch, &buf);
+    note(n.text, n.tone);
+}
+
+fn sendFrame(prefix: []const u8, body: []const u8) void {
+    var buf: [inputbox.max_frame]u8 = undefined;
+    if (prefix.len + body.len > buf.len) return;
+    @memcpy(buf[0..prefix.len], prefix);
+    @memcpy(buf[prefix.len..][0..body.len], body);
+    host.ws_send(&buf, prefix.len + body.len);
+}
+
+fn pressed(k: []const u8) void {
+    var buf: [32]u8 = undefined;
+    note(std.fmt.bufPrint(&buf, "Pressed {s}.", .{inputbox.keyLabel(k)}) catch "", .ok);
+}
+
+/// Send (the button, or Enter in the box): an answer word presses its key,
+/// anything else becomes an instruction line (inputbox.decide). The box is
+/// cleared only once something was sent.
+fn sendBox() void {
+    if (app.policy == .none) return;
+    var scratch: [box_cap]u8 = undefined;
+    const d = inputbox.decide(app.policy, readBox(), &scratch);
+    switch (d) {
+        .nothing => return,
+        .refuse => |r| return note(inputbox.refusalText(r), .bad),
+        else => if (app.conn.state != .live) return note(inputbox.refusalText(.offline), .bad),
+    }
+    switch (d) {
+        .nothing, .refuse => unreachable,
+        .key => |k| {
+            sendFrame("k:", k);
+            pressed(k);
+        },
+        .line => |l| {
+            @memcpy(app.last_line[0..l.len], l);
+            app.last_line_len = l.len;
+            sendFrame("l:", l);
+            note("Sent.", .ok);
+        },
+        .typed => |t| {
+            sendFrame("t:", t);
+            sendFrame("k:", "enter");
+            note("Sent.", .ok);
+        },
+    }
+    writeBox("");
+}
+
+/// The server refused the last instruction line: say why, and put the
+/// line back unless something new was typed meanwhile.
+fn onRejected(reason: []const u8) void {
+    if (std.mem.trim(u8, readBox(), " \t\r\n").len == 0 and app.last_line_len > 0)
+        writeBox(app.last_line[0..app.last_line_len]);
+    if (inputbox.serverRefusal(reason)) |r| {
+        note(inputbox.refusalText(r), .bad);
+    } else {
+        note("The desktop refused that line.", .bad);
+    }
 }
 
 fn perform(e: conn_mod.Effect) void {
@@ -186,8 +314,7 @@ export fn init(touch: u32) void {
         setText(0, "font failed to load", .bad);
         return;
     };
-    const ui = glyphs.Glyphs.init(gpa, regular, bold) catch return;
-    app = .{ .term = term, .ui = ui, .touch = touch != 0 };
+    app = .{ .term = term, .touch = touch != 0 };
     ready = true;
     perform(app.conn.start());
 }
@@ -215,6 +342,25 @@ export fn resize(css_w: f64, css_h: f64, dpr: f64) void {
     relayout();
 }
 
+/// The visible viewport changed (load, resize, rotation, the on-screen
+/// keyboard opening or closing, Safari scrolling to the caret). CSS
+/// pixels: window.innerWidth/innerHeight, visualViewport width, height and
+/// offsetTop, and the safe-area insets env(safe-area-inset-top/bottom).
+export fn on_viewport(inner_w: f64, inner_h: f64, vv_w: f64, vv_h: f64, vv_top: f64, safe_top: f64, safe_bottom: f64) void {
+    if (!ready) return;
+    app.vp = .{
+        .inner_w = inner_w,
+        .inner_h = inner_h,
+        .vv_w = vv_w,
+        .vv_h = vv_h,
+        .vv_top = vv_top,
+        .safe_top = safe_top,
+        .safe_bottom = safe_bottom,
+        .touch = app.touch,
+    };
+    relayoutPanes();
+}
+
 /// requestAnimationFrame callback: draw what changed and present it.
 export fn frame() void {
     if (!ready) return;
@@ -232,9 +378,7 @@ export fn frame() void {
     while (y < app.grid.rows) : (y += 1) {
         if (app.full or app.grid.dirty[y]) app.r.drawRow(&app.grid, &app.term, view, y);
     }
-    if (app.full or app.bar_dirty) app.r.drawBar(&app.ui, app.l, app.pressed);
     app.full = false;
-    app.bar_dirty = false;
     if (app.r.takeDirty()) |band| host.present(app.r.fb.pixels.ptr, app.r.fb.w, app.r.fb.h, band[0], band[1]);
 }
 
@@ -254,11 +398,16 @@ export fn on_ws_message(binary: u32, len: usize) void {
     const data = input(len) orelse return;
     if (binary == 0) {
         switch (proto.parseControl(data)) {
-            .hello => |p| {
-                app.policy = p;
-                setText(1, conn_mod.modeText(p), .neutral);
+            .hello => |h| {
+                app.policy = h.policy;
+                setText(1, conn_mod.modeText(h.policy), .neutral);
+                const ph = inputbox.placeholder(h.policy);
+                host.box_hint(ph.ptr, ph.len);
+                relayoutPanes();
+                showPreview();
                 relayout();
             },
+            .rejected => |reason| onRejected(reason),
             .exit => |code| perform(app.conn.onExit(code)),
             .logout => perform(app.conn.onLogout()),
             .unknown => {},
@@ -294,9 +443,9 @@ export fn on_check(status: u32, len: usize) void {
     perform(app.conn.onCheck(.{ .status = status, .path = path }));
 }
 
-/// keydown: `KeyboardEvent.key` in the input buffer; mods 1 shift, 2 ctrl,
-/// 4 alt, 8 meta. Returns 1 when handled (the bridge then prevents the
-/// browser default).
+/// keydown outside the input box: `KeyboardEvent.key` in the input
+/// buffer; mods 1 shift, 2 ctrl, 4 alt, 8 meta. Returns 1 when handled
+/// (the bridge then prevents the browser default).
 export fn on_key(len: usize, mods: u32) u32 {
     if (!ready) return 0;
     const key = input(len) orelse return 0;
@@ -306,20 +455,48 @@ export fn on_key(len: usize, mods: u32) u32 {
     return 1;
 }
 
-/// Pointer events on the canvas, CSS pixels. kind: 0 down, 1 move, 2 up,
-/// 3 cancel.
+/// The input box's text changed (typing, dictation, paste).
+export fn on_box_input() void {
+    if (!ready) return;
+    showPreview();
+}
+
+/// keydown in the input box: `KeyboardEvent.key` in the input buffer,
+/// mods as on_key plus 16 = IME composing. Returns 1 when handled (the
+/// bridge prevents the default: the newline of a sending Enter).
+export fn on_box_key(len: usize, mods: u32) u32 {
+    if (!ready) return 0;
+    const key = input(len) orelse return 0;
+    if (!inputbox.boxKeySends(key, mods)) return 0;
+    sendBox();
+    return 1;
+}
+
+/// The button row, by inputbox.Button: Yes No 1 2 3 Esc Enter Send.
+export fn on_button(id: u32) void {
+    if (!ready) return;
+    const b = std.enums.fromInt(inputbox.Button, id) orelse return;
+    switch (b) {
+        .send => sendBox(),
+        else => {
+            if (app.policy == .none) return;
+            if (app.conn.state != .live) return note(inputbox.refusalText(.offline), .bad);
+            const k = inputbox.buttonKey(b).?;
+            sendFrame("k:", k);
+            pressed(k);
+        },
+    }
+}
+
+/// Pointer events on the canvas, CSS pixels: dragging pans a zoomed view.
+/// kind: 0 down, 1 move, 2 up, 3 cancel.
 export fn on_pointer(kind: u32, x_css: f64, y_css: f64) void {
     if (!ready or !app.sized) return;
     const x = layout.toInt(x_css * app.l.dpr);
     const y = layout.toInt(y_css * app.l.dpr);
     switch (kind) {
-        0 => {
-            if (app.l.hitButton(x, y)) |i| {
-                app.pressed = i;
-                app.bar_dirty = true;
-            } else if (app.l.term.contains(x, y)) {
-                app.drag = .{ .x = x, .y = y, .pan = app.pan };
-            }
+        0 => if (app.l.term.contains(x, y)) {
+            app.drag = .{ .x = x, .y = y, .pan = app.pan };
         },
         1 => if (app.drag) |d| {
             const p = app.l.clampPan(.{ d.pan[0] - (x - d.x), d.pan[1] - (y - d.y) });
@@ -328,15 +505,7 @@ export fn on_pointer(kind: u32, x_css: f64, y_css: f64) void {
                 app.full = true;
             }
         },
-        else => {
-            if (app.pressed) |i| {
-                // A tap counts if it ends on the button it started on.
-                if (kind == 2 and app.l.hitButton(x, y) == i) send(.{ .key = keys.answer_bar[i].name });
-                app.pressed = null;
-                app.bar_dirty = true;
-            }
-            app.drag = null;
-        },
+        else => app.drag = null,
     }
     schedule();
 }

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-visual">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Portal">
@@ -12,6 +12,8 @@
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body class="viewer">
+<!-- Measures env(safe-area-inset-top) as its height and -bottom as its width. -->
+<div id="safe" aria-hidden="true"></div>
 <header>
   <span id="status" class="status">connecting…</span>
   <span id="mode" class="mode"></span>
@@ -21,8 +23,26 @@
   <button type="button" data-cmd="3" title="Larger text">A+</button>
   <form method="post" action="/logout"><button type="submit" title="Forget this device">Unpair</button></form>
 </header>
-<!-- The terminal and the answer bar are drawn by the wasm client (src/wasm). -->
+<!-- Three panes, editor style: the terminal (drawn by the wasm client,
+     src/wasm), the input box (a native textarea, so keyboard dictation
+     and Win+H fill it), and the button row. The wasm client sizes them
+     (src/wasm/panes.zig) and decides what Send does (inputbox.zig). -->
 <main id="wrap"><canvas id="screen" aria-label="Terminal"></canvas></main>
+<section id="input" aria-label="Input">
+  <textarea id="box" rows="2" enterkeyhint="send" autocomplete="off" autocapitalize="sentences"
+    aria-label="Instruction or answer" aria-describedby="note"></textarea>
+  <p id="note" class="note" aria-live="polite"></p>
+</section>
+<nav id="keys" aria-label="Answer keys">
+  <button type="button" data-btn="0">Yes</button>
+  <button type="button" data-btn="1">No</button>
+  <button type="button" data-btn="2">1</button>
+  <button type="button" data-btn="3">2</button>
+  <button type="button" data-btn="4">3</button>
+  <button type="button" data-btn="5">Esc</button>
+  <button type="button" data-btn="6">Enter</button>
+  <button type="button" data-btn="7" class="send">Send</button>
+</nav>
 <script src="/static/app.js"></script>
 </body>
 </html>

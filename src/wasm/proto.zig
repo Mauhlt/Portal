@@ -383,12 +383,19 @@ pub const Utf8Iter = struct {
 
 // ------------------------------------------------------------ JSON control
 
-pub const Policy = enum { none, keys, text };
+pub const Policy = @import("inputbox.zig").Policy;
+
+pub const Hello = struct {
+    policy: Policy,
+};
 
 pub const Control = union(enum) {
-    hello: Policy,
+    hello: Hello,
     exit: i64,
     logout,
+    /// An `l:` line was refused; the reason (a keymap.LineError name)
+    /// points into the message.
+    rejected: []const u8,
     unknown,
 };
 
@@ -399,12 +406,12 @@ pub fn parseControl(text: []const u8) Control {
     const t = stringField(text, "t") orelse return .unknown;
     if (std.mem.eql(u8, t, "hello")) {
         const input = stringField(text, "input") orelse "none";
-        if (std.mem.eql(u8, input, "keys")) return .{ .hello = .keys };
-        if (std.mem.eql(u8, input, "text")) return .{ .hello = .text };
-        return .{ .hello = .none };
+        const policy = std.meta.stringToEnum(Policy, input) orelse .none;
+        return .{ .hello = .{ .policy = policy } };
     }
     if (std.mem.eql(u8, t, "exit")) return .{ .exit = intField(text, "code") orelse 0 };
     if (std.mem.eql(u8, t, "logout")) return .logout;
+    if (std.mem.eql(u8, t, "rejected")) return .{ .rejected = stringField(text, "reason") orelse "" };
     return .unknown;
 }
 
@@ -782,10 +789,21 @@ test "frames produced by the server's own emulator decode identically" {
 }
 
 test "control messages" {
-    try testing.expectEqual(Control{ .hello = .keys }, parseControl("{\"t\":\"hello\",\"input\":\"keys\"}"));
-    try testing.expectEqual(Control{ .hello = .text }, parseControl("{\"t\": \"hello\", \"input\": \"text\"}"));
-    try testing.expectEqual(Control{ .hello = .none }, parseControl("{\"t\":\"hello\",\"input\":\"none\"}"));
-    try testing.expectEqual(Control{ .hello = .none }, parseControl("{\"t\":\"hello\",\"input\":\"bogus\"}"));
+    try testing.expectEqual(Control{ .hello = .{ .policy = .keys } }, parseControl("{\"t\":\"hello\",\"input\":\"keys\"}"));
+    try testing.expectEqual(Control{ .hello = .{ .policy = .text } }, parseControl("{\"t\": \"hello\", \"input\": \"text\"}"));
+    try testing.expectEqual(Control{ .hello = .{ .policy = .none } }, parseControl("{\"t\":\"hello\",\"input\":\"none\"}"));
+    try testing.expectEqual(Control{ .hello = .{ .policy = .none } }, parseControl("{\"t\":\"hello\",\"input\":\"bogus\"}"));
+    try testing.expectEqual(Control{ .hello = .{ .policy = .instruct } }, parseControl("{\"t\":\"hello\",\"input\":\"instruct\"}"));
+    // Unknown extra fields are ignored.
+    try testing.expectEqual(Control{ .hello = .{ .policy = .keys } }, parseControl("{\"t\":\"hello\",\"input\":\"keys\",\"x\":1}"));
+    switch (parseControl("{\"t\":\"rejected\",\"reason\":\"ShellEscape\"}")) {
+        .rejected => |r| try testing.expectEqualStrings("ShellEscape", r),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parseControl("{\"t\":\"rejected\"}")) {
+        .rejected => |r| try testing.expectEqualStrings("", r),
+        else => return error.TestUnexpectedResult,
+    }
     try testing.expectEqual(Control{ .exit = 3 }, parseControl("{\"t\":\"exit\",\"code\":3}"));
     try testing.expectEqual(Control{ .exit = -1073741510 }, parseControl("{\"t\":\"exit\",\"code\":-1073741510}"));
     try testing.expectEqual(Control{ .exit = 0 }, parseControl("{\"t\":\"exit\",\"code\":99999999999999999999999}"));

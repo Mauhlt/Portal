@@ -129,8 +129,18 @@ fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
             .root_source_file = b.path("tests/e2e/main.zig"),
             .target = target,
             .optimize = optimize,
-            // The images group writes its test PNG with pngcheck's encoder.
-            .imports = &.{.{ .name = "pngcheck", .module = pngcheck }},
+            // The images group writes its test PNG with pngcheck's encoder;
+            // the webinput group decides what to send with the browser
+            // client's own input-box logic.
+            .imports = &.{
+                .{ .name = "pngcheck", .module = pngcheck },
+                .{ .name = "inputbox", .module = b.createModule(.{
+                    .root_source_file = b.path("src/wasm/inputbox.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "keymap", .module = keymapModule(b, target, optimize) }},
+                }) },
+            },
         }),
     });
     const run = b.addRunArtifact(e2e_exe);
@@ -145,14 +155,21 @@ fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
 }
 
 /// The browser client's module graph: `vt` (src/vt.zig, for the colour
-/// sentinels, cell widths and, in tests, real server frames) and the
+/// sentinels, cell widths and, in tests, real server frames), `keymap`
+/// (src/keymap.zig, instruction-line rules) and the
 /// bundled fonts as `font_regular` / `font_bold`.
+fn keymapModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("src/keymap.zig"), .target = target, .optimize = optimize });
+}
+
 fn clientModule(b: *std.Build, root_src: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     const img = imageModules(b, target, optimize);
     const m = b.createModule(.{ .root_source_file = b.path(root_src), .target = target, .optimize = optimize });
     const vt_mod = b.createModule(.{ .root_source_file = b.path("src/vt.zig"), .target = target, .optimize = optimize });
     vt_mod.addImport("pngcheck", img.pngcheck);
     m.addImport("vt", vt_mod);
+    // The input box checks instruction lines with the server's own rules.
+    m.addImport("keymap", keymapModule(b, target, optimize));
     m.addImport("imgdec", img.imgdec);
     m.addImport("pngcheck", img.pngcheck);
     m.addAnonymousImport("font_regular", .{ .root_source_file = b.path("src/web/fonts/DejaVuSansMono.ttf") });

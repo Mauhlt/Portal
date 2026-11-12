@@ -7,6 +7,8 @@ test {
     _ = @import("keys.zig");
     _ = @import("conn.zig");
     _ = @import("layout.zig");
+    _ = @import("panes.zig");
+    _ = @import("inputbox.zig");
     _ = @import("glyphs.zig");
     _ = @import("render.zig");
     _ = @import("font/ttf.zig");

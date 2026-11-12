@@ -8,9 +8,10 @@
 const std = @import("std");
 /// What web viewers may send (`portal run --input`).
 ///   none - view only.
-///   keys - (default) answer the agent's numbered prompts: digits, y/n, Enter,
-///          and at most one Esc per second.
-///   instruct - answer keys, plus whole instruction lines (`l:<text>`) that
+///   keys - answer the session program's numbered prompts: digits, y/n,
+///          Enter, and at most one Esc per second. (`portal run` uses this
+///          for a shell, where instruct would be remote typing.)
+///   instruct - (default) answer keys, plus whole instruction lines (`l:<text>`) that
 ///          Portal validates before typing them (validateLine): no `!` shell
 ///          escape, no `/` slash commands, no `#` memory shortcut, no control
 ///          characters or line breaks. The agent still asks permission for

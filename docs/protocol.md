@@ -101,7 +101,7 @@ frames must be masked; no fragmentation; no extensions.
 
 | `t` | fields | meaning |
 |---|---|---|
-| `hello` | `input`: `"none"`, `"keys"`, `"instruct"` or `"text"` | sent first; which input is accepted |
+| `hello` | `input`: `"none"`, `"keys"`, `"instruct"` or `"text"` | sent first; which input is accepted. `portal run` defaults to `instruct` (`keys` when the session program is a shell); clients must ignore fields they don't know |
 | `exit` | `code` | the session's program exited; stream ends |
 | `logout` | | session revoked or expired; sign in again |
 | `rejected` | `reason` | an `l:` instruction line was refused (e.g. `ShellEscape`, `SlashCommand`, `MemoryShortcut`, `ControlCharacter`, `TooLong`, `Empty`); nothing was typed |
@@ -230,4 +230,16 @@ are ignored.
   go back to sign-in.
 * Keep the window independent of the terminal size: scale the font, or scroll
   or pan, to fit `cols × rows`.
-* Show the input mode clearly ("view only", "answer keys", "typing allowed").
+* Show the input mode clearly ("view only", "answer keys", "instructions",
+  "typing allowed").
+* The browser client sends instruction lines from a text box (so phone
+  dictation works) and maps answer words to keys before sending ("Yes." →
+  `k:y`, "two" → `k:2`, "OK" → `k:enter`; table in `src/wasm/inputbox.zig`).
+  It checks lines with the server's rules first, so a refusal is shown
+  without a round trip; `rejected` still covers anything it missed.
+
+## 6. Voice
+
+iPhone voice = keyboard dictation into the input box; laptops transcribe
+locally on their NPU. Portal never records or sends audio from the phone,
+and the protocol has no audio messages or routes.

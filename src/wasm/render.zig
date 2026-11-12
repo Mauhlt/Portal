@@ -1,4 +1,4 @@
-//! Draws the grid, cursor and answer bar into an RGBA framebuffer that the
+//! Draws the grid and cursor into an RGBA framebuffer that the
 //! bridge copies to the <canvas> with putImageData.
 //!
 //! Only rows marked dirty are redrawn (glyphs come from the cache), and the
@@ -9,19 +9,12 @@ const std = @import("std");
 const proto = @import("proto.zig");
 const layout = @import("layout.zig");
 const glyphs = @import("glyphs.zig");
-const keys = @import("keys.zig");
 
 const Rect = layout.Rect;
 
 pub const Theme = struct {
     fg: u32 = 0xd4d4d4,
     bg: u32 = 0x0c0c0c,
-    panel: u32 = 0x1f1f1d,
-    border: u32 = 0x34342f,
-    button: u32 = 0x2a2a27,
-    label: u32 = 0xececea,
-    pressed: u32 = 0x7aa2ff,
-    pressed_label: u32 = 0x10131a,
     cursor: u32 = 0xd4d4d4,
     cursor_alpha: u8 = 140, // ≈ 0.55, as the old viewer
     /// Outline and label of an image that can't be shown.
@@ -303,32 +296,6 @@ pub const Renderer = struct {
             r.fb.glyph(@intCast(gx), @intCast(ly), cov, @intCast(cw), @intCast(ch), clip, r.theme.placeholder);
         }
     }
-
-    /// The answer bar: buttons with centred labels; `pressed` highlighted.
-    pub fn drawBar(r: *Renderer, ui: *glyphs.Glyphs, l: layout.Layout, pressed: ?usize) void {
-        if (l.bar.h == 0) return;
-        const all = l.bar;
-        r.fb.fill(all, all, r.theme.panel);
-        const line = @max(1, @as(i32, @intFromFloat(@round(l.dpr))));
-        r.fb.fill(.{ .x = all.x, .y = all.y, .w = all.w, .h = line }, all, r.theme.border);
-        for (l.buttons, keys.answer_bar, 0..) |b, k, i| {
-            const down = pressed != null and pressed.? == i;
-            r.fb.fill(b, all, if (down) r.theme.pressed else r.theme.border);
-            const inner: Rect = .{ .x = b.x + line, .y = b.y + line, .w = b.w - 2 * line, .h = b.h - 2 * line };
-            if (!down) r.fb.fill(inner, all, r.theme.button);
-            const lw: i32 = @intCast(ui.cw);
-            const lh: i32 = @intCast(ui.ch);
-            const text_w = lw * @as(i32, @intCast(k.label.len));
-            var x = b.x + @divFloor(b.w - text_w, 2);
-            const y = b.y + @divFloor(b.h - lh, 2);
-            for (k.label) |c| {
-                const cov = ui.get(c, .{ .bold = true }, 1);
-                r.fb.glyph(x, y, cov, ui.cw, ui.ch, b, if (down) r.theme.pressed_label else r.theme.label);
-                x += lw;
-            }
-        }
-        r.touch(all.y, all.bottom());
-    }
 };
 
 // ------------------------------------------------------------------ tests
@@ -379,7 +346,7 @@ test "images land on their cells; placeholders for bad blobs; clipping" {
     const gpa = testing.allocator;
     var gl = try glyphs.Glyphs.init(gpa, @embedFile("font_regular"), @embedFile("font_bold"));
     defer gl.deinit();
-    const in: layout.Input = .{ .css_w = 200, .css_h = 200, .dpr = 1, .touch = false, .show_bar = false, .cols = 10, .rows = 4, .zoom = .{}, .m = gl.metrics() };
+    const in: layout.Input = .{ .css_w = 200, .css_h = 200, .dpr = 1, .cols = 10, .rows = 4, .zoom = .{}, .m = gl.metrics() };
     const l = layout.compute(in);
     gl.setSize(l.cw, l.ch, l.em);
     var r: Renderer = .{};
@@ -453,8 +420,6 @@ test "draw a frame end to end and clip at every pan offset" {
     const gpa = testing.allocator;
     var gl = try glyphs.Glyphs.init(gpa, @embedFile("font_regular"), @embedFile("font_bold"));
     defer gl.deinit();
-    var ui = try glyphs.Glyphs.init(gpa, @embedFile("font_regular"), @embedFile("font_bold"));
-    defer ui.deinit();
     var g: proto.Grid = .{};
     defer g.deinit(gpa);
     // Build a 10x3 grid through the real decoder.
@@ -468,14 +433,12 @@ test "draw a frame end to end and clip at every pan offset" {
 
     var r: Renderer = .{};
     defer r.fb.deinit(gpa);
-    const in: layout.Input = .{ .css_w = 120, .css_h = 300, .dpr = 1, .touch = true, .show_bar = true, .cols = 10, .rows = 3, .zoom = .{}, .m = gl.metrics() };
+    const in: layout.Input = .{ .css_w = 120, .css_h = 300, .dpr = 1, .cols = 10, .rows = 3, .zoom = .{}, .m = gl.metrics() };
     const l = layout.compute(in);
     try r.fb.resize(gpa, l.w, l.h);
     gl.setSize(l.cw, l.ch, l.em);
-    ui.setEm(l.label_em);
     r.clearTerm(l);
     for (0..3) |y| r.drawRow(&g, &gl, .{ .l = l, .pan = .{ 0, 0 }, .show_cursor = true }, @intCast(y));
-    r.drawBar(&ui, l, 2);
     try testing.expect(!g.dirty[0]);
     const band = r.takeDirty().?;
     try testing.expectEqual(@as(u32, 0), band[0]);
@@ -487,13 +450,12 @@ test "draw a frame end to end and clip at every pan offset" {
     try testing.expectEqual(pixel(0xCD0000), r.fb.pixels[ay * l.w + ax]);
 
     // Pans and zooms far outside the content must clip, never index out.
-    const zl = layout.compute(.{ .css_w = 50, .css_h = 60, .dpr = 2, .touch = false, .show_bar = true, .cols = 10, .rows = 3, .zoom = .{ .fit = false, .font_px = 30 }, .m = gl.metrics() });
+    const zl = layout.compute(.{ .css_w = 50, .css_h = 60, .dpr = 2, .cols = 10, .rows = 3, .zoom = .{ .fit = false, .font_px = 30 }, .m = gl.metrics() });
     try r.fb.resize(gpa, zl.w, zl.h);
     gl.setSize(zl.cw, zl.ch, zl.em);
     const pans = [_][2]i32{ .{ -5000, -5000 }, .{ 0, 0 }, .{ 37, 11 }, .{ 5000, 5000 }, zl.panMax() };
     for (pans) |p| {
         r.clearTerm(zl);
         for (0..3) |y| r.drawRow(&g, &gl, .{ .l = zl, .pan = p, .show_cursor = true }, @intCast(y));
-        r.drawBar(&ui, zl, null);
     }
 }

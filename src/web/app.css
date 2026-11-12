@@ -44,28 +44,60 @@ form button[type=submit] { width: 100%; padding: 8px; background: var(--accent);
 .error { color: var(--bad); }
 .info { color: var(--ok); }
 
-/* viewer: header (HTML) + one canvas the wasm client draws everything into */
-body.viewer { display: flex; flex-direction: column; height: 100%; height: 100dvh; overflow: hidden;
-  overscroll-behavior: none; }
-header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
-  padding: max(6px, env(safe-area-inset-top)) max(10px, env(safe-area-inset-right)) 6px max(10px, env(safe-area-inset-left));
+/* viewer, editor style: header, terminal canvas, input box, button row.
+   The wasm client (src/wasm/panes.zig) sets the --* variables on <body>
+   from the visual viewport, so the panes sit right above the on-screen
+   keyboard; the fallbacks are for the moment before it starts. */
+body.viewer { position: fixed; left: 0; right: 0; top: var(--app-top, 0px);
+  height: 100dvh; height: var(--app-h, 100dvh); display: flex; flex-direction: column;
+  overflow: hidden; overscroll-behavior: none; }
+#safe { position: fixed; top: 0; left: 0; visibility: hidden; pointer-events: none;
+  height: env(safe-area-inset-top, 0px); width: env(safe-area-inset-bottom, 0px); }
+header { flex: none; display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; overflow: hidden;
+  height: calc(var(--head-h, 40px) + var(--head-pad, 0px));
+  padding: var(--head-pad, 0px) max(10px, env(safe-area-inset-right)) 0 max(10px, env(safe-area-inset-left));
   border-bottom: 1px solid var(--border); background: var(--panel); }
+body.nohead header { display: none; }
 header form { margin: 0; }
 header form button[type=submit] { width: auto; padding: 4px 10px; background: var(--panel);
   color: var(--fg); border-color: var(--border); }
-.status { font-weight: 600; }
+.status { font-weight: 600; white-space: nowrap; }
 .status.ok { color: var(--ok); }
 .status.bad { color: var(--bad); }
-.mode { color: var(--muted); font-size: 13px; }
+.mode { color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .spacer { flex: 1; }
-/* The canvas sits inside the safe area; the strips outside it (home
-   indicator, notch in landscape) match the answer bar drawn in wasm. */
+header button { white-space: nowrap; flex: none; }
+/* Top pane: the terminal, inside the left/right safe area. */
 #wrap { flex: 1; position: relative; min-height: 0; background: #1f1f1d; }
 #screen { position: absolute; top: 0; left: env(safe-area-inset-left); display: block;
-  width: calc(100% - env(safe-area-inset-left) - env(safe-area-inset-right));
-  height: calc(100% - env(safe-area-inset-bottom));
+  width: calc(100% - env(safe-area-inset-left) - env(safe-area-inset-right)); height: 100%;
   touch-action: none; -webkit-user-select: none; user-select: none;
   -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+/* Middle pane: the input box. 16px text: smaller makes iOS zoom on focus. */
+#input, #keys { display: none; flex: none; background: var(--panel);
+  padding-left: max(6px, env(safe-area-inset-left)); padding-right: max(6px, env(safe-area-inset-right)); }
+body.mode-keys #input, body.mode-instruct #input, body.mode-text #input { display: flex; }
+body.mode-keys #keys, body.mode-instruct #keys, body.mode-text #keys { display: grid; }
+#input { flex-direction: column; height: var(--input-h, 106px); padding-top: 6px;
+  border-top: 1px solid var(--border); }
+#box { flex: none; width: 100%; height: var(--box-h, 80px); margin: 0; padding: 6px 10px;
+  font: 16px/22px system-ui, -apple-system, "Segoe UI", sans-serif; resize: none;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--fg); }
+#box:focus { outline: none; border-color: var(--accent); }
+body.mode-keys #box { background: var(--panel); border-style: dashed; color: var(--muted); }
+.note { flex: none; height: var(--note-h, 18px); margin: 0; padding: 0 4px; overflow: hidden;
+  font-size: 13px; line-height: 18px; color: var(--muted); white-space: nowrap; text-overflow: ellipsis; }
+.note.ok { color: var(--ok); }
+.note.bad { color: var(--bad); }
+/* Bottom pane: the button row; --pad-b keeps it off the home indicator. */
+#keys { height: calc(var(--bar-h, 56px) + var(--pad-b, 0px)); gap: 6px;
+  padding-top: 6px; padding-bottom: calc(6px + var(--pad-b, 0px));
+  grid-template-columns: repeat(var(--cols, 8), minmax(0, 1fr)); grid-auto-rows: var(--btn-h, 44px); }
+#keys button { height: var(--btn-h, 44px); min-width: 0; padding: 0 2px; font-weight: 600;
+  touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+#keys button:active { background: var(--accent); color: #fff; }
+#keys .send { background: var(--accent); border-color: var(--accent); color: #fff; }
+body:not(.touch) #keys { grid-template-columns: repeat(var(--cols, 8), minmax(0, 110px)); justify-content: end; }
 @media (pointer: coarse) {
   header button { min-height: 36px; min-width: 44px; }
 }

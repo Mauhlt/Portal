@@ -2007,11 +2007,14 @@ const bridge_imports = [_][]const u8{
     "log",           "get_origin", "ws_open",       "ws_send",
     "ws_close",      "canvas_size", "present",      "request_frame",
     "set_timer",     "check_session", "navigate_pair", "set_text",
+    "set_layout",    "set_class",     "box_read",      "box_write",
+    "box_hint",
 };
 /// Every export the bridge calls.
 const client_exports = [_][]const u8{
     "memory",     "init",     "in_alloc", "resize",   "frame",    "on_ws_open", "on_ws_close",
     "on_ws_message", "on_timer", "on_check", "on_key", "on_pointer", "on_wheel", "on_cmd",
+    "on_viewport",   "on_box_input", "on_box_key", "on_button",
 };
 
 const WasmReader = struct {
@@ -2106,7 +2109,7 @@ test "app.wasm imports only the bridge's host functions and exports what it call
         try std.testing.expect(std.mem.indexOf(u8, app_js, call) != null);
     }
     // The bridge stays small: it is glue, not an application.
-    try std.testing.expect(std.mem.count(u8, app_js, "\n") <= 90);
+    try std.testing.expect(std.mem.count(u8, app_js, "\n") <= 100);
 }
 
 test "csp allows wasm compilation but no eval or inline script" {

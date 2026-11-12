@@ -1,20 +1,23 @@
 // Portal browser bridge: UNAVOIDABLE BROWSER GLUE, NO APPLICATION LOGIC.
 // The viewer is Zig compiled to WebAssembly (src/wasm/, served as
 // /static/app.wasm). Browsers can only start WebAssembly from JavaScript,
-// so this file (1) instantiates the module, (2) forwards DOM events into its
-// exports and (3) implements its host imports, each a one-line wrapper
-// around a browser API. Every decision (protocol, drawing, layout, key
-// mapping, taps, reconnects, status text) is made in wasm. web.zig's tests
-// check this file defines exactly the imports app.wasm declares.
+// so this file (1) instantiates the module, (2) forwards DOM events and
+// values into its exports and (3) implements its host imports, each a
+// one-line wrapper around a browser API. Every decision (protocol, drawing,
+// pane layout, key mapping, what Send does, reconnects, status text) is
+// made in wasm. web.zig's tests check this file defines exactly the
+// imports app.wasm declares.
 'use strict';
 (async () => {
   const cv = document.getElementById('screen'), ctx = cv.getContext('2d');
+  const box = document.getElementById('box'), safe = document.getElementById('safe');
   const enc = new TextEncoder(), dec = new TextDecoder();
   let X = null, ws = null; // wasm exports; the one WebSocket
   const mem = () => new Uint8Array(X.memory.buffer); // re-made: memory can grow
   const str = (p, n) => dec.decode(mem().subarray(p, p + n));
   // Copy bytes into wasm's input buffer; returns the length for the handler.
   const put = (b) => { const p = X.in_alloc(b.length); if (p) mem().set(b, p); return b.length; };
+  const mods = (e) => e.shiftKey | e.ctrlKey << 1 | e.altKey << 2 | e.metaKey << 3 | e.isComposing << 4;
   const env = {
     log: (p, n) => console.log('portal:', str(p, n)),
     get_origin: (p, cap) => enc.encodeInto(location.protocol + '//' + location.host, mem().subarray(p, p + cap)).written,
@@ -37,10 +40,15 @@
       (r) => X.on_check(r.status, put(enc.encode(new URL(r.url).pathname))), () => X.on_check(0, 0)),
     navigate_pair: () => location.assign('/pair'),
     set_text: (slot, p, n, cls) => {
-      const el = document.getElementById(slot ? 'mode' : 'status');
+      const el = document.getElementById(['status', 'mode', 'note'][slot]);
       el.textContent = str(p, n);
       el.className = el.id + ['', ' ok', ' bad'][cls];
     },
+    set_layout: (p, n) => { document.body.style.cssText = str(p, n); },
+    set_class: (p, n) => { document.body.className = str(p, n); },
+    box_read: (p, cap) => enc.encodeInto(box.value, mem().subarray(p, p + cap)).written,
+    box_write: (p, n) => { box.value = str(p, n); },
+    box_hint: (p, n) => { box.placeholder = str(p, n); },
   };
   try {
     const { instance } = await WebAssembly.instantiateStreaming(fetch('/static/app.wasm'), { env });
@@ -50,18 +58,31 @@
     return;
   }
   X.init(matchMedia('(pointer: coarse)').matches ? 1 : 0);
+  // The visible viewport (it shrinks when the on-screen keyboard opens).
+  const vv = visualViewport, view = () => X.on_viewport(innerWidth, innerHeight,
+    vv.width, vv.height, vv.offsetTop, safe.offsetHeight, safe.offsetWidth);
+  ['resize', 'scroll'].forEach((t) => vv.addEventListener(t, view));
+  addEventListener('resize', view);
+  view();
   // Size in CSS pixels + devicePixelRatio; wasm picks the backing size.
   const size = () => X.resize(cv.clientWidth, cv.clientHeight, window.devicePixelRatio || 1);
   new ResizeObserver(size).observe(cv);
   // devicePixelRatio changes alone (another monitor) resize nothing: watch it.
   const dpr = () => matchMedia('(resolution: ' + devicePixelRatio + 'dppx)').addEventListener('change', () => { size(); dpr(); }, { once: true });
   dpr();
-  // Header buttons carry a command number for on_cmd (Fit / A− / A+).
+  // Header buttons carry a command number for on_cmd (Fit / A− / A+);
+  // the button row an inputbox.Button number for on_button.
   for (const b of document.querySelectorAll('[data-cmd]')) b.onclick = () => X.on_cmd(+b.dataset.cmd);
-  addEventListener('keydown', (e) => {
-    const mods = e.shiftKey | e.ctrlKey << 1 | e.altKey << 2 | e.metaKey << 3;
-    if (X.on_key(put(enc.encode(e.key)), mods)) e.preventDefault();
+  for (const b of document.querySelectorAll('[data-btn]')) {
+    b.onclick = () => X.on_button(+b.dataset.btn);
+    b.onpointerdown = (e) => e.preventDefault(); // keeps focus (and the keyboard) in the box
+  }
+  ['input', 'change'].forEach((t) => box.addEventListener(t, () => X.on_box_input()));
+  box.addEventListener('keydown', (e) => {
+    e.stopPropagation(); // typing in the box is not terminal keys
+    if (X.on_box_key(put(enc.encode(e.key)), mods(e))) e.preventDefault();
   });
+  addEventListener('keydown', (e) => { if (X.on_key(put(enc.encode(e.key)), mods(e))) e.preventDefault(); });
   ['pointerdown', 'pointermove', 'pointerup', 'pointercancel'].forEach((type, kind) =>
     cv.addEventListener(type, (e) => {
       if (!e.isPrimary) return;
