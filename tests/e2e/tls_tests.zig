@@ -311,19 +311,20 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
             }
             _ = r.check("no plain-named (non-__Host-) cookie is set over HTTPS", resp.setCookieLine(client.pairreq_cookie) == null, "", .{});
         }
+        // The first /pair/wait is answered at once; later ones are held
+        // until the desk answers (long poll), so keep this page's code.
+        var page_code: [4]u8 = @splat('?');
         {
             var resp = try client.waitPage(inst, req_cookie, null);
             defer resp.deinit();
             _ = r.check("waiting page over HTTPS: 200, refreshes, issues nothing", resp.status == 200 and resp.bodyContains("http-equiv=\"refresh\"") and resp.setCookieCount() == 0, "{d}", .{resp.status});
             scan.look("/pair/wait", resp.raw);
+            const hc = resp.header("x-portal-request-code") orelse "";
+            if (hc.len == 4 and resp.bodyContains(hc)) @memcpy(&page_code, hc);
         }
         _ = r.check("desk prompt appears for the device", pc.waitFor("[y/N]", 10_000), "{s}", .{pc.output()});
         const code = pc.lastAfter("(request ", 4) orelse "????";
-        {
-            var resp = try client.waitPage(inst, req_cookie, null);
-            defer resp.deinit();
-            _ = r.check("device page shows the same request code as the desk", resp.bodyContains(code), "code={s}", .{code});
-        }
+        _ = r.check("device page shows the same request code as the desk", std.mem.eql(u8, &page_code, code), "page={s} desk={s}", .{ &page_code, code });
         pc.answer("y\r\n");
         const decided = try waitDecided(inst, req_cookie, 10_000);
         if (decided) |d| {

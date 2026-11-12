@@ -19,6 +19,8 @@ pub const Pty = struct {
     in_write: w.HANDLE,
     /// Portal reads terminal output here.
     out_read: w.HANDLE,
+    /// Owned by the one thread that calls `waitExit` (which closes it);
+    /// nothing else touches it, so no wait can race a CloseHandle.
     process: w.HANDLE,
     /// Job object with KILL_ON_JOB_CLOSE: if Portal dies for any reason, the
     /// child and everything it spawned die with it. No orphaned sessions that
@@ -94,7 +96,13 @@ pub const Pty = struct {
             _ = w.CloseHandle(pi.hProcess);
             return error.JobObjectFailed;
         }
-        _ = w.ResumeThread(pi.hThread);
+        // A child that never starts would otherwise sit suspended forever,
+        // with Portal waiting for it to exit.
+        if (w.ResumeThread(pi.hThread) == std.math.maxInt(w.DWORD)) {
+            _ = w.TerminateProcess(pi.hProcess, 1);
+            _ = w.CloseHandle(pi.hProcess);
+            return error.ResumeThreadFailed;
+        }
 
         return .{ .hpc = hpc, .in_write = in_write, .out_read = out_read, .process = pi.hProcess, .job = job };
     }
@@ -131,27 +139,40 @@ pub const Pty = struct {
         _ = w.ResizePseudoConsole(p.hpc, size.coord());
     }
 
-    /// Blocks until the child exits; returns its exit code.
-    pub fn wait(p: *Pty) u32 {
+    /// Blocks until the child exits; returns its exit code and closes the
+    /// process handle. Call exactly once, from the one thread that waits
+    /// for the child (the caller owns `process` from then on).
+    pub fn waitExit(p: *Pty) u32 {
         _ = w.WaitForSingleObject(p.process, w.INFINITE);
         var code: w.DWORD = 1;
         _ = w.GetExitCodeProcess(p.process, &code);
+        _ = w.CloseHandle(p.process);
         return code;
     }
 
-    /// Closes the pseudo console (which ends the output stream) and kills
-    /// anything left in the job. The output reader must still be draining
-    /// when this is called, or ClosePseudoConsole can block (before Windows
-    /// 11 24H2 it waits for conhost to flush all output). Not thread safe:
-    /// the caller must first stop every resize (Session.pty_live) and every
-    /// write (Session.input_open), since HPCON and in_write are freed here.
-    pub fn close(p: *Pty) void {
+    /// Closes the pseudo console: the output stream ends (once conhost has
+    /// flushed it), and a child still running sees its console go away
+    /// (CTRL_CLOSE_EVENT), its cue to exit. The job and the process handle
+    /// stay: whoever waits for the child still needs them, and process exit
+    /// closes the job (KILL_ON_JOB_CLOSE). The output reader must still be
+    /// draining when this is called, or ClosePseudoConsole can block
+    /// (before Windows 11 24H2 it waits for conhost to flush all output).
+    /// Not thread safe: the caller must first stop every resize
+    /// (Session.pty_live) and every write (Session.input_open), since HPCON
+    /// and in_write are freed here.
+    pub fn closeConsole(p: *Pty) void {
         if (p.closed) return;
         p.closed = true;
         w.ClosePseudoConsole(p.hpc);
         _ = w.CloseHandle(p.in_write);
-        _ = w.CloseHandle(p.job); // KILL_ON_JOB_CLOSE
-        _ = w.CloseHandle(p.process);
+    }
+
+    /// Ends the child and everything it started, at once (the job). For a
+    /// child that did not exit in time after `closeConsole`. Safe from any
+    /// thread while `waitExit` runs: the job handle is never closed before
+    /// the process exits.
+    pub fn terminate(p: *Pty) void {
+        _ = w.TerminateJobObject(p.job, 1);
     }
 };
 

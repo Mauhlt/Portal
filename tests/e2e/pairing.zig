@@ -160,11 +160,16 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
             const third = try client.requestPair(inst, null);
             _ = r.check("pending requests per address are bounded (busy)", std.mem.eql(u8, third.location(), "/pair?e=busy"), "{s}", .{third.location()});
         }
+        // The first /pair/wait is answered at once; later ones are held
+        // until the desk answers (long poll), so keep this page's code.
+        var page_code: [4]u8 = @splat('?');
         {
             var resp = try client.waitPage(inst, rq.cookie(), null);
             defer resp.deinit();
             _ = r.check("waiting page: 200, refreshes itself, issues nothing", resp.status == 200 and resp.bodyContains("http-equiv=\"refresh\"") and
                 resp.bodyContains("Request code") and resp.setCookieCount() == 0, "{d} cookies={d}", .{ resp.status, resp.setCookieCount() });
+            const hc = resp.header("x-portal-request-code") orelse "";
+            if (hc.len == 4 and resp.bodyContains(hc)) @memcpy(&page_code, hc);
             var resp2 = try client.waitPage(inst, rq.cookie(), other_ip);
             defer resp2.deinit();
             _ = r.check("a request token is bound to its address", !two_ips or (resp2.status == 303 and std.mem.eql(u8, resp2.location(), "/pair?e=expired")), "{d} {s}", .{ resp2.status, resp2.location() });
@@ -187,11 +192,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         const n_prompts: usize = if (racer != null) 2 else 1;
         _ = r.check("desk prompt for the device", pc.waitForCount("[y/N]", n_prompts, 10_000), "{s}", .{pc.output()});
         const code = pc.lastAfter("(request ", 4) orelse "????";
-        {
-            var resp = try client.waitPage(inst, rq.cookie(), null);
-            defer resp.deinit();
-            _ = r.check("device page shows the same request code as the desk", resp.bodyContains(code), "code={s}", .{code});
-        }
+        _ = r.check("device page shows the same request code as the desk", std.mem.eql(u8, &page_code, code), "page={s} desk={s}", .{ &page_code, code });
         // The page above was the first answer for this request; asking
         // again is held until the desk answers (no poll interval).
         var held: HeldWait = .{ .inst = inst, .cookie = rq.cookie() };

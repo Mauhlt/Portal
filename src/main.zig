@@ -41,6 +41,7 @@ const conpty = @import("conpty.zig");
 const console_mod = @import("console.zig");
 const Console = console_mod.Console;
 const Session = @import("session.zig").Session;
+const LocalInput = @import("session.zig").LocalInput;
 const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
 const fsutil = @import("fsutil.zig");
@@ -1491,7 +1492,13 @@ const max_read_failures = 1000;
 
 /// How long shutdown waits for ClosePseudoConsole plus the output drain
 /// before exiting anyway (process exit closes the job, which kills the child).
+/// Also how long a program gets to exit after the window was closed.
 const shutdown_timeout_ms = 10_000;
+/// After ending a program that did not exit in time (the job), how long
+/// to wait for it to be gone.
+const terminate_timeout_ms = 5_000;
+/// How long viewers get to receive the exit notice and disconnect.
+const viewer_goodbye_ms = 2_000;
 
 /// Set by each shutdown step as it finishes (output drained, pseudo console
 /// closed, child exited), so the main thread sleeps until one finishes or
@@ -1573,9 +1580,10 @@ const Threads = struct {
     }
 
     /// GUI mode: the main thread runs the window, so the child is waited
-    /// for here.
+    /// for here. This thread owns the process handle (Pty.waitExit closes
+    /// it); shutdown only ever touches the job.
     fn waitChild(io: Io, pty: *conpty.Pty, code: *std.atomic.Value(u32), done: *std.atomic.Value(bool), host: *gui.LocalHost) void {
-        code.store(pty.wait(), .release);
+        code.store(pty.waitExit(), .release);
         shutdownStepDone(io, done);
         host.wakeChildExited(); // the GUI loop sleeps until woken
     }
@@ -1822,6 +1830,10 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .term = vt.Terminal.init(gpa, initial.cols, initial.rows) catch fatal("out of memory", .{}),
         .size = initial,
     };
+    // Desktop input reaches the PTY through its own writer thread.
+    const local_input = gpa.create(LocalInput) catch fatal("out of memory", .{});
+    local_input.* = .{ .gpa = gpa, .io = io, .session = &session };
+    session.local = local_input;
     if (host) |h| h.attach(&session);
 
     var server: web.Server = .{
@@ -1919,6 +1931,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     const out_thread = std.Thread.spawn(.{}, Threads.ptyOutput, .{ &session, &console, &pty, io, &out_done }) catch |err|
         fatal("cannot start output thread: {t}", .{err});
     out_thread.detach(); // waited for via out_done, with a timeout
+    const input_thread = std.Thread.spawn(.{}, LocalInput.run, .{local_input}) catch |err|
+        fatal("cannot start input writer thread: {t}", .{err});
+    input_thread.detach(); // ends when shutdownPty closes the queue
     if (opts.console) {
         const in_thread = std.Thread.spawn(.{}, Threads.consoleInput, .{ &session, &console }) catch |err|
             fatal("cannot start input thread: {t}", .{err});
@@ -1939,12 +1954,20 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         t.detach();
     }
 
-    var code: u32 = undefined;
+    // Two ways the session ends, kept apart:
+    //   * the program exits (either mode): the pseudo console is closed
+    //     at once, its remaining output drains to EOF, viewers get the
+    //     program's exit code;
+    //   * the window is closed while the program runs (GUI): closing the
+    //     pseudo console is the program's cue to exit (its console goes
+    //     away), and Portal WAITS for it to exit, up to
+    //     shutdown_timeout_ms; only a program still running then is ended
+    //     through its job. The waiter thread owns the process handle
+    //     throughout, so no wait races a close.
     var window_closed = false;
     if (host) |h| {
         // GUI: the window owns the main thread; a waiter thread watches
-        // the child. Closing the window ends the session the same way the
-        // child exiting does (below): ClosePseudoConsole ends the child.
+        // the child.
         const waiter = std.Thread.spawn(.{}, Threads.waitChild, .{ io, &pty, &child_code, &child_done, h }) catch |err|
             fatal("cannot start child waiter thread: {t}", .{err});
         waiter.detach();
@@ -1953,21 +1976,21 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .window_closed => {
                 window_closed = true;
                 h.hide();
-                log.print("local window closed: ending the session", .{});
+                log.print("local window closed: asking the program to exit and waiting for it", .{});
             },
         }
         log.print("local window: {d} wake-ups, {d} frames presented", .{ h.wakeups, h.presents }); // [fix2/desk]
-        code = child_code.load(.acquire);
     } else {
-        code = pty.wait();
+        child_code.store(pty.waitExit(), .release);
+        child_done.store(true, .release);
     }
-    // Let trailing output drain before tearing down the pseudo console.
-    if (!window_closed) io.sleep(.fromMilliseconds(200), .awake) catch {};
 
     // ClosePseudoConsole can block (pre-24H2 it waits for conhost to flush),
     // so run it on its own thread and stop waiting after a timeout rather
     // than leaving the user's console hung. Session.shutdownPty stops resizes
     // and writes first, so nothing touches the freed HPCON or input pipe.
+    // The output thread keeps draining meanwhile: everything the program
+    // wrote reaches the terminal (and viewers) before EOF.
     var close_done: std.atomic.Value(bool) = .init(false);
     if (std.Thread.spawn(.{}, Threads.closePty, .{ &session, &close_done })) |t| {
         t.detach();
@@ -1975,18 +1998,27 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         Threads.closePty(&session, &close_done);
     }
     // One deadline for the whole shutdown; each step wakes this thread.
-    const shutdown_deadline = Io.Clock.awake.now(io).toMilliseconds() + shutdown_timeout_ms;
-    const clean = waitShutdown(io, &.{ &close_done, &out_done }, shutdown_deadline);
-    if (window_closed) {
-        // The child was ended by closing its pseudo console; report its
-        // own exit code if it has gone within the remaining time.
-        code = if (waitShutdown(io, &.{&child_done}, shutdown_deadline)) child_code.load(.acquire) else 1;
+    var shutdown_deadline = Io.Clock.awake.now(io).toMilliseconds() + shutdown_timeout_ms;
+    var ended_by_portal = false;
+    if (window_closed and !waitShutdown(io, &.{&child_done}, shutdown_deadline)) {
+        log.print("the program did not exit within {d} s of the window closing: ending it", .{shutdown_timeout_ms / 1000});
+        pty.terminate();
+        ended_by_portal = true;
+        shutdown_deadline = Io.Clock.awake.now(io).toMilliseconds() + terminate_timeout_ms;
+        _ = waitShutdown(io, &.{&child_done}, shutdown_deadline);
     }
+    const clean = waitShutdown(io, &.{ &close_done, &out_done }, shutdown_deadline);
+    const code: u32 = if (child_done.load(.acquire)) child_code.load(.acquire) else 1;
 
     session.markClosed(code);
-    log.print("stop: child exited with code {d}{s}", .{ code, if (clean) "" else " (pseudo console did not close in time)" });
-    // Give viewers a moment to receive the exit notice.
-    io.sleep(.fromMilliseconds(500), .awake) catch {};
+    log.print("stop: child exited with code {d}{s}{s}", .{
+        code,
+        if (ended_by_portal) " (ended by Portal after the window closed)" else "",
+        if (clean) "" else " (pseudo console did not close in time)",
+    });
+    // Viewers receive the exit notice, then disconnect: wait for that
+    // (event-driven), at most viewer_goodbye_ms.
+    session.waitViewersGone(Io.Clock.awake.now(io).toMilliseconds() + viewer_goodbye_ms);
     // Do NOT close the listener: the accept thread is blocked on it and std
     // hits `unreachable` on the cancelled accept. Process exit reclaims it.
     console.restore();
