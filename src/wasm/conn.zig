@@ -120,12 +120,7 @@ pub const Conn = struct {
 };
 
 pub fn modeText(p: proto.Policy) []const u8 {
-    return switch (p) {
-        .none => "view only",
-        .keys => "answer keys",
-        .instruct => "instructions",
-        .text => "typing allowed",
-    };
+    return p.label();
 }
 
 // ------------------------------------------------------------------ tests

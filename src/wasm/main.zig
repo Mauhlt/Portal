@@ -555,7 +555,8 @@ export fn on_check(status: u32, len: usize) void {
 export fn on_key(len: usize, mods: u32) u32 {
     if (!ready) return 0;
     const key = input(len) orelse return 0;
-    const action = keys.fromKeyboard(app.policy, key, keys.Mods.fromBits(mods));
+    var cbuf: [4]u8 = undefined;
+    const action = keys.fromKeyboard(app.policy, key, keys.modsFromBits(mods), &cbuf);
     if (action == .none) return 0;
     send(action);
     return 1;

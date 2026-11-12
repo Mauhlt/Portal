@@ -188,6 +188,19 @@ pub fn runText(h: *proc.Harness, r: *Runner, port: u16) !void {
     _ = r.check("text mode: ! after other text is ordinary", waitEnds(v, "REM guarded !mid", 5000), "'{s}'", .{v.cursorLine()});
     v.send("k:esc");
     _ = waitLine(v, "E2E>", 3000);
+    // An editing key counts as a new line start too: `t:x`, `k:backspace`,
+    // `t:!...` must not leave a leading `!`.
+    v.send("t:x");
+    v.send("k:backspace");
+    v.send("t:!REM after-backspace");
+    _ = r.check("text mode: ! dropped after Backspace", waitEnds(v, "REM after-backspace", 5000) and std.mem.indexOfScalar(u8, v.cursorLine(), '!') == null, "'{s}'", .{v.cursorLine()});
+    v.send("k:left");
+    v.send("t:!");
+    v.pump(400);
+    _ = r.check("text mode: ! dropped after an arrow key", std.mem.indexOfScalar(u8, v.cursorLine(), '!') == null, "'{s}'", .{v.cursorLine()});
+    net.sleep(1100); // one Esc per second
+    v.send("k:esc");
+    _ = waitLine(v, "E2E>", 3000);
 
     _ = r.check("every frame decoded strictly", v.bad == null, "{?t}", .{v.bad});
     _ = r.ok("portal still running", s.inst.alive() and client.alive(s.inst));

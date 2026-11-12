@@ -11,6 +11,10 @@
 //!   "view"   src/view/root.zig   window, Vulkan drawing, fonts, input types.
 //!                                No networking; imports only "Renderer".
 //!   client   src/main.zig        pairing, refresh, WebSocket, 'G' decoding.
+//!   "inputrules"  ../src/inputrules/root.zig   the input policy, key names
+//!                                and input line, shared with Portal's server
+//!                                and browser client (Portal's own source
+//!                                tree: this build lives inside it).
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -31,7 +35,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "view", .module = view }},
+        .imports = &.{
+            .{ .name = "view", .module = view },
+            .{ .name = "inputrules", .module = inputrulesModule(b, target, optimize) },
+        },
     }) });
     const test_step = b.step("test", "Run unit tests and compile-check the executables");
     test_step.dependOn(&b.addRunArtifact(view_tests).step);
@@ -69,12 +76,23 @@ pub fn viewModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     });
 }
 
+/// The input policy and input line, shared with Portal's server and
+/// browser client: Portal's src/inputrules (one directory up; Zig allows a
+/// module root outside the build root, and this build only ever runs from
+/// inside the Portal checkout).
+pub fn inputrulesModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("../src/inputrules/root.zig"), .target = target, .optimize = optimize });
+}
+
 fn addClient(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
     return b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = target.result.os.tag != .windows, // libsecret / Security.framework via dlopen
-        .imports = &.{.{ .name = "view", .module = viewModule(b, target, optimize) }},
+        .imports = &.{
+            .{ .name = "view", .module = viewModule(b, target, optimize) },
+            .{ .name = "inputrules", .module = inputrulesModule(b, target, optimize) },
+        },
     }) });
 }

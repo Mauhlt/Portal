@@ -70,7 +70,13 @@ pub const Status = enum {
 pub const Shared = struct {
     mutex: Io.Mutex = .init,
     grid: Grid = .{},
-    mode: keys.Mode = .unknown,
+    /// hello's `input` (null before hello and while disconnected).
+    mode: ?keys.Policy = null,
+    /// The last {"t":"rejected"} reason (a LineError name) and a counter
+    /// bumped with each one, for the UI thread's instruction field.
+    rejected_buf: [32]u8 = undefined,
+    rejected_len: usize = 0,
+    rejected_gen: u64 = 0,
     status: Status = .starting,
     detail_buf: [160]u8 = undefined,
     detail_len: usize = 0,
@@ -217,7 +223,7 @@ pub const Client = struct {
         s.detail_len = d.len;
         if (status != .pair_waiting) s.pair_code = null;
         if (status == .connected) s.last_error = null;
-        if (status != .connected) s.mode = if (status == .session_ended) s.mode else .unknown;
+        if (status != .connected) s.mode = if (status == .session_ended) s.mode else null;
         s.mutex.unlock(c.io);
         c.notify();
     }
@@ -666,6 +672,7 @@ pub const Client = struct {
         t: []const u8 = "",
         input: ?[]const u8 = null,
         code: ?i64 = null,
+        reason: ?[]const u8 = null,
     };
 
     fn handleFrame(c: *Client, frame: ws.Frame, backoff: *i64) ?StreamResult {
@@ -700,11 +707,21 @@ pub const Client = struct {
                 const m = parsed.value;
                 if (std.mem.eql(u8, m.t, "hello")) {
                     c.shared.mutex.lockUncancelable(c.io);
-                    c.shared.mode = keys.Mode.parse(m.input orelse "none");
+                    c.shared.mode = keys.parsePolicy(m.input orelse "none");
                     c.shared.mutex.unlock(c.io);
                     backoff.* = 1000;
                     c.notify();
                     c.signalSync(); // look for updates on every (re)connect
+                } else if (std.mem.eql(u8, m.t, "rejected")) {
+                    // An instruction line was refused (docs/protocol.md §4).
+                    const why = m.reason orelse "";
+                    c.shared.mutex.lockUncancelable(c.io);
+                    const n = @min(why.len, c.shared.rejected_buf.len);
+                    @memcpy(c.shared.rejected_buf[0..n], why[0..n]);
+                    c.shared.rejected_len = n;
+                    c.shared.rejected_gen +%= 1;
+                    c.shared.mutex.unlock(c.io);
+                    c.notify();
                 } else if (std.mem.eql(u8, m.t, "updates")) {
                     c.signalSync();
                 } else if (std.mem.eql(u8, m.t, "exit")) {
@@ -743,7 +760,7 @@ pub const Client = struct {
         };
     }
 
-    /// Sends an input frame ("k:..." or "t:..."); callable from the UI thread.
+    /// Sends an input frame ("k:...", "t:..." or "l:..."); callable from the UI thread.
     pub fn sendInput(c: *Client, text: []const u8) bool {
         c.sendFrame(.text, text) catch return false;
         return true;

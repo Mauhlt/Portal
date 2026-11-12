@@ -1136,8 +1136,11 @@ fn drawPane(tv: *TermView, ui: fontset.Metrics, p: Pane, r: Rect, s: f32) void {
             const tx = box.x + cw;
             const ty = box.y + @round(@min(cw, (box.h - lh) / 2));
             const inner = box.w - 2 * cw;
-            if (f.value.len == 0 and !f.focused) {
-                _ = tv.text(ui, tx, ty, clipText(ui, f.hint, inner, false), toneColor(.muted), false);
+            if (f.value.len == 0) {
+                // The hint stays visible in an empty focused box, after the cursor.
+                const cur = if (f.focused) @max(2, @round(2 * s)) else 0;
+                if (f.focused) tv.rect(tx, ty, cur, lh, focus_edge);
+                _ = tv.text(ui, tx + cur * 2, ty, clipText(ui, f.hint, inner - cur * 2, false), toneColor(.muted), false);
             } else {
                 const end = tv.text(ui, tx, ty, clipText(ui, f.value, inner - cw, true), button_fg, false);
                 if (f.focused) tv.rect(end, ty, @max(2, @round(2 * s)), lh, focus_edge);

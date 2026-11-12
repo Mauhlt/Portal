@@ -78,15 +78,18 @@ pub const Event = union(enum) {
 /// On-screen answer buttons. `key` uses the protocol key names
 /// (docs/protocol.md section 4): digits, "y", "n", "enter", "esc".
 pub const Answer = struct { label: []const u8, key: []const u8 };
+/// The same buttons, in the same order, as the browser's button row: the
+/// shared list in Portal's src/inputrules/send.zig (`answer_buttons`; the
+/// view module has no imports, so client/src/keys.zig tests that the two
+/// agree).
 pub const answers = [_]Answer{
+    .{ .label = "Yes", .key = "y" },
+    .{ .label = "No", .key = "n" },
     .{ .label = "1", .key = "1" },
     .{ .label = "2", .key = "2" },
     .{ .label = "3", .key = "3" },
-    .{ .label = "4", .key = "4" },
-    .{ .label = "Yes", .key = "y" },
-    .{ .label = "No", .key = "n" },
-    .{ .label = "Enter", .key = "enter" },
     .{ .label = "Esc", .key = "esc" },
+    .{ .label = "Enter", .key = "enter" },
 };
 
 /// Where TermView sends input. All callbacks run on the UI thread.
