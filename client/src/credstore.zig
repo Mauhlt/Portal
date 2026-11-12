@@ -167,20 +167,20 @@ const macos = struct {
         var sec = std.DynLib.open("/System/Library/Frameworks/Security.framework/Security") catch return error.Unavailable;
         libs = .{ cf, sec };
         var a: Api = undefined;
-        inline for (@typeInfo(Api).@"struct".fields) |f| {
-            const is_cf = comptime std.mem.startsWith(u8, f.name, "CF") or std.mem.startsWith(u8, f.name, "kCF") or
-                std.mem.endsWith(u8, f.name, "callbacks");
+        inline for (@typeInfo(Api).@"struct".field_names, @typeInfo(Api).@"struct".field_types) |f_name, f_type| {
+            const is_cf = comptime std.mem.startsWith(u8, f_name, "CF") or std.mem.startsWith(u8, f_name, "kCF") or
+                std.mem.endsWith(u8, f_name, "callbacks");
             const lib = if (is_cf) &cf else &sec;
-            if (comptime std.mem.startsWith(u8, f.name, "k")) {
+            if (comptime std.mem.startsWith(u8, f_name, "k")) {
                 // Data symbols: the CFStringRef/CFBooleanRef variable.
-                const p = lib.lookup(*const CFTypeRef, f.name) orelse return error.Unavailable;
-                @field(a, f.name) = p.*;
-            } else if (comptime std.mem.eql(u8, f.name, "key_callbacks")) {
+                const p = lib.lookup(*const CFTypeRef, f_name) orelse return error.Unavailable;
+                @field(a, f_name) = p.*;
+            } else if (comptime std.mem.eql(u8, f_name, "key_callbacks")) {
                 a.key_callbacks = lib.lookup(*const anyopaque, "kCFTypeDictionaryKeyCallBacks") orelse return error.Unavailable;
-            } else if (comptime std.mem.eql(u8, f.name, "value_callbacks")) {
+            } else if (comptime std.mem.eql(u8, f_name, "value_callbacks")) {
                 a.value_callbacks = lib.lookup(*const anyopaque, "kCFTypeDictionaryValueCallBacks") orelse return error.Unavailable;
             } else {
-                @field(a, f.name) = lib.lookup(f.type, f.name) orelse return error.Unavailable;
+                @field(a, f_name) = lib.lookup(f_type, f_name) orelse return error.Unavailable;
             }
         }
         api = a;
@@ -312,9 +312,9 @@ const linux = struct {
         var secret = std.DynLib.open("libsecret-1.so.0") catch return error.Unavailable;
         var glib = std.DynLib.open("libglib-2.0.so.0") catch return error.Unavailable;
         var a: Api = undefined;
-        inline for (@typeInfo(Api).@"struct".fields) |f| {
-            const lib = if (comptime std.mem.startsWith(u8, f.name, "secret_")) &secret else &glib;
-            @field(a, f.name) = lib.lookup(f.type, f.name) orelse return error.Unavailable;
+        inline for (@typeInfo(Api).@"struct".field_names, @typeInfo(Api).@"struct".field_types) |f_name, f_type| {
+            const lib = if (comptime std.mem.startsWith(u8, f_name, "secret_")) &secret else &glib;
+            @field(a, f_name) = lib.lookup(f_type, f_name) orelse return error.Unavailable;
         }
         api = a;
         return &api.?;
@@ -336,7 +336,7 @@ const linux = struct {
     fn load(target: []const u8, out: []u8) Error!?[]u8 {
         const a = try get();
         var tz: [max_target + 1]u8 = undefined;
-        const t = std.fmt.bufPrintZ(&tz, "{s}", .{target}) catch return error.TooLong;
+        const t = std.fmt.bufPrintSentinel(&tz, "{s}", .{target}, 0) catch return error.TooLong;
         const table = try attrs(a, t);
         defer a.g_hash_table_unref(table);
         var err: ?*GError = null;
@@ -354,10 +354,10 @@ const linux = struct {
     fn save(target: []const u8, secret: []const u8) Error!void {
         const a = try get();
         var tz: [max_target + 1]u8 = undefined;
-        const t = std.fmt.bufPrintZ(&tz, "{s}", .{target}) catch return error.TooLong;
+        const t = std.fmt.bufPrintSentinel(&tz, "{s}", .{target}, 0) catch return error.TooLong;
         var sz: [max_secret + 1]u8 = undefined;
         defer std.crypto.secureZero(u8, &sz);
-        const s = std.fmt.bufPrintZ(&sz, "{s}", .{secret}) catch return error.TooLong;
+        const s = std.fmt.bufPrintSentinel(&sz, "{s}", .{secret}, 0) catch return error.TooLong;
         const table = try attrs(a, t);
         defer a.g_hash_table_unref(table);
         var err: ?*GError = null;
@@ -369,7 +369,7 @@ const linux = struct {
     fn delete(target: []const u8) Error!void {
         const a = try get();
         var tz: [max_target + 1]u8 = undefined;
-        const t = std.fmt.bufPrintZ(&tz, "{s}", .{target}) catch return error.TooLong;
+        const t = std.fmt.bufPrintSentinel(&tz, "{s}", .{target}, 0) catch return error.TooLong;
         const table = try attrs(a, t);
         defer a.g_hash_table_unref(table);
         var err: ?*GError = null;
