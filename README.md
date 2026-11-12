@@ -316,14 +316,18 @@ portalctl sync subscriptions
 * **Delivery is event-driven**: a publish or a subscription change sends
   the subscribed devices `{"t":"updates"}` on their WebSocket; they fetch,
   verify (signature, SHA-256 and size of every file) and install into
-  `%LOCALAPPDATA%\Portal\sync\packages\<package>\<version>\`, read-only.
+  that desktop's own folder,
+  `%LOCALAPPDATA%\Portal\sync\desktops\<host>-<key>\packages\<package>\<version>\`,
+  read-only, so two paired desktops can never overwrite each other.
   A running program is never overwritten: each version is a new folder.
 * **On the device** (`portal connect`): data installs by itself; a program
   asks "Install <package> <version> from <desktop>?" with the publisher key
   and size, every new version. Right after pairing it asks "Install voice
   model?" for subscribed voice packages. Ctrl+Shift+K shows Packages
-  (installed, waiting for approval, Roll back). Nothing is ever run
-  automatically.
+  (installed, waiting for approval, Roll back, Revoke a program's
+  approval, Forget this desktop). There are no letter shortcuts and panels
+  ignore input for their first 600 ms, so typing can't approve anything.
+  Nothing is ever run automatically.
 * Devices paired before this existed have no pinned release key: pair them
   again to turn sync on.
 

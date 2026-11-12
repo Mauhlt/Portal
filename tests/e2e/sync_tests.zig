@@ -10,6 +10,11 @@
 //!   * a tampered file, a tampered manifest, a release key the device did
 //!     not pin, and a downgrade are all refused, and nothing changes;
 //!   * a manifest with a path traversal is never offered;
+//!   * each desktop has its own folder on the device: another desktop's
+//!     records (even at a huge sequence) and the old shared store are
+//!     never read or written;
+//!   * revoking an executable's approval goes back to the previous version,
+//!     then uninstalls; a revoked version is not installed again;
 //!   * /sync routes: 401 without a session, 404 for packages a device is
 //!     not subscribed to, files only by index;
 //!   * privacy: no local paths or user names in any sync response.
@@ -38,6 +43,9 @@ const Ctx = struct {
     dev: []const u8,
     server_arg: []const u8,
     pem: []const u8,
+    /// The device's folder for this desktop:
+    /// <dev>\Portal\sync\desktops\<host stem>-<16 hex of the key SHA-256>.
+    desk_dir: []const u8 = "",
     leaks: *privacy.Leaks,
     scanned: usize = 0,
     leaked: usize = 0,
@@ -74,7 +82,7 @@ const Ctx = struct {
     }
 
     fn devPath(c: *Ctx, comptime fmt: []const u8, args: anytype) ![]u8 {
-        return std.fmt.allocPrint(c.h.gpa, "{s}\\Portal\\sync\\" ++ fmt, .{c.dev} ++ args);
+        return std.fmt.allocPrint(c.h.gpa, "{s}\\" ++ fmt, .{c.desk_dir} ++ args);
     }
 
     fn deskPath(c: *Ctx, comptime fmt: []const u8, args: anytype) ![]u8 {
@@ -85,13 +93,28 @@ const Ctx = struct {
         return Io.Dir.cwd().readFileAlloc(c.h.io, path, c.h.gpa, .limited(1 << 20)) catch null;
     }
 
-    /// The version the device's current pointer names ("" if none).
+    /// The version the device's record names as current ("" if none).
     fn current(c: *Ctx, pkg: []const u8) []const u8 {
-        const p = c.devPath("current\\{s}.txt", .{pkg}) catch return "";
+        return c.slot(pkg, "\ncurrent ");
+    }
+
+    fn previous(c: *Ctx, pkg: []const u8) []const u8 {
+        return c.slot(pkg, "\nprevious ");
+    }
+
+    fn slot(c: *Ctx, pkg: []const u8, key: []const u8) []const u8 {
+        const p = c.devPath("state\\{s}.txt", .{pkg}) catch return "";
         const text = c.readFile(p) orelse return "";
-        const i = std.mem.indexOf(u8, text, "\nversion ") orelse return "";
-        const rest = text[i + 9 ..];
-        return rest[0 .. std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len];
+        const i = std.mem.indexOf(u8, text, key) orelse return "";
+        const rest = text[i + key.len ..];
+        const line = rest[0 .. std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len];
+        if (std.mem.eql(u8, line, "-")) return "";
+        return line[0 .. std.mem.indexOfScalar(u8, line, ' ') orelse line.len];
+    }
+
+    fn exists(c: *Ctx, path: []const u8) bool {
+        Io.Dir.cwd().access(c.h.io, path, .{}) catch return false;
+        return true;
     }
 
     fn writeSource(c: *Ctx, name: []const u8, files: []const [2][]const u8) ![]u8 {
@@ -168,6 +191,19 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const fp_at = std.mem.indexOf(u8, key.out, "SHA-256 ") orelse 0;
     const fingerprint = if (fp_at > 0 and key.out.len >= fp_at + 8 + 95) key.out[fp_at + 8 ..][0..95] else "?";
     _ = r.check("the desktop has a release key (created at start, shown by `sync key`)", key.code == 0 and fp_at > 0, "{s}", .{key.out});
+    {
+        // desktops\127.0.0.1_<port>-<first 16 hex digits of the SHA-256>
+        var hex: [16]u8 = undefined;
+        var n: usize = 0;
+        for (fingerprint) |ch| {
+            if (ch == ':') continue;
+            if (n == hex.len) break;
+            hex[n] = std.ascii.toLower(ch);
+            n += 1;
+        }
+        const colon = std.mem.lastIndexOfScalar(u8, inst.host, ':') orelse 0;
+        c.desk_dir = try std.fmt.allocPrint(gpa, "{s}\\Portal\\sync\\desktops\\{s}_{s}-{s}", .{ dev, inst.host[0..colon], inst.host[colon + 1 ..], hex[0..n] });
+    }
     {
         const init_again = try c.desk(&.{ "sync", "key", "init" });
         _ = r.check("`sync key init` refuses to replace the key without --force", init_again.code != 0 and has(init_again.out, "--force"), "{s}", .{init_again.out});
@@ -257,6 +293,22 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("anything but /sync/pkg/<pkg>/<ver>/{manifest,file/<n>} of a subscribed package is refused", bad == 0, "{d} served", .{bad});
     }
 
+    // ------------------------------------------- per-desktop folders on the device
+    // Another desktop's folder with a record for the same package at a huge
+    // sequence, and the shared store of earlier versions: neither may block
+    // or be touched by this desktop's installs.
+    const other_desk = try std.fmt.allocPrint(gpa, "{s}\\Portal\\sync\\desktops\\10.9.9.9_8420-0011223344556677", .{dev});
+    const other_rec = "portal-sync-state-v2\nsigner " ++ "abababababababababababababababababababababababababababababababab" ++ "\ncurrent 99.0 999999\nprevious -\nhighest 999999\n";
+    const legacy_ptr = try std.fmt.allocPrint(gpa, "{s}\\Portal\\sync\\current\\stt-model.txt", .{dev});
+    const legacy_rec = "portal-sync-pointer-v1\nversion 99.0\nsequence 999999\nhighest 999999\n";
+    {
+        const p = try std.fmt.allocPrint(gpa, "{s}\\state\\stt-model.txt", .{other_desk});
+        if (std.fs.path.dirname(p)) |d| try Io.Dir.cwd().createDirPath(h.io, d);
+        try Io.Dir.cwd().writeFile(h.io, .{ .sub_path = p, .data = other_rec });
+        if (std.fs.path.dirname(legacy_ptr)) |d| try Io.Dir.cwd().createDirPath(h.io, d);
+        try Io.Dir.cwd().writeFile(h.io, .{ .sub_path = legacy_ptr, .data = legacy_rec });
+    }
+
     // --------------------------------- publish/subscribe -> updates -> install
     {
         const lc = try c.deviceLive(&.{ "--wait-updates", "30" });
@@ -273,7 +325,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         const p = (try c.devPath("packages\\stt-model\\1.0\\model.bin", .{}));
         const got = c.readFile(p) orelse "";
         _ = r.check("installed files are byte-identical, in packages\\<pkg>\\<ver>", std.mem.eql(u8, got, "model weights version one"), "'{s}'", .{got});
-        _ = r.check("current\\stt-model.txt points at 1.0", std.mem.eql(u8, c.current("stt-model"), "1.0"), "'{s}'", .{c.current("stt-model")});
+        _ = r.check("state\\stt-model.txt names 1.0 as current", std.mem.eql(u8, c.current("stt-model"), "1.0"), "'{s}'", .{c.current("stt-model")});
         var it_count: usize = 0;
         if (Io.Dir.cwd().openDir(h.io, try c.devPath("staging", .{}), .{ .iterate = true })) |d| {
             var dd = d;
@@ -282,6 +334,11 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
             while (it.next(h.io) catch null) |_| it_count += 1;
         } else |_| {}
         _ = r.check("staging is empty afterwards", it_count == 0, "{d} entries", .{it_count});
+        const op = try std.fmt.allocPrint(gpa, "{s}\\state\\stt-model.txt", .{other_desk});
+        const other_now = c.readFile(op) orelse "";
+        const legacy_now = c.readFile(legacy_ptr) orelse "";
+        _ = r.check("installs land in this desktop's own folder: another desktop's record (sequence 999999) and the old shared store neither block nor change",
+            std.mem.eql(u8, other_now, other_rec) and std.mem.eql(u8, legacy_now, legacy_rec) and std.mem.eql(u8, c.current("stt-model"), "1.0"), "other '{s}' legacy '{s}'", .{ other_now, legacy_now });
     }
     {
         const lc = try c.deviceLive(&.{ "--wait-updates", "30" });
@@ -312,6 +369,21 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = try c.publish("npu-probe", s2, "executable", "0.2");
         const next = try c.device(&.{});
         _ = r.check("every new executable version needs approval again", has(next.out, "pending_approval npu-probe 0.2") and std.mem.eql(u8, c.current("npu-probe"), "0.1"), "{s}", .{next.out});
+
+        // Revoking an approval: back to the previous version, then none.
+        const ok2 = try c.device(&.{ "--approve", "--only", "npu-probe" });
+        _ = r.check("0.2 approved and installed (0.1 previous)", has(ok2.out, "installed npu-probe 0.2") and std.mem.eql(u8, c.current("npu-probe"), "0.2") and
+            std.mem.eql(u8, c.previous("npu-probe"), "0.1"), "{s}", .{ok2.out});
+        const rv = try c.device(&.{ "--revoke", "npu-probe" });
+        _ = r.check("revoke goes back to the previous version and deletes the revoked one", rv.code == 0 and has(rv.out, "back to 0.1") and
+            std.mem.eql(u8, c.current("npu-probe"), "0.1") and c.previous("npu-probe").len == 0 and
+            c.readFile(try c.devPath("packages\\npu-probe\\0.2\\npu-probe.exe", .{})) == null, "{s}", .{rv.out});
+        const again = try c.device(&.{ "--approve", "--only", "npu-probe" });
+        _ = r.check("a revoked version is not installed again, even with approval", has(again.out, "refused npu-probe 0.2") and
+            std.mem.eql(u8, c.current("npu-probe"), "0.1"), "{s}", .{again.out});
+        const rv2 = try c.device(&.{ "--revoke", "npu-probe" });
+        _ = r.check("revoking the last version uninstalls it", rv2.code == 0 and has(rv2.out, "uninstalled") and c.current("npu-probe").len == 0 and
+            c.readFile(try c.devPath("packages\\npu-probe\\0.1\\npu-probe.exe", .{})) == null, "{s}", .{rv2.out});
     }
 
     // ------------------------------------------------------------ tampering
@@ -367,7 +439,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
             std.mem.eql(u8, c.current("stt-model"), "2.0"), "{s}", .{res.out});
         const again = try c.publish("stt-model", pub1, "data", "2.0");
         _ = r.check("an unpublished version name is never reused", again.code != 0, "{s}", .{again.out});
-        const rb = try proc.runCli(h, dev, &.{ "sync-device", "--rollback", "stt-model" });
+        const rb = try proc.runCli(h, dev, &.{ "sync-device", "--server", c.server_arg, "--rollback", "stt-model" });
         _ = r.check("the owner can roll back locally", rb.code == 0 and std.mem.eql(u8, c.current("stt-model"), "1.0"), "{s}", .{rb.out});
     }
 
@@ -385,6 +457,8 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     {
         const f = try c.device(&.{"--forget"});
         _ = r.check("the device forgets its credential and pins", f.code == 0, "{s}", .{f.out});
+        _ = r.check("...and deletes this desktop's sync folder, only that one", !c.exists(c.desk_dir) and c.exists(other_desk) and
+            c.exists(legacy_ptr), "{s}", .{f.out});
     }
     _ = r.ok("portal still running at end of group", inst.alive() and client.alive(inst));
 }
