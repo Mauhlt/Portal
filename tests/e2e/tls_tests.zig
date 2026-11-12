@@ -170,7 +170,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         }
         var resp = try client.get(inst, "/pair", null);
         defer resp.deinit();
-        _ = r.check("GET /pair over HTTPS is 200", resp.status == 200 and resp.bodyContains("portal pair"), "{d}", .{resp.status});
+        _ = r.check("GET /pair over HTTPS is 200", resp.status == 200 and resp.bodyContains("Pair a device"), "{d}", .{resp.status});
         scan.look("/pair", resp.raw);
     }
     {
