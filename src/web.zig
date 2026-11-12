@@ -2,24 +2,39 @@
 //!
 //! Request pipeline (every request):
 //!   1. Host header must be on the allowlist        (DNS rebinding)
-//!   2. Route; unknown paths/methods are rejected
-//!   3. State-changing requests and the WebSocket upgrade require an
+//!   2. Framing checks (no Transfer-Encoding, Expect, GET bodies, unknown
+//!      methods); any problem closes the connection
+//!   3. Route; unknown paths/methods are rejected
+//!   4. State-changing requests and the WebSocket upgrade require an
 //!      allowed Origin                              (CSRF / CSWSH)
-//!   4. Anything beyond the login page and static assets requires a live
+//!   5. Anything beyond the login page and static assets requires a live
 //!      session cookie
 //!
 //! The web side can only (a) watch the session's output and (b) send
 //! keystrokes that pass the input filter into that same session. There is no
 //! route that starts a process, changes directory, or touches files.
+//!
+//! Connection model. Every accepted connection gets a supervisor thread and
+//! a worker task (`io.concurrent`). The worker does all socket I/O; the
+//! supervisor enforces deadlines (head/body read, keep-alive idle, stuck
+//! sends), evictions and session revocation by cancelling the worker, which
+//! makes a blocked recv/send return error.Canceled. Sockets are only closed
+//! once nothing is blocked on them: on Windows, closing a socket another
+//! thread is blocked on hits `unreachable` inside std, and shutdown() does
+//! not unblock a pending recv.
+//!
+//! HTTP parsing is src/http1.zig, never std.http.Server (which had remotely
+//! reachable panics). Any panic on any thread kills the user's live session,
+//! so nothing here may assert, unwrap or overflow on peer-controlled data.
 
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
-const http = std.http;
 const Allocator = std.mem.Allocator;
 
 const auth = @import("auth.zig");
 const guard = @import("guard.zig");
+const http1 = @import("http1.zig");
 const Session = @import("session.zig").Session;
 const Log = @import("log.zig").Log;
 
@@ -30,11 +45,37 @@ const app_css = @embedFile("web/app.css");
 const xterm_js = @embedFile("web/vendor/xterm.js");
 const xterm_css = @embedFile("web/vendor/xterm.css");
 
-const max_connections = 16;
+/// Hard cap on simultaneous connections (each costs a supervisor thread and
+/// a worker thread, a WebSocket one more).
+const max_connections = 32;
+/// Connections that have not yet presented a live session cookie. The
+/// difference to `max_connections` is reserved for signed-in browsers.
+const max_pre_auth = 16;
+const max_pre_auth_per_ip = 8;
+
 const max_requests_per_connection = 200;
 const max_login_body = 512;
 const max_input_message = 4096;
+/// 'i' prefix + up to max_input_message bytes of keystrokes.
+const max_ws_payload = max_input_message + 1;
+/// Largest client frame header: 2 + 8 (64-bit length) + 4 (mask).
+const max_ws_header = 14;
+
 const auth_recheck_ms = 5000;
+/// A request head (and body) must arrive within this long of its first byte,
+/// or of the connection being accepted.
+const head_timeout_ms = 10_000;
+/// Keep-alive connection waiting for its next request.
+const idle_timeout_ms = 60_000;
+/// Any single response or WebSocket message must be accepted by the peer
+/// within this long.
+const send_timeout_ms = 30_000;
+/// After the supervisor sees a WebSocket's auth session gone, the writer has
+/// this long to notice and say goodbye before the connection is cancelled.
+const revoke_grace_ms = 10_000;
+const supervise_tick_ms = 500;
+const login_fail_delay_ms = 500;
+const no_deadline = std.math.maxInt(i64);
 
 pub const Config = struct {
     /// Exact Host header values accepted, e.g. "10.8.0.1:8420".
@@ -44,6 +85,161 @@ pub const Config = struct {
     /// Adds `Secure` and uses the `__Host-` cookie prefix. Only valid over HTTPS.
     secure_cookie: bool,
     token_hash: auth.Hash,
+};
+
+// ------------------------------------------------------------ pure helpers
+
+/// Peer address without the port; IPv4 is stored v4-mapped.
+pub const IpKey = [16]u8;
+
+pub fn ipKey(addr: net.IpAddress) IpKey {
+    var k: IpKey = @splat(0);
+    switch (addr) {
+        .ip4 => |a| {
+            k[10] = 0xff;
+            k[11] = 0xff;
+            @memcpy(k[12..16], &a.bytes);
+        },
+        .ip6 => |a| k = a.bytes,
+    }
+    return k;
+}
+
+/// Connection slot bookkeeping. Pure: the caller holds a mutex and supplies
+/// time. Pre-auth connections over their limits evict the oldest pre-auth
+/// connection (from the same address first), so idle or slow connections
+/// cannot lock a real user out; signed-in connections are never evicted.
+pub const ConnTable = struct {
+    pub const Entry = struct {
+        used: bool = false,
+        key: IpKey = @splat(0),
+        authed: bool = false,
+        evicted: bool = false,
+        since_ms: i64 = 0,
+    };
+
+    pub const Admission = struct {
+        /// Slot for the new connection, or null to refuse it.
+        slot: ?usize,
+        /// An existing connection that must now be torn down.
+        victim: ?usize,
+    };
+
+    entries: [max_connections]Entry = @splat(.{}),
+    max_pre_auth: usize = max_pre_auth,
+    max_pre_auth_per_ip: usize = max_pre_auth_per_ip,
+
+    fn isPreAuth(e: Entry) bool {
+        return e.used and !e.authed and !e.evicted;
+    }
+
+    fn oldestPreAuth(t: *const ConnTable, key: ?IpKey) ?usize {
+        var best: ?usize = null;
+        var best_ms: i64 = no_deadline;
+        for (t.entries, 0..) |e, i| {
+            if (!isPreAuth(e)) continue;
+            if (key) |k| if (!std.mem.eql(u8, &k, &e.key)) continue;
+            if (best == null or e.since_ms < best_ms) {
+                best = i;
+                best_ms = e.since_ms;
+            }
+        }
+        return best;
+    }
+
+    pub fn admit(t: *ConnTable, key: IpKey, now_ms: i64) Admission {
+        var free: ?usize = null;
+        var pre_total: usize = 0;
+        var pre_ip: usize = 0;
+        for (t.entries, 0..) |e, i| {
+            if (!e.used) {
+                if (free == null) free = i;
+                continue;
+            }
+            if (isPreAuth(e)) {
+                pre_total += 1;
+                if (std.mem.eql(u8, &key, &e.key)) pre_ip += 1;
+            }
+        }
+        var victim: ?usize = null;
+        if (pre_ip >= t.max_pre_auth_per_ip) {
+            victim = t.oldestPreAuth(key);
+        } else if (pre_total >= t.max_pre_auth or free == null) {
+            victim = t.oldestPreAuth(null);
+        }
+        if (victim) |v| t.entries[v].evicted = true;
+        const slot = free orelse return .{ .slot = null, .victim = victim };
+        t.entries[slot] = .{ .used = true, .key = key, .since_ms = now_ms };
+        return .{ .slot = slot, .victim = victim };
+    }
+
+    pub fn promote(t: *ConnTable, slot: usize) void {
+        if (slot < t.entries.len) t.entries[slot].authed = true;
+    }
+
+    pub fn release(t: *ConnTable, slot: usize) void {
+        if (slot < t.entries.len) t.entries[slot] = .{};
+    }
+};
+
+/// "Log at most once per interval, and say how many were suppressed."
+pub const LogLimiter = struct {
+    last_ms: i64 = std.math.minInt(i64),
+    suppressed: u32 = 0,
+
+    /// Returns the number of suppressed events if this one should be logged.
+    pub fn check(l: *LogLimiter, now_ms: i64, interval_ms: i64) ?u32 {
+        if (now_ms -| l.last_ms >= interval_ms) {
+            const n = l.suppressed;
+            l.suppressed = 0;
+            l.last_ms = now_ms;
+            return n;
+        }
+        l.suppressed +|= 1;
+        return null;
+    }
+};
+
+/// Exponential backoff for the accept loop: 100 ms doubling to 5 s.
+pub const Backoff = struct {
+    cur_ms: i64 = 0,
+    pub const min_ms = 100;
+    pub const max_ms = 5000;
+
+    pub fn next(b: *Backoff) i64 {
+        b.cur_ms = if (b.cur_ms <= 0) min_ms else @min(b.cur_ms *| 2, max_ms);
+        return b.cur_ms;
+    }
+
+    pub fn reset(b: *Backoff) void {
+        b.cur_ms = 0;
+    }
+};
+
+// ------------------------------------------------------------------ server
+
+/// Per-connection state shared by the supervisor thread and the worker task.
+const Conn = struct {
+    stream: net.Stream,
+    slot: usize,
+    peer_buf: [64]u8 = undefined,
+    peer_len: usize = 0,
+    /// Monotonic ms after which the supervisor cancels the worker.
+    deadline_ms: std.atomic.Value(i64),
+    done: std.atomic.Value(bool) = .init(false),
+    /// Set (release) once `ws_cookie` is filled in, for revocation checks.
+    ws_active: std.atomic.Value(bool) = .init(false),
+    ws_cookie: [auth.encoded_len]u8 = undefined,
+    /// Worker-only: already promoted to an authenticated slot.
+    authed: bool = false,
+
+    fn peer(c: *const Conn) []const u8 {
+        return c.peer_buf[0..c.peer_len];
+    }
+
+    fn setDeadline(c: *Conn, ms: i64) void {
+        c.deadline_ms.store(ms, .release);
+    }
 };
 
 pub const Server = struct {
@@ -57,7 +253,17 @@ pub const Server = struct {
     auth_mutex: Io.Mutex = .init,
     sessions: auth.Sessions = .{},
     limiter: auth.RateLimiter = .{},
-    active_conns: std.atomic.Value(u32) = .init(0),
+    /// Held for the fixed delay after a failed login, so guesses are
+    /// serialised across all connections.
+    fail_mutex: Io.Mutex = .init,
+
+    conn_mutex: Io.Mutex = .init,
+    conns: ConnTable = .{},
+    conn_wake: [max_connections]Io.Event = @splat(.unset),
+    conn_evict: [max_connections]std.atomic.Value(bool) = @splat(.init(false)),
+
+    note_mutex: Io.Mutex = .init,
+    host_reject_log: LogLimiter = .{},
 
     fn cookieName(srv: *const Server) []const u8 {
         return if (srv.cfg.secure_cookie) "__Host-portal" else "portal_session";
@@ -76,44 +282,209 @@ pub const Server = struct {
 
     /// Accept loop. Runs on its own thread for the life of the process.
     pub fn run(srv: *Server) void {
+        var backoff: Backoff = .{};
+        var accept_log: LogLimiter = .{};
+        var full_log: LogLimiter = .{};
         while (true) {
             const stream = srv.listener.accept(srv.io) catch |err| {
-                srv.log.print("accept error: {t}", .{err});
-                srv.io.sleep(.fromMilliseconds(100), .awake) catch {};
+                if (accept_log.check(srv.nowMs(), std.time.ms_per_min)) |n|
+                    srv.log.print("accept error: {t} ({d} more since last report)", .{ err, n });
+                srv.io.sleep(.fromMilliseconds(backoff.next()), .awake) catch {};
                 continue;
             };
-            if (srv.active_conns.fetchAdd(1, .acq_rel) >= max_connections) {
-                _ = srv.active_conns.fetchSub(1, .acq_rel);
-                stream.close(srv.io);
-                continue;
-            }
-            const t = std.Thread.spawn(.{}, handleConnection, .{ srv, stream }) catch {
-                _ = srv.active_conns.fetchSub(1, .acq_rel);
-                stream.close(srv.io);
-                continue;
-            };
-            t.detach();
+            backoff.reset();
+            srv.admit(stream, &full_log);
         }
     }
 
-    fn handleConnection(srv: *Server, stream: net.Stream) void {
-        defer _ = srv.active_conns.fetchSub(1, .acq_rel);
-        defer stream.close(srv.io);
+    fn admit(srv: *Server, stream: net.Stream, full_log: *LogLimiter) void {
+        const io = srv.io;
+        const now = srv.nowMs();
+        srv.conn_mutex.lockUncancelable(io);
+        const adm = srv.conns.admit(ipKey(stream.socket.address), now);
+        if (adm.victim) |v| {
+            srv.conn_evict[v].store(true, .release);
+            srv.conn_wake[v].set(io);
+        }
+        if (adm.slot) |s| {
+            // The previous occupant's supervisor has fully exited.
+            srv.conn_evict[s].store(false, .release);
+            srv.conn_wake[s].reset();
+        }
+        srv.conn_mutex.unlock(io);
 
-        var recv_buf: [16 * 1024]u8 = undefined;
+        const slot = adm.slot orelse {
+            if (full_log.check(now, 10_000)) |n|
+                srv.log.print("connection refused: {d} connections open ({d} more refusals since last report)", .{ max_connections, n });
+            stream.close(io); // nothing else has seen this socket
+            return;
+        };
+        const t = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, supervise, .{ srv, stream, slot }) catch {
+            srv.releaseSlot(slot);
+            stream.close(io);
+            return;
+        };
+        t.detach();
+    }
+
+    fn releaseSlot(srv: *Server, slot: usize) void {
+        srv.conn_mutex.lockUncancelable(srv.io);
+        srv.conns.release(slot);
+        srv.conn_mutex.unlock(srv.io);
+    }
+
+    fn promote(srv: *Server, conn: *Conn) void {
+        if (conn.authed) return;
+        conn.authed = true;
+        srv.conn_mutex.lockUncancelable(srv.io);
+        srv.conns.promote(conn.slot);
+        srv.conn_mutex.unlock(srv.io);
+    }
+
+    /// Supervisor thread: owns the socket, runs the worker, enforces deadlines.
+    fn supervise(srv: *Server, stream: net.Stream, slot: usize) void {
+        const io = srv.io;
+        defer srv.releaseSlot(slot);
+        // Safe: the worker has finished (cancel/await below) before this runs.
+        defer stream.close(io);
+
+        var conn: Conn = .{
+            .stream = stream,
+            .slot = slot,
+            .deadline_ms = .init(srv.nowMs() +| head_timeout_ms),
+        };
+        const peer = std.fmt.bufPrint(&conn.peer_buf, "{f}", .{stream.socket.address}) catch blk: {
+            conn.peer_buf[0] = '?';
+            break :blk conn.peer_buf[0..1];
+        };
+        conn.peer_len = peer.len;
+
+        var worker = io.concurrent(connMain, .{ srv, &conn }) catch {
+            srv.log.print("connection from {s} dropped: no thread available", .{conn.peer()});
+            return;
+        };
+
+        var reason: ?[]const u8 = null;
+        var last_auth = srv.nowMs();
+        var revoked_since: ?i64 = null;
+        while (!conn.done.load(.acquire)) {
+            srv.conn_wake[slot].waitTimeout(io, .{ .duration = .{
+                .raw = .fromMilliseconds(supervise_tick_ms),
+                .clock = .awake,
+            } }) catch {};
+            if (conn.done.load(.acquire)) break;
+            if (srv.conn_evict[slot].load(.acquire)) {
+                reason = "evicted (too many unauthenticated connections)";
+                break;
+            }
+            const now = srv.nowMs();
+            if (now >= conn.deadline_ms.load(.acquire)) {
+                reason = "timed out";
+                break;
+            }
+            if (conn.ws_active.load(.acquire) and now -| last_auth >= auth_recheck_ms) {
+                last_auth = now;
+                if (srv.sessionLive(&conn.ws_cookie, false)) {
+                    revoked_since = null;
+                } else if (revoked_since == null) {
+                    revoked_since = now;
+                }
+            }
+            if (revoked_since) |r| {
+                if (now -| r >= revoke_grace_ms) {
+                    reason = "signed out";
+                    break;
+                }
+            }
+        }
+        // Interrupts any blocked recv/send in the worker (error.Canceled),
+        // then waits for it to finish. A no-op wait if it already finished.
+        worker.cancel(io);
+        if (reason) |r| {
+            if (conn.ws_active.load(.acquire)) srv.log.print("websocket from {s} cancelled: {s}", .{ conn.peer(), r });
+        }
+    }
+
+    fn connMain(srv: *Server, conn: *Conn) void {
+        defer {
+            conn.done.store(true, .release);
+            srv.conn_wake[conn.slot].set(srv.io);
+        }
+        srv.serveHttp(conn) catch {};
+    }
+
+    fn readSome(conn: *Conn, io: Io, dest: []u8) !usize {
+        if (dest.len == 0) return error.NoBufferSpace;
+        var iov = [_][]u8{dest};
+        const r = try conn.stream.readWithControl(io, &iov, &.{});
+        return r.data_len;
+    }
+
+    fn serveHttp(srv: *Server, conn: *Conn) !void {
+        const io = srv.io;
+        // Head (up to max_head_bytes) plus a login body.
+        var buf: [http1.max_head_bytes + max_login_body]u8 = undefined;
+        var len: usize = 0;
         var send_buf: [16 * 1024]u8 = undefined;
-        var sr = stream.reader(srv.io, &recv_buf);
-        var sw = stream.writer(srv.io, &send_buf);
-        var hs = http.Server.init(&sr.interface, &sw.interface);
-
-        var peer_buf: [64]u8 = undefined;
-        const peer = std.fmt.bufPrint(&peer_buf, "{f}", .{stream.socket.address}) catch "?";
+        var sw = conn.stream.writer(io, &send_buf);
+        const w = &sw.interface;
 
         var n: u32 = 0;
         while (n < max_requests_per_connection) : (n += 1) {
-            var req = hs.receiveHead() catch return;
-            const keep = srv.handleRequest(&req, stream, peer) catch return;
-            if (!keep) return;
+            // First request on a connection, or bytes of the next one already
+            // buffered (pipelining): head timeout. Otherwise keep-alive idle.
+            if (n == 0 or len > 0) {
+                if (n > 0) conn.setDeadline(srv.nowMs() +| head_timeout_ms);
+            } else {
+                conn.setDeadline(srv.nowMs() +| idle_timeout_ms);
+            }
+
+            const head_len: usize = while (true) {
+                if (http1.findHeadEnd(buf[0..len])) |e| break e;
+                if (len >= http1.max_head_bytes) {
+                    _ = try srv.fail(conn, w, .header_fields_too_large, "headers too large\n");
+                    return;
+                }
+                const was_empty = len == 0;
+                const got = try readSome(conn, io, buf[len..http1.max_head_bytes]);
+                if (got == 0) return; // peer closed
+                if (was_empty and n > 0) conn.setDeadline(srv.nowMs() +| head_timeout_ms);
+                len += got;
+            };
+            if (head_len > http1.max_head_bytes) {
+                _ = try srv.fail(conn, w, .header_fields_too_large, "headers too large\n");
+                return;
+            }
+
+            const req = http1.parseHead(buf[0..head_len]) catch {
+                _ = try srv.fail(conn, w, .bad_request, "bad request\n");
+                return;
+            };
+
+            var body: []const u8 = "";
+            if (req.method == .POST) {
+                if (req.has_transfer_encoding or req.has_expect) {
+                    // Answered by framingError below, without reading a body.
+                } else if (req.content_length) |cl_u64| {
+                    if (cl_u64 <= max_login_body) {
+                        const need = head_len + @as(usize, @intCast(cl_u64));
+                        while (len < need) {
+                            const got = try readSome(conn, io, buf[len..need]);
+                            if (got == 0) return;
+                            len += got;
+                        }
+                        body = buf[head_len..need];
+                    }
+                }
+            }
+
+            const keep = try srv.handleRequest(conn, w, &req, body, buf[head_len..len]);
+            if (!keep or req.connection_close or req.method != .GET) return;
+
+            // Keep any pipelined bytes of the next request.
+            const rest = len - head_len;
+            std.mem.copyForwards(u8, buf[0..rest], buf[head_len..len]);
+            len = rest;
         }
     }
 
@@ -124,84 +495,78 @@ pub const Server = struct {
         content_type: ?[]const u8 = null,
     };
 
-    fn collectHeaders(srv: *const Server, req: *const http.Server.Request, cookie_out: *[auth.encoded_len]u8) Headers {
-        var h: Headers = .{ .content_type = req.head.content_type };
-        var it = req.iterateHeaders();
-        while (it.next()) |hdr| {
-            if (std.ascii.eqlIgnoreCase(hdr.name, "host")) {
-                h.host = hdr.value;
-            } else if (std.ascii.eqlIgnoreCase(hdr.name, "origin")) {
-                h.origin = hdr.value;
-            } else if (std.ascii.eqlIgnoreCase(hdr.name, "cookie")) {
-                if (guard.getCookie(hdr.value, srv.cookieName())) |v| {
-                    if (v.len == auth.encoded_len) {
-                        @memcpy(cookie_out, v);
-                        h.cookie = cookie_out;
-                    }
+    fn collectHeaders(srv: *const Server, req: *const http1.Request, cookie_out: *[auth.encoded_len]u8) Headers {
+        var h: Headers = .{ .host = req.host, .origin = req.origin, .content_type = req.content_type };
+        var it = req.cookieHeaders();
+        while (it.next()) |value| {
+            if (guard.getCookie(value, srv.cookieName())) |v| {
+                if (v.len == auth.encoded_len) {
+                    @memcpy(cookie_out, v);
+                    h.cookie = cookie_out;
+                    break;
                 }
             }
         }
         return h;
     }
 
+    fn noteHostRejected(srv: *Server, peer: []const u8, host: ?[]const u8) void {
+        srv.note_mutex.lockUncancelable(srv.io);
+        const n = srv.host_reject_log.check(srv.nowMs(), 10_000);
+        srv.note_mutex.unlock(srv.io);
+        const suppressed = n orelse return;
+        const h = host orelse "(none)";
+        srv.log.print("rejected request from {s}: Host '{s}' not allowed ({d} more since last report)", .{
+            peer, h[0..@min(h.len, 80)], suppressed,
+        });
+    }
+
     /// Returns whether to keep the connection open for another request.
-    fn handleRequest(srv: *Server, req: *http.Server.Request, stream: net.Stream, peer: []const u8) !bool {
+    fn handleRequest(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, body: []const u8, leftover: []const u8) !bool {
         var cookie_buf: [auth.encoded_len]u8 = undefined;
         const h = srv.collectHeaders(req, &cookie_buf);
+        const peer = conn.peer();
 
         if (!guard.hostAllowed(h.host, srv.cfg.allowed_hosts)) {
-            try srv.plain(req, .misdirected_request, "unknown host\n");
-            return false;
+            srv.noteHostRejected(peer, h.host);
+            return srv.fail(conn, w, .misdirected_request, "unknown host\n");
+        }
+        if (http1.framingError(req, max_login_body)) |r| return srv.fail(conn, w, r.status, r.msg);
+
+        if (!conn.authed) {
+            if (h.cookie) |c| {
+                if (srv.sessionLive(c, false)) srv.promote(conn);
+            }
         }
 
-        // std.http.Server asserts (panics, killing the whole process) when it
-        // tries to reuse a connection after a body-bearing request that had
-        // neither content-length nor transfer-encoding. Reject those, and any
-        // chunked body (we never need one), before anything else.
-        if (req.head.method != .GET and req.head.method != .POST) {
-            try srv.plain(req, .method_not_allowed, "method not allowed\n"); // keep_alive=false: no body discard
-            return false;
+        const path = req.path;
+        switch (req.method) {
+            .GET => {
+                if (std.mem.eql(u8, path, "/static/xterm.js")) return srv.asset(conn, w, req, xterm_js, "text/javascript; charset=utf-8");
+                if (std.mem.eql(u8, path, "/static/xterm.css")) return srv.asset(conn, w, req, xterm_css, "text/css; charset=utf-8");
+                if (std.mem.eql(u8, path, "/static/app.js")) return srv.asset(conn, w, req, app_js, "text/javascript; charset=utf-8");
+                if (std.mem.eql(u8, path, "/static/app.css")) return srv.asset(conn, w, req, app_css, "text/css; charset=utf-8");
+                if (std.mem.eql(u8, path, "/login")) return srv.loginPage(conn, w, req);
+                if (std.mem.eql(u8, path, "/")) {
+                    if (h.cookie) |c| if (srv.sessionLive(c, true)) return srv.asset(conn, w, req, index_html, "text/html; charset=utf-8");
+                    return srv.redirect(conn, w, req, "/login", null);
+                }
+                if (std.mem.eql(u8, path, "/ws")) {
+                    try srv.webSocket(conn, w, req, h, leftover);
+                    return false;
+                }
+            },
+            .POST => {
+                if (!guard.originAllowed(h.origin, srv.cfg.scheme, srv.cfg.allowed_hosts)) {
+                    srv.log.print("rejected {s} from {s}: bad origin", .{ path[0..@min(path.len, 80)], peer });
+                    return srv.fail(conn, w, .forbidden, "bad origin\n");
+                }
+                if (std.mem.eql(u8, path, "/login")) return srv.login(conn, w, req, h, body);
+                if (std.mem.eql(u8, path, "/logout")) return srv.logout(conn, w, req, h);
+            },
+            .other => return srv.fail(conn, w, .method_not_allowed, "method not allowed\n"),
         }
-        if (req.head.transfer_encoding != .none or
-            (req.head.method.requestHasBody() and req.head.content_length == null))
-        {
-            try srv.plain(req, .length_required, "content-length required\n");
-            return false;
-        }
-
-        const target = req.head.target;
-        const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
-        const query = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[q + 1 ..] else "";
-        const method = req.head.method;
-
-        if (method == .GET) {
-            if (std.mem.eql(u8, path, "/static/xterm.js")) return srv.asset(req, xterm_js, "text/javascript; charset=utf-8");
-            if (std.mem.eql(u8, path, "/static/xterm.css")) return srv.asset(req, xterm_css, "text/css; charset=utf-8");
-            if (std.mem.eql(u8, path, "/static/app.js")) return srv.asset(req, app_js, "text/javascript; charset=utf-8");
-            if (std.mem.eql(u8, path, "/static/app.css")) return srv.asset(req, app_css, "text/css; charset=utf-8");
-            if (std.mem.eql(u8, path, "/login")) return srv.loginPage(req, query);
-            if (std.mem.eql(u8, path, "/")) {
-                if (h.cookie) |c| if (srv.sessionLive(c, true)) return srv.asset(req, index_html, "text/html; charset=utf-8");
-                return srv.redirect(req, "/login", null);
-            }
-            if (std.mem.eql(u8, path, "/ws")) {
-                try srv.webSocket(req, h, stream, peer);
-                return false;
-            }
-        } else if (method == .POST) {
-            if (!guard.originAllowed(h.origin, srv.cfg.scheme, srv.cfg.allowed_hosts)) {
-                srv.log.print("rejected {s} from {s}: bad origin", .{ path, peer });
-                try srv.plain(req, .forbidden, "bad origin\n");
-                return false;
-            }
-            if (std.mem.eql(u8, path, "/login")) return srv.login(req, h, peer);
-            if (std.mem.eql(u8, path, "/logout")) return srv.logout(req, h, peer);
-        } else {
-            try srv.plain(req, .method_not_allowed, "method not allowed\n");
-            return false;
-        }
-        try srv.plain(req, .not_found, "not found\n");
-        return true;
+        return srv.fail(conn, w, .not_found, "not found\n");
     }
 
     // ---------------------------------------------------------- responses
@@ -210,9 +575,9 @@ pub const Server = struct {
         "connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; " ++
         "form-action 'self'; frame-ancestors 'none'";
 
-    fn respond(req: *http.Server.Request, status: http.Status, body: []const u8, content_type: []const u8, extra: []const http.Header, keep_alive: bool) !void {
-        var headers: [16]http.Header = undefined;
-        const common = [_]http.Header{
+    fn respond(srv: *Server, conn: *Conn, w: *Io.Writer, status: http1.Status, body: []const u8, content_type: []const u8, extra: []const http1.Header, keep_alive: bool) !void {
+        var headers: [12]http1.Header = undefined;
+        const common = [_]http1.Header{
             .{ .name = "content-type", .value = content_type },
             .{ .name = "content-security-policy", .value = csp },
             .{ .name = "x-content-type-options", .value = "nosniff" },
@@ -222,27 +587,27 @@ pub const Server = struct {
             .{ .name = "cross-origin-resource-policy", .value = "same-origin" },
             .{ .name = "cache-control", .value = "no-store" },
         };
+        if (common.len + extra.len > headers.len) return error.TooManyHeaders;
         @memcpy(headers[0..common.len], &common);
-        std.debug.assert(common.len + extra.len <= headers.len);
         @memcpy(headers[common.len..][0..extra.len], extra);
-        try req.respond(body, .{
-            .status = status,
-            .keep_alive = keep_alive,
-            .extra_headers = headers[0 .. common.len + extra.len],
-        });
+        conn.setDeadline(srv.nowMs() +| send_timeout_ms);
+        try http1.writeResponse(w, status, headers[0 .. common.len + extra.len], body, keep_alive);
     }
 
-    fn plain(_: *Server, req: *http.Server.Request, status: http.Status, body: []const u8) !void {
-        try respond(req, status, body, "text/plain; charset=utf-8", &.{}, false);
+    /// Error response; always closes the connection.
+    fn fail(srv: *Server, conn: *Conn, w: *Io.Writer, status: http1.Status, body: []const u8) !bool {
+        try srv.respond(conn, w, status, body, "text/plain; charset=utf-8", &.{}, false);
+        return false;
     }
 
-    fn asset(_: *Server, req: *http.Server.Request, body: []const u8, content_type: []const u8) !bool {
-        try respond(req, .ok, body, content_type, &.{}, true);
-        return true;
+    fn asset(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, body: []const u8, content_type: []const u8) !bool {
+        const keep = !req.connection_close;
+        try srv.respond(conn, w, .ok, body, content_type, &.{}, keep);
+        return keep;
     }
 
-    fn redirect(_: *Server, req: *http.Server.Request, location: []const u8, set_cookie: ?[]const u8) !bool {
-        var extra: [2]http.Header = undefined;
+    fn redirect(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, location: []const u8, set_cookie: ?[]const u8) !bool {
+        var extra: [2]http1.Header = undefined;
         var n: usize = 0;
         extra[n] = .{ .name = "location", .value = location };
         n += 1;
@@ -250,15 +615,15 @@ pub const Server = struct {
             extra[n] = .{ .name = "set-cookie", .value = c };
             n += 1;
         }
-        // Never reuse a connection after a POST: avoids body-discard paths in
-        // std.http entirely.
-        const keep = req.head.method != .POST;
-        try respond(req, .see_other, "", "text/plain; charset=utf-8", extra[0..n], keep);
+        // Never reuse a connection after a POST.
+        const keep = req.method == .GET and !req.connection_close;
+        try srv.respond(conn, w, .see_other, "", "text/plain; charset=utf-8", extra[0..n], keep);
         return keep;
     }
 
-    fn loginPage(srv: *Server, req: *http.Server.Request, query: []const u8) !bool {
+    fn loginPage(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request) !bool {
         const marker = "<!--MESSAGE-->";
+        const query = req.query;
         const msg: []const u8 = if (std.mem.eql(u8, query, "e=1"))
             "<p class=\"error\">That token was not accepted.</p>"
         else if (std.mem.eql(u8, query, "e=locked"))
@@ -270,54 +635,52 @@ pub const Server = struct {
         const idx = comptime std.mem.indexOf(u8, login_html, marker).?;
         const page = try std.mem.concat(srv.gpa, u8, &.{ login_html[0..idx], msg, login_html[idx + marker.len ..] });
         defer srv.gpa.free(page);
-        try respond(req, .ok, page, "text/html; charset=utf-8", &.{}, true);
-        return true;
+        return srv.asset(conn, w, req, page, "text/html; charset=utf-8");
     }
 
     // -------------------------------------------------------------- auth
 
-    fn login(srv: *Server, req: *http.Server.Request, h: Headers, peer: []const u8) !bool {
+    fn login(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, h: Headers, body: []const u8) !bool {
+        const peer = conn.peer();
         const ct = h.content_type orelse "";
         if (!std.ascii.startsWithIgnoreCase(ct, "application/x-www-form-urlencoded")) {
-            try srv.plain(req, .unsupported_media_type, "expected form\n");
-            return false;
+            return srv.fail(conn, w, .unsupported_media_type, "expected form\n");
         }
-        const len = req.head.content_length orelse {
-            try srv.plain(req, .length_required, "length required\n");
-            return false;
-        };
-        if (len > max_login_body) {
-            try srv.plain(req, .payload_too_large, "too large\n");
-            return false;
-        }
-        var body_buf: [max_login_body]u8 = undefined;
-        const body_reader = try req.readerExpectContinue(&.{});
-        const body = body_buf[0..@intCast(len)];
-        body_reader.readSliceAll(body) catch return false;
+        // framingError guaranteed a Content-Length <= max_login_body, and
+        // serveHttp read exactly that many bytes.
+        if (body.len != (req.content_length orelse 0)) return srv.fail(conn, w, .bad_request, "bad body\n");
 
         var token_buf: [256]u8 = undefined;
         const presented = guard.formValue(body, "token", &token_buf) orelse "";
 
+        // Verify first: the right token always works, even during a lockout
+        // (otherwise anyone could lock the owner out). Lockout and delay
+        // apply only to failures.
+        const ok = auth.verify(srv.cfg.token_hash, presented);
+        std.crypto.secureZero(u8, &token_buf);
+
         srv.auth_mutex.lockUncancelable(srv.io);
         const now = srv.nowMs();
-        if (!srv.limiter.allowed(now)) {
-            srv.auth_mutex.unlock(srv.io);
-            srv.log.print("login refused from {s}: locked out", .{peer});
-            return srv.redirect(req, "/login?e=locked", null);
-        }
-        if (!auth.verify(srv.cfg.token_hash, presented)) {
-            srv.limiter.recordFailure(now);
+        const was_locked = !srv.limiter.allowed(now);
+        if (!ok) {
+            if (!was_locked) srv.limiter.recordFailure(now);
             const locked = !srv.limiter.allowed(now);
             srv.auth_mutex.unlock(srv.io);
-            srv.log.print("login FAILED from {s}{s}", .{ peer, if (locked) " (now locked out)" else "" });
-            return srv.redirect(req, if (locked) "/login?e=locked" else "/login?e=1", null);
+            srv.log.print("login FAILED from {s}{s}", .{
+                peer,
+                if (was_locked) " (locked out)" else if (locked) " (now locked out)" else "",
+            });
+            // Fixed delay, serialised across connections.
+            try srv.fail_mutex.lock(srv.io);
+            defer srv.fail_mutex.unlock(srv.io);
+            try srv.io.sleep(.fromMilliseconds(login_fail_delay_ms), .awake);
+            return srv.redirect(conn, w, req, if (locked) "/login?e=locked" else "/login?e=1", null);
         }
         srv.limiter.recordSuccess();
         var raw: [auth.secret_bytes]u8 = undefined;
         srv.io.randomSecure(&raw) catch {
             srv.auth_mutex.unlock(srv.io);
-            try srv.plain(req, .internal_server_error, "no entropy\n");
-            return false;
+            return srv.fail(conn, w, .internal_server_error, "no entropy\n");
         };
         var cookie_val: [auth.encoded_len]u8 = undefined;
         _ = auth.encodeSecret(&raw, &cookie_val);
@@ -325,7 +688,7 @@ pub const Server = struct {
         srv.sessions.create(&cookie_val, now);
         srv.auth_mutex.unlock(srv.io);
 
-        srv.log.print("login ok from {s}", .{peer});
+        srv.log.print("login ok from {s}{s}", .{ peer, if (was_locked) " (during lockout)" else "" });
         var cookie_hdr: [192]u8 = undefined;
         const set_cookie = try std.fmt.bufPrint(&cookie_hdr, "{s}={s}; Path=/; HttpOnly; SameSite=Strict; Max-Age={d}{s}", .{
             srv.cookieName(),
@@ -333,60 +696,87 @@ pub const Server = struct {
             @divTrunc(srv.sessions.absolute_timeout_ms, 1000),
             if (srv.cfg.secure_cookie) "; Secure" else "",
         });
-        return srv.redirect(req, "/", set_cookie);
+        return srv.redirect(conn, w, req, "/", set_cookie);
     }
 
-    fn logout(srv: *Server, req: *http.Server.Request, h: Headers, peer: []const u8) !bool {
+    fn logout(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, h: Headers) !bool {
         if (h.cookie) |c| {
             srv.auth_mutex.lockUncancelable(srv.io);
             srv.sessions.revoke(c);
             srv.auth_mutex.unlock(srv.io);
-            srv.log.print("logout from {s}", .{peer});
+            srv.log.print("logout from {s}", .{conn.peer()});
         }
         var cookie_hdr: [128]u8 = undefined;
         const clear = try std.fmt.bufPrint(&cookie_hdr, "{s}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{s}", .{
             srv.cookieName(),
             if (srv.cfg.secure_cookie) "; Secure" else "",
         });
-        return srv.redirect(req, "/login?bye", clear);
+        return srv.redirect(conn, w, req, "/login?bye", clear);
     }
 
     // --------------------------------------------------------- websocket
 
     const WsConn = struct {
-        ws: http.Server.WebSocket,
-        stream: net.Stream,
+        conn: *Conn,
+        w: *Io.Writer,
         write_mutex: Io.Mutex = .init,
+        /// Guarded by write_mutex: a close frame went out, send nothing more.
+        close_sent: bool = false,
         dead: std.atomic.Value(bool) = .init(false),
         cookie: [auth.encoded_len]u8,
 
-        fn send(c: *WsConn, io: Io, data: []const u8, op: http.Server.WebSocket.Opcode) bool {
-            c.write_mutex.lockUncancelable(io);
-            defer c.write_mutex.unlock(io);
-            c.ws.writeMessage(data, op) catch return false;
+        /// Returns false if the connection should end. Cancelable: the
+        /// supervisor can always tear down a sender stuck behind another.
+        fn send(c: *WsConn, srv: *Server, data: []const u8, op: http1.Opcode) bool {
+            c.write_mutex.lock(srv.io) catch return false;
+            defer c.write_mutex.unlock(srv.io);
+            if (c.close_sent) return false;
+            if (op == .close) c.close_sent = true;
+            c.conn.setDeadline(srv.nowMs() +| send_timeout_ms);
+            http1.writeFrame(c.w, op, data) catch return false;
+            c.conn.setDeadline(no_deadline);
             return true;
         }
     };
 
-    fn webSocket(srv: *Server, req: *http.Server.Request, h: Headers, stream: net.Stream, peer: []const u8) !void {
+    fn webSocket(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, h: Headers, leftover: []const u8) !void {
+        const peer = conn.peer();
         if (!guard.originAllowed(h.origin, srv.cfg.scheme, srv.cfg.allowed_hosts)) {
             srv.log.print("websocket rejected from {s}: bad origin", .{peer});
-            return srv.plain(req, .forbidden, "bad origin\n");
+            _ = try srv.fail(conn, w, .forbidden, "bad origin\n");
+            return;
         }
-        const cookie = h.cookie orelse return srv.plain(req, .unauthorized, "login required\n");
-        if (!srv.sessionLive(cookie, true)) return srv.plain(req, .unauthorized, "login required\n");
-        const key = switch (req.upgradeRequested()) {
-            .websocket => |k| k orelse return srv.plain(req, .bad_request, "missing key\n"),
-            else => return srv.plain(req, .bad_request, "expected websocket\n"),
+        const cookie = h.cookie orelse {
+            _ = try srv.fail(conn, w, .unauthorized, "login required\n");
+            return;
         };
+        if (!srv.sessionLive(cookie, true)) {
+            _ = try srv.fail(conn, w, .unauthorized, "login required\n");
+            return;
+        }
+        if (!req.upgrade_websocket or !req.connection_upgrade) {
+            _ = try srv.fail(conn, w, .bad_request, "expected websocket\n");
+            return;
+        }
+        if (!std.mem.eql(u8, req.ws_version orelse "", "13")) {
+            _ = try srv.fail(conn, w, .bad_request, "unsupported websocket version\n");
+            return;
+        }
+        var accept_buf: [28]u8 = undefined;
+        const accept = http1.wsAccept(req.ws_key orelse "", &accept_buf) catch {
+            _ = try srv.fail(conn, w, .bad_request, "bad websocket key\n");
+            return;
+        };
+        if (leftover.len > max_ws_header + max_ws_payload) return;
 
-        var conn: WsConn = .{
-            .ws = try req.respondWebSocket(.{ .key = key }),
-            .stream = stream,
-            .cookie = undefined,
-        };
-        @memcpy(&conn.cookie, cookie);
-        try conn.ws.flush();
+        conn.setDeadline(srv.nowMs() +| send_timeout_ms);
+        try http1.writeUpgrade(w, accept);
+        conn.setDeadline(no_deadline);
+
+        var ws: WsConn = .{ .conn = conn, .w = w, .cookie = undefined };
+        @memcpy(&ws.cookie, cookie);
+        @memcpy(&conn.ws_cookie, cookie);
+        conn.ws_active.store(true, .release);
 
         const viewers = srv.session.viewerDelta(1);
         srv.log.print("viewer connected from {s} ({d} watching)", .{ peer, viewers });
@@ -397,12 +787,12 @@ pub const Server = struct {
             srv.updateTitle(left);
         }
 
-        const reader = std.Thread.spawn(.{}, wsReadLoop, .{ srv, &conn }) catch return;
-        srv.wsWriteLoop(&conn);
-        // Unblock the reader (it may be parked in a socket read), then wait.
-        conn.dead.store(true, .release);
-        conn.stream.shutdown(srv.io, .both) catch {};
-        reader.join();
+        var reader = srv.io.concurrent(wsReadLoop, .{ srv, &ws, leftover }) catch return;
+        srv.wsWriteLoop(&ws);
+        ws.dead.store(true, .release);
+        // Interrupts the reader if it is parked in a recv; never close a
+        // socket another task is blocked on.
+        reader.cancel(srv.io);
     }
 
     fn updateTitle(srv: *Server, viewers: u32) void {
@@ -414,7 +804,7 @@ pub const Server = struct {
         srv.session.console.setTitle(title);
     }
 
-    fn wsWriteLoop(srv: *Server, conn: *WsConn) void {
+    fn wsWriteLoop(srv: *Server, ws: *WsConn) void {
         const s = srv.session;
         var out: [32 * 1024]u8 = undefined;
         var msg: [128]u8 = undefined;
@@ -424,17 +814,24 @@ pub const Server = struct {
         var sent_gen = s.size_gen -% 1; // force an initial size message
         s.mutex.unlock(srv.io);
 
-        const hello = std.fmt.bufPrint(&msg, "{{\"t\":\"hello\",\"input\":\"{t}\"}}", .{s.policy}) catch unreachable;
-        if (!conn.send(srv.io, hello, .text)) return;
+        const hello = std.fmt.bufPrint(&msg, "{{\"t\":\"hello\",\"input\":\"{t}\"}}", .{s.policy}) catch return;
+        if (!ws.send(srv, hello, .text)) return;
 
         var last_auth = srv.nowMs();
         while (true) {
             s.mutex.lockUncancelable(srv.io);
-            if (!s.closed and pos >= s.ring.total and sent_gen == s.size_gen and !conn.dead.load(.acquire)) {
+            if (!s.closed and pos >= s.ring.total and sent_gen == s.size_gen and !ws.dead.load(.acquire)) {
                 s.cond.waitTimeout(srv.io, &s.mutex, .{ .duration = .{
                     .raw = .fromMilliseconds(auth_recheck_ms),
                     .clock = .awake,
-                } }) catch {};
+                } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => {
+                        // waitTimeout re-acquired the mutex before returning.
+                        s.mutex.unlock(srv.io);
+                        return;
+                    },
+                };
             }
             const res = s.ring.readFrom(pos, &out);
             pos = res.next;
@@ -444,60 +841,192 @@ pub const Server = struct {
             const exit_code = s.exit_code;
             s.mutex.unlock(srv.io);
 
-            if (conn.dead.load(.acquire)) return;
+            if (ws.dead.load(.acquire)) return;
 
             if (gen != sent_gen) {
                 sent_gen = gen;
-                const m = std.fmt.bufPrint(&msg, "{{\"t\":\"size\",\"cols\":{d},\"rows\":{d}}}", .{ size.cols, size.rows }) catch unreachable;
-                if (!conn.send(srv.io, m, .text)) return;
+                const m = std.fmt.bufPrint(&msg, "{{\"t\":\"size\",\"cols\":{d},\"rows\":{d}}}", .{ size.cols, size.rows }) catch return;
+                if (!ws.send(srv, m, .text)) return;
+            }
+            if (res.skipped) {
+                // This viewer fell behind the scrollback; what follows starts
+                // mid-stream, so the client resets its terminal and asks for
+                // a repaint.
+                if (!ws.send(srv, "{\"t\":\"reset\"}", .text)) return;
             }
             if (res.n > 0) {
-                if (!conn.send(srv.io, out[0..res.n], .binary)) return;
+                if (!ws.send(srv, out[0..res.n], .binary)) return;
             } else if (closed) {
-                const m = std.fmt.bufPrint(&msg, "{{\"t\":\"exit\",\"code\":{d}}}", .{exit_code}) catch unreachable;
-                _ = conn.send(srv.io, m, .text);
+                const m = std.fmt.bufPrint(&msg, "{{\"t\":\"exit\",\"code\":{d}}}", .{exit_code}) catch return;
+                _ = ws.send(srv, m, .text);
                 return;
             }
 
             const now = srv.nowMs();
-            if (now - last_auth >= auth_recheck_ms) {
+            if (now -| last_auth >= auth_recheck_ms) {
                 last_auth = now;
                 // Logout, expiry or restart of the auth state ends the stream.
-                if (!srv.sessionLive(&conn.cookie, false)) {
-                    _ = conn.send(srv.io, "{\"t\":\"logout\"}", .text);
+                if (!srv.sessionLive(&ws.cookie, false)) {
+                    _ = ws.send(srv, "{\"t\":\"logout\"}", .text);
                     return;
                 }
             }
         }
     }
 
-    fn wsReadLoop(srv: *Server, conn: *WsConn) void {
+    fn wsReadLoop(srv: *Server, ws: *WsConn, leftover: []const u8) void {
         defer {
-            conn.dead.store(true, .release);
+            ws.dead.store(true, .release);
             // Wake the writer so it notices promptly.
             srv.session.mutex.lockUncancelable(srv.io);
             srv.session.mutex.unlock(srv.io);
             srv.session.cond.broadcast(srv.io);
         }
-        while (!conn.dead.load(.acquire)) {
-            const m = conn.ws.readSmallMessage() catch return;
-            switch (m.opcode) {
-                .ping => if (!conn.send(srv.io, m.data, .pong)) return,
-                .text, .binary => {
-                    if (m.data.len == 0 or m.data.len > max_input_message) continue;
-                    switch (m.data[0]) {
-                        'i' => {
-                            if (srv.session.policy == .none) continue;
-                            // Re-check on every keystroke batch, not just periodically.
-                            if (!srv.sessionLive(&conn.cookie, false)) return;
-                            srv.session.writeWebInput(m.data[1..], srv.nowMs());
-                        },
-                        'r' => srv.session.requestRedraw(srv.nowMs()),
-                        else => {},
-                    }
-                },
-                else => {},
+        var buf: [max_ws_header + max_ws_payload]u8 = undefined;
+        if (leftover.len > buf.len) return;
+        @memcpy(buf[0..leftover.len], leftover);
+        var len: usize = leftover.len;
+
+        while (!ws.dead.load(.acquire)) {
+            const parsed = http1.parseFrameHeader(buf[0..len], max_ws_payload) catch {
+                _ = ws.send(srv, &.{ 0x03, 0xea }, .close); // 1002 protocol error
+                return;
+            };
+            if (parsed) |f| {
+                const total = f.header_len + f.payload_len;
+                if (total <= len) {
+                    const payload = buf[f.header_len..total];
+                    http1.unmask(payload, f.mask);
+                    if (!srv.wsHandleFrame(ws, f.opcode, payload)) return;
+                    std.mem.copyForwards(u8, buf[0 .. len - total], buf[total..len]);
+                    len -= total;
+                    continue;
+                }
             }
+            if (len >= buf.len) return; // cannot happen: the largest frame fits
+            const got = readSome(ws.conn, srv.io, buf[len..]) catch return;
+            if (got == 0) return;
+            len += got;
+        }
+    }
+
+    /// Returns false to end the connection.
+    fn wsHandleFrame(srv: *Server, ws: *WsConn, opcode: http1.Opcode, payload: []const u8) bool {
+        switch (opcode) {
+            .ping => return ws.send(srv, payload, .pong),
+            .pong => return true,
+            .close => {
+                // Echo the status code (if any), then end.
+                _ = ws.send(srv, if (payload.len >= 2) payload[0..2] else "", .close);
+                return false;
+            },
+            .text, .binary => {
+                if (payload.len == 0) return true;
+                switch (payload[0]) {
+                    'i' => {
+                        if (srv.session.policy == .none) return true;
+                        // Re-check on every keystroke batch, not just periodically.
+                        if (!srv.sessionLive(&ws.cookie, false)) return false;
+                        srv.session.writeWebInput(payload[1..], srv.nowMs());
+                    },
+                    'r' => {
+                        if (!srv.sessionLive(&ws.cookie, false)) return false;
+                        srv.session.requestRedraw(srv.nowMs());
+                    },
+                    else => {},
+                }
+                return true;
+            },
+            else => return false,
         }
     }
 };
+
+// -------------------------------------------------------------------- tests
+
+const testing = std.testing;
+
+test {
+    _ = http1;
+}
+
+fn testKey(last: u8) IpKey {
+    var k: IpKey = @splat(0);
+    k[15] = last;
+    return k;
+}
+
+test "conn table: per-ip pre-auth cap evicts that address's oldest" {
+    var t: ConnTable = .{ .max_pre_auth = 10, .max_pre_auth_per_ip = 2 };
+    const a = t.admit(testKey(1), 0);
+    const b = t.admit(testKey(1), 1);
+    try testing.expect(a.slot != null and b.slot != null and a.victim == null and b.victim == null);
+    const other = t.admit(testKey(2), 2);
+    try testing.expect(other.victim == null);
+    const c = t.admit(testKey(1), 3);
+    try testing.expect(c.slot != null);
+    try testing.expectEqual(a.slot, c.victim);
+    // The victim no longer counts, so the next one evicts b.
+    const d = t.admit(testKey(1), 4);
+    try testing.expectEqual(b.slot, d.victim);
+}
+
+test "conn table: authenticated connections are never evicted" {
+    var t: ConnTable = .{ .max_pre_auth = 10, .max_pre_auth_per_ip = 1 };
+    const a = t.admit(testKey(1), 0);
+    t.promote(a.slot.?);
+    const b = t.admit(testKey(1), 1);
+    try testing.expect(b.victim == null);
+    const c = t.admit(testKey(1), 2);
+    try testing.expectEqual(b.slot, c.victim);
+}
+
+test "conn table: global pre-auth cap and full table" {
+    var t: ConnTable = .{ .max_pre_auth = 3, .max_pre_auth_per_ip = 100 };
+    var slots: [max_connections]usize = undefined;
+    for (0..3) |i| slots[i] = t.admit(testKey(@intCast(i)), @intCast(i)).slot.?;
+    const d = t.admit(testKey(9), 10);
+    try testing.expectEqual(@as(?usize, slots[0]), d.victim);
+
+    // Fill every slot with authenticated connections: new ones are refused.
+    var full: ConnTable = .{};
+    for (0..max_connections) |i| {
+        const s = full.admit(testKey(@intCast(i % 200)), @intCast(i)).slot.?;
+        full.promote(s);
+    }
+    const r = full.admit(testKey(1), 100);
+    try testing.expect(r.slot == null and r.victim == null);
+    full.release(5);
+    try testing.expectEqual(@as(?usize, 5), full.admit(testKey(1), 101).slot);
+}
+
+test "log limiter" {
+    var l: LogLimiter = .{};
+    try testing.expectEqual(@as(?u32, 0), l.check(0, 1000));
+    try testing.expectEqual(@as(?u32, null), l.check(10, 1000));
+    try testing.expectEqual(@as(?u32, null), l.check(999, 1000));
+    try testing.expectEqual(@as(?u32, 2), l.check(1000, 1000));
+    // Survives extreme clock values without overflow.
+    var m: LogLimiter = .{};
+    _ = m.check(std.math.minInt(i64), 1000);
+    try testing.expect(m.check(std.math.maxInt(i64), 1000) != null);
+    try testing.expect(m.check(std.math.minInt(i64), 1000) == null);
+}
+
+test "accept backoff" {
+    var b: Backoff = .{};
+    try testing.expectEqual(@as(i64, 100), b.next());
+    try testing.expectEqual(@as(i64, 200), b.next());
+    for (0..20) |_| _ = b.next();
+    try testing.expectEqual(@as(i64, 5000), b.next());
+    b.reset();
+    try testing.expectEqual(@as(i64, 100), b.next());
+}
+
+test "ip key" {
+    const a = try net.IpAddress.parse("10.8.0.2", 1);
+    const b = try net.IpAddress.parse("10.8.0.2", 2);
+    const c = try net.IpAddress.parse("10.8.0.3", 1);
+    try testing.expectEqualSlices(u8, &ipKey(a), &ipKey(b));
+    try testing.expect(!std.mem.eql(u8, &ipKey(a), &ipKey(c)));
+}
