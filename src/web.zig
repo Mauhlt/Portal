@@ -637,6 +637,9 @@ pub const Server = struct {
     /// own device and its subscriptions. Unknown and unsubscribed packages
     /// look the same (404).
     fn syncRoute(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, h: Headers) !bool {
+        // Only these exist; anything else under /sync/ is a plain 404.
+        if (!std.mem.eql(u8, req.path, "/sync/key") and !std.mem.eql(u8, req.path, "/sync/index") and
+            !std.mem.startsWith(u8, req.path, "/sync/pkg/")) return srv.fail(conn, w, .not_found, "not found\n");
         const cookie = h.cookie orelse return srv.fail(conn, w, .unauthorized, "login required\n");
         var tag_buf: [auth.Sessions.max_tag]u8 = undefined;
         const device = blk: {

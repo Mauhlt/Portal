@@ -7,6 +7,10 @@ sync, with directories laid out so nothing clashes.
 This channel delivers code to the laptop, so it is security-critical.
 Treat every rule below as a hard requirement.
 
+**Status: implemented** (branch feat/sync). Everything below is in place
+unless marked *deferred*; the concrete formats and flows are in
+[Implementation](#implementation) at the end.
+
 ## Trust
 
 * **A dedicated release-signing key** (Ed25519) lives on the desktop. It is
@@ -70,7 +74,8 @@ after that, new adapter versions arrive whenever training produces one.
   folder: no `..`, no drive letters, no ADS (`:`), no reserved device names.
 * **Running programs are never overwritten.** A new version is a new
   folder. Pruning keeps current, previous and any version still in use.
-* **Quotas:** per-package size caps and total sync cap.
+* **Quotas:** per-package size caps and total sync cap (8 GiB per
+  package version, 32 GiB for the whole store by default).
 
 ## Desktop side
 
@@ -123,3 +128,168 @@ endpoints in `docs/stt-sync-contract.md`.
 * Executable approval.
 * Never overwriting a running exe.
 * Privacy scan.
+
+
+## Implementation
+
+Code: `client/src/sync/` (shared format and the device side: `manifest.zig`,
+`store.zig`, `keypin.zig`, `engine.zig`, `ui.zig`), `src/sync.zig` (desktop
+stores), `src/sync_cli.zig` (portalctl commands), the `/sync` routes and
+the `updates` message in `src/web.zig`, `SyncWatch` in `src/main.zig`.
+
+### Manifest (canonical text)
+
+```
+portal-manifest-v1
+package <id>                [a-z0-9-]{1,32}, no leading/trailing '-', not a device name
+version <version>           [0-9A-Za-z.+-]{1,64}, no "..", no leading/trailing '.', not a device name
+kind <data|executable>
+sequence <n>                1..2^63-1, monotonic per package (downgrade/replay protection)
+created <unix seconds>
+min-client <d[.d[.d[.d]]]>  numeric, compared with the device's Portal version
+files <count>               at most 4096
+file <size> <sha256> <path> one per file, sorted by path (bytewise)
+end
+```
+
+* ASCII only, LF line ends, single spaces, decimal numbers without leading
+  zeros, lowercase hex. The path is the rest of its line.
+* **One encoding only**: the parser rejects anything that does not
+  re-encode to the identical bytes, so the signed bytes are the bytes
+  interpreted.
+* Caps: 4096 files, 260-byte paths, 32 levels, 8 GiB per version, 2 MiB per
+  manifest.
+* **Paths**: relative, '/'-separated, no empty / `.` / `..` component, no
+  leading '/', no drive (`C:`), no backslash, no `:` (alternate data
+  streams), printable ASCII without `<>"|?*`, no leading space, no trailing
+  dot or space, no reserved device name (CON, PRN, AUX, NUL, COM0-9,
+  LPT0-9, CONIN$, CONOUT$, CLOCK$, also with an extension such as
+  `nul.txt`), and no two paths equal ignoring case (nor a file that is also
+  a folder name).
+* **Signature**: Ed25519 (std, `verifyStrict`) over the exact manifest
+  bytes. The publisher key fingerprint is the SHA-256 of the 32-byte
+  public key, shown as `AB:CD:...`.
+
+### Trust and pinning
+
+* `portalctl sync key [show | init [--force]]`. The key is a 32-byte
+  Ed25519 seed in `%LOCALAPPDATA%\Portal\sync-key\release.key`
+  (`PORTAL-SYNC-KEY-V1` + a DPAPI current-user blob with its own entropy
+  purpose, "Portal sync release key v1", so it can't be swapped with the
+  CA key's blob) and the public key in `release.pub`, which must match on
+  every load. `portal run` creates it on first start, like the CA. It is
+  decrypted only to sign a publish.
+* **Pinned at pairing**: when a device collects its credential, it calls
+  `GET /sync/key` with its brand-new session over the CA-pinned TLS
+  connection and pins the key in `<per-user config>\servers\<host>.sync-key`
+  (next to the CA pin; public data). A key change on the server is refused
+  (the CLI warns); only pairing again replaces the pin. Devices paired
+  before sync existed must be paired again.
+
+### Desktop
+
+* `portalctl publish <pkg> <folder> --kind data|executable [--version V]
+  [--min-client V]` walks the folder (regular files only; links refused),
+  refuses unsafe paths with the reason, copies each file into
+  `publish\<pkg>\.tmp-<random>\files\<n>` while hashing it (what is stored
+  is what is hashed), writes `manifest.txt` and `manifest.sig`, verifies the
+  signature, and renames the folder to `publish\<pkg>\<version>`. The
+  sequence is reserved first in `publish\<pkg>\history.txt`; sequences and
+  version names are never reused, even after `unpublish`. The default
+  version is the sequence number.
+* `portalctl publish --list`, `portalctl unpublish <pkg> <version>`.
+* Subscriptions: `%LOCALAPPDATA%\Portal\sync-subscriptions.txt` (locked
+  read-modify-write, flushed temp file, MoveFileEx WRITE_THROUGH), via
+  `portalctl sync subscribe|unsubscribe <device> <pkg>`, `portalctl sync
+  subscriptions`, or the Devices panel (P on a device row).
+* The server serves the stores as they are and does not need the key: it
+  parses manifests strictly to build the index (a manifest that does not
+  parse, e.g. one naming `../x`, is never listed or served) but the
+  signature is the device's to check.
+
+### Endpoints
+
+See [protocol.md section 7](protocol.md#7-portal-sync-signed-packages-for-paired-devices):
+`GET /sync/key`, `GET /sync/index`, `GET /sync/pkg/<pkg>/<ver>/manifest`
+(signature in `x-portal-signature`), `GET /sync/pkg/<pkg>/<ver>/file/<n>`
+(by index, streamed in 32 KiB chunks, each under the send deadline; a
+stored file whose size differs from the manifest is not served). All need
+a live session and serve only that device's subscriptions (404 otherwise).
+
+**Announcements.** `SyncWatch` waits on two directory change notifications
+(the data folder, for the subscriptions and device files, and `publish\`
+with its subtree) and nothing else. On each wake it hashes every
+subscribed device's index; each WebSocket writer sends `{"t":"updates"}`
+when its device's hash changed.
+
+### Device install flow
+
+`client/src/sync/engine.zig`, the same code in `portal connect` (a worker
+thread woken by every stream connect and `updates`) and `portalctl
+sync-device` (headless, for tests):
+
+1. `GET /sync/index`; then per line, `GET .../manifest`;
+2. SHA-256 of the manifest = the index line; signature verifies with the
+   pinned key (first: nothing unsigned is interpreted); strict parse;
+   package, version, sequence, kind and size = the index line;
+3. store policy: sequence above the highest ever installed for the
+   package (else *downgrade* or *replay*, refused), client new enough,
+   quota;
+4. `data` continues; `executable` stops as *waiting for approval* unless
+   that exact manifest (package, sequence, SHA-256) was approved;
+5. each file `GET .../file/<n>` into `staging\<random>\<n>` (created
+   exclusively), bounded by the manifest size and hashed as it arrives;
+   any mismatch deletes the staging folder and nothing changes;
+6. the files move into `packages\<pkg>\.incoming-<random>\<path>` (no
+   replace), each marked read-only; the manifest and signature go to
+   `packages\<pkg>\.manifests\<ver>.{txt,sig}`; the folder is renamed to
+   `packages\<pkg>\<ver>` (an existing version folder is never written: the
+   same version must come back with the identical manifest, else refused);
+7. `previous\<pkg>.txt` := the old current, then `current\<pkg>.txt` :=
+   the new one (each a flushed temp file + MoveFileEx REPLACE_EXISTING |
+   WRITE_THROUGH; the pointer also keeps the highest sequence installed);
+8. `data\<pkg>\` is created; versions other than current and previous are
+   pruned unless a file in them can't be opened exclusively (a running
+   program), in which case they stay.
+
+Leftover staging, `.incoming-*` and `.trash-*` folders are removed at the
+start of every pass. Rollback (`sync-device --rollback <pkg>`, Roll back in
+Packages) swaps current and previous and keeps the highest sequence, so the
+version rolled back from is not taken again.
+
+### UI
+
+* `portal connect`: "Install <pkg> <ver> from <desktop>?" with the
+  publisher key SHA-256 and size, Reject focused, `y`/`n`; "Install voice
+  model?" after pairing when voice packages are subscribed (Install also
+  approves stt-local; Not now holds them for this run); Packages
+  (Ctrl+Shift+K): installed versions with Roll back, versions waiting for
+  approval with Approve, rejected ones with the reason.
+* The desk: Devices shows each device's package count; P on a row opens
+  its packages (known ids and everything published) with
+  Subscribe / Unsubscribe.
+
+### Tests
+
+* Unit: manifest canonical form, every non-canonical variation, a fuzz
+  loop (random, truncated and mutated input; anything accepted
+  re-encodes identically); every path rule; signatures good / tampered /
+  wrong key; index strictness; store: atomic install, read-only files,
+  upgrade, downgrade and replay refused, rollback, hash and size
+  mismatches in staging, quota, staging cleanup, an existing version
+  folder never written, a held-open ("running") exe whose version folder
+  is kept while new versions land in new folders; release key DPAPI
+  round trip and purpose binding; publish, sequences, names never reused,
+  per-device index; subscriptions file; the panels' state machines.
+* e2e group `sync` (port offset 110, TLS on): see `tests/e2e/sync_tests.zig`.
+
+### Deferred
+
+* Running installed programs (e.g. launching `npu-probe` from Packages):
+  nothing runs packages yet.
+* Self-update of `portal-client` through sync, and publishing from the
+  desk window (publishing is `portalctl publish` only).
+* Quotas are fixed (8 GiB per version, 32 GiB in total); no setting yet.
+* A device-side end-to-end test of a *signed* path-traversal manifest:
+  the server never offers one, and device-side rejection is covered by
+  unit tests.

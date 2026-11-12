@@ -314,6 +314,7 @@ pub fn describe(err: anyerror) []const u8 {
         error.NotCanonical, error.BadManifest, error.BadPackageId, error.BadVersion => "malformed manifest",
         error.TooLarge, error.TooManyFiles => "the package is over the size limits",
         error.OverQuota => "not enough sync quota left on this device",
+        error.Downgrade => "downgrade or replay refused",
         error.VersionFolderClash => "that version is already installed with different content",
         error.NoSignature => "the server sent no signature",
         error.FileRefused, error.ManifestRefused => "the server refused the download",

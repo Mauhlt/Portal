@@ -55,6 +55,7 @@ pub const Error = error{
     BadPointer,
     NothingToRollBack,
     NotInstalled,
+    Downgrade,
 } || Allocator.Error;
 
 /// What current\<pkg>.txt and previous\<pkg>.txt hold.
@@ -289,6 +290,11 @@ pub const Store = struct {
     /// staging before anything moves into packages\.
     pub fn install(s: *Store, m: *const Manifest, manifest_bytes: []const u8, sig: [manifest.signature_len]u8, source: anytype) !Installed {
         if (m.totalSize() > manifest.max_package_bytes) return error.TooLarge;
+        // Again here, whatever the caller checked: sequences only go up.
+        if (try s.current(m.package)) |cur| {
+            const same = cur.sequence == m.sequence and std.mem.eql(u8, cur.version(), m.version);
+            if (!same and m.sequence <= cur.highest) return error.Downgrade;
+        }
         if ((try s.usage()) +| m.totalSize() > s.quota) return error.OverQuota;
         var result: Installed = .{};
 
@@ -782,6 +788,9 @@ test "atomic install, read-only files, upgrade, downgrade/replay refused, rollba
     const replay = try TestPkg.make(gpa, kp, "stt-model", "2.1", 2, &.{"x"}, &.{"x"});
     defer replay.destroy(gpa);
     try testing.expectEqual(Offer.replay, try s.checkOffer(&replay.m, "0.1.0"));
+    // install refuses them too, even if a caller skipped checkOffer.
+    var src_old: MemSource = .{ .contents = &.{ "cfg", "weights-one" } };
+    try testing.expectError(error.Downgrade, s.install(&v1.m, v1.bytes, v1.sig, &src_old));
 
     // Explicit local rollback; the rolled-back-from version is not taken
     // again automatically.

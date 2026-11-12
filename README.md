@@ -19,7 +19,7 @@ through that window.
 | Program | Subsystem | What it is |
 |---|---|---|
 | `portal.exe` | Windows GUI | The Portal window (`portal`, `portal run ...`) and the remote viewer (`portal connect`). Never opens a console; a terminal that starts it gets its prompt back at once. Errors go to a message box. |
-| `portalctl.exe` | console | Scripting and tests: `pair`, `devices`, `unpair`, `ca`, `show`, `version`, and `run --console` (a session in that console). |
+| `portalctl.exe` | console | Scripting and tests: `pair`, `devices`, `unpair`, `ca`, `show`, `version`, `run --console` (a session in that console), and Portal sync: `sync`, `publish`, `unpublish`, `sync-device`. |
 | `portal-show.exe` | console | `portal-show picture.png`, run inside a session (see Inline images). |
 
 All three are built from the same source (`zig build`); `portal.exe` and
@@ -290,6 +290,42 @@ Trust the CA once on each device: **Export certificate…** in the window
 `portalctl ca` shows the CA, its constraints and the server certificate.
 `portalctl ca init --force` replaces the CA, and every device must then
 trust the new one.
+
+## Portal sync: packages for your devices
+
+The desktop can deliver the owner's own programs and data (the laptop's
+speech model, adapter and NPU tools) to paired devices, signed with a
+release key that each device pinned when it paired. Vendor runtimes (such
+as Qualcomm's QNN DLLs) are never shipped. Design and rules:
+[docs/sync-design.md](docs/sync-design.md); wire format: section 7 of
+[docs/protocol.md](docs/protocol.md).
+
+```powershell
+portalctl sync key                                    # the release key's SHA-256
+portalctl publish stt-model D:\models\stt --kind data    # signs a new version
+portalctl publish npu-probe .\zig-out\bin --kind executable --version 0.2
+portalctl publish --list
+portalctl sync subscribe laptop stt-model             # or: Devices panel, P on a row
+portalctl sync subscriptions
+```
+
+* **Release key**: Ed25519, DPAPI-protected in `%LOCALAPPDATA%\Portal\sync-key`,
+  separate from the CA key; created when Portal first starts. `portalctl
+  sync key init --force` replaces it, and every device must then be paired
+  again before it accepts packages.
+* **Delivery is event-driven**: a publish or a subscription change sends
+  the subscribed devices `{"t":"updates"}` on their WebSocket; they fetch,
+  verify (signature, SHA-256 and size of every file) and install into
+  `%LOCALAPPDATA%\Portal\sync\packages\<package>\<version>\`, read-only.
+  A running program is never overwritten: each version is a new folder.
+* **On the device** (`portal connect`): data installs by itself; a program
+  asks "Install <package> <version> from <desktop>?" with the publisher key
+  and size, every new version. Right after pairing it asks "Install voice
+  model?" for subscribed voice packages. Ctrl+Shift+K shows Packages
+  (installed, waiting for approval, Roll back). Nothing is ever run
+  automatically.
+* Devices paired before this existed have no pinned release key: pair them
+  again to turn sync on.
 
 ## The browser viewer (Zig → WebAssembly)
 

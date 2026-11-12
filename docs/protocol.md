@@ -110,6 +110,7 @@ frames must be masked; no fragmentation; no extensions.
 | `state` | `state`: `"working"`, `"waiting"` or `"done"` | **planned, not sent yet**: what the session program is doing, from its OSC 7501 status. Clients show it in the status line ("waiting for you" for `waiting`) and treat unknown values as unknown |
 | `exit` | `code` | the session's program exited; stream ends |
 | `logout` | | session revoked or expired; sign in again |
+| `updates` | | Portal sync: this device's package index changed (a publish, or a subscription changed at the desk). Fetch `GET /sync/index` (section 7). Devices also look on every connect |
 | `rejected` | `reason` | an `l:` instruction line was refused (e.g. `ShellEscape`, `SlashCommand`, `MemoryShortcut`, `ControlCharacter`, `TooLong`, `Empty`); nothing was typed |
 
 **Binary frames**: grid updates, always starting with `'G'`, little-endian:
@@ -243,6 +244,37 @@ are ignored.
   `k:y`, "two" → `k:2`, "OK" → `k:enter`; table in `src/wasm/inputbox.zig`).
   It checks lines with the server's rules first, so a refusal is shown
   without a round trip; `rejected` still covers anything it missed.
+
+## 7. Portal sync (signed packages for paired devices)
+
+The design and the rules are in [sync-design.md](sync-design.md). Every
+route is `GET`, needs the session cookie (`401` without a live one), and
+serves only the session's own device: packages it is not subscribed to,
+and anything unknown, answer `404`. Responses carry `Content-Length`;
+connection timeouts, slot limits and rate limits are the usual ones.
+
+| route | body |
+|---|---|
+| `GET /sync/key` | `portal-sync-key-v1\n<64 hex>\n`: the desktop's Ed25519 release public key; header `x-portal-sync-key-fingerprint: AB:CD:...` (SHA-256 of the 32-byte key) |
+| `GET /sync/index` | `portal-sync-index-v1\n`, then one line per subscribed package that has a published version, `pkg <id> <version> <sequence> <data\|executable> <total size> <manifest sha256 hex>\n`, then `end\n` |
+| `GET /sync/pkg/<id>/<version>/manifest` | the canonical manifest bytes; header `x-portal-signature: <128 hex>`, Ed25519 over exactly those bytes |
+| `GET /sync/pkg/<id>/<version>/file/<n>` | file `n` (0-based, in manifest order, decimal without leading zeros) as `application/octet-stream`, exactly the manifest's size, streamed |
+
+**Pinning.** Right after pairing (the `/pair/wait` that returns the
+credential), the device asks `GET /sync/key` with its new session, over the
+CA-pinned TLS connection, and pins the key for that server next to the CA
+pin (`<host>.sync-key` in the per-user config folder). A different key
+later is refused; only pairing again replaces the pin.
+
+**Device rules.** The index is advisory. For each line the device fetches
+the manifest, checks its SHA-256 against the line, verifies the signature
+with the pinned key, parses it strictly, and checks that its package,
+version, sequence, kind and size match the line. It installs only a
+sequence above anything it ever installed for that package (no downgrade,
+no replay), fetches files by index into a staging folder, bounded by and
+checked against the manifest's size and SHA-256, and moves them into a new
+read-only version folder. `executable` packages wait for approval on the
+device, every version; nothing is ever run automatically.
 
 ## 6. Voice
 
