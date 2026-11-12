@@ -85,7 +85,7 @@ fn writeRequest(r: *const Remote, path: []const u8, out: []u8) ![]const u8 {
 }
 
 fn getTask(r: *const Remote, wd: *watchdog.Watchdog, path: []const u8, target: BodyTarget) anyerror!Response {
-    const conn = try tlsconn.Conn.open(r.gpa, r.io, r.addr, r.security);
+    const conn = try tlsconn.Conn.openWatched(r.gpa, r.io, r.addr, r.security, &wd.stopped);
     defer conn.close(r.gpa);
     wd.extend(progress_timeout_ms);
     var req_buf: [1024]u8 = undefined;
@@ -181,6 +181,15 @@ pub const Options = struct {
     /// Packages to offer instead of installing (the app's "Install voice
     /// model?" right after pairing): reported as `.offered`.
     hold: []const []const u8 = &.{},
+    /// Called before each package (on the pass's thread): `portal connect`
+    /// performs the user's pending rollback / revoke there, so the pass's
+    /// thread stays the store's only writer.
+    between: ?Hook = null,
+
+    pub const Hook = struct {
+        ctx: *anyopaque,
+        f: *const fn (*anyopaque) void,
+    };
 };
 
 pub const Outcome = enum {
@@ -279,6 +288,9 @@ pub const Log = struct {
 /// problems are items in the report.
 pub fn run(r: *const Remote, st: *store_mod.Store, pinned: keypin.Key, opts: Options, rep: *Report, log: Log) !void {
     rep.n = 0;
+    // The store is this desktop's (keypin.desktopRoot): it must be the one
+    // for this very key.
+    if (!std.mem.eql(u8, &st.signer, &manifest.fingerprint(pinned))) return error.SignerMismatch;
     _ = st.cleanup() catch 0; // never resume from a half-done staging folder
     var idx = try get(r, "/sync/index", .{ .collect = manifest.max_index_bytes });
     defer idx.deinit(r.gpa);
@@ -288,6 +300,7 @@ pub fn run(r: *const Remote, st: *store_mod.Store, pinned: keypin.Key, opts: Opt
     const entries = try manifest.parseIndex(idx.body, &entries_buf);
     for (entries) |e| {
         if (opts.only) |o| if (!std.mem.eql(u8, o, e.package)) continue;
+        if (opts.between) |h| h.f(h.ctx);
         const it = &rep.items[rep.n];
         rep.n += 1;
         it.* = .{};
@@ -315,6 +328,7 @@ pub fn describe(err: anyerror) []const u8 {
         error.TooLarge, error.TooManyFiles => "the package is over the size limits",
         error.OverQuota => "not enough sync quota left on this device",
         error.Downgrade => "downgrade or replay refused",
+        error.SignerMismatch => "this device's record of the package names another release key",
         error.VersionFolderClash => "that version is already installed with different content",
         error.NoSignature => "the server sent no signature",
         error.FileRefused, error.ManifestRefused => "the server refused the download",
