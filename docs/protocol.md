@@ -151,6 +151,11 @@ repeat n_rows:
 * Binary frames are told apart by their first byte. **Clients must ignore
   binary frames whose first byte they don't know** (all current clients do),
   so new frame types can be added without breaking them.
+* Both Portal clients decode these frames with one decoder
+  (`shared/screen.zig`): a malformed frame (truncated, trailing bytes, a
+  row index outside the grid, a size of 0 or over 1000, a cursor flag
+  other than 0/1) is dropped whole, before anything is applied. Invalid
+  UTF-8 and control characters in text are shown as U+FFFD.
 
 ### Inline images (`'I'` and `'P'` frames)
 
@@ -200,7 +205,9 @@ repeat n:
   with their memory: drop blobs over 6 MiB, anything that is not a
   well-formed PNG, and images over 8192 px per side or 32 Mpx; decode with
   a bounded allocator; show a placeholder for images they can't decode.
-  Unknown ids in `'P'` are skipped.
+  Unknown ids in `'P'` are skipped. Portal's clients keep at most what the
+  server holds (64 blobs, 64 MiB, 256 placements), dropping the oldest
+  blob first.
 * Blobs are rate limited per viewer (8 MiB burst, 4 MiB/s) so images can't
   starve grid updates; a placement appears once its blob has been sent.
 * Old clients that predate these frames ignore them and simply show no

@@ -11,6 +11,8 @@
 //!   "view"   src/view/root.zig   window, Vulkan drawing, fonts, input types.
 //!                                No networking; imports only "Renderer".
 //!   client   src/main.zig        pairing, refresh, WebSocket, 'G' decoding.
+//!   "shared" ../shared/root.zig  protocol code shared with Portal's server
+//!                                and browser client (a path dependency).
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -31,13 +33,22 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "view", .module = view }},
+        .imports = &.{
+            .{ .name = "view", .module = view },
+            .{ .name = "shared", .module = sharedModule(b, target, optimize) },
+        },
     }) });
     const test_step = b.step("test", "Run unit tests and compile-check the executables");
     test_step.dependOn(&b.addRunArtifact(view_tests).step);
     test_step.dependOn(&b.addRunArtifact(client_tests).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sharedModule(b, target, optimize) })).step);
     test_step.dependOn(&exe.step);
     test_step.dependOn(&addClient(b, "portal-client-releasesafe-check", target, .ReleaseSafe).step);
+}
+
+/// Portal's shared protocol module (../shared/root.zig).
+pub fn sharedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.dependency("shared", .{ .target = target, .optimize = optimize }).module("shared");
 }
 
 /// The reusable view module (src/view), wired to the Renderer package.
@@ -65,6 +76,7 @@ pub fn viewModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
         .imports = &.{
             .{ .name = "Renderer", .module = renderer.module("Renderer") },
             .{ .name = "imgdec", .module = imgdec },
+            .{ .name = "shared", .module = sharedModule(b, target, optimize) },
         },
     });
 }
@@ -75,6 +87,9 @@ fn addClient(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, 
         .target = target,
         .optimize = optimize,
         .link_libc = target.result.os.tag != .windows, // libsecret / Security.framework via dlopen
-        .imports = &.{.{ .name = "view", .module = viewModule(b, target, optimize) }},
+        .imports = &.{
+            .{ .name = "view", .module = viewModule(b, target, optimize) },
+            .{ .name = "shared", .module = sharedModule(b, target, optimize) },
+        },
     }) });
 }

@@ -15,5 +15,8 @@
         // PINNED by the owner's request to Image@065e8ec: a detached
         // worktree of their Image repo at that commit, used read-only.
         .Image = .{ .path = "../Image-wt-portal" },
+        // Protocol and crypto code shared by the server, both clients and
+        // the e2e tests (shared/root.zig; client/ depends on it too).
+        .shared = .{ .path = "shared" },
     },
 }
