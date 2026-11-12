@@ -2377,7 +2377,7 @@ const bridge_imports = [_][]const u8{
 const client_exports = [_][]const u8{
     "memory",     "init",     "in_alloc", "resize",   "frame",    "on_ws_open", "on_ws_close",
     "on_ws_message", "on_timer", "on_check", "on_key", "on_pointer", "on_wheel", "on_cmd",
-    "on_viewport",   "on_box_input", "on_box_key", "on_button", "on_tab", "on_split",
+    "on_viewport",   "on_box_input", "on_box_key", "on_button",
 };
 
 const WasmReader = struct {

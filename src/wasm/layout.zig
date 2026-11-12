@@ -1,7 +1,12 @@
 //! Terminal canvas layout in device pixels: canvas size, cell size
-//! (fit-to-width or a manual zoom) and pan limits. Pure math, no state
-//! beyond its inputs. The page around the canvas (input box, buttons) is
-//! panes.zig.
+//! (fit or a manual zoom) and pan limits. Pure math, no state beyond its
+//! inputs. The page around the canvas (header, Data slice, input box,
+//! buttons) is slices.zig.
+//!
+//! Fit, the same rule as the native viewer (TermView.fitEm): the cell size
+//! at which the columns fill the canvas width, made smaller to show every
+//! row too, but not below `Zoom.readable_px`; rows that still do not fit
+//! are panned to follow the cursor (`followPan`).
 //!
 //! All inputs come from the browser (via the bridge) and are sanitised
 //! here: NaN, negative or absurd sizes must not reach an @intFromFloat.
@@ -38,6 +43,8 @@ pub const Zoom = struct {
 
     pub const min_px: f32 = 4;
     pub const max_px: f32 = 40;
+    /// Fit shrinks for the rows' sake down to this size (CSS px), no further.
+    pub const readable_px: f32 = 12;
 };
 
 pub const max_side: u32 = 8192;
@@ -121,7 +128,12 @@ pub fn compute(in: Input) Layout {
     if (in.zoom.fit and in.cols > 0) {
         const avail: f64 = @floatFromInt(@max(1, l.term.w - 2 * l.pad));
         const cw_fit = @floor(avail / @as(f64, @floatFromInt(in.cols)));
-        em = std.math.clamp(cw_fit / adv, min_em, max_em);
+        const by_w = cw_fit / adv;
+        // Every row too, if that stays readable.
+        const avail_h: f64 = @floatFromInt(@max(1, l.term.h - 2 * l.pad));
+        const by_h = if (in.rows > 0) avail_h / (@as(f64, @floatFromInt(in.rows)) * line) else by_w;
+        const readable = @as(f64, Zoom.readable_px) * dpr;
+        em = std.math.clamp(@min(by_w, @max(by_h, readable)), min_em, max_em);
     } else {
         em = sane(in.zoom.font_px, Zoom.min_px, Zoom.max_px) * dpr;
     }
@@ -139,6 +151,25 @@ pub fn compute(in: Input) Layout {
     l.content_w = @as(i32, in.cols) * @as(i32, @intCast(l.cw)) + 2 * l.pad;
     l.content_h = @as(i32, in.rows) * @as(i32, @intCast(l.ch)) + 2 * l.pad;
     return l;
+}
+
+/// The first grid row to show when only `visible` of `rows` fit: the
+/// lowest rows with content (`last`: the last non-blank row), keeping the
+/// cursor in view; 0 when everything fits (TermView.followTop).
+pub fn followTop(rows: u16, visible: u16, cursor: u16, last: u16) u16 {
+    if (visible == 0 or visible >= rows) return 0;
+    const bottom = @max(cursor, last);
+    var first = (bottom + 1) -| visible;
+    first = @min(first, rows - visible);
+    return @min(first, cursor);
+}
+
+/// The vertical pan (device px) that shows the rows `followTop` picks.
+pub fn followPan(l: Layout, rows: u16, cursor: u16, last: u16) i32 {
+    const ch: i32 = @intCast(@max(1, l.ch));
+    const visible: u16 = @intCast(std.math.clamp(@divFloor(l.term.h - 2 * l.pad, ch), 1, @max(1, @as(i32, rows))));
+    const first = followTop(rows, visible, cursor, last);
+    return l.clampPan(.{ 0, @as(i32, first) * ch })[1];
 }
 
 /// A− / A+: leaves fit mode at the current size, then steps by one CSS px.
@@ -229,4 +260,25 @@ test "hostile sizes from the browser" {
     in.cols = 0;
     in.rows = 0;
     _ = compute(in);
+}
+
+test "fit: rows too if readable, else the rows follow the cursor" {
+    // A laptop browser: 120 x 40 in 1000 x 500 CSS px at dpr 1. The width
+    // allows a 8 px cell (13.3 px font); every row would need 10.7 px:
+    // below readable, so 12 px and the rows pan.
+    var in: Input = .{ .css_w = 1000, .css_h = 500, .dpr = 1, .cols = 120, .rows = 40, .zoom = .{} };
+    const l = compute(in);
+    try testing.expectEqual(@as(u32, 7), l.cw); // 12 px * 0.602
+    try testing.expect(l.panMax()[1] > 0 and l.panMax()[0] == 0);
+    // Taller window: the width decides, everything fits.
+    in.css_h = 2000;
+    const t = compute(in);
+    try testing.expectEqual(@as(u32, 8), t.cw);
+    try testing.expectEqual(@as(i32, 0), t.panMax()[1]);
+    // Following: the cursor's region, clamped to the content.
+    try testing.expectEqual(@as(i32, 0), followPan(l, 40, 2, 2));
+    try testing.expectEqual(l.panMax()[1], followPan(l, 40, 39, 39));
+    try testing.expectEqual(@as(i32, 0), followPan(t, 40, 39, 39));
+    try testing.expectEqual(@as(u16, 15), followTop(40, 25, 30, 39));
+    try testing.expectEqual(@as(u16, 10), followTop(40, 5, 10, 39));
 }

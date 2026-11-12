@@ -1,18 +1,19 @@
-//! The native client's Data slice (docs/layout-design.md ③): the images
-//! the session pushed, newest first, in a column at the right of the
-//! window (TermView.DataColumn). The model is the browser's (module
-//! "datafeed": bounded history, a badge for what arrived while hidden);
-//! here the payload is the PNG bytes, which TermView decodes and scales
-//! like the terminal's inline images.
+//! The native Data slice (docs/layout-design.md): the images the session
+//! pushed, newest first, in a strip under the terminal (TermView.DataSlice)
+//! on the laptop viewer and on the desk alike. The model is the browser's
+//! (module "datafeed": bounded history, a badge for what arrived while
+//! collapsed, the slice's size rule); here the payload is the PNG bytes,
+//! which TermView decodes and scales like the terminal's inline images.
 //!
 //! Feeding: the UI thread calls `sync` with the grid's image store under
 //! the shared lock whenever it draws; every blob not seen before becomes an
 //! item. (A blob the server sends and drops again between two frames is
 //! missed; the terminal never showed it either.)
 //!
-//! F2 shows or hides the column. It is drawn only when the window is wide
-//! enough (TermView.data_min_window_w); while hidden, new items are counted
-//! for the status line.
+//! The slice is a thin header strip while empty ("Data · nothing yet") and
+//! grows when items arrive (TermView.dataHeight). F2 or its Hide button
+//! collapses it to the strip, which then counts what is new; Clear empties
+//! it.
 
 const std = @import("std");
 const datafeed = @import("datafeed");
@@ -46,18 +47,20 @@ pub fn pngSize(png: []const u8) [2]u32 {
 
 pub const DataView = struct {
     feed: datafeed.Feed(Png) = .{},
-    /// The column's image store for TermView: non-owning views of the
+    /// The slice's image store for TermView: non-owning views of the
     /// feed's PNG bytes under tagged ids (rebuilt when the feed changes;
     /// only `blobs.deinit` is ever called on it).
     store: Images = .{},
-    /// The user's choice (F2).
+    /// The user's choice (F2 / Hide / Show).
     shown: bool = true,
-    /// Whether the last frame could draw the column (window wide enough).
-    fits: bool = true,
     seen_gen: u64 = std.math.maxInt(u64),
+    /// Blob ids of the terminal's store already taken (a Clear must not
+    /// bring them back on the next sync).
+    taken: [datafeed.max_items * 2]u32 = undefined,
+    n_taken: usize = 0,
     captions: [datafeed.max_items][48]u8 = undefined,
     items: [datafeed.max_items]TermView.DataItem = undefined,
-    hint_buf: [48]u8 = undefined,
+    summary_buf: [48]u8 = undefined,
 
     pub fn deinit(d: *DataView, gpa: std.mem.Allocator) void {
         d.store.blobs.deinit(gpa);
@@ -65,7 +68,21 @@ pub const DataView = struct {
     }
 
     pub fn visible(d: *const DataView) bool {
-        return d.shown and d.fits;
+        return d.shown;
+    }
+
+    fn wasTaken(d: *const DataView, id: u32) bool {
+        for (d.taken[0..d.n_taken]) |t| if (t == id) return true;
+        return false;
+    }
+
+    fn take(d: *DataView, id: u32) void {
+        if (d.n_taken == d.taken.len) {
+            std.mem.copyForwards(u32, d.taken[0 .. d.taken.len - 1], d.taken[1..]);
+            d.n_taken -= 1;
+        }
+        d.taken[d.n_taken] = id;
+        d.n_taken += 1;
     }
 
     /// Picks up new blobs from the terminal's store. Under the lock that
@@ -75,7 +92,8 @@ pub const DataView = struct {
         d.seen_gen = grid.generation;
         var changed = false;
         for (grid.blobs.items) |b| {
-            if (d.feed.find(.image, b.id) != null) continue;
+            if (d.feed.find(.image, b.id) != null or d.wasTaken(b.id)) continue;
+            d.take(b.id);
             const size = pngSize(b.png);
             _ = d.feed.add(gpa, .image, b.id, size[0], size[1], d.visible()) catch continue;
             changed = true;
@@ -94,22 +112,39 @@ pub const DataView = struct {
         d.store.generation +%= 1;
     }
 
-    /// F2.
+    /// F2 / the header's Hide and Show.
     pub fn toggle(d: *DataView) void {
         d.shown = !d.shown;
         if (d.visible()) d.feed.seen();
     }
 
-    /// The window width decided whether the column fits.
-    pub fn setFits(d: *DataView, fits: bool) void {
-        d.fits = fits;
-        if (d.visible()) d.feed.seen();
+    /// The header's Clear: the slice shrinks back to its strip.
+    pub fn clear(d: *DataView, gpa: std.mem.Allocator) void {
+        d.feed.clear(gpa);
+        d.rebuildStore(gpa);
     }
 
-    /// The column for TermView (null while hidden). Slices point into `d`.
-    pub fn column(d: *DataView) ?TermView.DataColumn {
-        if (!d.shown) return null;
+    /// The slice for TermView. Slices point into `d`. `toggle_id` and
+    /// `clear_id`: the header buttons' ids for InputSink.button.
+    pub fn slice(d: *DataView, toggle_id: u32, clear_id: u32) TermView.DataSlice {
         const all = d.feed.items.items;
+        var out: TermView.DataSlice = .{
+            .collapsed = !d.shown,
+            .toggle = .{ .label = if (d.shown) "Hide (F2)" else "Show (F2)", .id = toggle_id },
+            .clear = if (all.len > 0) .{ .label = "Clear", .id = clear_id } else null,
+            .images = &d.store,
+        };
+        if (all.len == 0) {
+            out.summary = "\u{00B7} nothing yet";
+            return out;
+        }
+        if (!d.shown and d.feed.unseen > 0) {
+            out.summary = std.fmt.bufPrint(&d.summary_buf, "\u{00B7} {d} new", .{d.feed.unseen}) catch "";
+            out.summary_tone = .warn;
+        } else {
+            out.summary = std.fmt.bufPrint(&d.summary_buf, "\u{00B7} {d} image{s}", .{ all.len, if (all.len == 1) "" else "s" }) catch "";
+        }
+        if (!d.shown) return out;
         var n: usize = 0;
         var i = all.len;
         while (i > 0 and n < d.items.len) {
@@ -122,14 +157,10 @@ pub const DataView = struct {
             d.items[n] = .{ .caption = cap, .image = if (it.data != null) it.seq | store_tag else null, .w = it.w, .h = it.h };
             n += 1;
         }
-        return .{ .hint = "F2 hides", .items = d.items[0..n], .images = &d.store };
+        out.items = d.items[0..n];
+        return out;
     }
 
-    /// Status-line note while hidden with new items ("" otherwise).
-    pub fn badge(d: *DataView) []const u8 {
-        if (d.visible() or d.feed.unseen == 0) return "";
-        return std.fmt.bufPrint(&d.hint_buf, "{d} new in Data{s}", .{ d.feed.unseen, if (d.shown) " (window too narrow)" else " (F2)" }) catch "";
-    }
 };
 
 // ------------------------------------------------------------------ tests
@@ -154,6 +185,11 @@ test "blobs from the terminal become items, newest first, tagged in the store" {
     defer grid.deinit(gpa);
     var b1: [33]u8 = undefined;
     var b2: [33]u8 = undefined;
+    // Empty: the header strip says so.
+    var sl = d.slice(1, 2);
+    try testing.expectEqual(@as(usize, 0), sl.items.len);
+    try testing.expectEqualStrings("\u{00B7} nothing yet", sl.summary);
+    try testing.expect(sl.clear == null);
     try grid.putBlob(gpa, 5, testPng(64, 32, &b1));
     try testing.expect(d.sync(gpa, &grid));
     try testing.expect(!d.sync(gpa, &grid)); // nothing new
@@ -162,33 +198,55 @@ test "blobs from the terminal become items, newest first, tagged in the store" {
     // The terminal dropping a blob (cache rule) does not remove the item.
     try grid.setPlacements(gpa, &.{});
     _ = d.sync(gpa, &grid);
-    const col = d.column().?;
-    try testing.expectEqual(@as(usize, 2), col.items.len);
-    try testing.expectEqualStrings("image 10\u{00D7}20", col.items[0].caption);
-    try testing.expectEqualStrings("image 64\u{00D7}32", col.items[1].caption);
-    const id = col.items[0].image.?;
+    sl = d.slice(1, 2);
+    try testing.expectEqual(@as(usize, 2), sl.items.len);
+    try testing.expectEqualStrings("\u{00B7} 2 images", sl.summary);
+    try testing.expectEqualStrings("image 10\u{00D7}20", sl.items[0].caption);
+    try testing.expectEqualStrings("image 64\u{00D7}32", sl.items[1].caption);
+    try testing.expectEqual(@as(u32, 2), sl.clear.?.id);
+    const id = sl.items[0].image.?;
     try testing.expect(id & store_tag != 0);
-    try testing.expect(col.images.?.blob(id) != null);
-    try testing.expect(col.images.?.blob(9) == null); // never the terminal's id
+    try testing.expect(sl.images.?.blob(id) != null);
+    try testing.expect(sl.images.?.blob(9) == null); // never the terminal's id
+    // Clear: back to the strip, and the same blobs do not come back.
+    d.clear(gpa);
+    grid.generation +%= 1;
+    _ = d.sync(gpa, &grid);
+    sl = d.slice(1, 2);
+    try testing.expectEqual(@as(usize, 0), sl.items.len);
+    try testing.expect(sl.images.?.blob(id) == null);
 }
 
-test "hidden: badge counts new items; F2 shows and clears it" {
+test "collapsed: the strip counts new items; F2 shows and clears the count" {
     const gpa = testing.allocator;
     var d: DataView = .{};
     defer d.deinit(gpa);
     var grid: Images = .{};
     defer grid.deinit(gpa);
     d.toggle(); // hide
-    try testing.expect(d.column() == null);
     var b: [33]u8 = undefined;
     try grid.putBlob(gpa, 1, testPng(2, 2, &b));
     _ = d.sync(gpa, &grid);
-    try testing.expectEqualStrings("1 new in Data (F2)", d.badge());
+    var sl = d.slice(1, 2);
+    try testing.expect(sl.collapsed);
+    try testing.expectEqual(@as(usize, 0), sl.items.len);
+    try testing.expectEqualStrings("\u{00B7} 1 new", sl.summary);
+    try testing.expectEqualStrings("Show (F2)", sl.toggle.?.label);
     d.toggle();
-    try testing.expectEqualStrings("", d.badge());
-    d.setFits(false);
-    try grid.putBlob(gpa, 2, testPng(2, 2, &b));
-    _ = d.sync(gpa, &grid);
-    try testing.expectEqualStrings("1 new in Data (window too narrow)", d.badge());
+    sl = d.slice(1, 2);
+    try testing.expect(!sl.collapsed);
+    try testing.expectEqualStrings("\u{00B7} 1 image", sl.summary);
     try testing.expectEqual([2]u32{ 0, 0 }, pngSize("not a png at all, really not one"));
+}
+
+test "TermView's Data slice height is datafeed's rule" {
+    try testing.expectEqual(@as(f32, @floatCast(datafeed.max_share)), TermView.data_max_share);
+    const cases = [_][4]f32{
+        .{ 600, 28, 0, 0 },  .{ 600, 28, 90, 0 },   .{ 600, 28, 2000, 0 }, .{ 600, 28, 2000, 1 },
+        .{ 40, 28, 500, 0 }, .{ 10, 28, 500, 0 },   .{ 0, 0, 0, 0 },       .{ 1234, 33, 321, 0 },
+    };
+    for (cases) |c| try testing.expectEqual(
+        @as(f32, @floatCast(datafeed.sliceHeight(c[0], c[1], c[2], c[3] != 0))),
+        TermView.dataHeight(c[0], c[1], c[2], c[3] != 0),
+    );
 }

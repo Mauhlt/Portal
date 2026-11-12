@@ -15,16 +15,12 @@
 <!-- Measures env(safe-area-inset-top) as its height and -bottom as its width. -->
 <div id="safe" aria-hidden="true"></div>
 <!-- Slices (src/wasm/slices.zig places them; the wasm client decides
-     everything): the terminal under its header, the data slice, and the
-     interaction slice (a native textarea, so keyboard dictation and Win+H
-     fill it, plus the button row). Narrow screens show Terminal or Data
-     via the segmented control; wide ones put Data in a right column. -->
+     everything), top to bottom as on every device: the terminal under its
+     header, the Data slice (a header strip that grows when the session
+     shows something), and the interaction slice (a native textarea, so
+     keyboard dictation and Win+H fill it, plus the big buttons). -->
 <header id="head">
   <div class="ctl">
-    <div class="tabs" role="tablist" aria-label="View">
-      <button type="button" role="tab" data-tab="0">Terminal</button>
-      <button type="button" role="tab" data-tab="1">Data<span class="dot" aria-label="new data"></span></button>
-    </div>
     <span class="spacer"></span>
     <button type="button" class="zoom" data-cmd="1" title="Fit terminal to window">Fit</button>
     <button type="button" class="zoom" data-cmd="2" title="Smaller text">A−</button>
@@ -35,10 +31,12 @@
 </header>
 <main id="wrap" aria-label="Terminal"><canvas id="screen" aria-label="Terminal"></canvas></main>
 <section id="dslice" aria-label="Data">
-  <div class="dhead">Data</div>
+  <div class="dhead"><b>Data</b><span id="dsum" class="dsum"></span><span class="spacer"></span>
+    <button type="button" class="dclear" data-cmd="5">Clear</button>
+    <button type="button" class="dtoggle" data-cmd="4"><span class="dhide">Hide</span><span class="dshow">Show</span></button>
+  </div>
   <div id="dwrap"><canvas id="data" aria-label="Data the session sent"></canvas></div>
 </section>
-<div id="split" role="separator" aria-orientation="vertical" title="Drag to resize"></div>
 <section id="inter" aria-label="Input">
   <div id="input">
     <textarea id="box" rows="2" enterkeyhint="send" autocomplete="off" autocapitalize="sentences"
