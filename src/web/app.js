@@ -38,7 +38,8 @@
     request_frame: () => requestAnimationFrame(() => X.frame()),
     set_timer: (ms) => setTimeout(() => X.on_timer(), ms),
     check_session: () => fetch('/', { credentials: 'same-origin', cache: 'no-store' }).then(
-      (r) => X.on_check(r.status, put(enc.encode(new URL(r.url).pathname))), () => X.on_check(0, 0)),
+      (r) => X.on_check(r.status, put(enc.encode(new URL(r.url).pathname)), 0),
+      () => X.on_check(0, 0, navigator.onLine === false ? 1 : 0)),
     navigate_pair: () => location.assign('/pair'),
     set_text: (slot, p, n, cls) => { // TextSlot order in main.zig
       const el = $(['status', 'mode', 'note', 'project', 'state', 'dsum'][slot]);

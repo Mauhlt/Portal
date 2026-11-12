@@ -1487,8 +1487,11 @@ const shutdown_timeout_ms = 10_000;
 /// After ending a program that did not exit in time (the job), how long
 /// to wait for it to be gone.
 const terminate_timeout_ms = 5_000;
-/// How long viewers get to receive the exit notice and disconnect.
-const viewer_goodbye_ms = 2_000;
+/// How long viewers get to receive the exit notice and close their end
+/// (web.goodbye_ms each, concurrently), plus the TLS close and socket
+/// close after it. Shutdown returns as soon as the last viewer socket is
+/// closed; this only bounds a viewer that never answers.
+const viewer_goodbye_ms = web.goodbye_ms + 1_500;
 
 /// Set by each shutdown step as it finishes (output drained, pseudo console
 /// closed, child exited), so the main thread sleeps until one finishes or

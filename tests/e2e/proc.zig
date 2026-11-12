@@ -473,6 +473,15 @@ pub const Instance = struct {
         return w.WaitForSingleObject(p, 0) == w.WAIT_TIMEOUT;
     }
 
+    /// The process's exit code once it has exited within `ms`, else null.
+    pub fn waitExit(inst: *const Instance, ms: u32) ?u32 {
+        const p = inst.process orelse return null;
+        if (w.WaitForSingleObject(p, ms) != w.WAIT_OBJECT_0) return null;
+        var code: w.DWORD = 0;
+        if (w.GetExitCodeProcess(p, &code) == 0) return null;
+        return code;
+    }
+
     pub fn kill(inst: *Instance) void {
         const p = inst.process orelse return;
         _ = w.TerminateProcess(p, 1);

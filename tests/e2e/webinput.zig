@@ -11,7 +11,7 @@ const client = @import("client.zig");
 const Runner = @import("runner.zig").Runner;
 const inputbox = @import("inputrules");
 /// The native client's instruction line (client/src/inputline.zig).
-const inputline = @import("inputline");
+const inputline = @import("client").inputline;
 
 /// The native line's sender: frames go out on the test socket.
 const LineSender = struct {

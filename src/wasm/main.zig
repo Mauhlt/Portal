@@ -146,7 +146,21 @@ fn showStatus() void {
     var buf: [64]u8 = undefined;
     const st = app.conn.statusText(&buf);
     setText(.status, st.text, st.kind);
+    // The full sentence (session ended / desktop offline / network error)
+    // goes in the note under the box; put the preview back once it no
+    // longer applies.
+    var nbuf: [160]u8 = undefined;
+    if (app.conn.noteText(&nbuf)) |t| {
+        note(t, .bad);
+        conn_note = true;
+    } else if (conn_note) {
+        conn_note = false;
+        showPreview();
+    }
 }
+
+/// The note under the box currently shows Conn.noteText.
+var conn_note = false;
 
 fn showState(s: proto.SessionState) void {
     switch (s) {
@@ -302,7 +316,10 @@ fn writeBox(text: []const u8) void {
 
 /// Shows what Send would do with the box's current text.
 fn showPreview() void {
-    var buf: [128]u8 = undefined;
+    var buf: [160]u8 = undefined;
+    // While the session is ended or the desktop unreachable, that is
+    // what the note says (Send is refused anyway).
+    if (app.conn.noteText(&buf)) |t| return note(t, .bad);
     const n = inputbox.preview(app.policy, readBox(), app.touch, &buf);
     note(n.text, n.tone);
 }
@@ -330,7 +347,7 @@ fn sendBox() void {
     switch (d) {
         .nothing => return,
         .refuse => |r| return note(inputbox.refusalText(r), .bad),
-        else => if (app.conn.state != .live) return note(inputbox.refusalText(.offline), .bad),
+        else => if (!app.conn.canSend()) return note(inputbox.refusalText(.offline), .bad),
     }
     switch (d) {
         .nothing, .refuse => unreachable,
@@ -390,7 +407,7 @@ fn perform(e: conn_mod.Effect) void {
 }
 
 fn send(action: keys.Action) void {
-    if (app.policy == .none or app.conn.state != .live) return;
+    if (app.policy == .none or !app.conn.canSend()) return;
     var buf: [64]u8 = undefined;
     const f = keys.frame(&buf, action) orelse return;
     host.ws_send(f.ptr, f.len);
@@ -567,10 +584,10 @@ export fn on_timer() void {
 
 /// Result of check_session: final HTTP status (0 = network error) and the
 /// final URL's path (in the input buffer).
-export fn on_check(status: u32, len: usize) void {
+export fn on_check(status: u32, len: usize, device_offline: u32) void {
     if (!ready) return;
     const path = input(len) orelse "";
-    perform(app.conn.onCheck(.{ .status = status, .path = path }));
+    perform(app.conn.onCheck(.{ .status = status, .path = path, .device_offline = device_offline != 0 }));
 }
 
 /// keydown outside the input box: `KeyboardEvent.key` in the input
@@ -611,7 +628,7 @@ export fn on_button(id: u32) void {
         .send => sendBox(),
         else => {
             if (app.policy == .none) return;
-            if (app.conn.state != .live) return note(inputbox.refusalText(.offline), .bad);
+            if (!app.conn.canSend()) return note(inputbox.refusalText(.offline), .bad);
             const k = inputbox.buttonKey(b).?;
             sendFrame("k:", k);
             pressed(k);

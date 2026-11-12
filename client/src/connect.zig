@@ -42,6 +42,7 @@ pub const net_client = client_mod;
 pub const net_http = http;
 pub const net_ws = @import("shared").ws;
 pub const tlsconn = @import("net/tlsconn.zig");
+pub const inputline = @import("inputline.zig");
 pub const watchdog = @import("net/watchdog.zig");
 pub const credstore_mod = credstore;
 pub const pin = pin_mod;
@@ -148,6 +149,7 @@ const Host = struct {
             .code = s.pair_code,
             .err = s.last_error,
             .pin_fp = h.pin_fp_buf[0..h.pin_fp_len],
+            .exit_code = s.exit_code,
         }, &h.bufs);
         var oo = o;
         h.sync.mutex.lockUncancelable(h.client.io);

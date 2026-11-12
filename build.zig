@@ -244,20 +244,13 @@ fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
             // The images group writes its test PNG with imgcheck's fixtures;
             // the webinput group decides what to send with the clients'
             // own input-line logic, and drives the native client's
-            // instruction line (client/src/inputline.zig).
+            // instruction line (client/src/inputline.zig, through "client");
+            // the ended group runs the native client's own stream code.
             .imports = &.{
+                .{ .name = "client", .module = gui.client },
                 .{ .name = "imgcheck", .module = gui.imgcheck },
                 .{ .name = "inputrules", .module = gui.inputrules },
                 .{ .name = "shared", .module = sharedModule(b, target, optimize) },
-                .{ .name = "inputline", .module = b.createModule(.{
-                    .root_source_file = b.path("client/src/inputline.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .imports = &.{
-                        .{ .name = "view", .module = gui.view },
-                        .{ .name = "inputrules", .module = gui.inputrules },
-                    },
-                }) },
             },
         }),
     });
