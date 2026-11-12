@@ -36,7 +36,7 @@ pub const sync = @import("sync/root.zig");
 // For portalctl's headless sync-device (src/sync_cli.zig).
 pub const net_client = client_mod;
 pub const net_http = http;
-pub const net_ws = @import("net/ws.zig");
+pub const net_ws = @import("shared").ws;
 pub const tlsconn = @import("net/tlsconn.zig");
 pub const watchdog = @import("net/watchdog.zig");
 pub const credstore_mod = credstore;

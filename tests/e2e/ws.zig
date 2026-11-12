@@ -1,22 +1,16 @@
-//! WebSocket (RFC 6455) client: masked client frames, strict parsing of
-//! server frames (FIN set, no RSV bits, unmasked, known opcode, control
-//! frames at most 125 bytes).
+//! WebSocket (RFC 6455) test client. Server frames are parsed with the
+//! shared, strict parser (shared/ws.zig) every Portal program uses; client
+//! frames are encoded here, so tests can also send malformed ones (no FIN,
+//! RSV bits, unmasked, lying lengths) at the server.
 
 const std = @import("std");
+const shared_ws = @import("shared").ws;
 const net = @import("net.zig");
 const http = @import("http.zig");
 const tlsnet = @import("tlsnet.zig");
 const Allocator = std.mem.Allocator;
 
-pub const Op = enum(u4) {
-    continuation = 0,
-    text = 1,
-    binary = 2,
-    close = 8,
-    ping = 9,
-    pong = 10,
-    _,
-};
+pub const Op = shared_ws.Opcode;
 
 pub const Frame = struct {
     op: Op,
@@ -95,14 +89,8 @@ pub const Client = struct {
         if (c.status == 101) {
             const head = c.buf.items[0..head_end];
             // Verify Sec-WebSocket-Accept.
-            var expect_buf: [28]u8 = undefined;
-            var sha = std.crypto.hash.Sha1.init(.{});
-            sha.update(key);
-            sha.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-            var digest: [20]u8 = undefined;
-            sha.final(&digest);
-            const expect = std.base64.standard.Encoder.encode(&expect_buf, &digest);
-            if (std.mem.indexOf(u8, head, expect) == null) return error.BadAccept;
+            const expect = shared_ws.accept(key) catch return error.BadAccept;
+            if (std.mem.indexOf(u8, head, &expect) == null) return error.BadAccept;
         }
         c.pos = head_end;
         return c;
@@ -185,33 +173,10 @@ pub const Client = struct {
     }
 
     fn parseOne(c: *Client) !?Frame {
-        const b = c.buf.items[c.pos..];
-        if (b.len < 2) return null;
-        if (b[0] & 0x80 == 0) return error.BadFrame; // server never fragments
-        if (b[0] & 0x70 != 0) return error.BadFrame;
-        const op: Op = @fromBackingInt(@intCast(@as(u4, @truncate(b[0]))));
-        switch (op) {
-            .text, .binary, .close, .ping, .pong => {},
-            else => return error.BadFrame,
-        }
-        if (b[1] & 0x80 != 0) return error.BadFrame; // server frames are unmasked
-        var len: u64 = b[1] & 0x7f;
-        var off: usize = 2;
-        if (len == 126) {
-            if (b.len < 4) return null;
-            len = std.mem.readInt(u16, b[2..4], .big);
-            off = 4;
-        } else if (len == 127) {
-            if (b.len < 10) return null;
-            len = std.mem.readInt(u64, b[2..10], .big);
-            off = 10;
-        }
-        if (len > 16 * 1024 * 1024) return error.BadFrame;
-        if (@backingInt(op) >= 8 and len > 125) return error.BadFrame;
-        const total = off + @as(usize, @intCast(len));
-        if (b.len < total) return null;
-        c.pos += total;
-        return .{ .op = op, .payload = b[off..total] };
+        const f = (shared_ws.parseServerFrame(c.buf.items[c.pos..], 16 * 1024 * 1024) catch
+            return error.BadFrame) orelse return null;
+        c.pos += f.len;
+        return .{ .op = f.opcode, .payload = f.payload };
     }
 
     /// Reads and discards everything until the peer closes; returns whether

@@ -29,7 +29,7 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 const http = @import("http.zig");
-const ws = @import("ws.zig");
+const ws = @import("shared").ws;
 const tlsconn = @import("tlsconn.zig");
 const x509check = @import("x509check.zig");
 const watchdog = @import("watchdog.zig");
@@ -610,7 +610,7 @@ pub const Client = struct {
         const resp = http.parseResponseHead(buf.items[0..head_end]) catch return .{ .failed = "bad upgrade response" };
         if (resp.status == 401) return .unauthorized;
         if (resp.status != 101) return .{ .failed = "upgrade refused" };
-        const expected = ws.expectedAccept(&key);
+        const expected = ws.accept(&key) catch return .{ .failed = "bad websocket key" };
         if (!resp.upgrade_websocket or !resp.connection_upgrade or resp.accept == null or
             !std.mem.eql(u8, resp.accept.?, &expected)) return .{ .failed = "bad websocket handshake" };
         // Drop the head; keep any frame bytes that followed it.

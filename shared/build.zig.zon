@@ -8,5 +8,5 @@
     .minimum_zig_version = "0.18.0-dev.4+5a23bf4b2",
     .fingerprint = 0xd25ebfa7ac0ea9e,
     .dependencies = .{},
-    .paths = .{ "build.zig", "build.zig.zon", "root.zig", "screen.zig" },
+    .paths = .{ "build.zig", "build.zig.zon", "root.zig", "screen.zig", "ws.zig" },
 }
