@@ -614,6 +614,21 @@ fn writeFlushed(path_w: [:0]const u16, data: []const u8) !void {
     if (FlushFileBuffers(h) == 0) return error.DeviceStoreWriteFailed;
 }
 
+/// The pause between attempts to open a busy lock file. A cancelation that
+/// lands here is re-armed before it is returned: callers in the web server
+/// turn store errors into HTTP responses, so without re-arming the request
+/// would be consumed and the connection's next read would block forever,
+/// with the supervisor stuck waiting in `worker.cancel` (a pre-auth DoS that
+/// leaks the connection slot).
+pub fn lockRetrySleep(io: Io) error{Canceled}!void {
+    io.sleep(.fromMilliseconds(10), .awake) catch |err| switch (err) {
+        error.Canceled => {
+            io.recancel();
+            return error.Canceled;
+        },
+    };
+}
+
 /// Locked read-modify-write of the device store. `op(ctx, *Store)` returns
 /// whether it changed the store; if so the file is replaced atomically
 /// (written, flushed to disk, then renamed over the old one).
@@ -628,7 +643,7 @@ pub fn withStore(gpa: Allocator, io: Io, paths: Paths, now: i64, ctx: anytype, c
     while (tries < 200) : (tries += 1) {
         lock = w.validHandle(w.CreateFileW(lock_w.ptr, w.GENERIC_WRITE, 0, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null));
         if (lock != null) break;
-        io.sleep(.fromMilliseconds(10), .awake) catch {};
+        try lockRetrySleep(io);
     }
     const lock_h = lock orelse return error.DeviceStoreBusy;
     defer _ = w.CloseHandle(lock_h);
@@ -1151,6 +1166,45 @@ test "Desk: begin, see a request, approve, collect, cancel (on a real store file
     try testing.expect((try desk.get(43)) == null);
     // The tmp file was flushed and renamed; nothing is left behind.
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, "devices.txt.tmp", .{}));
+}
+
+test "withStore: a cancel during the busy-lock retry is returned and stays armed" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&pbuf, ".zig-cache\\tmp\\{s}", .{&tmp.sub_path});
+    const paths: Paths = .{ .dir = dir };
+
+    // Hold the lock so withStore keeps retrying.
+    var lbuf: [1024]u8 = undefined;
+    const lock_w = try wide(testing.allocator, try paths.join(&lbuf, "devices.lock"));
+    defer testing.allocator.free(lock_w);
+    const held = w.validHandle(w.CreateFileW(lock_w.ptr, w.GENERIC_WRITE, 0, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null)) orelse return error.SkipZigTest;
+    defer _ = w.CloseHandle(held);
+
+    const Task = struct {
+        /// Like the web handlers: the store error is turned into something
+        /// else (a 500), then the task carries on to its next blocking call.
+        fn run(t_io: Io, p: Paths, started: *Io.Event) struct { store: anyerror!void, next: Io.Cancelable!void } {
+            started.set(t_io);
+            const r = withStore(testing.allocator, t_io, p, 0, {}, struct {
+                fn op(_: void, _: *Store) !bool {
+                    return false;
+                }
+            }.op);
+            // The next cancelation point must still see the cancel.
+            const next = t_io.sleep(.fromSeconds(30), .awake);
+            return .{ .store = r, .next = next };
+        }
+    };
+    var started: Io.Event = .unset;
+    var fut = io.concurrent(Task.run, .{ io, paths, &started }) catch return error.SkipZigTest;
+    try started.wait(io);
+    try io.sleep(.fromMilliseconds(30), .awake); // let it reach the retry loop
+    const res = fut.cancel(io);
+    try testing.expectError(error.Canceled, res.store);
+    try testing.expectError(error.Canceled, res.next);
 }
 
 test "error messages tell the owner how to recover" {

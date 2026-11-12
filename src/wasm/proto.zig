@@ -117,7 +117,7 @@ pub const placement_entry_len = 14;
 /// decode modest. Bigger images draw as a placeholder box.
 pub const decode_budget: usize = 96 << 20;
 pub const decode_max_side: u32 = 1024;
-/// The owner's pinned Image decoder (Image@d9da247) does not compile for
+/// The owner's pinned Image decoder (Image@065e8ec) does not compile for
 /// 32-bit targets: src/inflate/inflate.zig indexes its tables with a u64
 /// bit buffer (`d.pre[b.buf & mask(pre_bits)]`, lines 184, 403, 473),
 /// which is a compile error where usize is 32 bits, i.e. wasm32. Until that

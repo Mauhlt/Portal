@@ -345,6 +345,10 @@ const Conn = struct {
     /// Times the supervisor woke up (for the wakeup measurement in the log).
     sup_wakes: std.atomic.Value(u32) = .init(0),
     done: std.atomic.Value(bool) = .init(false),
+    /// Set by the supervisor before it cancels the worker. A cancelation is
+    /// delivered once; if some code path swallows it, `readSome` still
+    /// refuses to block again, so the worker ends and `worker.cancel` returns.
+    stop: std.atomic.Value(bool) = .init(false),
     /// Set (release) once `ws_cookie` is filled in, for revocation checks.
     ws_active: std.atomic.Value(bool) = .init(false),
     ws_cookie: [auth.encoded_len]u8 = undefined,
@@ -865,6 +869,9 @@ pub const Server = struct {
         }
         // Interrupts any blocked recv/send in the worker (error.Canceled),
         // then waits for it to finish. A no-op wait if it already finished.
+        // `stop` first: should the worker swallow the one cancelation, its
+        // next read fails instead of blocking with nobody left to cancel it.
+        conn.stop.store(true, .seq_cst);
         worker.cancel(io);
         if (reason) |r| {
             if (conn.ws_active.load(.acquire)) srv.log.print("websocket from {s} cancelled: {s}", .{ conn.peer(), r });
@@ -960,6 +967,7 @@ pub const Server = struct {
 
     fn readSome(conn: *Conn, io: Io, dest: []u8) !usize {
         if (dest.len == 0) return error.NoBufferSpace;
+        if (conn.stop.load(.seq_cst)) return error.Canceled;
         if (conn.tls) |t| return t.readSome(dest);
         var iov = [_][]u8{dest};
         const r = try conn.stream.readWithControl(io, &iov, &.{});

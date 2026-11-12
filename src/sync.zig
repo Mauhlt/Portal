@@ -86,7 +86,7 @@ const Lock = struct {
         var tries: usize = 0;
         while (tries < 500) : (tries += 1) {
             if (w.validHandle(w.CreateFileW(lw.ptr, w.GENERIC_WRITE, 0, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null))) |h| return .{ .h = h };
-            io.sleep(.fromMilliseconds(10), .awake) catch {};
+            try devices.lockRetrySleep(io);
         }
         return error.SyncStoreBusy;
     }

@@ -1,7 +1,7 @@
 # Image decoder findings (for the owner)
 
 Portal decodes inline images with your Image package, pinned to
-**Image@d9da247** (`../Image-wt-portal`, a detached worktree, used
+**Image@065e8ec** (`../Image-wt-portal`, a detached worktree, used
 read-only). Nothing in Image was changed. Portal wraps the decoder in
 `client/src/image/imgdec.zig`:
 

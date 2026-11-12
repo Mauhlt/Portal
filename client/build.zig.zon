@@ -8,7 +8,7 @@
         // main Renderer checkout, change this to "../../Renderer".
         .Renderer = .{ .path = "../../Renderer-wt-portal" },
         // The owner's Image package (PNG decoder), PINNED by the owner's
-        // request to Image@c64d400 (a detached worktree, used read-only).
+        // request to Image@065e8ec (a detached worktree, used read-only).
         .Image = .{ .path = "../../Image-wt-portal" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "tools", "README.md" },
