@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Portal sign in</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="login">
+<main>
+  <h1>Portal</h1>
+  <p class="sub">Desktop session viewer</p>
+  <!--MESSAGE-->
+  <form method="post" action="/login" autocomplete="off">
+    <label for="token">Access token</label>
+    <input id="token" name="token" type="password" autocomplete="current-password" required autofocus spellcheck="false">
+    <button type="submit">Sign in</button>
+  </form>
+  <p class="hint">Generate a token on the desktop with <code>portal token</code>.</p>
+</main>
+</body>
+</html>

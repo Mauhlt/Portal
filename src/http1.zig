@@ -1,0 +1,422 @@
+//! Minimal, strict HTTP/1.1 + WebSocket (RFC 6455) protocol code.
+//!
+//! Replaces std.http.Server, which had two remotely reachable panics
+//! (an assert on body-less POSTs during keep-alive, and a null unwrap in
+//! HeaderIterator on a head split across reads) and whose API churns between
+//! Zig releases. Everything here is pure: it operates on byte slices, never
+//! asserts on peer input, and rejects anything unusual instead of guessing.
+
+const std = @import("std");
+
+pub const max_head_bytes = 8 * 1024;
+pub const max_headers = 64;
+pub const max_target_bytes = 2048;
+
+pub const Method = enum { GET, POST, other };
+
+pub const ParseError = error{
+    BadRequestLine,
+    UnsupportedVersion,
+    BadTarget,
+    BadHeader,
+    TooManyHeaders,
+    DuplicateHeader,
+    BadContentLength,
+};
+
+pub const Request = struct {
+    method: Method,
+    path: []const u8,
+    query: []const u8,
+    host: ?[]const u8 = null,
+    origin: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
+    content_length: ?u64 = null,
+    /// Any Transfer-Encoding header at all. Portal never accepts one.
+    has_transfer_encoding: bool = false,
+    has_expect: bool = false,
+    connection_close: bool = false,
+    connection_upgrade: bool = false,
+    upgrade_websocket: bool = false,
+    ws_key: ?[]const u8 = null,
+    ws_version: ?[]const u8 = null,
+    /// Raw header lines, for cookie lookup (there may be several Cookie headers).
+    headers: [max_headers]Header = undefined,
+    header_count: usize = 0,
+
+    pub fn cookieHeaders(r: *const Request) CookieIterator {
+        return .{ .req = r };
+    }
+};
+
+pub const Header = struct { name: []const u8, value: []const u8 };
+
+pub const CookieIterator = struct {
+    req: *const Request,
+    i: usize = 0,
+    pub fn next(it: *CookieIterator) ?[]const u8 {
+        while (it.i < it.req.header_count) {
+            const h = it.req.headers[it.i];
+            it.i += 1;
+            if (std.ascii.eqlIgnoreCase(h.name, "cookie")) return h.value;
+        }
+        return null;
+    }
+};
+
+/// Returns the length of the head including the terminating CRLFCRLF, or
+/// null if not yet complete.
+pub fn findHeadEnd(buf: []const u8) ?usize {
+    const i = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
+    return i + 4;
+}
+
+fn isTokenChar(c: u8) bool {
+    return switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
+}
+
+fn validValue(v: []const u8) bool {
+    for (v) |c| {
+        if (c == '\t') continue;
+        if (c < 0x20 or c == 0x7f) return false;
+    }
+    return true;
+}
+
+fn listContainsToken(value: []const u8, token: []const u8) bool {
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |part| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, part, " \t"), token)) return true;
+    }
+    return false;
+}
+
+/// Parses a complete head (as delimited by `findHeadEnd`). Returned slices
+/// point into `head`.
+pub fn parseHead(head: []const u8) ParseError!Request {
+    if (head.len < 4 or !std.mem.endsWith(u8, head, "\r\n\r\n")) return error.BadRequestLine;
+    const body = head[0 .. head.len - 4]; // without final blank line
+    var lines = std.mem.splitSequence(u8, body, "\r\n");
+
+    // Request line: METHOD SP TARGET SP HTTP/1.1
+    const line = lines.first();
+    var parts = std.mem.splitScalar(u8, line, ' ');
+    const m = parts.next() orelse return error.BadRequestLine;
+    const target = parts.next() orelse return error.BadRequestLine;
+    const version = parts.next() orelse return error.BadRequestLine;
+    if (parts.next() != null) return error.BadRequestLine;
+    if (m.len == 0) return error.BadRequestLine;
+    for (m) |c| if (!isTokenChar(c)) return error.BadRequestLine;
+    if (!std.mem.eql(u8, version, "HTTP/1.1")) return error.UnsupportedVersion;
+    if (target.len == 0 or target.len > max_target_bytes or target[0] != '/') return error.BadTarget;
+    for (target) |c| if (c <= 0x20 or c >= 0x7f) return error.BadTarget;
+
+    const q = std.mem.indexOfScalar(u8, target, '?');
+    var req: Request = .{
+        .method = if (std.mem.eql(u8, m, "GET")) .GET else if (std.mem.eql(u8, m, "POST")) .POST else .other,
+        .path = if (q) |i| target[0..i] else target,
+        .query = if (q) |i| target[i + 1 ..] else "",
+    };
+
+    while (lines.next()) |hl| {
+        if (hl.len == 0) return error.BadHeader; // blank line before end: cannot happen with a valid head
+        if (hl[0] == ' ' or hl[0] == '\t') return error.BadHeader; // obsolete line folding
+        if (std.mem.indexOfAny(u8, hl, "\r\n") != null) return error.BadHeader; // bare CR / LF
+        const colon = std.mem.indexOfScalar(u8, hl, ':') orelse return error.BadHeader;
+        const name = hl[0..colon];
+        if (name.len == 0) return error.BadHeader;
+        for (name) |c| if (!isTokenChar(c)) return error.BadHeader;
+        const value = std.mem.trim(u8, hl[colon + 1 ..], " \t");
+        if (!validValue(value)) return error.BadHeader;
+        if (req.header_count >= max_headers) return error.TooManyHeaders;
+        req.headers[req.header_count] = .{ .name = name, .value = value };
+        req.header_count += 1;
+
+        if (std.ascii.eqlIgnoreCase(name, "host")) {
+            if (req.host != null) return error.DuplicateHeader;
+            req.host = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "origin")) {
+            if (req.origin != null) return error.DuplicateHeader;
+            req.origin = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "content-type")) {
+            if (req.content_type != null) return error.DuplicateHeader;
+            req.content_type = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            if (req.content_length != null) return error.DuplicateHeader;
+            if (value.len == 0 or value.len > 10) return error.BadContentLength;
+            for (value) |c| if (c < '0' or c > '9') return error.BadContentLength;
+            req.content_length = std.fmt.parseInt(u64, value, 10) catch return error.BadContentLength;
+        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            req.has_transfer_encoding = true;
+        } else if (std.ascii.eqlIgnoreCase(name, "expect")) {
+            req.has_expect = true;
+        } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
+            if (listContainsToken(value, "close")) req.connection_close = true;
+            if (listContainsToken(value, "upgrade")) req.connection_upgrade = true;
+        } else if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
+            if (listContainsToken(value, "websocket")) req.upgrade_websocket = true;
+        } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-key")) {
+            if (req.ws_key != null) return error.DuplicateHeader;
+            req.ws_key = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-version")) {
+            if (req.ws_version != null) return error.DuplicateHeader;
+            req.ws_version = value;
+        }
+    }
+    return req;
+}
+
+// ------------------------------------------------------------- responses
+
+pub const Status = enum(u16) {
+    ok = 200,
+    switching_protocols = 101,
+    see_other = 303,
+    bad_request = 400,
+    unauthorized = 401,
+    forbidden = 403,
+    not_found = 404,
+    method_not_allowed = 405,
+    length_required = 411,
+    payload_too_large = 413,
+    unsupported_media_type = 415,
+    misdirected_request = 421,
+    header_fields_too_large = 431,
+    internal_server_error = 500,
+
+    pub fn phrase(s: Status) []const u8 {
+        return switch (s) {
+            .ok => "OK",
+            .switching_protocols => "Switching Protocols",
+            .see_other => "See Other",
+            .bad_request => "Bad Request",
+            .unauthorized => "Unauthorized",
+            .forbidden => "Forbidden",
+            .not_found => "Not Found",
+            .method_not_allowed => "Method Not Allowed",
+            .length_required => "Length Required",
+            .payload_too_large => "Payload Too Large",
+            .unsupported_media_type => "Unsupported Media Type",
+            .misdirected_request => "Misdirected Request",
+            .header_fields_too_large => "Request Header Fields Too Large",
+            .internal_server_error => "Internal Server Error",
+        };
+    }
+};
+
+/// Header values written by Portal are constants or base64url; this guards
+/// against a future caller accidentally passing CR/LF (response splitting).
+pub fn headerSafe(h: Header) bool {
+    if (h.name.len == 0) return false;
+    for (h.name) |c| if (!isTokenChar(c)) return false;
+    return validValue(h.value);
+}
+
+pub fn writeResponse(
+    w: *std.Io.Writer,
+    status: Status,
+    headers: []const Header,
+    body: []const u8,
+    keep_alive: bool,
+) !void {
+    try w.print("HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(status), status.phrase() });
+    for (headers) |h| {
+        if (!headerSafe(h)) return error.UnsafeHeader;
+        try w.print("{s}: {s}\r\n", .{ h.name, h.value });
+    }
+    try w.print("content-length: {d}\r\nconnection: {s}\r\n\r\n", .{ body.len, if (keep_alive) "keep-alive" else "close" });
+    try w.writeAll(body);
+    try w.flush();
+}
+
+// ------------------------------------------------------------- websocket
+
+pub const ws_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/// Computes Sec-WebSocket-Accept. The key must be the base64 of 16 bytes.
+pub fn wsAccept(key: []const u8, out: *[28]u8) ![]const u8 {
+    var decoded: [16]u8 = undefined;
+    if (key.len != 24) return error.BadKey;
+    std.base64.standard.Decoder.decode(&decoded, key) catch return error.BadKey;
+    var sha = std.crypto.hash.Sha1.init(.{});
+    sha.update(key);
+    sha.update(ws_guid);
+    var digest: [20]u8 = undefined;
+    sha.final(&digest);
+    return std.base64.standard.Encoder.encode(out, &digest);
+}
+
+pub const Opcode = enum(u4) {
+    continuation = 0,
+    text = 1,
+    binary = 2,
+    close = 8,
+    ping = 9,
+    pong = 10,
+    _,
+};
+
+pub const FrameError = error{
+    ProtocolError,
+    Unmasked,
+    Fragmented,
+    TooLarge,
+};
+
+pub const FrameHeader = struct {
+    opcode: Opcode,
+    payload_len: usize,
+    mask: [4]u8,
+    header_len: usize,
+};
+
+/// Parses a client frame header from `buf`. Returns null if more bytes are
+/// needed. Clients must mask; fragmentation and RSV bits are rejected.
+pub fn parseFrameHeader(buf: []const u8, max_payload: usize) FrameError!?FrameHeader {
+    if (buf.len < 2) return null;
+    const b0 = buf[0];
+    const b1 = buf[1];
+    if (b0 & 0x70 != 0) return error.ProtocolError; // RSV bits (no extensions negotiated)
+    const fin = b0 & 0x80 != 0;
+    const opcode: Opcode = @enumFromInt(@as(u4, @truncate(b0)));
+    switch (opcode) {
+        .text, .binary, .close, .ping, .pong => {},
+        else => return error.ProtocolError,
+    }
+    if (!fin) return error.Fragmented;
+    if (b1 & 0x80 == 0) return error.Unmasked;
+    const len7: u8 = b1 & 0x7f;
+    var len: u64 = len7;
+    var off: usize = 2;
+    if (len7 == 126) {
+        if (buf.len < 4) return null;
+        len = std.mem.readInt(u16, buf[2..4], .big);
+        off = 4;
+    } else if (len7 == 127) {
+        if (buf.len < 10) return null;
+        len = std.mem.readInt(u64, buf[2..10], .big);
+        off = 10;
+    }
+    const is_control = @intFromEnum(opcode) >= 8;
+    if (is_control and len > 125) return error.ProtocolError;
+    if (len > max_payload) return error.TooLarge;
+    if (buf.len < off + 4) return null;
+    return .{
+        .opcode = opcode,
+        .payload_len = @intCast(len),
+        .mask = buf[off..][0..4].*,
+        .header_len = off + 4,
+    };
+}
+
+pub fn unmask(payload: []u8, mask: [4]u8) void {
+    for (payload, 0..) |*b, i| b.* ^= mask[i & 3];
+}
+
+/// Writes one unmasked server frame.
+pub fn writeFrame(w: *std.Io.Writer, opcode: Opcode, payload: []const u8) !void {
+    try w.writeByte(0x80 | @as(u8, @intFromEnum(opcode)));
+    if (payload.len < 126) {
+        try w.writeByte(@intCast(payload.len));
+    } else if (payload.len <= 0xffff) {
+        try w.writeByte(126);
+        try w.writeInt(u16, @intCast(payload.len), .big);
+    } else {
+        try w.writeByte(127);
+        try w.writeInt(u64, payload.len, .big);
+    }
+    try w.writeAll(payload);
+    try w.flush();
+}
+
+// ----------------------------------------------------------------- tests
+
+const testing = std.testing;
+
+test "findHeadEnd" {
+    try testing.expectEqual(@as(?usize, null), findHeadEnd("GET / HTTP/1.1\r\nA\r\n"));
+    try testing.expectEqual(@as(?usize, 18), findHeadEnd("GET / HTTP/1.1\r\n\r\nrest"));
+}
+
+test "parse simple GET" {
+    const r = try parseHead("GET /login?e=1 HTTP/1.1\r\nHost: 10.8.0.1:8420\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n");
+    try testing.expectEqual(Method.GET, r.method);
+    try testing.expectEqualStrings("/login", r.path);
+    try testing.expectEqualStrings("e=1", r.query);
+    try testing.expectEqualStrings("10.8.0.1:8420", r.host.?);
+    var it = r.cookieHeaders();
+    try testing.expectEqualStrings("a=1", it.next().?);
+    try testing.expectEqualStrings("b=2", it.next().?);
+    try testing.expect(it.next() == null);
+}
+
+test "reject the head shape that crashed std.http" {
+    // "GET / HTTP/1.1\r\nA\r\n" never contains CRLFCRLF, so findHeadEnd keeps
+    // waiting; and parseHead refuses it outright.
+    try testing.expectError(error.BadRequestLine, parseHead("GET / HTTP/1.1\r\nA\r\n"));
+    try testing.expectError(error.BadHeader, parseHead("GET / HTTP/1.1\r\nA\r\n\r\n"));
+}
+
+test "reject malformed request lines and headers" {
+    try testing.expectError(error.UnsupportedVersion, parseHead("GET / HTTP/1.0\r\n\r\n"));
+    try testing.expectError(error.BadRequestLine, parseHead("GET  / HTTP/1.1\r\n\r\n"));
+    try testing.expectError(error.BadTarget, parseHead("GET http://x/ HTTP/1.1\r\n\r\n"));
+    try testing.expectError(error.BadTarget, parseHead("GET /\x01 HTTP/1.1\r\n\r\n"));
+    try testing.expectError(error.BadHeader, parseHead("GET / HTTP/1.1\r\nHost: a\r\n folded\r\n\r\n"));
+    try testing.expectError(error.BadHeader, parseHead("GET / HTTP/1.1\r\nBad Name: a\r\n\r\n"));
+    try testing.expectError(error.BadHeader, parseHead("GET / HTTP/1.1\r\nX: a\x00b\r\n\r\n"));
+    try testing.expectError(error.BadHeader, parseHead("GET / HTTP/1.1\r\nX: a\rb\r\n\r\n"));
+    try testing.expectError(error.DuplicateHeader, parseHead("GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"));
+    try testing.expectError(error.DuplicateHeader, parseHead("POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n"));
+    try testing.expectError(error.BadContentLength, parseHead("POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n"));
+    try testing.expectError(error.BadContentLength, parseHead("POST / HTTP/1.1\r\nContent-Length: 1 2\r\n\r\n"));
+    try testing.expectError(error.BadContentLength, parseHead("POST / HTTP/1.1\r\nContent-Length: 99999999999\r\n\r\n"));
+}
+
+test "too many headers" {
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeAll("GET / HTTP/1.1\r\n");
+    for (0..max_headers + 1) |_| try w.writeAll("X: y\r\n");
+    try w.writeAll("\r\n");
+    try testing.expectError(error.TooManyHeaders, parseHead(w.buffered()));
+}
+
+test "websocket upgrade fields" {
+    const r = try parseHead("GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nTransfer-Encoding: chunked\r\n\r\n");
+    try testing.expect(r.upgrade_websocket and r.connection_upgrade and r.has_transfer_encoding);
+    var out: [28]u8 = undefined;
+    // RFC 6455 section 1.3 example.
+    try testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", try wsAccept(r.ws_key.?, &out));
+    try testing.expectError(error.BadKey, wsAccept("short", &out));
+}
+
+test "frame header parsing" {
+    // masked text frame "Hi"
+    const f = [_]u8{ 0x81, 0x82, 1, 2, 3, 4, 'H' ^ 1, 'i' ^ 2 };
+    const h = (try parseFrameHeader(&f, 4096)).?;
+    try testing.expectEqual(Opcode.text, h.opcode);
+    try testing.expectEqual(@as(usize, 2), h.payload_len);
+    var p = f[h.header_len..][0..2].*;
+    unmask(&p, h.mask);
+    try testing.expectEqualStrings("Hi", &p);
+
+    try testing.expectEqual(@as(?FrameHeader, null), try parseFrameHeader(&[_]u8{0x81}, 4096));
+    try testing.expectError(error.Unmasked, parseFrameHeader(&[_]u8{ 0x81, 0x02, 'H', 'i' }, 4096));
+    try testing.expectError(error.Fragmented, parseFrameHeader(&[_]u8{ 0x01, 0x80, 0, 0, 0, 0 }, 4096));
+    try testing.expectError(error.ProtocolError, parseFrameHeader(&[_]u8{ 0xC1, 0x80, 0, 0, 0, 0 }, 4096)); // RSV1
+    try testing.expectError(error.ProtocolError, parseFrameHeader(&[_]u8{ 0x83, 0x80, 0, 0, 0, 0 }, 4096)); // reserved opcode
+    try testing.expectError(error.ProtocolError, parseFrameHeader(&[_]u8{ 0x89, 0xFE, 0, 200, 0, 0, 0, 0 }, 4096)); // big ping
+    try testing.expectError(error.TooLarge, parseFrameHeader(&[_]u8{ 0x82, 0xFF, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0 }, 4096));
+    try testing.expectError(error.TooLarge, parseFrameHeader(&[_]u8{ 0x82, 0xFE, 0x20, 0x00, 0, 0, 0, 0 }, 4096));
+}
+
+test "response refuses header injection" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try testing.expectError(error.UnsafeHeader, writeResponse(&w, .ok, &.{.{ .name = "x", .value = "a\r\nSet-Cookie: evil" }}, "", false));
+}
