@@ -270,30 +270,7 @@ pub const LogLimiter = struct {
     }
 };
 
-/// Token bucket in milli-units: `rate` per second, holding at most `burst`.
-pub const Bucket = struct {
-    rate: i64,
-    burst: i64,
-    level_m: i64,
-    last_ms: ?i64 = null,
-
-    pub fn init(rate: i64, burst: i64) Bucket {
-        return .{ .rate = rate, .burst = burst, .level_m = burst * 1000 };
-    }
-
-    fn refill(b: *Bucket, now_ms: i64) void {
-        if (b.last_ms) |last| {
-            // A clock that went back refills nothing; a long gap refills fully.
-            const dt = std.math.clamp(now_ms -| last, 0, 3_600_000);
-            b.level_m = @min(b.burst * 1000, b.level_m +| dt *| b.rate);
-        }
-        b.last_ms = now_ms;
-    }
-
-    fn has(b: *const Bucket, n: i64) bool {
-        return b.level_m >= n *| 1000;
-    }
-};
+const Bucket = @import("bucket.zig").Bucket;
 
 /// Per-connection input limit: a message must fit both buckets.
 pub const InputLimit = struct {
@@ -305,9 +282,7 @@ pub const InputLimit = struct {
         l.bytes.refill(now_ms);
         const n: i64 = @intCast(len);
         if (!l.msgs.has(1) or !l.bytes.has(n)) return false;
-        l.msgs.level_m -= 1000;
-        l.bytes.level_m -= n * 1000;
-        return true;
+        return l.msgs.take(1) and l.bytes.take(n);
     }
 };
 
@@ -1837,7 +1812,7 @@ pub const Server = struct {
         var rows: std.ArrayList(u16) = .empty;
         defer rows.deinit(srv.gpa);
         // Inline images: 'I' blobs and 'P' placements (web_images.zig).
-        var images: web_images.Sender = .{ .last_ms = srv.nowMs() };
+        var images: web_images.Sender = .{};
         defer images.deinit(srv.gpa);
 
         var hello_buf: [256]u8 = undefined;
@@ -1867,8 +1842,9 @@ pub const Server = struct {
             {
                 s.cond.waitTimeout(srv.io, &s.mutex, .{ .duration = .{
                     // Until the session expires, or sooner while an image
-                    // blob is waiting for this viewer's byte budget.
-                    .raw = .fromMilliseconds(if (images.pending) @min(expires_in, web_images.retry_ms) else expires_in),
+                    // blob waits for this viewer's byte budget: exactly
+                    // when the budget will have refilled enough for it.
+                    .raw = .fromMilliseconds(if (images.wait_ms) |ms| @min(expires_in, @max(ms, 1)) else expires_in),
                     .clock = .awake,
                 } }) catch |err| switch (err) {
                     error.Timeout => {},

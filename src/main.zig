@@ -2020,6 +2020,7 @@ test {
     _ = @import("sync.zig");
     _ = @import("sync_cli.zig");
     _ = @import("fsutil.zig");
+    _ = @import("bucket.zig");
 }
 
 test "isYes" {
