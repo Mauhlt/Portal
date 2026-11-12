@@ -12,8 +12,11 @@
 //!   device (headless; the same code `portal connect` runs, for tests)
 //!     portalctl sync-device --server IP:PORT --ca FILE [--pair]
 //!         [--approve] [--wait-updates SECONDS] [--only PACKAGE]
-//!     portalctl sync-device --rollback PACKAGE | --status
+//!     portalctl sync-device --server IP:PORT --rollback PACKAGE | --revoke PACKAGE | --status
 //!     portalctl sync-device --server IP:PORT --forget
+//!
+//!   Each desktop has its own store on the device (client/src/sync/keypin.zig,
+//!   desktopRoot), so every device command names the desktop (--server).
 
 const std = @import("std");
 const Io = std.Io;
@@ -189,11 +192,12 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
     var wait_s: ?u32 = null;
     var only: ?[]const u8 = null;
     var rollback: ?[]const u8 = null;
+    var revoke: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         const needs = std.mem.eql(u8, a, "--server") or std.mem.eql(u8, a, "--ca") or std.mem.eql(u8, a, "--wait-updates") or
-            std.mem.eql(u8, a, "--only") or std.mem.eql(u8, a, "--rollback");
+            std.mem.eql(u8, a, "--only") or std.mem.eql(u8, a, "--rollback") or std.mem.eql(u8, a, "--revoke");
         if (needs) {
             i += 1;
             if (i >= args.len) fatal("{s} needs a value", .{a});
@@ -208,6 +212,8 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
             only = args[i];
         } else if (std.mem.eql(u8, a, "--rollback")) {
             rollback = args[i];
+        } else if (std.mem.eql(u8, a, "--revoke")) {
+            revoke = args[i];
         } else if (std.mem.eql(u8, a, "--pair")) {
             pair = true;
         } else if (std.mem.eql(u8, a, "--forget")) {
@@ -216,18 +222,46 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
             status = true;
         } else if (std.mem.eql(u8, a, "--approve")) {
             approve = true;
-        } else fatal("usage: portalctl sync-device --server IP:PORT --ca FILE [--pair] [--approve] [--wait-updates S] [--only PKG] | --rollback PKG | --status | --server IP:PORT --forget", .{});
+        } else fatal("usage: portalctl sync-device --server IP:PORT [--ca FILE] [--pair] [--approve] [--wait-updates S] [--only PKG] | --rollback PKG | --revoke PKG | --status | --forget", .{});
     }
 
+    const srv = server orelse fatal("--server IP:PORT is required (each desktop has its own sync folder)", .{});
+    var hb: [64]u8 = undefined;
+    const host = http.canonicalHost(srv, &hb) catch fatal("bad --server '{s}'", .{srv});
+    if (forget) {
+        const r = client.forgetDesktop(io, host);
+        var mb: [400]u8 = undefined;
+        var w: Io.Writer = .fixed(&mb);
+        r.describe(&w, host) catch {};
+        std.debug.print("sync-device: {s}\n", .{w.buffered()});
+        return;
+    }
+
+    // This desktop's own store, named after the pinned host and key.
+    const pinned_now = keypin.load(io, host) catch |err| fatal("the pinned release key is unreadable: {t}", .{err});
     var root_buf: [client.pin.max_path]u8 = undefined;
-    const root = keypin.syncRoot(&root_buf) catch fatal("no LOCALAPPDATA", .{});
-    var st = store_mod.Store.open(gpa, io, root) catch |err| fatal("cannot open the sync store {s}: {t}", .{ root, err });
+    var st_opt: ?store_mod.Store = null;
+    if (pinned_now) |k| {
+        const root = keypin.desktopRoot(host, k, &root_buf) catch fatal("no LOCALAPPDATA", .{});
+        st_opt = store_mod.Store.open(gpa, io, root, manifest.fingerprint(k)) catch |err| fatal("cannot open the sync store {s}: {t}", .{ root, err });
+    }
+    if ((rollback != null or revoke != null or status) and st_opt == null)
+        fatal("no release key pinned for {s}: nothing was synced from it", .{host});
     if (rollback) |pkg| {
-        const p = st.rollback(pkg) catch |err| fatal("rollback of {s} failed: {t}", .{ pkg, err });
+        const p = st_opt.?.rollback(pkg) catch |err| fatal("rollback of {s} failed: {t}", .{ pkg, err });
         std.debug.print("sync-device: rolled {s} back to {s} (sequence {d})\n", .{ pkg, p.version(), p.sequence });
         return;
     }
+    if (revoke) |pkg| {
+        const r = st_opt.?.revoke(pkg) catch |err| fatal("revoke of {s} failed: {t}", .{ pkg, err });
+        if (r.now) |p|
+            std.debug.print("sync-device: revoked {s}: back to {s} (sequence {d})\n", .{ pkg, p.version(), p.sequence })
+        else
+            std.debug.print("sync-device: revoked {s}: uninstalled\n", .{pkg});
+        return;
+    }
     if (status) {
+        const st = &st_opt.?;
         var ids: [64][manifest.max_package_id]u8 = undefined;
         var lens: [64]u8 = undefined;
         const n = try st.installedPackages(&ids, &lens);
@@ -240,24 +274,15 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
         return;
     }
 
-    const srv = server orelse fatal("--server IP:PORT is required", .{});
-    var hb: [64]u8 = undefined;
-    const host = http.canonicalHost(srv, &hb) catch fatal("bad --server '{s}'", .{srv});
-    if (forget) {
-        var tbuf: [client.credstore_mod.max_target]u8 = undefined;
-        client.credstore_mod.delete(client.credstore_mod.targetName(host, false, &tbuf)) catch {};
-        keypin.delete(io, host) catch {};
-        if (client.pin.Pin.forHost(host)) |p| p.delete(io) catch {} else |_| {}
-        std.debug.print("sync-device: forgot the credential, the CA pin and the release key pin for {s}\n", .{host});
-        return;
-    }
+
     const ca_path = ca_file orelse fatal("--ca FILE is required (the Portal CA, portal-ca.pem)", .{});
     var ca_buf: [client.x509check_mod.max_cert_len]u8 = undefined;
     const der = client.pin.readCaFile(io, ca_path, &ca_buf) catch |err| fatal("cannot use {s} as the Portal CA: {t}", .{ ca_path, err });
 
     var shared: client.net_client.Shared = .{};
     var c = Client.init(gpa, io, &shared, host, .{ .tls = der }) catch fatal("bad --server", .{});
-    c.pair_poll_ms = 200;
+    c.pair_retry_ms = 200;
+    c.pair_min_interval_ms = 0;
 
     if (pair) {
         std.debug.print("sync-device: asking the desk to pair\n", .{});
@@ -278,8 +303,8 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
         return;
     }
 
-    const pinned = (keypin.load(io, host) catch |err| fatal("the pinned release key is unreadable: {t}", .{err})) orelse
-        fatal("no release key pinned for {s}: pair this device first (--pair)", .{host});
+    const pinned = pinned_now orelse fatal("no release key pinned for {s}: pair this device first (--pair)", .{host});
+    var st = st_opt.?;
     var session = c.signIn() catch |err| fatal("sign-in failed: {t}", .{err});
     defer session.wipe();
     const remote = c.syncRemote(session.value());
@@ -309,7 +334,7 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
 fn waitUpdates(gpa: Allocator, io: Io, c: *Client, session: *const http.Cookie, secs: u32) void {
     var wd: client.watchdog.Watchdog = .{ .io = io };
     wd.extend(@as(i64, secs) * 1000);
-    const r = wd.run(waitTask, .{ gpa, io, c, session }, null);
+    const r = wd.run(waitTask, .{ gpa, io, c, session, &wd }, null);
     if (wd.expired.load(.acquire)) {
         std.debug.print("sync-device: no updates announced within {d} s\n", .{secs});
         return;
@@ -318,9 +343,9 @@ fn waitUpdates(gpa: Allocator, io: Io, c: *Client, session: *const http.Cookie, 
     std.debug.print("sync-device: server announced updates\n", .{});
 }
 
-fn waitTask(gpa: Allocator, io: Io, c: *Client, session: *const http.Cookie) anyerror!void {
+fn waitTask(gpa: Allocator, io: Io, c: *Client, session: *const http.Cookie, wd: *client.watchdog.Watchdog) anyerror!void {
     const ws = client.net_ws;
-    const conn = try client.tlsconn.Conn.open(gpa, io, c.addr, .{ .tls = .{ .ca_der = c.ca_buf[0..c.ca_len], .ip = c.ip_buf[0..c.ip_len] } });
+    const conn = try client.tlsconn.Conn.openWatched(gpa, io, c.addr, .{ .tls = .{ .ca_der = c.ca_buf[0..c.ca_len], .ip = c.ip_buf[0..c.ip_len] } }, &wd.stopped);
     defer conn.close(gpa);
     var rnd: [16]u8 = undefined;
     try io.randomSecure(&rnd);

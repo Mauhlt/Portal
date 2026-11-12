@@ -21,7 +21,7 @@
 
 const std = @import("std");
 const w = @import("win32.zig");
-const pngcheck = @import("pngcheck");
+const imgcheck = @import("imgcheck");
 const gfx = @import("vt_gfx.zig");
 
 const usage =
@@ -59,13 +59,13 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     }
     const file = path orelse return fail("{s}", .{usage});
 
-    const png = std.Io.Dir.cwd().readFileAlloc(io, file, gpa, .limited(pngcheck.max_file_bytes)) catch |err| switch (err) {
-        error.StreamTooLong => return fail("{s}: larger than {d} bytes", .{ file, pngcheck.max_file_bytes }),
+    const png = std.Io.Dir.cwd().readFileAlloc(io, file, gpa, .limited(imgcheck.max_file_bytes)) catch |err| switch (err) {
+        error.StreamTooLong => return fail("{s}: larger than {d} bytes", .{ file, imgcheck.max_file_bytes }),
         else => return fail("{s}: {t}", .{ file, err }),
     };
     defer gpa.free(png);
-    const info = pngcheck.validate(png) catch |err| switch (err) {
-        error.TooLarge => return fail("{s}: too large (at most {d}x{d} and {d} megapixels)", .{ file, pngcheck.max_side, pngcheck.max_side, pngcheck.max_pixels >> 20 }),
+    const info = imgcheck.validate(png) catch |err| switch (err) {
+        error.FileTooLarge, error.ImageTooLarge, error.TooManyChunks => return fail("{s}: too large (at most {d}x{d} and {d} megapixels)", .{ file, imgcheck.max_side, imgcheck.max_side, imgcheck.max_pixels >> 20 }),
         else => return fail("{s}: not a valid PNG ({t})", .{ file, err }),
     };
 
@@ -90,7 +90,7 @@ fn fail(comptime fmt: []const u8, args: anytype) u8 {
 /// Cells for an image `info` at most `max_cols` x `max_rows`, from `--cols`
 /// or the image's pixel size at kitty's nominal cell size, keeping the
 /// aspect ratio (cells are twice as tall as wide).
-pub fn cellSize(info: pngcheck.Info, cols_arg: ?u32, max_cols: u32, max_rows: u32) [2]u32 {
+pub fn cellSize(info: imgcheck.Info, cols_arg: ?u32, max_cols: u32, max_rows: u32) [2]u32 {
     const iw: u64 = @max(info.width, 1);
     const ih: u64 = @max(info.height, 1);
     const cw = gfx.nominal_cell_w;
@@ -138,7 +138,7 @@ fn appendChunks(out: *std.ArrayList(u8), gpa: std.mem.Allocator, prefix: []const
     }
 }
 
-fn showStdout(gpa: std.mem.Allocator, info: pngcheck.Info, cols_arg: ?u32, b64: []const u8) u8 {
+fn showStdout(gpa: std.mem.Allocator, info: imgcheck.Info, cols_arg: ?u32, b64: []const u8) u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     var keys_buf: [96]u8 = undefined;
@@ -188,7 +188,7 @@ const Console = struct {
         return i;
     }
 
-    fn show(c: Console, gpa: std.mem.Allocator, img: pngcheck.Info, cols_arg: ?u32, b64: []const u8) u8 {
+    fn show(c: Console, gpa: std.mem.Allocator, img: imgcheck.Info, cols_arg: ?u32, b64: []const u8) u8 {
         // Escape sequences must reach the terminal, not be printed.
         _ = w.SetConsoleMode(c.h, c.mode | w.ENABLE_PROCESSED_OUTPUT | w.ENABLE_VIRTUAL_TERMINAL_PROCESSING);
         const before = c.info() orelse return fail("cannot read the console size", .{});
@@ -224,11 +224,11 @@ const Console = struct {
 };
 
 test "cellSize keeps the aspect ratio and fits" {
-    const info: pngcheck.Info = .{ .width = 200, .height = 100, .bit_depth = 8, .color_type = 6, .interlaced = false };
+    const info: imgcheck.Info = .{ .format = .png, .width = 200, .height = 100, .channels = 4, .bits = 8, .decode_bytes = 0 };
     try std.testing.expectEqual([2]u32{ 20, 5 }, cellSize(info, null, 80, 24));
     try std.testing.expectEqual([2]u32{ 40, 10 }, cellSize(info, 40, 80, 24));
     try std.testing.expectEqual([2]u32{ 10, 3 }, cellSize(info, null, 10, 24));
     // Too tall for the screen: rows capped, columns follow.
-    const tall: pngcheck.Info = .{ .width = 100, .height = 1000, .bit_depth = 8, .color_type = 6, .interlaced = false };
+    const tall: imgcheck.Info = .{ .format = .png, .width = 100, .height = 1000, .channels = 4, .bits = 8, .decode_bytes = 0 };
     try std.testing.expectEqual([2]u32{ 2, 10 }, cellSize(tall, null, 80, 10));
 }

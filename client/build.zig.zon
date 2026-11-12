@@ -7,9 +7,12 @@
         // The owner's Renderer (branch portal-client). Once merged into the
         // main Renderer checkout, change this to "../../Renderer".
         .Renderer = .{ .path = "../../Renderer-wt-portal" },
-        // The owner's Image package (PNG decoder), PINNED by the owner's
-        // request to Image@065e8ec (a detached worktree, used read-only).
-        .Image = .{ .path = "../../Image-wt-portal" },
+        // The owner's Image package (Image.check + PNG decoder): the de-facto
+        // checkout, no pin.
+        .Image = .{ .path = "../../Image" },
+        // Portal's shared protocol code (../shared/root.zig), also used by
+        // the server and the browser client.
+        .shared = .{ .path = "../shared" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "tools", "README.md" },
 }

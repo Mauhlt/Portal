@@ -19,6 +19,8 @@
 //!                                tree: this build lives inside it).
 //!   "datafeed"    ../src/datafeed/root.zig     the Data slice's model,
 //!                                shared with the browser client.
+//!   "shared" ../shared/root.zig  protocol code shared with Portal's server
+//!                                and browser client (a path dependency).
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -41,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "view", .module = view },
+            .{ .name = "shared", .module = sharedModule(b, target, optimize) },
             .{ .name = "inputrules", .module = inputrulesModule(b, target, optimize) },
             .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
         },
@@ -48,6 +51,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests and compile-check the executables");
     test_step.dependOn(&b.addRunArtifact(view_tests).step);
     test_step.dependOn(&b.addRunArtifact(client_tests).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sharedModule(b, target, optimize) })).step);
     test_step.dependOn(&exe.step);
     test_step.dependOn(&addClient(b, "portal-client-releasesafe-check", target, .ReleaseSafe).step);
     // The laptop client on the other OSes, compile only (they cannot run
@@ -65,19 +69,31 @@ pub const cross_targets = [_]std.Target.Query{
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
 };
 
+/// Portal's shared protocol module (../shared/root.zig).
+pub fn sharedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.dependency("shared", .{ .target = target, .optimize = optimize }).module("shared");
+}
+
 /// The reusable view module (src/view), wired to the Renderer package.
 pub fn viewModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     const renderer = b.dependency("Renderer", .{ .target = target, .optimize = optimize, .demo = false });
-    // Inline images: pngcheck + imgdec (src/image) on the owner's pinned
-    // Image package (see build.zig.zon), as in Portal's root build.
-    const pngcheck = b.createModule(.{ .root_source_file = b.path("src/image/pngcheck.zig"), .target = target, .optimize = optimize });
+    // Inline images: imgcheck + imgdec (src/image) on the owner's Image
+    // package (see build.zig.zon), as in Portal's root build.
+    // Same args as Renderer's, so both share Image's and Renderer's ../Vulkan module.
+    const image = b.dependency("Image", .{ .target = target, .optimize = optimize });
+    const imgcheck = b.createModule(.{
+        .root_source_file = b.path("src/image/imgcheck.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ImageCheck", .module = image.module("ImageCheck") }},
+    });
     const imgdec = b.createModule(.{
         .root_source_file = b.path("src/image/imgdec.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "Image", .module = b.dependency("Image", .{ .target = target }).module("Image") },
-            .{ .name = "pngcheck", .module = pngcheck },
+            .{ .name = "Image", .module = image.module("Image") },
+            .{ .name = "imgcheck", .module = imgcheck },
         },
     });
     return b.createModule(.{
@@ -95,6 +111,7 @@ pub fn viewModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
             // Fonts and cell widths: the Renderer's Font module.
             .{ .name = "Font", .module = renderer.module("Font") },
             .{ .name = "imgdec", .module = imgdec },
+            .{ .name = "shared", .module = sharedModule(b, target, optimize) },
         },
     });
 }
@@ -121,6 +138,7 @@ fn addClient(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, 
         .link_libc = target.result.os.tag != .windows, // libsecret / Security.framework via dlopen
         .imports = &.{
             .{ .name = "view", .module = viewModule(b, target, optimize) },
+            .{ .name = "shared", .module = sharedModule(b, target, optimize) },
             .{ .name = "inputrules", .module = inputrulesModule(b, target, optimize) },
             .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
         },

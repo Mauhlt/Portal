@@ -729,6 +729,15 @@ test "record layer: padding, key update, close_notify, and bad records" {
         }
         // Further reads keep failing.
         try testing.expectError(error.ReadFailed, h.conn.readSome(&got));
+        if (b.kind == 8) {
+            // A protected fatal alert ends the write side too: nothing more
+            // is sent (no close_notify, no data) to a peer that is gone.
+            try testing.expect(h.conn.write_dead);
+            try testing.expectEqual(@as(?server.AlertDescription, .handshake_failure), h.conn.diag.received_alert);
+            const before = out.buffered().len;
+            h.conn.close();
+            try testing.expectEqual(before, out.buffered().len);
+        }
     }
 
     // A protected close_notify is still a clean end; a protected fatal

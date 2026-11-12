@@ -1,5 +1,5 @@
 //! Portal's private certificate authority: X.509 profiles for the CA and
-//! the server (leaf) certificate, built with the DER writer in der.zig and
+//! the server (leaf) certificate, built with the DER writer in shared/pki/der.zig and
 //! signed with ECDSA P-256 / SHA-256 (std.crypto).
 //!
 //! CA profile (RFC 5280):
@@ -38,7 +38,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const der = @import("der.zig");
+const shared_pki = @import("shared").pki;
+const der = shared_pki.der;
+const cert = shared_pki.cert;
+const pki_fp = shared_pki.fingerprint;
 const oids = der.oids;
 const Tag = der.Tag;
 
@@ -388,163 +391,13 @@ pub fn formatIp(buf: []u8, ip: []const u8) []const u8 {
 
 // ----------------------------------------------------------------- parsing
 
-/// What Portal needs to know about a certificate it wrote earlier. Every
-/// field is located with the bounds-checked reader.
-pub const Info = struct {
-    tbs_raw: []const u8,
-    serial: []const u8,
-    issuer_raw: []const u8,
-    subject_raw: []const u8,
-    not_before: i64,
-    not_after: i64,
-    /// Uncompressed SEC1 point (65 bytes for P-256).
-    public_key: []const u8,
-    /// The whole SubjectPublicKeyInfo (for SPKI pins).
-    spki_raw: []const u8,
-    signature_der: []const u8,
-    /// subjectAltName extension value (GeneralNames DER), or empty.
-    san: []const u8 = "",
-    /// nameConstraints extension value, or empty.
-    name_constraints: []const u8 = "",
-    name_constraints_critical: bool = false,
-    is_ca: bool = false,
-    path_len: ?u64 = null,
-    basic_constraints_critical: bool = false,
-    key_usage: []const u8 = "",
-    key_usage_critical: bool = false,
-    eku: []const u8 = "",
-    ski: []const u8 = "",
-    aki: []const u8 = "",
-};
-
-pub fn parse(cert: []const u8) !Info {
-    var top: der.Reader = .init(cert);
-    const certificate = try top.expect(Tag.sequence);
-    if (!top.atEnd()) return error.DerMalformed;
-    var c: der.Reader = .init(certificate.content);
-    const tbs = try c.expect(Tag.sequence);
-    const alg = try c.expect(Tag.sequence);
-    const sig = try c.expect(Tag.bit_string);
-    if (!c.atEnd()) return error.DerMalformed;
-    if (!std.mem.eql(u8, alg.content, &([_]u8{ Tag.oid, oids.ecdsa_with_sha256.len } ++ oids.ecdsa_with_sha256)))
-        return error.UnsupportedAlgorithm;
-    if (sig.content.len < 2 or sig.content[0] != 0) return error.DerMalformed;
-
-    var t: der.Reader = .init(tbs.content);
-    const version = try t.expect(Tag.contextConstructed(0));
-    var vr: der.Reader = .init(version.content);
-    const v = try vr.expect(Tag.integer);
-    if (!std.mem.eql(u8, v.content, &.{2})) return error.UnsupportedVersion;
-    const serial = try t.expect(Tag.integer);
-    _ = try t.expect(Tag.sequence); // signature algorithm (checked above via outer)
-    const issuer = try t.expect(Tag.sequence);
-    const validity = try t.expect(Tag.sequence);
-    const subject = try t.expect(Tag.sequence);
-    const spki_e = try t.expect(Tag.sequence);
-
-    var vv: der.Reader = .init(validity.content);
-    const nb = try der.parseTime(try vv.next());
-    const na = try der.parseTime(try vv.next());
-
-    var sp: der.Reader = .init(spki_e.content);
-    const algid = try sp.expect(Tag.sequence);
-    const expect_alg = [_]u8{ Tag.oid, oids.ec_public_key.len } ++ oids.ec_public_key ++
-        [_]u8{ Tag.oid, oids.prime256v1.len } ++ oids.prime256v1;
-    if (!std.mem.eql(u8, algid.content, &expect_alg)) return error.UnsupportedAlgorithm;
-    const pk_bits = try sp.expect(Tag.bit_string);
-    if (pk_bits.content.len != 66 or pk_bits.content[0] != 0) return error.DerMalformed;
-
-    var info: Info = .{
-        .tbs_raw = tbs.raw,
-        .serial = serial.content,
-        .issuer_raw = issuer.raw,
-        .subject_raw = subject.raw,
-        .not_before = nb,
-        .not_after = na,
-        .public_key = pk_bits.content[1..],
-        .spki_raw = spki_e.raw,
-        .signature_der = sig.content[1..],
-    };
-
-    while (!t.atEnd()) {
-        const e = try t.next();
-        if (e.tag != Tag.contextConstructed(3)) continue;
-        var outer: der.Reader = .init(e.content);
-        const list = try outer.expect(Tag.sequence);
-        var exts: der.Reader = .init(list.content);
-        while (!exts.atEnd()) {
-            const ext = try exts.expect(Tag.sequence);
-            var er: der.Reader = .init(ext.content);
-            const oid = try er.expect(Tag.oid);
-            var critical = false;
-            if (er.peekTag() == Tag.boolean) {
-                const b = try er.next();
-                critical = b.content.len == 1 and b.content[0] == 0xff;
-            }
-            const val = (try er.expect(Tag.octet_string)).content;
-            if (std.mem.eql(u8, oid.content, &oids.subject_alt_name)) {
-                info.san = val;
-            } else if (std.mem.eql(u8, oid.content, &oids.name_constraints)) {
-                info.name_constraints = val;
-                info.name_constraints_critical = critical;
-            } else if (std.mem.eql(u8, oid.content, &oids.basic_constraints)) {
-                info.basic_constraints_critical = critical;
-                var br: der.Reader = .init(val);
-                const bs = try br.expect(Tag.sequence);
-                var bi: der.Reader = .init(bs.content);
-                if (bi.peekTag() == Tag.boolean) {
-                    const b = try bi.next();
-                    info.is_ca = b.content.len == 1 and b.content[0] == 0xff;
-                }
-                if (bi.peekTag() == Tag.integer) {
-                    const n = try bi.next();
-                    if (n.content.len >= 1 and n.content.len <= 8) {
-                        var x: u64 = 0;
-                        for (n.content) |byte| x = (x << 8) | byte;
-                        info.path_len = x;
-                    }
-                }
-            } else if (std.mem.eql(u8, oid.content, &oids.key_usage)) {
-                info.key_usage = val;
-                info.key_usage_critical = critical;
-            } else if (std.mem.eql(u8, oid.content, &oids.ext_key_usage)) {
-                info.eku = val;
-            } else if (std.mem.eql(u8, oid.content, &oids.subject_key_identifier)) {
-                info.ski = val;
-            } else if (std.mem.eql(u8, oid.content, &oids.authority_key_identifier)) {
-                info.aki = val;
-            }
-        }
-    }
-    return info;
-}
-
-/// Verifies that `subject` was signed by the key in `issuer` (and the names
-/// chain). Does not check validity times.
-pub fn verifySignedBy(subject: Info, issuer: Info) !void {
-    if (!std.mem.eql(u8, subject.issuer_raw, issuer.subject_raw)) return error.IssuerMismatch;
-    const pk = try Ecdsa.PublicKey.fromSec1(issuer.public_key);
-    const sig = try Ecdsa.Signature.fromDer(subject.signature_der);
-    try sig.verify(subject.tbs_raw, pk);
-}
-
-/// SHA-256 over the DER certificate, the fingerprint users compare.
-pub fn fingerprint(cert: []const u8) [32]u8 {
-    var h: [32]u8 = undefined;
-    Sha256.hash(cert, &h, .{});
-    return h;
-}
-
-/// "AB:CD:..." form of a fingerprint.
-pub fn formatFingerprint(fp: [32]u8, out: *[95]u8) []const u8 {
-    const hex = "0123456789ABCDEF";
-    for (fp, 0..) |b, i| {
-        out[i * 3] = hex[b >> 4];
-        out[i * 3 + 1] = hex[b & 0xf];
-        if (i < 31) out[i * 3 + 2] = ':';
-    }
-    return out[0..95];
-}
+/// Certificate reading lives in shared/pki/cert.zig (also used by the
+/// native client); fingerprints in shared/pki/fingerprint.zig.
+pub const Info = cert.Info;
+pub const parse = cert.parse;
+pub const verifySignedBy = cert.verifySignedBy;
+pub const fingerprint = pki_fp.sha256;
+pub const formatFingerprint = pki_fp.format;
 
 // -------------------------------------------------------------------- tests
 
@@ -711,6 +564,81 @@ test "certificate profile fields" {
     });
     defer gpa.free(forged);
     try testing.expectError(error.SignatureVerificationFailed, verifySignedBy(try parse(forged), ca));
+}
+
+/// A leaf like buildLeaf's but with the given extensions, for tests.
+fn customLeaf(gpa: Allocator, p: *const TestPki, now: i64, exts: []const []const u8) ![]u8 {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const d: der.Writer = .{ .arena = arena.allocator() };
+    const ca = try parse(p.ca_der);
+    const tbs = try d.seq(&.{
+        try d.tlv(Tag.contextConstructed(0), try d.uint(2)),
+        try d.uintBytes(&positiveSerial(@splat(0x33))),
+        try sigAlg(d),
+        ca.subject_raw,
+        try d.seq(&.{ try d.time(now - backdate_s), try d.time(now + 86400) }),
+        try leafSubject(d),
+        try spki(d, p.leaf_key.public_key),
+        try d.tlv(Tag.contextConstructed(3), try d.seq(exts)),
+    });
+    return gpa.dupe(u8, try finish(d, tbs, &p.ca_key, null));
+}
+
+test "parser rejects duplicate extensions and a swapped signature algorithm" {
+    const gpa = testing.allocator;
+    const now: i64 = 1_790_000_000;
+    var p = try TestPki.init(gpa, now, &.{ip4(10, 8, 0, 1)});
+    defer p.deinit(gpa);
+
+    // The signed AlgorithmIdentifier comes first; change its hash.
+    const alg = [_]u8{ Tag.sequence, 2 + oids.ecdsa_with_sha256.len, Tag.oid, oids.ecdsa_with_sha256.len } ++ oids.ecdsa_with_sha256;
+    const swapped = try gpa.dupe(u8, p.leaf_der);
+    defer gpa.free(swapped);
+    const at = std.mem.indexOf(u8, swapped, &alg).?;
+    swapped[at + alg.len - 1] = 0x03; // ecdsa-with-SHA384
+    try testing.expectError(error.AlgorithmMismatch, parse(swapped));
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const d: der.Writer = .{ .arena = arena.allocator() };
+    const bc_false = try extension(d, &oids.basic_constraints, true, try d.seq(&.{}));
+    const dup = try customLeaf(gpa, &p, now, &.{ bc_false, bc_false });
+    defer gpa.free(dup);
+    try testing.expectError(error.DuplicateExtension, parse(dup));
+}
+
+test "the native client accepts only server certificates from the pinned CA" {
+    const gpa = testing.allocator;
+    const now: i64 = 1_790_000_000;
+    var p = try TestPki.init(gpa, now, &.{ip4(10, 8, 0, 1)});
+    defer p.deinit(gpa);
+    const x509check = @import("client").x509check_mod;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const d: der.Writer = .{ .arena = arena.allocator() };
+    const bc_false = try extension(d, &oids.basic_constraints, true, try d.seq(&.{}));
+    const bc_true = try extension(d, &oids.basic_constraints, true, try d.seq(&.{try d.boolean(true)}));
+    const ku = try extension(d, &oids.key_usage, true, try d.namedBits(0x8000));
+    const eku = try extension(d, &oids.ext_key_usage, false, try ekuServerAuth(d));
+    const san = try extension(d, &oids.subject_alt_name, false, try sanValue(d, &.{ip4(10, 8, 0, 1)}));
+
+    try x509check.verifyLeaf(p.leaf_der, p.ca_der, "10.8.0.1", now);
+    const Case = struct { exts: []const []const u8, ok: bool };
+    for ([_]Case{
+        .{ .exts = &.{ bc_false, ku, eku, san }, .ok = true },
+        .{ .exts = &.{ bc_false, ku, san }, .ok = false }, // no extKeyUsage
+        .{ .exts = &.{ ku, eku, san }, .ok = false }, // no basicConstraints
+        .{ .exts = &.{ bc_true, ku, eku, san }, .ok = false }, // CA:TRUE
+    }) |c| {
+        const leaf = try customLeaf(gpa, &p, now, c.exts);
+        defer gpa.free(leaf);
+        if (c.ok) {
+            try x509check.verifyLeaf(leaf, p.ca_der, "10.8.0.1", now);
+        } else {
+            try testing.expectError(error.UnsupportedCertificate, x509check.verifyLeaf(leaf, p.ca_der, "10.8.0.1", now));
+        }
+    }
 }
 
 test "certificate parser never panics on corrupted certificates" {

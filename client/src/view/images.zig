@@ -143,7 +143,7 @@ pub const Layer = struct {
             l.decodes_left -= 1;
             var src = imgdec.decode(l.gpa, png, .{ .budget = decode_budget, .max_side = 2048 }) catch {
                 e.failed = true;
-                if (imgdec.pngcheck.header(png)) |info| {
+                if (imgdec.imgcheck.header(png)) |info| {
                     e.dims = .{ info.width, info.height };
                 } else |_| {}
                 return .{ .placeholder = e.dims };
@@ -201,7 +201,7 @@ test "prepare decodes once per frame, uploads, drops unplaced, placeholders" {
     const gpa = testing.allocator;
     var im: grid_mod.Images = .{};
     defer im.deinit(gpa);
-    const a = try imgdec.pngcheck.testImage(gpa, 30, 20);
+    const a = try imgdec.imgcheck.testImage(gpa, 30, 20);
     defer gpa.free(a);
     try im.putBlob(gpa, 1, a);
     try im.putBlob(gpa, 2, a);

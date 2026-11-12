@@ -356,7 +356,7 @@ test "images land on their cells; placeholders for bad blobs; clipping" {
     // A solid red 4x4 PNG placed at cells (2,1)-(4,2).
     var px: [4 * 4 * 4]u8 = undefined;
     for (0..16) |i| px[i * 4 ..][0..4].* = .{ 255, 0, 0, 255 };
-    const png = try @import("pngcheck").encodeStored(gpa, 4, 4, &px);
+    const png = try @import("imgcheck").encodeStored(gpa, 4, 4, &px);
     defer gpa.free(png);
     var g: proto.Grid = .{};
     defer g.deinit(gpa);

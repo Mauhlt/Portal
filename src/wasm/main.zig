@@ -521,11 +521,13 @@ export fn on_ws_message(binary: u32, len: usize) void {
     }
     const old_y = app.grid.cursor_y;
     // 'G' grid, 'I' image, 'P' placements; unknown types are ignored.
-    const res = proto.applyBinary(&app.grid, gpa, msg) catch |err| blk: {
+    // A malformed frame is rejected whole (nothing changed): log it, and
+    // only announce an image that was actually stored.
+    const res = proto.applyBinary(&app.grid, gpa, msg) catch |err| {
         logMsg("bad {c} frame: {t}", .{ if (msg.len > 0 and msg[0] >= 0x20 and msg[0] < 0x7f) msg[0] else '?', err });
-        break :blk proto.FrameResult{};
+        return;
     };
-    noteImage(msg);
+    if (res.images) noteImage(msg);
     if (res.resized) {
         relayout();
     } else if (app.grid.rows > 0) {

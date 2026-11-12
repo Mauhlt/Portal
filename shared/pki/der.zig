@@ -4,9 +4,12 @@
 //! children and returns the encoded parent, allocated from an arena. That
 //! keeps every length exact without a second pass.
 //!
-//! The reader is used on certificate files read back from disk. std's
-//! `Certificate.der.Element.parse` indexes without bounds checks, so it is
-//! only ever given bytes this reader has walked first.
+//! The reader is the one bounds-checked DER walker of every Portal program:
+//! the server reads back its own certificate files with it (cert.zig), and
+//! the native client checks a server's certificate with it before std's
+//! `Certificate` parser, which indexes without bounds checks, sees the
+//! bytes (client/src/net/x509check.zig). It accepts DER only: one-byte
+//! tags, definite minimal lengths.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -236,9 +239,12 @@ pub const Reader = struct {
             const n = l0 & 0x7f;
             if (n == 0 or n > 3) return error.DerMalformed; // no indefinite / huge lengths
             if (r.buf.len - p < n) return error.DerMalformed;
+            // Minimal (X.690 10.1): long form only from 0x80, and no
+            // leading zero length octets.
+            if (r.buf[p] == 0) return error.DerMalformed;
             for (r.buf[p..][0..n]) |b| len = (len << 8) | b;
             p += n;
-            if (len < 0x80) return error.DerMalformed; // non-minimal
+            if (len < 0x80) return error.DerMalformed;
         }
         if (r.buf.len - p < len) return error.DerMalformed;
         r.pos = p + len;
@@ -337,6 +343,23 @@ test "der time round trip" {
     try testing.expectEqual(Tag.generalized_time, e2[0]);
     var r2: Reader = .init(e2);
     try testing.expectEqual(t2, try parseTime(try r2.next()));
+}
+
+test "der reader rejects non-minimal and indefinite lengths" {
+    const zeros: [0x80]u8 = @splat(0);
+    var ok: Reader = .init(&([_]u8{ 0x04, 0x81, 0x80 } ++ zeros));
+    _ = try ok.next();
+    const bad = [_][]const u8{
+        &.{ 0x04, 0x81, 0x05, 1, 2, 3, 4, 5 }, // short length in long form
+        &([_]u8{ 0x04, 0x82, 0x00, 0x80 } ++ zeros), // leading zero length octet
+        &.{ 0x30, 0x80, 0x00, 0x00 }, // indefinite
+        &.{ 0x04, 0x84, 0, 0, 0, 1, 0 }, // four length octets
+        &.{ 0x1f, 0x01, 0x00 }, // high tag number
+    };
+    for (bad) |b| {
+        var r: Reader = .init(b);
+        try testing.expectError(error.DerMalformed, r.next());
+    }
 }
 
 test "der reader never panics on garbage" {
