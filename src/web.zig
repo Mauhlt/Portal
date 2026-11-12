@@ -7,7 +7,7 @@
 //!   3. Route; unknown paths/methods are rejected
 //!   4. State-changing requests and the WebSocket upgrade require an
 //!      allowed Origin                              (CSRF / CSWSH)
-//!   5. Anything beyond the login page and static assets requires a live
+//!   5. Anything beyond the pairing page and static assets requires a live
 //!      session cookie
 //!
 //! The web side can only (a) watch the session's output and (b) send
@@ -37,9 +37,10 @@ const guard = @import("guard.zig");
 const http1 = @import("http1.zig");
 const Session = @import("session.zig").Session;
 const Log = @import("log.zig").Log;
+const devices = @import("devices.zig");
 
 const index_html = @embedFile("web/index.html");
-const login_html = @embedFile("web/login.html");
+const pair_html = @embedFile("web/pair.html");
 const app_js = @embedFile("web/app.js");
 const app_css = @embedFile("web/app.css");
 
@@ -52,7 +53,7 @@ const max_pre_auth = 16;
 const max_pre_auth_per_ip = 8;
 
 const max_requests_per_connection = 200;
-const max_login_body = 512;
+const max_body = 512;
 const max_input_message = 4096;
 /// 'i' prefix + up to max_input_message bytes of keystrokes.
 const max_ws_payload = max_input_message + 1;
@@ -74,7 +75,6 @@ const send_timeout_ms = 30_000;
 /// this long to notice and say goodbye before the connection is cancelled.
 const revoke_grace_ms = 10_000;
 const supervise_tick_ms = 500;
-const login_fail_delay_ms = 500;
 const no_deadline = std.math.maxInt(i64);
 
 pub const Config = struct {
@@ -84,7 +84,8 @@ pub const Config = struct {
     scheme: []const u8,
     /// Adds `Secure` and uses the `__Host-` cookie prefix. Only valid over HTTPS.
     secure_cookie: bool,
-    token_hash: auth.Hash,
+    /// Where the paired-device store lives (%LOCALAPPDATA%\Portal).
+    devices: devices.Paths,
 };
 
 // ------------------------------------------------------------ pure helpers
@@ -252,10 +253,6 @@ pub const Server = struct {
 
     auth_mutex: Io.Mutex = .init,
     sessions: auth.Sessions = .{},
-    limiter: auth.RateLimiter = .{},
-    /// Held for the fixed delay after a failed login, so guesses are
-    /// serialised across all connections.
-    fail_mutex: Io.Mutex = .init,
 
     conn_mutex: Io.Mutex = .init,
     conns: ConnTable = .{},
@@ -267,6 +264,14 @@ pub const Server = struct {
 
     fn cookieName(srv: *const Server) []const u8 {
         return if (srv.cfg.secure_cookie) "__Host-portal" else "portal_session";
+    }
+
+    fn deviceCookieName(srv: *const Server) []const u8 {
+        return if (srv.cfg.secure_cookie) "__Host-portal_device" else "portal_device";
+    }
+
+    fn nowUnix(srv: *const Server) i64 {
+        return Io.Timestamp.now(srv.io, .real).toSeconds();
     }
 
     fn nowMs(srv: *const Server) i64 {
@@ -423,7 +428,7 @@ pub const Server = struct {
     fn serveHttp(srv: *Server, conn: *Conn) !void {
         const io = srv.io;
         // Head (up to max_head_bytes) plus a login body.
-        var buf: [http1.max_head_bytes + max_login_body]u8 = undefined;
+        var buf: [http1.max_head_bytes + max_body]u8 = undefined;
         var len: usize = 0;
         var send_buf: [16 * 1024]u8 = undefined;
         var sw = conn.stream.writer(io, &send_buf);
@@ -466,7 +471,7 @@ pub const Server = struct {
                 if (req.has_transfer_encoding or req.has_expect) {
                     // Answered by framingError below, without reading a body.
                 } else if (req.content_length) |cl_u64| {
-                    if (cl_u64 <= max_login_body) {
+                    if (cl_u64 <= max_body) {
                         const need = head_len + @as(usize, @intCast(cl_u64));
                         while (len < need) {
                             const got = try readSome(conn, io, buf[len..need]);
@@ -488,15 +493,29 @@ pub const Server = struct {
         }
     }
 
+    const device_cookie_max = devices.max_name + 1 + auth.encoded_len;
+
     const Headers = struct {
         host: ?[]const u8 = null,
         origin: ?[]const u8 = null,
         cookie: ?[]const u8 = null,
+        /// `<name>.<secret>` from the paired-device cookie.
+        device: ?[]const u8 = null,
         content_type: ?[]const u8 = null,
     };
 
-    fn collectHeaders(srv: *const Server, req: *const http1.Request, cookie_out: *[auth.encoded_len]u8) Headers {
+    fn collectHeaders(srv: *const Server, req: *const http1.Request, cookie_out: *[auth.encoded_len]u8, device_out: *[device_cookie_max]u8) Headers {
         var h: Headers = .{ .host = req.host, .origin = req.origin, .content_type = req.content_type };
+        var dit = req.cookieHeaders();
+        while (dit.next()) |value| {
+            if (guard.getCookie(value, srv.deviceCookieName())) |v| {
+                if (v.len > 0 and v.len <= device_cookie_max) {
+                    @memcpy(device_out[0..v.len], v);
+                    h.device = device_out[0..v.len];
+                    break;
+                }
+            }
+        }
         var it = req.cookieHeaders();
         while (it.next()) |value| {
             if (guard.getCookie(value, srv.cookieName())) |v| {
@@ -523,15 +542,17 @@ pub const Server = struct {
 
     /// Returns whether to keep the connection open for another request.
     fn handleRequest(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, body: []const u8, leftover: []const u8) !bool {
+        _ = body; // no route reads a request body any more (pairing posts are empty)
         var cookie_buf: [auth.encoded_len]u8 = undefined;
-        const h = srv.collectHeaders(req, &cookie_buf);
+        var device_buf: [device_cookie_max]u8 = undefined;
+        const h = srv.collectHeaders(req, &cookie_buf, &device_buf);
         const peer = conn.peer();
 
         if (!guard.hostAllowed(h.host, srv.cfg.allowed_hosts)) {
             srv.noteHostRejected(peer, h.host);
             return srv.fail(conn, w, .misdirected_request, "unknown host\n");
         }
-        if (http1.framingError(req, max_login_body)) |r| return srv.fail(conn, w, r.status, r.msg);
+        if (http1.framingError(req, max_body)) |r| return srv.fail(conn, w, r.status, r.msg);
 
         if (!conn.authed) {
             if (h.cookie) |c| {
@@ -544,10 +565,14 @@ pub const Server = struct {
             .GET => {
                 if (std.mem.eql(u8, path, "/static/app.js")) return srv.asset(conn, w, req, app_js, "text/javascript; charset=utf-8");
                 if (std.mem.eql(u8, path, "/static/app.css")) return srv.asset(conn, w, req, app_css, "text/css; charset=utf-8");
-                if (std.mem.eql(u8, path, "/login")) return srv.loginPage(conn, w, req);
+                if (std.mem.eql(u8, path, "/pair")) return srv.pairPage(conn, w, req);
+                if (std.mem.eql(u8, path, "/login")) return srv.redirect(conn, w, req, "/pair", &.{});
                 if (std.mem.eql(u8, path, "/")) {
                     if (h.cookie) |c| if (srv.sessionLive(c, true)) return srv.asset(conn, w, req, index_html, "text/html; charset=utf-8");
-                    return srv.redirect(conn, w, req, "/login", null);
+                    // No live session (first visit, or Portal restarted): a
+                    // paired device signs in silently with its credential.
+                    if (h.device) |d| return srv.deviceSignIn(conn, w, req, d, .page);
+                    return srv.redirect(conn, w, req, "/pair", &.{});
                 }
                 if (std.mem.eql(u8, path, "/ws")) {
                     try srv.webSocket(conn, w, req, h, leftover);
@@ -559,7 +584,11 @@ pub const Server = struct {
                     srv.log.print("rejected {s} from {s}: bad origin", .{ path[0..@min(path.len, 80)], peer });
                     return srv.fail(conn, w, .forbidden, "bad origin\n");
                 }
-                if (std.mem.eql(u8, path, "/login")) return srv.login(conn, w, req, h, body);
+                if (std.mem.eql(u8, path, "/pair")) return srv.pairDevice(conn, w, req);
+                if (std.mem.eql(u8, path, "/auth/refresh")) {
+                    const d = h.device orelse return srv.fail(conn, w, .unauthorized, "not paired\n");
+                    return srv.deviceSignIn(conn, w, req, d, .api);
+                }
                 if (std.mem.eql(u8, path, "/logout")) return srv.logout(conn, w, req, h);
             },
             .other => return srv.fail(conn, w, .method_not_allowed, "method not allowed\n"),
@@ -604,12 +633,12 @@ pub const Server = struct {
         return keep;
     }
 
-    fn redirect(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, location: []const u8, set_cookie: ?[]const u8) !bool {
-        var extra: [2]http1.Header = undefined;
+    fn redirect(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, location: []const u8, set_cookies: []const []const u8) !bool {
+        var extra: [3]http1.Header = undefined;
         var n: usize = 0;
         extra[n] = .{ .name = "location", .value = location };
         n += 1;
-        if (set_cookie) |c| {
+        for (set_cookies[0..@min(set_cookies.len, 2)]) |c| {
             extra[n] = .{ .name = "set-cookie", .value = c };
             n += 1;
         }
@@ -619,97 +648,272 @@ pub const Server = struct {
         return keep;
     }
 
-    fn loginPage(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request) !bool {
-        const marker = "<!--MESSAGE-->";
-        const query = req.query;
-        const msg: []const u8 = if (std.mem.eql(u8, query, "e=1"))
-            "<p class=\"error\">That token was not accepted.</p>"
-        else if (std.mem.eql(u8, query, "e=locked"))
-            "<p class=\"error\">Too many failed attempts. Try again in 15 minutes.</p>"
-        else if (std.mem.eql(u8, query, "bye"))
-            "<p class=\"info\">Signed out.</p>"
+    fn pairPage(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request) !bool {
+        const q = req.query;
+        var open_name: [devices.max_name]u8 = undefined;
+        var open_len: usize = 0;
+        const now = srv.nowUnix();
+        const Ctx = struct { now: i64, name: *[devices.max_name]u8, len: *usize };
+        devices.withStore(srv.gpa, srv.io, srv.cfg.devices, now, Ctx{ .now = now, .name = &open_name, .len = &open_len }, struct {
+            fn op(c: Ctx, st: *devices.Store) !bool {
+                if (st.pairingName(c.now)) |n| {
+                    @memcpy(c.name[0..n.len], n);
+                    c.len.* = n.len;
+                }
+                return false;
+            }
+        }.op) catch {};
+        const msg: []const u8 = if (std.mem.eql(u8, q, "e=closed"))
+            "<p class=\"error\">No pairing window is open. Run the command below at the desktop first.</p>"
+        else if (std.mem.eql(u8, q, "e=revoked"))
+            "<p class=\"error\">This device's credential was used from somewhere else, so it was revoked. Pair it again at the desktop.</p>"
+        else if (std.mem.eql(u8, q, "e=address"))
+            "<p class=\"error\">This device is paired from a different WireGuard address. Pair it again at the desktop.</p>"
+        else if (std.mem.eql(u8, q, "bye"))
+            "<p class=\"info\">This device was unpaired.</p>"
         else
             "";
-        const idx = comptime std.mem.indexOf(u8, login_html, marker).?;
-        const page = try std.mem.concat(srv.gpa, u8, &.{ login_html[0..idx], msg, login_html[idx + marker.len ..] });
+        // The device name comes from the store and is [a-z0-9-] only
+        // (devices.validName), so it is safe to place in HTML.
+        var action_buf: [512]u8 = undefined;
+        const action: []const u8 = if (open_len > 0)
+            std.fmt.bufPrint(&action_buf, "<form method=\"post\" action=\"/pair\"><p>Pairing is open for <strong>{s}</strong>.</p>" ++
+                "<button type=\"submit\">Pair this device</button></form>", .{open_name[0..open_len]}) catch ""
+        else
+            "<p>This device is not paired yet. At the desktop, run:</p><pre>portal pair &lt;name&gt;</pre>" ++
+                "<p>then reload this page within 2 minutes.</p>";
+        const marker_msg = "<!--MESSAGE-->";
+        const marker_act = "<!--ACTION-->";
+        const i_msg = comptime std.mem.indexOf(u8, pair_html, marker_msg).?;
+        const i_act = comptime std.mem.indexOf(u8, pair_html, marker_act).?;
+        comptime std.debug.assert(i_msg < i_act);
+        const page = try std.mem.concat(srv.gpa, u8, &.{
+            pair_html[0..i_msg],
+            msg,
+            pair_html[i_msg + marker_msg.len .. i_act],
+            action,
+            pair_html[i_act + marker_act.len ..],
+        });
         defer srv.gpa.free(page);
         return srv.asset(conn, w, req, page, "text/html; charset=utf-8");
     }
 
-    // -------------------------------------------------------------- auth
-
-    fn login(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, h: Headers, body: []const u8) !bool {
-        const peer = conn.peer();
-        const ct = h.content_type orelse "";
-        if (!std.ascii.startsWithIgnoreCase(ct, "application/x-www-form-urlencoded")) {
-            return srv.fail(conn, w, .unsupported_media_type, "expected form\n");
-        }
-        // framingError guaranteed a Content-Length <= max_login_body, and
-        // serveHttp read exactly that many bytes.
-        if (body.len != (req.content_length orelse 0)) return srv.fail(conn, w, .bad_request, "bad body\n");
-
-        var token_buf: [256]u8 = undefined;
-        const presented = guard.formValue(body, "token", &token_buf) orelse "";
-
-        // Verify first: the right token always works, even during a lockout
-        // (otherwise anyone could lock the owner out). Lockout and delay
-        // apply only to failures.
-        const ok = auth.verify(srv.cfg.token_hash, presented);
-        std.crypto.secureZero(u8, &token_buf);
-
-        srv.auth_mutex.lockUncancelable(srv.io);
-        const now = srv.nowMs();
-        const was_locked = !srv.limiter.allowed(now);
-        if (!ok) {
-            if (!was_locked) srv.limiter.recordFailure(now);
-            const locked = !srv.limiter.allowed(now);
-            srv.auth_mutex.unlock(srv.io);
-            srv.log.print("login FAILED from {s}{s}", .{
-                peer,
-                if (was_locked) " (locked out)" else if (locked) " (now locked out)" else "",
-            });
-            // Fixed delay, serialised across connections.
-            try srv.fail_mutex.lock(srv.io);
-            defer srv.fail_mutex.unlock(srv.io);
-            try srv.io.sleep(.fromMilliseconds(login_fail_delay_ms), .awake);
-            return srv.redirect(conn, w, req, if (locked) "/login?e=locked" else "/login?e=1", null);
-        }
-        srv.limiter.recordSuccess();
+    fn newSecret(srv: *Server, out: *[auth.encoded_len]u8) !void {
         var raw: [auth.secret_bytes]u8 = undefined;
-        srv.io.randomSecure(&raw) catch {
-            srv.auth_mutex.unlock(srv.io);
-            return srv.fail(conn, w, .internal_server_error, "no entropy\n");
-        };
-        var cookie_val: [auth.encoded_len]u8 = undefined;
-        _ = auth.encodeSecret(&raw, &cookie_val);
+        try srv.io.randomSecure(&raw);
+        _ = auth.encodeSecret(&raw, out);
         std.crypto.secureZero(u8, &raw);
-        srv.sessions.create(&cookie_val, now);
-        srv.auth_mutex.unlock(srv.io);
-
-        srv.log.print("login ok from {s}{s}", .{ peer, if (was_locked) " (during lockout)" else "" });
-        var cookie_hdr: [192]u8 = undefined;
-        const set_cookie = try std.fmt.bufPrint(&cookie_hdr, "{s}={s}; Path=/; HttpOnly; SameSite=Strict; Max-Age={d}{s}", .{
-            srv.cookieName(),
-            &cookie_val,
-            @divTrunc(srv.sessions.absolute_timeout_ms, 1000),
-            if (srv.cfg.secure_cookie) "; Secure" else "",
-        });
-        return srv.redirect(conn, w, req, "/", set_cookie);
     }
 
+    const CookiePair = struct {
+        device_buf: [256]u8 = undefined,
+        session_buf: [192]u8 = undefined,
+        device: []const u8 = "",
+        session: []const u8 = "",
+    };
+
+    /// Builds Set-Cookie values for a device credential and a new session.
+    fn issueCookies(srv: *Server, name: []const u8, device_secret: []const u8, out: *CookiePair) !void {
+        var session_val: [auth.encoded_len]u8 = undefined;
+        try srv.newSecret(&session_val);
+        defer std.crypto.secureZero(u8, &session_val);
+        srv.auth_mutex.lockUncancelable(srv.io);
+        srv.sessions.createTagged(&session_val, srv.nowMs(), name);
+        srv.auth_mutex.unlock(srv.io);
+        const secure = if (srv.cfg.secure_cookie) "; Secure" else "";
+        out.device = try std.fmt.bufPrint(&out.device_buf, "{s}={s}.{s}; Path=/; HttpOnly; SameSite=Strict; Max-Age={d}{s}", .{
+            srv.deviceCookieName(), name, device_secret, devices.unused_expiry_s, secure,
+        });
+        out.session = try std.fmt.bufPrint(&out.session_buf, "{s}={s}; Path=/; HttpOnly; SameSite=Strict; Max-Age={d}{s}", .{
+            srv.cookieName(), &session_val, @divTrunc(srv.sessions.absolute_timeout_ms, 1000), secure,
+        });
+    }
+
+    fn clearCookies(srv: *Server, buf: *[2][128]u8) ![2][]const u8 {
+        const secure = if (srv.cfg.secure_cookie) "; Secure" else "";
+        return .{
+            try std.fmt.bufPrint(&buf[0], "{s}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{s}", .{ srv.deviceCookieName(), secure }),
+            try std.fmt.bufPrint(&buf[1], "{s}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{s}", .{ srv.cookieName(), secure }),
+        };
+    }
+
+    /// POST /pair: consume an open pairing window for this device's address.
+    fn pairDevice(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request) !bool {
+        const peer = conn.peer();
+        const ip = devices.ipOnly(peer);
+        var secret: [auth.encoded_len]u8 = undefined;
+        srv.newSecret(&secret) catch return srv.fail(conn, w, .internal_server_error, "no entropy\n");
+        defer std.crypto.secureZero(u8, &secret);
+        var name_buf: [devices.max_name]u8 = undefined;
+        var name_len: usize = 0;
+        const now = srv.nowUnix();
+        const Ctx = struct { ip: []const u8, hash: auth.Hash, now: i64, name: *[devices.max_name]u8, len: *usize };
+        devices.withStore(srv.gpa, srv.io, srv.cfg.devices, now, Ctx{
+            .ip = ip,
+            .hash = auth.hashSecret(&secret),
+            .now = now,
+            .name = &name_buf,
+            .len = &name_len,
+        }, struct {
+            fn op(c: Ctx, st: *devices.Store) !bool {
+                const n = st.completePair(c.ip, c.hash, c.now) catch return false;
+                @memcpy(c.name[0..n.len], n);
+                c.len.* = n.len;
+                return true;
+            }
+        }.op) catch |err| {
+            srv.log.print("pairing from {s} failed: {t}", .{ peer, err });
+            return srv.fail(conn, w, .internal_server_error, "device store unavailable\n");
+        };
+        if (name_len == 0) {
+            srv.log.print("pairing attempt from {s}: no window open", .{peer});
+            return srv.redirect(conn, w, req, "/pair?e=closed", &.{});
+        }
+        const name = name_buf[0..name_len];
+        srv.log.print("PAIRED device '{s}' at {s}", .{ name, ip });
+        var cookies: CookiePair = .{};
+        try srv.issueCookies(name, &secret, &cookies);
+        return srv.redirect(conn, w, req, "/", &.{ cookies.device, cookies.session });
+    }
+
+    const SignInMode = enum { page, api };
+    const SignInOutcome = enum { ok, wrong_address, revoked, unknown };
+
+    /// A paired device presents its credential: verify it against the
+    /// device's bound address, rotate it, and start a session. A stale or
+    /// wrong secret revokes the device (see devices.zig).
+    fn deviceSignIn(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, presented: []const u8, mode: SignInMode) !bool {
+        const peer = conn.peer();
+        const ip = devices.ipOnly(peer);
+        var secret: [auth.encoded_len]u8 = undefined;
+        srv.newSecret(&secret) catch return srv.fail(conn, w, .internal_server_error, "no entropy\n");
+        defer std.crypto.secureZero(u8, &secret);
+
+        var outcome: SignInOutcome = .unknown;
+        var name_buf: [devices.max_name]u8 = undefined;
+        var name_len: usize = 0;
+        const now = srv.nowUnix();
+        const Ctx = struct {
+            presented: []const u8,
+            ip: []const u8,
+            hash: auth.Hash,
+            now: i64,
+            outcome: *SignInOutcome,
+            name: *[devices.max_name]u8,
+            len: *usize,
+        };
+        devices.withStore(srv.gpa, srv.io, srv.cfg.devices, now, Ctx{
+            .presented = presented,
+            .ip = ip,
+            .hash = auth.hashSecret(&secret),
+            .now = now,
+            .outcome = &outcome,
+            .name = &name_buf,
+            .len = &name_len,
+        }, struct {
+            fn op(c: Ctx, st: *devices.Store) !bool {
+                switch (st.authenticate(c.presented, c.ip, c.now)) {
+                    .ok => |idx| {
+                        const n = st.devices[idx].?.name.get();
+                        @memcpy(c.name[0..n.len], n);
+                        c.len.* = n.len;
+                        st.rotate(idx, c.presented, c.hash, c.now);
+                        c.outcome.* = .ok;
+                        return true;
+                    },
+                    .revoked => |n| {
+                        const m = @min(n.len, devices.max_name);
+                        @memcpy(c.name[0..m], n[0..m]);
+                        c.len.* = m;
+                        c.outcome.* = .revoked;
+                        return true;
+                    },
+                    .wrong_address => {
+                        c.outcome.* = .wrong_address;
+                        return false;
+                    },
+                    .unknown => return false,
+                }
+            }
+        }.op) catch |err| {
+            srv.log.print("device sign-in from {s} failed: {t}", .{ peer, err });
+            return srv.fail(conn, w, .internal_server_error, "device store unavailable\n");
+        };
+        const name = name_buf[0..name_len];
+        switch (outcome) {
+            .ok => {
+                var cookies: CookiePair = .{};
+                try srv.issueCookies(name, &secret, &cookies);
+                switch (mode) {
+                    .page => return srv.redirect(conn, w, req, "/", &.{ cookies.device, cookies.session }),
+                    .api => {
+                        const extra = [_]http1.Header{
+                            .{ .name = "set-cookie", .value = cookies.device },
+                            .{ .name = "set-cookie", .value = cookies.session },
+                        };
+                        try srv.respond(conn, w, .no_content, "", "text/plain; charset=utf-8", &extra, false);
+                        return false;
+                    },
+                }
+            },
+            .revoked => {
+                srv.auth_mutex.lockUncancelable(srv.io);
+                srv.sessions.revokeTag(name);
+                srv.auth_mutex.unlock(srv.io);
+                srv.log.print("DEVICE REVOKED '{s}': stale or wrong credential presented from {s} (copied credential?). Re-pair required.", .{ name, peer });
+            },
+            .wrong_address => srv.log.print("device credential presented from unexpected address {s}; rejected", .{peer}),
+            .unknown => {},
+        }
+        var clear_buf: [2][128]u8 = undefined;
+        const clear = try srv.clearCookies(&clear_buf);
+        switch (mode) {
+            .page => return srv.redirect(conn, w, req, switch (outcome) {
+                .revoked => "/pair?e=revoked",
+                .wrong_address => "/pair?e=address",
+                else => "/pair",
+            }, &clear),
+            .api => return srv.fail(conn, w, .unauthorized, "not paired\n"),
+        }
+    }
+
+    /// Whether device `name` is still in the store (it may have been unpaired
+    /// by `portal unpair` from another process). Fails closed.
+    fn devicePaired(srv: *Server, name: []const u8) bool {
+        var found = false;
+        const Ctx = struct { name: []const u8, found: *bool };
+        devices.withStore(srv.gpa, srv.io, srv.cfg.devices, srv.nowUnix(), Ctx{ .name = name, .found = &found }, struct {
+            fn op(c: Ctx, st: *devices.Store) !bool {
+                c.found.* = st.find(c.name) != null;
+                return false;
+            }
+        }.op) catch return false;
+        return found;
+    }
+
+    /// POST /logout ("Unpair this device"): removes the device and its sessions.
     fn logout(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, h: Headers) !bool {
+        var tag_buf: [auth.Sessions.max_tag]u8 = undefined;
+        var name: []const u8 = "";
         if (h.cookie) |c| {
             srv.auth_mutex.lockUncancelable(srv.io);
+            name = srv.sessions.liveTag(c, srv.nowMs(), false, &tag_buf) orelse "";
             srv.sessions.revoke(c);
+            if (name.len > 0) srv.sessions.revokeTag(name);
             srv.auth_mutex.unlock(srv.io);
-            srv.log.print("logout from {s}", .{conn.peer()});
         }
-        var cookie_hdr: [128]u8 = undefined;
-        const clear = try std.fmt.bufPrint(&cookie_hdr, "{s}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{s}", .{
-            srv.cookieName(),
-            if (srv.cfg.secure_cookie) "; Secure" else "",
-        });
-        return srv.redirect(conn, w, req, "/login?bye", clear);
+        if (name.len > 0) {
+            const Ctx = struct { name: []const u8 };
+            devices.withStore(srv.gpa, srv.io, srv.cfg.devices, srv.nowUnix(), Ctx{ .name = name }, struct {
+                fn op(c: Ctx, st: *devices.Store) !bool {
+                    return st.remove(c.name);
+                }
+            }.op) catch {};
+            srv.log.print("device '{s}' unpaired itself from {s}", .{ name, conn.peer() });
+        }
+        var clear_buf: [2][128]u8 = undefined;
+        const clear = try srv.clearCookies(&clear_buf);
+        return srv.redirect(conn, w, req, "/pair?bye", &clear);
     }
 
     // --------------------------------------------------------- websocket
@@ -722,6 +926,8 @@ pub const Server = struct {
         close_sent: bool = false,
         dead: std.atomic.Value(bool) = .init(false),
         cookie: [auth.encoded_len]u8,
+        device: [auth.Sessions.max_tag]u8 = undefined,
+        device_len: u8 = 0,
 
         /// Returns false if the connection should end. Cancelable: the
         /// supervisor can always tear down a sender stuck behind another.
@@ -773,6 +979,12 @@ pub const Server = struct {
 
         var ws: WsConn = .{ .conn = conn, .w = w, .cookie = undefined };
         @memcpy(&ws.cookie, cookie);
+        {
+            srv.auth_mutex.lockUncancelable(srv.io);
+            defer srv.auth_mutex.unlock(srv.io);
+            const tag = srv.sessions.liveTag(cookie, srv.nowMs(), false, &ws.device) orelse "";
+            ws.device_len = @intCast(tag.len);
+        }
         @memcpy(&conn.ws_cookie, cookie);
         conn.ws_active.store(true, .release);
 
@@ -880,7 +1092,14 @@ pub const Server = struct {
             const now = srv.nowMs();
             if (now -| last_auth >= auth_recheck_ms) {
                 last_auth = now;
-                // Logout, expiry or restart of the auth state ends the stream.
+                // Logout, expiry, or the device being unpaired (possibly by
+                // `portal unpair` in another process) ends the stream.
+                const dev = ws.device[0..ws.device_len];
+                if (dev.len > 0 and !srv.devicePaired(dev)) {
+                    srv.auth_mutex.lockUncancelable(srv.io);
+                    srv.sessions.revokeTag(dev);
+                    srv.auth_mutex.unlock(srv.io);
+                }
                 if (!srv.sessionLive(&ws.cookie, false)) {
                     _ = ws.send(srv, "{\"t\":\"logout\"}", .text);
                     return;

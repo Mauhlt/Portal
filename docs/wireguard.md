@@ -136,5 +136,6 @@ does **not** connect.
 1. Turn the laptop's Wi-Fi off and tether to your phone, so you are genuinely
    outside the home network.
 2. Activate the tunnel and open `http://10.8.0.1:8420/`.
-3. Sign in; the desktop console title should change to
+3. Pair the device (`portal pair <name>` at the desk first; see the README).
+   The desktop console title should change to
    `Portal - 1 REMOTE VIEWER CONNECTED`.

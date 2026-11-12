@@ -2,13 +2,13 @@
 //! and randomness, which keeps everything here unit-testable.
 //!
 //! Model:
-//!   * One access token (256-bit random, base64url) is generated on the
-//!     desktop with `portal token`. Only its SHA-256 is stored on disk.
-//!   * Logging in with the token creates a session; the browser holds a
-//!     random session id in an HttpOnly cookie. Only hashes of session ids
-//!     are kept in memory.
-//!   * Failed logins are rate limited globally (there is only one user).
-//!   * Sessions live in memory only, so restarting Portal logs everyone out.
+//!   * Devices are paired at the desk (devices.zig); a paired device's
+//!     rotating credential creates a session here.
+//!   * The browser holds a random session id in an HttpOnly cookie. Only
+//!     hashes of session ids are kept in memory, tagged with the device name
+//!     so unpairing a device ends its sessions.
+//!   * Sessions live in memory only; restarting Portal ends them, and paired
+//!     devices silently get new ones on their next visit.
 
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -37,24 +37,6 @@ pub fn verify(stored: Hash, presented: []const u8) bool {
     return std.crypto.timing_safe.eql(Hash, hashSecret(presented), stored);
 }
 
-// ---------------------------------------------------------------- token file
-
-pub const token_file_prefix = "portal-token-v1 sha256:";
-
-pub fn formatTokenFile(hash: Hash, out: []u8) ![]u8 {
-    return std.fmt.bufPrint(out, "{s}{x}\n", .{ token_file_prefix, &hash });
-}
-
-pub fn parseTokenFile(contents: []const u8) !Hash {
-    const line = std.mem.trim(u8, contents, " \t\r\n");
-    if (!std.mem.startsWith(u8, line, token_file_prefix)) return error.BadTokenFile;
-    const hex = line[token_file_prefix.len..];
-    if (hex.len != 64) return error.BadTokenFile;
-    var hash: Hash = undefined;
-    _ = std.fmt.hexToBytes(&hash, hex) catch return error.BadTokenFile;
-    return hash;
-}
-
 // ------------------------------------------------------------------ sessions
 
 pub const Sessions = struct {
@@ -64,15 +46,24 @@ pub const Sessions = struct {
     absolute_timeout_ms: i64 = 7 * std.time.ms_per_day,
     slots: [max_sessions]?Slot = @splat(null),
 
+    pub const max_tag = 32;
+
     const Slot = struct {
         id_hash: Hash,
         created_ms: i64,
         last_seen_ms: i64,
+        tag: [max_tag]u8 = undefined,
+        tag_len: u8 = 0,
     };
 
     /// Register a new session id (the encoded cookie value). Evicts the
     /// least-recently-used session when full.
     pub fn create(s: *Sessions, cookie_value: []const u8, now_ms: i64) void {
+        s.createTagged(cookie_value, now_ms, "");
+    }
+
+    /// Like `create`, remembering `tag` (the paired device's name).
+    pub fn createTagged(s: *Sessions, cookie_value: []const u8, now_ms: i64, tag: []const u8) void {
         s.expire(now_ms);
         var target: usize = 0;
         var oldest: i64 = std.math.maxInt(i64);
@@ -83,7 +74,11 @@ pub const Sessions = struct {
                 target = i;
             }
         }
-        s.slots[target] = .{ .id_hash = hashSecret(cookie_value), .created_ms = now_ms, .last_seen_ms = now_ms };
+        var slot: Slot = .{ .id_hash = hashSecret(cookie_value), .created_ms = now_ms, .last_seen_ms = now_ms };
+        const n = @min(tag.len, max_tag);
+        @memcpy(slot.tag[0..n], tag[0..n]);
+        slot.tag_len = @intCast(n);
+        s.slots[target] = slot;
     }
 
     /// Returns true and refreshes the idle timer if the cookie is a live session.
@@ -99,6 +94,25 @@ pub const Sessions = struct {
     pub fn isLive(s: *Sessions, cookie_value: []const u8, now_ms: i64) bool {
         s.expire(now_ms);
         return s.find(cookie_value) != null;
+    }
+
+    /// Copies the tag of a live session into `out`. Null if not live.
+    pub fn liveTag(s: *Sessions, cookie_value: []const u8, now_ms: i64, refresh: bool, out: *[max_tag]u8) ?[]const u8 {
+        s.expire(now_ms);
+        const idx = s.find(cookie_value) orelse return null;
+        const slot = &s.slots[idx].?;
+        if (refresh) slot.last_seen_ms = now_ms;
+        @memcpy(out[0..slot.tag_len], slot.tag[0..slot.tag_len]);
+        return out[0..slot.tag_len];
+    }
+
+    /// Ends every session belonging to device `tag`.
+    pub fn revokeTag(s: *Sessions, tag: []const u8) void {
+        for (&s.slots) |*slot| {
+            if (slot.*) |v| if (std.mem.eql(u8, v.tag[0..v.tag_len], tag)) {
+                slot.* = null;
+            };
+        }
     }
 
     pub fn revoke(s: *Sessions, cookie_value: []const u8) void {
@@ -144,47 +158,6 @@ pub const Sessions = struct {
     }
 };
 
-// -------------------------------------------------------------- rate limiter
-
-pub const RateLimiter = struct {
-    max_failures: u32 = 5,
-    window_ms: i64 = 15 * std.time.ms_per_min,
-    lockout_ms: i64 = 15 * std.time.ms_per_min,
-
-    failures: [16]i64 = @splat(0),
-    n: u32 = 0,
-    locked_until_ms: i64 = std.math.minInt(i64),
-
-    pub fn allowed(r: *const RateLimiter, now_ms: i64) bool {
-        return now_ms >= r.locked_until_ms;
-    }
-
-    pub fn recordFailure(r: *RateLimiter, now_ms: i64) void {
-        std.debug.assert(r.max_failures <= r.failures.len);
-        // Drop failures that fell out of the window.
-        var kept: u32 = 0;
-        for (r.failures[0..r.n]) |t| {
-            if (now_ms - t <= r.window_ms) {
-                r.failures[kept] = t;
-                kept += 1;
-            }
-        }
-        r.n = kept;
-        if (r.n < r.failures.len) {
-            r.failures[r.n] = now_ms;
-            r.n += 1;
-        }
-        if (r.n >= r.max_failures) {
-            r.locked_until_ms = now_ms + r.lockout_ms;
-            r.n = 0;
-        }
-    }
-
-    pub fn recordSuccess(r: *RateLimiter) void {
-        r.n = 0;
-    }
-};
-
 // --------------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -203,14 +176,6 @@ test "verify accepts right secret, rejects others" {
     try testing.expect(!verify(h, &wrong));
 }
 
-test "token file round trip and rejects garbage" {
-    const h = hashSecret("abc");
-    var buf: [128]u8 = undefined;
-    const text = try formatTokenFile(h, &buf);
-    try testing.expectEqual(h, try parseTokenFile(text));
-    try testing.expectError(error.BadTokenFile, parseTokenFile("nope"));
-    try testing.expectError(error.BadTokenFile, parseTokenFile(token_file_prefix ++ "zz"));
-}
 
 fn testCookie(fill: u8) [encoded_len]u8 {
     const raw: [secret_bytes]u8 = @splat(fill);
@@ -261,6 +226,19 @@ test "sessions: eviction when full keeps newest" {
     try testing.expect(s.isLive(&cookies[Sessions.max_sessions], 10));
 }
 
+test "sessions: tags" {
+    var s: Sessions = .{};
+    const a = testCookie(1);
+    const b = testCookie(2);
+    s.createTagged(&a, 0, "laptop");
+    s.createTagged(&b, 0, "phone");
+    var buf: [Sessions.max_tag]u8 = undefined;
+    try testing.expectEqualStrings("laptop", s.liveTag(&a, 1, false, &buf).?);
+    s.revokeTag("laptop");
+    try testing.expect(s.liveTag(&a, 2, false, &buf) == null);
+    try testing.expectEqualStrings("phone", s.liveTag(&b, 2, false, &buf).?);
+}
+
 test "sessions: clock going backwards fails closed" {
     var s: Sessions = .{};
     const a = testCookie(1);
@@ -268,22 +246,4 @@ test "sessions: clock going backwards fails closed" {
     try testing.expect(!s.validate(&a, 500));
 }
 
-test "rate limiter locks after max failures and unlocks later" {
-    var r: RateLimiter = .{ .max_failures = 3, .window_ms = 100, .lockout_ms = 1000 };
-    try testing.expect(r.allowed(0));
-    r.recordFailure(0);
-    r.recordFailure(10);
-    try testing.expect(r.allowed(20));
-    r.recordFailure(20);
-    try testing.expect(!r.allowed(21));
-    try testing.expect(!r.allowed(1019));
-    try testing.expect(r.allowed(1020));
-}
 
-test "rate limiter forgets failures outside window" {
-    var r: RateLimiter = .{ .max_failures = 3, .window_ms = 100, .lockout_ms = 1000 };
-    r.recordFailure(0);
-    r.recordFailure(10);
-    r.recordFailure(500);
-    try testing.expect(r.allowed(501));
-}

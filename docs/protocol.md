@@ -4,29 +4,47 @@ Used by every client: the browser viewer, and the native Zig + Vulkan clients
 for Windows, Linux and macOS. Transport is HTTP/1.1 + WebSocket (RFC 6455)
 over the WireGuard tunnel, plain HTTP inside the tunnel.
 
-## 1. Sign in
+## 1. Pairing and sign-in (no passwords)
+
+Every POST needs `Host` on the server's allowlist and `Origin: http://<that
+host>`, sent exactly; native clients must send both. POST bodies are empty
+(`Content-Length: 0`).
+
+**Pair (once per device).** The owner runs `portal pair <name>` at the
+desktop, which opens a 2-minute, single-use window. The client then sends:
 
 ```
-POST /login HTTP/1.1
+POST /pair HTTP/1.1
 Host: 10.8.0.1:8420
 Origin: http://10.8.0.1:8420
-Content-Type: application/x-www-form-urlencoded
-Content-Length: <n>
-
-token=<access token>
+Content-Length: 0
 ```
 
-* Success: `303 See Other`, `Location: /`, and
-  `Set-Cookie: portal_session=<43 chars>; Path=/; HttpOnly; SameSite=Strict; Max-Age=...`
-  (`__Host-portal` plus `Secure` when the server runs with `--https`).
-* Failure: `303` to `/login?e=1`, or `/login?e=locked` after repeated failures.
-  A correct token is always accepted.
-* `Host` must match the server's allowlist and `Origin` must be
-  `http://<that host>`. Native clients must send both exactly.
-* Native clients keep the cookie value only in memory. They should never write
-  the token to disk unless an OS credential store is used.
+* Success: `303`, `Location: /`, with two `Set-Cookie` headers:
+  * `portal_device=<name>.<43 chars>; Path=/; HttpOnly; SameSite=Strict; Max-Age=7776000`
+    is the device credential;
+  * `portal_session=<43 chars>; ...` is a session.
+* No window open: `303` to `/pair?e=closed`.
+* With `--https` the names are `__Host-portal_device` / `__Host-portal`, with `Secure`.
 
-`POST /logout` with the cookie and the same `Origin` ends the session.
+**Sign in (every launch or reconnect).** Present the device credential:
+
+* Browsers: `GET /` with the `portal_device` cookie. Returns `303 /` with a
+  rotated `portal_device` and a new session.
+* Native clients: `POST /auth/refresh` with the `portal_device` cookie.
+  Returns `204` with the same two `Set-Cookie` headers, or `401` if the
+  device is unknown or revoked.
+
+The device secret **rotates on every sign-in**, so clients must replace the
+stored value immediately. The previous value stays valid for 10 minutes to
+survive a lost response. Presenting anything older or wrong revokes the
+device (theft detection), and re-pairing is then required. Credentials are
+bound to the device's source (WireGuard) address. Native clients store the
+device credential only in the OS credential store and keep the session in
+memory.
+
+`POST /logout` with the session cookie unpairs this device and ends its
+sessions.
 
 ## 2. Open the stream
 

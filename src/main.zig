@@ -1,7 +1,9 @@
 //! Portal: watch (and answer prompts in) a terminal session running on this
 //! desktop from a browser elsewhere, over a private network (WireGuard).
 //!
-//!   portal token [--force]           create or rotate the access token
+//!   portal pair <name>               let a device pair (2-minute window)
+//!   portal devices                   list paired devices
+//!   portal unpair <name>             revoke a device
 //!   portal run [options] [-- cmd...] start a session (default cmd: claude)
 //!   portal version
 
@@ -20,6 +22,7 @@ const console_mod = @import("console.zig");
 const Console = console_mod.Console;
 const Session = @import("session.zig").Session;
 const Log = @import("log.zig").Log;
+const devices = @import("devices.zig");
 const w = @import("win32.zig");
 const web = @import("web.zig");
 
@@ -30,13 +33,18 @@ const usage =
     \\Portal {s} - remote viewer for a desktop terminal session
     \\
     \\Usage:
-    \\  portal token [--force]
-    \\      Generate a new access token and print it once. Only its hash is
-    \\      stored. A `portal run` that is already running keeps accepting
-    \\      the OLD token until it is restarted.
-    \\      Refuses unless stdout and stderr are an interactive console, so
-    \\      the token is not captured by a redirect, pipe or agent
-    \\      transcript. --force overrides that check.
+    \\  portal pair <name> [--minutes N]
+    \\      Open a pairing window (default 2 minutes, max 10) for a device
+    \\      called <name> (a-z, 0-9, -). On the device, with WireGuard on,
+    \\      open http://10.8.0.1:8420/ and tap "Pair this device". Nothing
+    \\      to type: the device gets its own credential, which rotates on
+    \\      every use and is bound to its WireGuard address.
+    \\
+    \\  portal devices
+    \\      List paired devices (and any open pairing window).
+    \\
+    \\  portal unpair <name>
+    \\      Revoke a device immediately, even while `portal run` is running.
     \\
     \\  portal run [options] [-- command args...]
     \\      Run `command` (default: claude) in this console and share it.
@@ -73,7 +81,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len == 0) return printUsage();
     const cmd = args[0];
-    if (std.mem.eql(u8, cmd, "token")) return cmdToken(gpa, io, init.environ_map, args[1..]);
+    if (std.mem.eql(u8, cmd, "pair")) return cmdPair(gpa, io, init.environ_map, args[1..]);
+    if (std.mem.eql(u8, cmd, "devices")) return cmdDevices(gpa, io, init.environ_map);
+    if (std.mem.eql(u8, cmd, "unpair")) return cmdUnpair(gpa, io, init.environ_map, args[1..]);
+    if (std.mem.eql(u8, cmd, "token")) fatal("access tokens were replaced by device pairing: run `portal pair <name>` (see `portal`)", .{});
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "version")) {
         std.debug.print("portal {s} (built with zig {s})\n", .{ portal_version, builtin.zig_version_string });
@@ -106,88 +117,98 @@ fn dataDir(gpa: Allocator, env: *const std.process.Environ.Map) ![]u8 {
     return std.fs.path.join(gpa, &.{ base, "Portal" });
 }
 
-fn tokenPath(gpa: Allocator, env: *const std.process.Environ.Map) ![]u8 {
+fn devicePaths(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) !devices.Paths {
     const dir = try dataDir(gpa, env);
-    defer gpa.free(dir);
-    return std.fs.path.join(gpa, &.{ dir, "token.sha256" });
-}
-
-// ------------------------------------------------------------------ token
-
-/// Returns whether --force was given, or null for an unknown argument.
-fn parseTokenArgs(args: []const []const u8) ?bool {
-    var force = false;
-    for (args) |a| {
-        if (std.mem.eql(u8, a, "--force")) force = true else return null;
-    }
-    return force;
-}
-
-fn cmdToken(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
-    const force = parseTokenArgs(args) orelse fatal("usage: portal token [--force]", .{});
-    // Checked before anything is generated, so a refusal leaves the current
-    // token untouched.
-    if (!force and !console_mod.stdioIsInteractive()) fatal(
-        \\refusing to print a new token: stdout/stderr is not an interactive
-        \\console (redirected, piped, or run by a tool or agent), so the token
-        \\would end up in a file or transcript. The existing token was NOT changed.
-        \\Run `portal token` yourself in a console window, or pass --force.
-    , .{});
-
-    const dir = try dataDir(gpa, env);
-    defer gpa.free(dir);
     try Io.Dir.cwd().createDirPath(io, dir);
-    const path = try tokenPath(gpa, env);
-    defer gpa.free(path);
+    return .{ .dir = dir };
+}
 
-    var raw: [auth.secret_bytes]u8 = undefined;
-    io.randomSecure(&raw) catch fatal("could not obtain secure randomness", .{});
-    var encoded: [auth.encoded_len]u8 = undefined;
-    const token = auth.encodeSecret(&raw, &encoded);
-    std.crypto.secureZero(u8, &raw);
+fn nowUnix(io: Io) i64 {
+    return Io.Timestamp.now(io, .real).toSeconds();
+}
 
-    var file_buf: [128]u8 = undefined;
-    const contents = try auth.formatTokenFile(auth.hashSecret(token), &file_buf);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
-
-    const log_path = try std.fs.path.join(gpa, &.{ dir, "portal.log" });
+fn openLog(gpa: Allocator, paths: devices.Paths, io: Io) ?Log {
+    const log_path = std.fs.path.join(gpa, &.{ paths.dir, "portal.log" }) catch return null;
     defer gpa.free(log_path);
-    if (Log.open(gpa, io, log_path)) |opened| {
+    return Log.open(gpa, io, log_path) catch null;
+}
+
+// ---------------------------------------------------------------- devices
+
+fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
+    if (args.len == 0) fatal("usage: portal pair <name> [--minutes N]", .{});
+    const name = args[0];
+    if (!devices.validName(name)) fatal("device name must be 1-32 characters of a-z, 0-9 and -", .{});
+    var minutes: i64 = 2;
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--minutes")) {
+        minutes = std.fmt.parseInt(i64, args[2], 10) catch fatal("--minutes needs a number", .{});
+        if (minutes < 1 or minutes > 10) fatal("--minutes must be 1-10", .{});
+    } else if (args.len != 1) fatal("usage: portal pair <name> [--minutes N]", .{});
+
+    const paths = try devicePaths(gpa, io, env);
+    defer gpa.free(paths.dir);
+    const now = nowUnix(io);
+    const Ctx = struct { name: []const u8, now: i64, secs: i64 };
+    devices.withStore(gpa, io, paths, now, Ctx{ .name = name, .now = now, .secs = minutes * 60 }, struct {
+        fn op(c: Ctx, st: *devices.Store) !bool {
+            try st.beginPair(c.name, c.now, c.secs);
+            return true;
+        }
+    }.op) catch |err| fatal("could not open the pairing window: {t}", .{err});
+    if (openLog(gpa, paths, io)) |opened| {
         var log = opened;
         defer log.close();
-        log.print("token rotated{s}; running instances keep accepting the old token until restarted", .{
-            if (force) " (--force: console check skipped)" else "",
-        });
-    } else |err| {
-        std.debug.print("portal: warning: could not open {s} ({t}); the rotation was not logged.\n", .{ log_path, err });
+        log.print("pairing window opened for '{s}' ({d} min)", .{ name, minutes });
     }
-
     std.debug.print(
-        \\New access token (shown once, store it in your password manager):
+        \\Pairing open for '{s}' for {d} minute(s).
         \\
-        \\    {s}
+        \\On the device: turn WireGuard on, open http://<this desktop's WireGuard
+        \\address>:<port>/ (e.g. http://10.8.0.1:8420/), and tap "Pair this device".
+        \\If `portal run` is not running yet, start it first.
         \\
-        \\Only its SHA-256 hash was saved to {s}
-        \\
-        \\IMPORTANT: a `portal run` that is already running keeps accepting the
-        \\OLD token (and its logged-in browsers) until you restart it.
-        \\
-        \\Clear this screen now (Clear-Host / cls) so the token does not stay in
-        \\the console scrollback.
-        \\
-    , .{ token, path });
-    std.crypto.secureZero(u8, &encoded);
+    , .{ name, minutes });
 }
 
-fn loadTokenHash(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) !auth.Hash {
-    const path = try tokenPath(gpa, env);
-    defer gpa.free(path);
-    const contents = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4096)) catch |err| switch (err) {
-        error.FileNotFound => fatal("no access token yet. Run `portal token` first.", .{}),
-        else => return err,
-    };
-    defer gpa.free(contents);
-    return auth.parseTokenFile(contents) catch fatal("token file {s} is corrupt; run `portal token` again.", .{path});
+fn cmdDevices(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) !void {
+    const paths = try devicePaths(gpa, io, env);
+    defer gpa.free(paths.dir);
+    const now = nowUnix(io);
+    const Ctx = struct { now: i64 };
+    devices.withStore(gpa, io, paths, now, Ctx{ .now = now }, struct {
+        fn op(c: Ctx, st: *devices.Store) !bool {
+            if (st.count() == 0) std.debug.print("No paired devices. Pair one with `portal pair <name>`.\n", .{});
+            for (st.devices) |slot| {
+                const d = slot orelse continue;
+                std.debug.print("  {s: <20} {s: <18} last used {d} min ago\n", .{
+                    d.name.get(), d.ip.get(), @divTrunc(c.now -| d.last_seen, 60),
+                });
+            }
+            if (st.pairingName(c.now)) |n| std.debug.print("Pairing window open for '{s}'.\n", .{n});
+            return false;
+        }
+    }.op) catch |err| fatal("could not read the device list: {t}", .{err});
+}
+
+fn cmdUnpair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
+    if (args.len != 1) fatal("usage: portal unpair <name>", .{});
+    const paths = try devicePaths(gpa, io, env);
+    defer gpa.free(paths.dir);
+    var removed = false;
+    const Ctx = struct { name: []const u8, removed: *bool };
+    devices.withStore(gpa, io, paths, nowUnix(io), Ctx{ .name = args[0], .removed = &removed }, struct {
+        fn op(c: Ctx, st: *devices.Store) !bool {
+            c.removed.* = st.remove(c.name);
+            return c.removed.*;
+        }
+    }.op) catch |err| fatal("could not update the device list: {t}", .{err});
+    if (!removed) fatal("no paired device named '{s}' (see `portal devices`)", .{args[0]});
+    if (openLog(gpa, paths, io)) |opened| {
+        var log = opened;
+        defer log.close();
+        log.print("device '{s}' unpaired from the desktop", .{args[0]});
+    }
+    std.debug.print("Unpaired '{s}'. Its open viewers are disconnected within a few seconds.\n", .{args[0]});
 }
 
 // -------------------------------------------------------------------- run
@@ -314,7 +335,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     var opts = try parseRunArgs(gpa, args);
     defer opts.hosts.deinit(gpa);
 
-    const token_hash = try loadTokenHash(gpa, io, env);
+    const paths = devicePaths(gpa, io, env) catch |err| fatal("cannot create the data directory: {t}", .{err});
 
     const addr = parseListen(opts.listen) catch fatal("bad --listen value '{s}' (want IP:PORT)", .{opts.listen});
     guard.checkListenAddress(addr) catch |err| switch (err) {
@@ -377,7 +398,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .allowed_hosts = opts.hosts.items,
             .scheme = if (opts.https) "https" else "http",
             .secure_cookie = opts.https,
-            .token_hash = token_hash,
+            .devices = paths,
         },
     };
 
@@ -451,6 +472,7 @@ test {
     _ = @import("console.zig");
     _ = @import("session.zig");
     _ = @import("log.zig");
+    _ = @import("devices.zig");
     _ = @import("vt.zig");
     _ = @import("web.zig"); // also pulls in http1.zig tests
 }
@@ -475,9 +497,3 @@ test "run defaults to keys input" {
     try std.testing.expect(std.mem.indexOf(u8, policyNote(.text), "FULL REMOTE CONTROL") != null);
 }
 
-test "parseTokenArgs" {
-    try std.testing.expectEqual(@as(?bool, false), parseTokenArgs(&.{}));
-    try std.testing.expectEqual(@as(?bool, true), parseTokenArgs(&.{"--force"}));
-    try std.testing.expectEqual(@as(?bool, null), parseTokenArgs(&.{"--forc"}));
-    try std.testing.expectEqual(@as(?bool, null), parseTokenArgs(&.{ "--force", "x" }));
-}

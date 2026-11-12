@@ -40,14 +40,19 @@ watching, and every login attempt and viewer connection is written to
 1. **Network**: Portal refuses to listen on `0.0.0.0` or any public address.
    Bind it to your WireGuard interface address. Only devices holding a
    WireGuard key can reach it; WireGuard encrypts everything.
-2. **Token**: a 256-bit random access token, generated on the desktop. Only
-   its SHA-256 is stored. Constant-time comparison. Every failed attempt
-   costs 500 ms, and 5 failures in 15 minutes reject further *wrong* tokens
-   for 15 minutes. The correct token always works, so nobody can lock you
-   out by guessing.
-3. **Session cookie**: random, HttpOnly, SameSite=Strict, 12 h idle / 7 day
-   absolute lifetime, held in memory only (restarting Portal logs everyone
-   out). Open WebSockets are closed within 5 s of sign-out or expiry.
+2. **Device pairing, no passwords**: each device is paired once at the
+   desk (`portal pair <name>` opens a 2-minute window; tap "Pair this
+   device"). It gets its own random 256-bit credential, which you never see:
+   * stored only as a SHA-256 hash on the desktop, and in an HttpOnly cookie
+     or the OS credential store on the device;
+   * bound to the device's WireGuard address;
+   * **rotated on every use**. If an older credential is ever presented
+     again (a copied cookie), the device is revoked and logged, and must be
+     paired again;
+   * revocable any time with `portal unpair <name>`, which also disconnects
+     its open viewers within seconds.
+3. **Sessions**: random, HttpOnly, SameSite=Strict, in memory only. A paired
+   device silently starts a new one after a Portal restart.
 4. **Browser hardening**: Host allowlist (blocks DNS rebinding), Origin checks
    on every POST and on the WebSocket upgrade (blocks CSRF and cross-site
    WebSocket hijacking), strict Content-Security-Policy, no framing.
@@ -74,21 +79,7 @@ promotes the result. It also installs a small launcher as
 `%LOCALAPPDATA%\Portal\bin\portal.exe` that always runs the current release.
 Put `%LOCALAPPDATA%\Portal\bin` on your PATH once, then type `portal`.
 
-### 2. Create the access token
-
-In a plain terminal (**not** through the agent or any tool that records
-output):
-
-```powershell
-portal token
-cls
-```
-
-Store the printed token in your password manager. It is shown only once.
-Portal refuses to print it when output is redirected. A running `portal run`
-keeps accepting the old token until it is restarted.
-
-### 3. WireGuard (free, open source)
+### 2. WireGuard (free, open source)
 
 See [docs/wireguard.md](docs/wireguard.md) for the full walk-through. In short:
 
@@ -99,7 +90,7 @@ See [docs/wireguard.md](docs/wireguard.md) for the full walk-through. In short:
    `Endpoint = <your home IP or DDNS name>:51820`, `AllowedIPs = 10.8.0.1/32`.
 4. Router: forward **UDP 51820** to the desktop. Nothing else.
 
-### 4. Run
+### 3. Run
 
 On the desktop, in the project you want to work on:
 
@@ -107,8 +98,22 @@ On the desktop, in the project you want to work on:
 portal run --listen 10.8.0.1:8420 -- claude          # --input keys is the default
 ```
 
-On the laptop, with the tunnel up, open `http://10.8.0.1:8420/` and sign in
-with the token.
+### 4. Pair each device once (at the desk)
+
+```powershell
+portal pair laptop          # or: portal pair iphone
+```
+
+Within 2 minutes, on that device: turn the WireGuard tunnel **on** and open
+`http://10.8.0.1:8420/`, then tap **Pair this device**. Pair through the
+WireGuard address even at home, because that's the address the device will
+use when away (browsers keep credentials per address). If your router can't
+reach its own public IP from inside the house, put the phone on cellular for
+those 30 seconds.
+
+From then on, opening `http://10.8.0.1:8420/` from anywhere with the tunnel on
+just works. `portal devices` lists paired devices; `portal unpair <name>`
+revokes one.
 
 ## Upgrading Zig safely
 

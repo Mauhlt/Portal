@@ -195,3 +195,6 @@ pub extern "kernel32" fn CreateFileW(
 ) callconv(.winapi) ?HANDLE;
 pub extern "kernel32" fn GetFileSizeEx(h: HANDLE, size: *i64) callconv(.winapi) BOOL;
 pub extern "kernel32" fn MoveFileExW(from: [*:0]const u16, to: [*:0]const u16, flags: DWORD) callconv(.winapi) BOOL;
+
+pub const GENERIC_WRITE: DWORD = 0x40000000;
+pub const MOVEFILE_WRITE_THROUGH: DWORD = 0x8;

@@ -173,6 +173,7 @@ pub fn parseHead(head: []const u8) ParseError!Request {
 
 pub const Status = enum(u16) {
     ok = 200,
+    no_content = 204,
     switching_protocols = 101,
     see_other = 303,
     bad_request = 400,
@@ -191,6 +192,7 @@ pub const Status = enum(u16) {
     pub fn phrase(s: Status) []const u8 {
         return switch (s) {
             .ok => "OK",
+            .no_content => "No Content",
             .switching_protocols => "Switching Protocols",
             .see_other => "See Other",
             .bad_request => "Bad Request",
