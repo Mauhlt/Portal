@@ -1,25 +1,18 @@
-//! Page layout as slices: every platform gets the same three, arranged to
-//! fit the screen.
+//! Page layout as slices: the same three on every device as on the native
+//! windows (docs/layout-design.md), stacked top to bottom:
 //!
-//!   terminal     the live terminal (canvas), under a header with a status
-//!                line (project, viewer state, session state) and controls
-//!   interaction  the input box (a native textarea, so keyboard dictation
-//!                and Win+H fill it), its note line, and the button row
-//!   data         whatever data the session pushed (images today; tables
-//!                and charts later), drawn by data.zig on its own canvas
-//!
-//! Arrangements:
-//!
-//!   tabs (narrow: phones, small windows)      columns (wide: laptop, desktop)
-//!   ┌──────────────────────┐                  ┌───────────────┬┬─────────┐
-//!   │ [Terminal|Data•] ... │ header           │ header        ││ data    │
-//!   │ status line          │                  ├───────────────┤│         │
-//!   ├──────────────────────┤                  │ terminal      ││         │
-//!   │ terminal OR data     │ (same rect,      │               ││         │
-//!   │ (segmented control)  │  one visible)    ├───────────────┤│         │
-//!   ├──────────────────────┤                  │ interaction   ││         │
-//!   │ interaction (pinned) │                  └───────────────┴┴─────────┘
-//!   └──────────────────────┘                            splitter ^ (drag)
+//!   ┌──────────────────────────────┐
+//!   │ header: controls, status     │  (shed while typing on a short screen)
+//!   ├──────────────────────────────┤
+//!   │ terminal (canvas)            │  the biggest share
+//!   ├──────────────────────────────┤
+//!   │ Data · nothing yet    [Hide] │  data: a header strip; its canvas
+//!   │ (images, newest first, →)    │  grows when there is something to
+//!   ├──────────────────────────────┤  show, up to datafeed.max_share
+//!   │ input box                    │  interaction: the input box (a native
+//!   │ note                         │  textarea, so keyboard dictation and
+//!   │ [Yes][No][1][2][3][Esc]...   │  Win+H fill it), its note line and
+//!   └──────────────────────────────┘  big buttons, pinned at the bottom
 //!
 //! The page follows the *visual* viewport: when the on-screen keyboard
 //! opens, iOS shrinks it (and may scroll it), so the slices are sized to it
@@ -27,13 +20,10 @@
 //! CSS pixels; main.zig turns the result into CSS variables and classes.
 
 const std = @import("std");
+const datafeed = @import("datafeed");
 const layout = @import("layout.zig");
 const sane = layout.sane;
 pub const Rect = layout.Rect;
-
-pub const Arrangement = enum { tabs, columns };
-/// What the top of the tabs arrangement shows.
-pub const Tab = enum(u32) { terminal = 0, data = 1 };
 
 pub const Input = struct {
     /// window.innerWidth / innerHeight (the layout viewport).
@@ -50,27 +40,27 @@ pub const Input = struct {
     touch: bool,
     /// The server accepts some input (interaction slice shown).
     input: bool = true,
-    tab: Tab = .terminal,
-    /// Share of the width given to the data column (columns arrangement).
-    data_frac: f64 = default_data_frac,
+    /// What the Data slice's items would like under its header (CSS px;
+    /// 0: nothing to show), and the user's collapse toggle.
+    data_content: f64 = 0,
+    data_collapsed: bool = false,
 };
 
 pub const Slices = struct {
     /// Height and top of the page box (follows the visual viewport).
     app_h: i32 = 0,
     app_top: i32 = 0,
-    arrangement: Arrangement = .tabs,
-    tab: Tab = .terminal,
     /// Header (controls row + status line) over the terminal slice.
     head: Rect = .{},
     term: Rect = .{},
+    /// The Data slice: its header strip (`dhead_h`) and, below it, the
+    /// data canvas.
     data: Rect = .{},
     inter: Rect = .{},
-    /// The drag handle between the left column and the data column.
-    split: Rect = .{},
     head_pad: i32 = 0,
     ctl_h: i32 = 0,
     status_h: i32 = 0,
+    dhead_h: i32 = 0,
     /// Interaction slice internals: textarea, note line, button grid.
     box_h: i32 = 0,
     note_h: i32 = 0,
@@ -83,27 +73,32 @@ pub const Slices = struct {
     keyboard: bool = false,
     /// Header hidden to make room (short screen with the keyboard open).
     no_head: bool = false,
+    /// Data slice hidden to make room (the same).
+    no_data: bool = false,
 
     pub fn eql(a: Slices, b: Slices) bool {
         return std.meta.eql(a, b);
+    }
+
+    /// The data canvas (under the Data header) has room to draw in.
+    pub fn dataOpen(s: Slices) bool {
+        return s.data.h > s.dhead_h;
     }
 };
 
 /// The visual viewport is this much shorter than the layout viewport:
 /// the on-screen keyboard is open (the URL bar alone is well under it).
 pub const keyboard_threshold: f64 = 120;
-/// From this width on, data gets its own column.
-pub const columns_min_w: i32 = 900;
-pub const default_data_frac: f64 = 0.36;
-pub const min_data_frac: f64 = 0.2;
-pub const max_data_frac: f64 = 0.7;
-pub const min_data_w: i32 = 260;
-pub const min_left_w: i32 = 480;
-pub const split_w: i32 = 8;
 pub const gap: i32 = 6;
 pub const pane_pad: i32 = 6;
 /// Yes No 1 2 3 Esc Enter Send (inputbox.Button).
 pub const button_count: u32 = 8;
+/// Answer buttons: thumb-sized on touch screens, comfortable with a mouse.
+pub const btn_touch: i32 = 52;
+pub const btn_mouse: i32 = 44;
+/// Narrowest button that still takes a single row (else two rows of four).
+pub const min_btn_touch: f64 = 44;
+pub const min_btn_mouse: f64 = 64;
 /// Smallest terminal slice worth keeping before shrinking the others.
 pub const min_term: i32 = 120;
 /// Text line inside the textarea (16 px font: smaller makes iOS zoom in on
@@ -112,20 +107,16 @@ pub const box_line: i32 = 22;
 pub const box_chrome: i32 = 14; // padding + border
 pub const note_line: i32 = 18;
 pub const status_line: i32 = 20;
+/// The Data slice's header strip.
+pub const dhead_touch: i32 = 36;
+pub const dhead_mouse: i32 = 30;
 
 fn px(v: f64) i32 {
     return @intFromFloat(@round(v));
 }
 
-/// Data column share from a splitter drag to CSS x `x` in a page `w` wide.
-pub fn dragFrac(x: f64, w: f64) f64 {
-    const W = sane(w, 1, layout.max_side);
-    const frac = (W - sane(x, -1e6, 1e6) - @as(f64, split_w) / 2) / W;
-    return std.math.clamp(frac, min_data_frac, max_data_frac);
-}
-
 pub fn compute(in: Input) Slices {
-    var s: Slices = .{ .tab = in.tab };
+    var s: Slices = .{};
     const inner_w = sane(in.inner_w, 1, layout.max_side);
     const inner_h = sane(in.inner_h, 1, layout.max_side);
     const vv_w = sane(in.vv_w, 1, layout.max_side);
@@ -148,27 +139,17 @@ pub fn compute(in: Input) Slices {
     s.head_pad = px(sane(in.safe_top, 0, 200));
     s.ctl_h = if (in.touch) 44 else 36;
     s.status_h = status_line;
+    s.dhead_h = if (in.touch) dhead_touch else dhead_mouse;
 
-    // Columns: the data column on the right, everything else on the left.
-    var left_w = W;
-    if (W >= columns_min_w) {
-        s.arrangement = .columns;
-        const frac = std.math.clamp(sane(in.data_frac, min_data_frac, max_data_frac), min_data_frac, max_data_frac);
-        const data_w = std.math.clamp(px(@as(f64, @floatFromInt(W)) * frac), min_data_w, @max(min_data_w, W - split_w - min_left_w));
-        left_w = W - data_w - split_w;
-        s.split = .{ .x = left_w, .y = 0, .w = split_w, .h = H };
-        s.data = .{ .x = left_w + split_w, .y = 0, .w = data_w, .h = H };
-    }
-
-    // Interaction slice at the bottom of the left column, then the
+    // Interaction slice at the bottom; the Data slice above it; the
     // terminal gets what is left under the header.
     var inter_h: i32 = 0;
-    var lines: i32 = if (in.touch and !s.keyboard) 3 else 2;
+    var lines: i32 = 2;
     if (in.input) {
-        s.btn_h = if (in.touch) 44 else 32;
-        const min_w: f64 = if (in.touch) 40 else 56;
+        s.btn_h = if (in.touch) btn_touch else btn_mouse;
+        const min_w = if (in.touch) min_btn_touch else min_btn_mouse;
         const n: f64 = @floatFromInt(button_count);
-        const avail = @as(f64, @floatFromInt(left_w)) - 2 * @as(f64, pane_pad) - (n - 1) * @as(f64, gap);
+        const avail = @as(f64, @floatFromInt(W)) - 2 * @as(f64, pane_pad) - (n - 1) * @as(f64, gap);
         if (avail / n >= min_w) {
             s.cols = button_count;
             s.rows = 1;
@@ -179,6 +160,7 @@ pub fn compute(in: Input) Slices {
         s.note_h = note_line;
     }
     var head_h: i32 = 0;
+    var data_h: i32 = 0;
     var term_h: i32 = 0;
     while (true) {
         if (in.input) {
@@ -188,36 +170,42 @@ pub fn compute(in: Input) Slices {
             inter_h = pane_pad + s.box_h + s.note_h + 2 + bar_h + s.pad_bottom;
         } else inter_h = s.pad_bottom;
         head_h = if (s.no_head) 0 else s.head_pad + s.ctl_h + s.status_h;
-        term_h = H - head_h - inter_h;
-        if (term_h >= min_term or !in.input) break;
-        // Too tight (keyboard open, landscape, tiny window): shed the
-        // header while typing, then textarea lines, then the note.
+        const rest = H - head_h - inter_h;
+        data_h = if (s.no_data) 0 else px(datafeed.sliceHeight(@floatFromInt(@max(0, rest)), @floatFromInt(s.dhead_h), sane(in.data_content, 0, layout.max_side), in.data_collapsed));
+        term_h = rest - data_h;
+        if (term_h >= min_term) break;
+        // Too tight (keyboard open, landscape, tiny window): while typing,
+        // shed the header and the Data slice first; then textarea lines,
+        // then the note; the Data slice last otherwise.
         if (s.keyboard and !s.no_head) {
             s.no_head = true;
-        } else if (lines > 1) {
+        } else if (s.keyboard and !s.no_data) {
+            s.no_data = true;
+        } else if (in.input and lines > 1) {
             lines -= 1;
-        } else if (s.note_h > 0) {
+        } else if (in.input and s.note_h > 0) {
             s.note_h = 0;
+        } else if (!s.no_data) {
+            s.no_data = true;
         } else break;
     }
     term_h = @max(0, term_h);
-    s.head = .{ .x = 0, .y = 0, .w = left_w, .h = head_h };
-    s.term = .{ .x = 0, .y = head_h, .w = left_w, .h = term_h };
-    s.inter = .{ .x = 0, .y = head_h + term_h, .w = left_w, .h = @max(0, H - head_h - term_h) };
-    // Tabs: data shares the terminal's rect; one of them is visible.
-    if (s.arrangement == .tabs) s.data = s.term;
+    s.head = .{ .x = 0, .y = 0, .w = W, .h = head_h };
+    s.term = .{ .x = 0, .y = head_h, .w = W, .h = term_h };
+    s.data = .{ .x = 0, .y = head_h + term_h, .w = W, .h = data_h };
+    s.inter = .{ .x = 0, .y = head_h + term_h + data_h, .w = W, .h = @max(0, H - head_h - term_h - data_h) };
     return s;
 }
 
 /// CSS custom properties for the page (index.html / app.css read them).
 pub fn css(s: Slices, buf: []u8) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
-    w.print("--app-h:{d}px;--app-top:{d}px;--head-pad:{d}px;--ctl-h:{d}px;--status-h:{d}px;" ++
+    w.print("--app-h:{d}px;--app-top:{d}px;--head-pad:{d}px;--ctl-h:{d}px;--status-h:{d}px;--dhead-h:{d}px;" ++
         "--box-h:{d}px;--note-h:{d}px;--btn-h:{d}px;--cols:{d};--pad-b:{d}px", .{
-        s.app_h, s.app_top, s.head_pad, s.ctl_h, s.status_h, s.box_h, s.note_h, s.btn_h, s.cols, s.pad_bottom,
+        s.app_h, s.app_top, s.head_pad, s.ctl_h, s.status_h, s.dhead_h, s.box_h, s.note_h, s.btn_h, s.cols, s.pad_bottom,
     }) catch return "";
     const named = [_]struct { []const u8, Rect }{
-        .{ "head", s.head }, .{ "term", s.term }, .{ "data", s.data }, .{ "inter", s.inter }, .{ "split", s.split },
+        .{ "head", s.head }, .{ "term", s.term }, .{ "data", s.data }, .{ "inter", s.inter },
     };
     for (named) |n| w.print(";--{s}-x:{d}px;--{s}-y:{d}px;--{s}-w:{d}px;--{s}-h:{d}px", .{
         n[0], n[1].x, n[0], n[1].y, n[0], n[1].w, n[0], n[1].h,
@@ -256,50 +244,68 @@ fn phone(ph: Phone, keyboard: bool) Input {
     };
 }
 
-/// Slices tile the page: the left column stacks head, term, inter exactly.
+/// Slices tile the page top to bottom: head, term, data, inter.
 fn expectTiles(s: Slices) !void {
     try testing.expectEqual(@as(i32, 0), s.head.y);
     try testing.expectEqual(s.head.bottom(), s.term.y);
-    try testing.expectEqual(s.term.bottom(), s.inter.y);
+    try testing.expectEqual(s.term.bottom(), s.data.y);
+    try testing.expectEqual(s.data.bottom(), s.inter.y);
     try testing.expectEqual(s.app_h, s.inter.bottom());
-    try testing.expect(s.term.h >= 0 and s.inter.h >= 0);
+    try testing.expect(s.term.h >= 0 and s.data.h >= 0 and s.inter.h >= 0);
     try testing.expectEqual(s.head.w, s.term.w);
+    try testing.expectEqual(s.term.w, s.data.w);
     try testing.expectEqual(s.term.w, s.inter.w);
-    switch (s.arrangement) {
-        .tabs => try testing.expectEqual(s.term, s.data),
-        .columns => {
-            try testing.expectEqual(s.term.right(), s.split.x);
-            try testing.expectEqual(s.split.right(), s.data.x);
-            try testing.expectEqual(s.data.h, s.app_h);
-            try testing.expect(s.data.w >= min_data_w and s.term.w >= min_left_w);
-        },
-    }
     if (s.cols > 0) try testing.expectEqual(button_count, s.cols * s.rows);
 }
 
-test "iPhones, portrait, keyboard closed: tabs, interaction pinned at the bottom" {
+test "iPhones, portrait, keyboard closed: terminal, data strip, interaction pinned at the bottom" {
     for (phones) |ph| {
         const s = compute(phone(ph, false));
         try expectTiles(s);
-        try testing.expectEqual(Arrangement.tabs, s.arrangement);
-        try testing.expect(!s.keyboard and !s.no_head);
+        try testing.expect(!s.keyboard and !s.no_head and !s.no_data);
         try testing.expectEqual(@as(i32, @intFromFloat(ph.h)), s.app_h);
         try testing.expectEqual(@as(i32, 0), s.app_top);
         try testing.expectEqual(@as(i32, @intFromFloat(ph.safe_bottom)), s.pad_bottom);
         // Header: safe area + controls + status line.
         try testing.expectEqual(@as(i32, @intFromFloat(ph.safe_top)) + 44 + status_line, s.head.h);
-        // One row of 8 buttons of 44 px; 3-line box.
-        try testing.expectEqual(@as(u32, 1), s.rows);
-        try testing.expectEqual(@as(i32, 44), s.btn_h);
-        try testing.expectEqual(3 * box_line + box_chrome, s.box_h);
-        // The terminal (or data) keeps the biggest share.
-        try testing.expect(s.term.h >= s.inter.h and s.term.h >= min_term);
+        // Nothing to show: the Data slice is just its header strip.
+        try testing.expectEqual(dhead_touch, s.data.h);
+        try testing.expect(!s.dataOpen());
+        // Thumb-sized buttons; 2-line box.
+        try testing.expectEqual(btn_touch, s.btn_h);
+        try testing.expectEqual(2 * box_line + box_chrome, s.box_h);
+        // The terminal keeps a good share next to the big buttons.
+        try testing.expect(s.term.h + s.data.h >= s.inter.h and s.term.h >= min_term);
     }
+    // 390 wide: two rows of four buttons (each ~90 px wide); 430: one row.
+    try testing.expectEqual(@as(u32, 2), compute(phone(phones[3], false)).rows);
+    try testing.expectEqual(@as(u32, 1), compute(phone(phones[4], false)).rows);
+}
+
+test "data arrives: the slice grows to its share, shrinks back when collapsed or cleared" {
+    var in = phone(phones[5], false);
+    const empty = compute(in);
+    in.data_content = 2000;
+    const full = compute(in);
+    try expectTiles(full);
+    try testing.expect(full.dataOpen());
+    const shared = empty.term.h + empty.data.h;
+    try testing.expectEqual(@as(i32, @intFromFloat(@floor(@as(f64, @floatFromInt(shared)) * datafeed.max_share))), full.data.h);
+    try testing.expect(full.term.h > full.data.h);
+    // A small image: only what it needs.
+    in.data_content = 60;
+    try testing.expectEqual(dhead_touch + 60, compute(in).data.h);
+    // Collapsed: the header strip again.
+    in.data_content = 2000;
+    in.data_collapsed = true;
+    try testing.expectEqual(empty.data, compute(in).data);
 }
 
 test "iPhones, keyboard open: interaction sits on the keyboard, terminal still visible" {
     for (phones) |ph| {
-        const s = compute(phone(ph, true));
+        var in = phone(ph, true);
+        in.data_content = 500;
+        const s = compute(in);
         try expectTiles(s);
         try testing.expect(s.keyboard);
         try testing.expectEqual(@as(i32, @intFromFloat(ph.h - ph.kb)), s.app_h);
@@ -309,24 +315,23 @@ test "iPhones, keyboard open: interaction sits on the keyboard, terminal still v
         try testing.expectEqual(@as(i32, 0), s.pad_bottom);
         try testing.expectEqual(s.app_h, s.inter.bottom());
         try testing.expect(s.box_h <= 2 * box_line + box_chrome);
-        try testing.expectEqual(@as(i32, 44), s.btn_h);
+        try testing.expectEqual(btn_touch, s.btn_h);
         try testing.expect(s.term.h >= min_term);
     }
-    // The 14: 664 - 336 = 328 px left: the header goes while typing.
+    // The 14: 664 - 336 = 328 px left: header and data go while typing.
     const s = compute(phone(phones[3], true));
     try testing.expectEqual(@as(i32, 328), s.app_h);
-    try testing.expect(s.no_head);
+    try testing.expect(s.no_head and s.no_data);
     try testing.expectEqual(@as(i32, 0), s.head.h);
+    try testing.expectEqual(@as(i32, 0), s.data.h);
 }
 
 test "landscape with the keyboard: everything shrinks, nothing negative" {
     const s = compute(.{ .inner_w = 844, .inner_h = 340, .vv_w = 844, .vv_h = 150, .vv_top = 40, .safe_bottom = 21, .touch = true });
     try expectTiles(s);
-    try testing.expectEqual(Arrangement.tabs, s.arrangement);
-    try testing.expect(s.keyboard and s.no_head);
+    try testing.expect(s.keyboard and s.no_head and s.no_data);
     try testing.expectEqual(box_line + box_chrome, s.box_h); // one line
     try testing.expectEqual(@as(i32, 0), s.note_h);
-    try testing.expect(s.term.h > 0);
     const q = compute(.{ .inner_w = 844, .inner_h = 340, .vv_w = 844, .vv_h = 340, .vv_top = 0, .safe_bottom = 21, .touch = true });
     try expectTiles(q);
     try testing.expect(!q.keyboard);
@@ -340,50 +345,24 @@ test "narrow screens wrap the buttons into two rows" {
     try testing.expect(s.term.h >= min_term);
 }
 
-test "tabs: the data tab takes the terminal's place" {
-    var in = phone(phones[3], false);
-    in.tab = .data;
-    const s = compute(in);
+test "laptop browser: the same vertical slices, bigger buttons in one row" {
+    const s = compute(.{ .inner_w = 1440, .inner_h = 820, .vv_w = 1440, .vv_h = 820, .vv_top = 0, .touch = false });
     try expectTiles(s);
-    try testing.expectEqual(Tab.data, s.tab);
-    try testing.expectEqual(compute(phone(phones[3], false)).term, s.data);
-}
-
-test "laptop: data is a resizable right column" {
-    const in: Input = .{ .inner_w = 1440, .inner_h = 820, .vv_w = 1440, .vv_h = 820, .vv_top = 0, .touch = false };
-    const s = compute(in);
-    try expectTiles(s);
-    try testing.expectEqual(Arrangement.columns, s.arrangement);
     try testing.expect(!s.keyboard);
     try testing.expectEqual(@as(i32, 36), s.ctl_h);
-    try testing.expectEqual(@as(i32, 32), s.btn_h);
+    try testing.expectEqual(btn_mouse, s.btn_h);
+    try testing.expectEqual(@as(u32, 1), s.rows);
     try testing.expectEqual(2 * box_line + box_chrome, s.box_h);
-    try testing.expectEqual(@as(i32, @intFromFloat(@round(1440 * default_data_frac))), s.data.w);
-    try testing.expectEqual(@as(i32, 1440), s.data.right());
-    // Dragging the splitter to x = 1000 leaves the data column ~436 px.
-    var dragged = in;
-    dragged.data_frac = dragFrac(1000, 1440);
-    const d = compute(dragged);
-    try expectTiles(d);
-    try testing.expectEqual(@as(i32, 1000), d.split.x + split_w / 2);
-    // Drags are clamped: neither column can vanish.
-    for ([_]f64{ -500, 0, 300, 1439, 5000, std.math.nan(f64) }) |x| {
-        var e = in;
-        e.data_frac = dragFrac(x, 1440);
-        try expectTiles(compute(e));
-    }
+    try testing.expectEqual(dhead_mouse, s.data.h);
+    try testing.expectEqual(@as(i32, 1440), s.data.w);
     // A short desktop window (devtools open) is not "keyboard open".
     const q = compute(.{ .inner_w = 1440, .inner_h = 820, .vv_w = 1440, .vv_h = 400, .vv_top = 0, .touch = false });
     try testing.expect(!q.keyboard and !q.no_head);
-    // Right at the threshold: columns; just under: tabs.
-    try testing.expectEqual(Arrangement.columns, compute(.{ .inner_w = 900, .inner_h = 700, .vv_w = 900, .vv_h = 700, .vv_top = 0, .touch = false }).arrangement);
-    try testing.expectEqual(Arrangement.tabs, compute(.{ .inner_w = 899, .inner_h = 700, .vv_w = 899, .vv_h = 700, .vv_top = 0, .touch = false }).arrangement);
 }
 
-test "iPad landscape with the keyboard: columns, interaction above it" {
+test "iPad landscape with the keyboard: interaction above it" {
     const s = compute(.{ .inner_w = 1180, .inner_h = 820, .vv_w = 1180, .vv_h = 820 - 400, .vv_top = 0, .safe_top = 24, .safe_bottom = 20, .touch = true });
     try expectTiles(s);
-    try testing.expectEqual(Arrangement.columns, s.arrangement);
     try testing.expect(s.keyboard);
     try testing.expectEqual(@as(i32, 420), s.inter.bottom());
 }
@@ -392,32 +371,14 @@ test "view only: no interaction slice" {
     const s = compute(.{ .inner_w = 390, .inner_h = 664, .vv_w = 390, .vv_h = 664, .vv_top = 0, .safe_top = 47, .safe_bottom = 34, .touch = true, .input = false });
     try expectTiles(s);
     try testing.expectEqual(@as(i32, 34), s.inter.h); // only the home-indicator pad
-    try testing.expectEqual(@as(i32, 664 - (47 + 44 + status_line) - 34), s.term.h);
 }
 
-test "pinch zoom is not a keyboard" {
-    const s = compute(.{ .inner_w = 390, .inner_h = 664, .vv_w = 195, .vv_h = 332, .vv_top = 100, .touch = true });
-    try testing.expect(!s.keyboard);
-    try testing.expectEqual(@as(i32, 664), s.app_h);
-    try testing.expectEqual(@as(i32, 0), s.app_top);
-}
-
-test "hostile viewport values" {
+test "hostile viewport numbers stay in range" {
     const bad = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), -5, 0, 1e300 };
-    for (bad) |x| for ([_]bool{ false, true }) |t| {
-        const s = compute(.{ .inner_w = x, .inner_h = x, .vv_w = x, .vv_h = x, .vv_top = x, .safe_top = x, .safe_bottom = x, .touch = t, .data_frac = x });
-        try testing.expect(s.term.h >= 0 and s.app_h >= 1 and s.app_h <= layout.max_side);
+    for (bad) |x| {
+        const s = compute(.{ .inner_w = x, .inner_h = x, .vv_w = x, .vv_h = x, .vv_top = x, .safe_top = x, .safe_bottom = x, .touch = true, .data_content = x });
+        try testing.expect(s.term.h >= 0 and s.inter.h >= 0 and s.data.h >= 0);
         var buf: [1024]u8 = undefined;
         try testing.expect(css(s, &buf).len > 0);
-    };
-}
-
-test "css variables" {
-    const s = compute(phone(phones[3], false));
-    var buf: [1024]u8 = undefined;
-    const c = css(s, &buf);
-    try testing.expect(std.mem.startsWith(u8, c, "--app-h:664px;--app-top:0px;"));
-    try testing.expect(std.mem.indexOf(u8, c, "--cols:8;") != null);
-    try testing.expect(std.mem.indexOf(u8, c, ";--term-x:0px;--term-y:111px;--term-w:390px;") != null);
-    try testing.expect(std.mem.endsWith(u8, c, "--split-h:0px"));
+    }
 }

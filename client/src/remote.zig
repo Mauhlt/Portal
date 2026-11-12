@@ -10,8 +10,8 @@
 //!   instruct  (the default) answer bar plus the instruction line under it,
 //!             which has the keyboard (inputline.zig).
 //!   text      answer bar; typing and the editing keys go to the terminal.
-//! In every mode the Data column (dataview.zig) shows what the session
-//! pushed; F2 shows or hides it.
+//! In every mode the Data slice under the terminal (dataview.zig) shows
+//! what the session pushed; F2 or its Hide button collapses it.
 
 const std = @import("std");
 const view = @import("view");
@@ -27,6 +27,11 @@ pub const pair_button_id = 1;
 pub const cancel_button_id = 2;
 /// The instruction line (a click on it reports this id).
 pub const line_field_id = 3;
+/// The instruction line's Send button.
+pub const send_button_id = 4;
+/// The Data slice's Hide/Show and Clear buttons.
+pub const data_toggle_id = 5;
+pub const data_clear_id = 6;
 
 /// InputSink that sends protocol key names / text per the server's
 /// `hello.input` mode.
@@ -40,7 +45,7 @@ pub const RemoteSink = struct {
     status: client_mod.Status = .starting,
     /// The instruction line (instruct mode). UI thread only.
     line: inputline.Line = .{},
-    /// The Data column. UI thread only (fed under the shared lock).
+    /// The Data slice. UI thread only (fed under the shared lock).
     data: dataview.DataView = .{},
 
     pub fn sink(r: *RemoteSink) input.InputSink {
@@ -113,7 +118,7 @@ pub const RemoteSink = struct {
     fn onKey(ctx: *anyopaque, key: input.Key, mods: input.Mods) void {
         const r: *RemoteSink = @ptrCast(@alignCast(ctx));
         if (r.modalActive()) |m| return m.key(m.ctx, key, mods);
-        // F2 (not a protocol key): show / hide the Data column.
+        // F2 (not a protocol key): collapse / open the Data slice.
         if (key == .f2 and !mods.ctrl and !mods.alt and !mods.super) {
             r.data.toggle();
             return r.redraw();
@@ -153,8 +158,23 @@ pub const RemoteSink = struct {
     fn onButton(ctx: *anyopaque, id: u32) void {
         const r: *RemoteSink = @ptrCast(@alignCast(ctx));
         if (r.modal) |m| if (m.button(m.ctx, id)) return;
-        if (id == pair_button_id) r.client.requestPairing();
-        if (id == cancel_button_id) r.client.cancelPairing();
+        switch (id) {
+            pair_button_id => r.client.requestPairing(),
+            cancel_button_id => r.client.cancelPairing(),
+            // Send: what Enter in the line does.
+            send_button_id => if (r.focus() == .line) {
+                if (r.line.onKey(.enter, .{}, LineSender{ .client = r.client })) r.redraw();
+            },
+            data_toggle_id => {
+                r.data.toggle();
+                r.redraw();
+            },
+            data_clear_id => {
+                r.data.clear(r.client.gpa);
+                r.redraw();
+            },
+            else => {},
+        }
     }
 
     fn onResized(_: *anyopaque, _: u32, _: u32, _: u16, _: u16) void {
@@ -210,9 +230,8 @@ pub const View = struct {
     detail: []const u8,
     /// The instruction line (shown in instruct mode).
     line: inputline.View = .{},
-    /// The Data column (null: hidden) and the status note while hidden.
-    data: ?TermView.DataColumn = null,
-    data_badge: []const u8 = "",
+    /// The Data slice under the terminal.
+    data: ?TermView.DataSlice = null,
     host: []const u8,
     has_grid: bool,
     /// The request code while waiting for the desk.
@@ -292,7 +311,7 @@ pub fn overlay(v: View, b: *Bufs) TermView.Overlay {
                     .hint = rules.placeholder(.instruct),
                     .id = line_field_id,
                     .focused = true,
-                } } };
+                } }, .send = .{ .label = "Send", .id = send_button_id } };
                 o.bottom = b.panes[0..1];
                 if (v.line.note.len > 0) {
                     o.status.extra = std.fmt.bufPrint(&b.extra, "{s}: {s}", .{ mode.label(), v.line.note }) catch mode.label();
@@ -333,7 +352,6 @@ pub fn overlay(v: View, b: *Bufs) TermView.Overlay {
         return o;
     }
     o.data = v.data;
-    if (v.data_badge.len > 0) o.status.right = std.fmt.bufPrint(&b.right, "{s}  \u{00B7}  {s}", .{ v.data_badge, v.host }) catch v.host;
     return o;
 }
 
@@ -379,23 +397,20 @@ test "overlay per input mode: the same features as the browser" {
     try std.testing.expectEqual(@as(usize, 1), o.bottom.len);
     try std.testing.expectEqualStrings("fix it", o.bottom[0].content.field.value);
     try std.testing.expect(o.bottom[0].content.field.focused);
+    try std.testing.expectEqual(@as(u32, send_button_id), o.bottom[0].send.?.id);
     try std.testing.expectEqualStrings("instructions: Sent.", o.status.extra);
     try std.testing.expectEqual(TermView.Tone.good, o.status.extra_tone);
 }
 
-test "overlay: the data column beside the terminal, its badge while hidden" {
+test "overlay: the Data slice under the terminal, not on pairing screens" {
     var b: Bufs = .{};
-    const col: TermView.DataColumn = .{};
-    var v: View = .{ .status = .connected, .mode = .instruct, .detail = "", .host = "h", .has_grid = true, .data = col };
-    try std.testing.expect(overlay(v, &b).data != null);
-    v.data = null;
-    v.data_badge = "2 new in Data (F2)";
+    const sl: TermView.DataSlice = .{ .collapsed = true };
+    var v: View = .{ .status = .connected, .mode = .instruct, .detail = "", .host = "h", .has_grid = true, .data = sl };
     const o = overlay(v, &b);
-    try std.testing.expect(o.data == null);
-    try std.testing.expectEqualStrings("2 new in Data (F2)  \u{00B7}  h", o.status.right);
-    // Pairing screens have no data column.
+    try std.testing.expect(o.data.?.collapsed);
+    try std.testing.expectEqualStrings("h", o.status.right);
+    // Pairing screens have no Data slice.
     v.status = .need_pairing;
-    v.data = col;
     try std.testing.expect(overlay(v, &b).data == null);
 }
 

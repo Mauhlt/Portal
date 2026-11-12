@@ -59,8 +59,31 @@ pub fn imageDecoded(f: *Feed, gpa: std.mem.Allocator, id: u32, rgba: @import("im
     }
 }
 
+/// Height (CSS px) the feed would like under the Data slice's header in a
+/// page `w` CSS px wide (0: nothing to show): a caption line and the
+/// tallest image at up to 1 image pixel per CSS px, at least a few lines.
+/// slices.compute caps it (datafeed.sliceHeight).
+pub fn wantedHeight(f: *const Feed, w: f64) f64 {
+    if (f.items.items.len == 0) return 0;
+    const pad = 10;
+    const line = 18;
+    const inner = @max(1, w - 2 * pad);
+    var tallest: f64 = line * 3;
+    for (f.items.items) |it| {
+        if (it.w == 0 or it.h == 0) {
+            tallest = @max(tallest, line * 6);
+            continue;
+        }
+        const k = @min(1, inner / @as(f64, @floatFromInt(it.w)));
+        tallest = @max(tallest, @round(@as(f64, @floatFromInt(it.h)) * k));
+    }
+    return pad + line + tallest + pad;
+}
+
 /// Redraws the whole feed into `fb` (device pixels; `dpr` scales the
-/// padding and text). `ui` must be sized for captions already.
+/// padding and text): the items left to right, newest first, each a
+/// caption over its image fitted to the canvas height. `ui` must be sized
+/// for captions already.
 pub fn draw(f: *Feed, fb: *render.Framebuffer, ui: *glyphs.Glyphs, theme: render.Theme, dpr: f32) void {
     f.dirty = false;
     const all: Rect = .{ .w = @intCast(fb.w), .h = @intCast(fb.h) };
@@ -71,9 +94,11 @@ pub fn draw(f: *Feed, fb: *render.Framebuffer, ui: *glyphs.Glyphs, theme: render
         text(fb, ui, "No data yet", @divFloor(all.w - textWidth(ui, "No data yet"), 2), @divFloor(all.h - line, 2), all, theme.placeholder);
         return;
     }
-    var y: i32 = pad;
+    const img_y = pad + line + @divFloor(pad, 2);
+    const img_h = @max(line, all.h - img_y - pad);
+    var x: i32 = pad;
     var i = f.items.items.len;
-    while (i > 0 and y < all.h) {
+    while (i > 0 and x < all.w - line * 4) {
         i -= 1;
         const it = f.items.items[i];
         var buf: [64]u8 = undefined;
@@ -83,18 +108,19 @@ pub fn draw(f: *Feed, fb: *render.Framebuffer, ui: *glyphs.Glyphs, theme: render
             else
                 "image",
         };
-        text(fb, ui, cap, pad, y, all, theme.fg);
-        y += line + @divFloor(pad, 2);
-        const card_w = @max(1, all.w - 2 * pad);
-        switch (it.kind) {
-            .image => y += drawImage(fb, ui, it, .{ .x = pad, .y = y, .w = card_w, .h = @max(line * 3, @divFloor(all.h * 3, 5)) }, all, theme, dpr),
-        }
-        y += pad * 2;
+        const room = all.w - pad - x;
+        const box_w = @min(room, @max(line * 4, @divFloor(all.w * 3, 5)));
+        const used = switch (it.kind) {
+            .image => drawImage(fb, ui, it, .{ .x = x, .y = img_y, .w = box_w, .h = img_h }, all, theme, dpr),
+        };
+        const cap_w = @min(room, @max(used, @min(textWidth(ui, cap), line * 12)));
+        text(fb, ui, cap, x, pad, .{ .x = x, .y = 0, .w = cap_w, .h = all.h }, theme.fg);
+        x += @max(used, cap_w) + pad * 2;
     }
 }
 
 /// Draws an image card fitted into `box` (keeping its aspect ratio);
-/// returns the height used.
+/// returns the width used.
 fn drawImage(fb: *render.Framebuffer, ui: *glyphs.Glyphs, it: Item, box: Rect, clip: Rect, theme: render.Theme, dpr: f32) i32 {
     var w = box.w;
     var h = box.h;
@@ -125,7 +151,7 @@ fn drawImage(fb: *render.Framebuffer, ui: *glyphs.Glyphs, it: Item, box: Rect, c
         if (lw + 2 * t < r.w and @as(i32, @intCast(ui.ch)) < r.h)
             text(fb, ui, label, r.x + @divFloor(r.w - lw, 2), r.y + @divFloor(r.h - @as(i32, @intCast(ui.ch)), 2), clip, theme.placeholder);
     }
-    return h;
+    return w;
 }
 
 /// Nearest-neighbour scale of a w x h RGBA image into `r`.
@@ -234,6 +260,11 @@ test "draw: empty feed, decoded image and placeholder, any size" {
     }
     try testing.expectEqual(@as(usize, 8 * 4), red); // 4x2 at 2x upscale
     try testing.expect(!f.dirty);
+    // What the slice would like: a caption and the tallest image.
+    try testing.expect(wantedHeight(&f, 1000) >= 480 + 18);
+    try testing.expect(wantedHeight(&f, 330) < 480); // scaled to the width
+    var e: Feed = .{};
+    try testing.expectEqual(@as(f64, 0), wantedHeight(&e, 1000));
     // Tiny and odd framebuffers never index out of bounds.
     for ([_][2]u32{ .{ 1, 1 }, .{ 3, 500 }, .{ 500, 3 }, .{ 37, 41 } }) |sz| {
         try fb.resize(gpa, sz[0], sz[1]);

@@ -46,32 +46,26 @@ form button[type=submit] { width: 100%; padding: 8px; background: var(--accent);
 
 
 /* viewer: slices placed by the wasm client (src/wasm/slices.zig) through
-   the --<slice>-x/y/w/h variables on <body>, following the visual viewport
-   so the interaction slice sits right above the on-screen keyboard. The
-   fallbacks are for the moment before it starts. */
+   the --<slice>-x/y/w/h variables on <body>, stacked top to bottom (header,
+   terminal, Data, interaction) and following the visual viewport so the
+   interaction slice sits right above the on-screen keyboard. The fallbacks
+   are for the moment before it starts. */
 body.viewer { position: fixed; left: 0; right: 0; top: var(--app-top, 0px);
   height: 100dvh; height: var(--app-h, 100dvh); overflow: hidden; overscroll-behavior: none; }
 #safe { position: fixed; top: 0; left: 0; visibility: hidden; pointer-events: none;
   height: env(safe-area-inset-top, 0px); width: env(safe-area-inset-bottom, 0px); }
-#head, #wrap, #dslice, #inter, #split { position: absolute; overflow: hidden; }
+#head, #wrap, #dslice, #inter { position: absolute; overflow: hidden; }
 #head { left: var(--head-x, 0px); top: var(--head-y, 0px); width: var(--head-w, 100%); height: var(--head-h, 64px);
   padding-top: var(--head-pad, 0px); display: flex; flex-direction: column;
   border-bottom: 1px solid var(--border); background: var(--panel); }
 body.nohead #head { display: none; }
-#wrap { left: var(--term-x, 0px); top: var(--term-y, 64px); width: var(--term-w, 100%); height: var(--term-h, 50%);
+#wrap { left: var(--term-x, 0px); top: var(--term-y, 64px); width: var(--term-w, 100%); height: var(--term-h, 60%);
   background: #0c0c0c; }
-#dslice { left: var(--data-x, 0px); top: var(--data-y, 64px); width: var(--data-w, 100%); height: var(--data-h, 50%);
-  display: flex; flex-direction: column; background: #0c0c0c; }
-#inter { left: var(--inter-x, 0px); top: var(--inter-y, 70%); width: var(--inter-w, 100%); height: var(--inter-h, 30%);
+#dslice { left: var(--data-x, 0px); top: var(--data-y, 70%); width: var(--data-w, 100%); height: var(--data-h, 30px);
+  display: flex; flex-direction: column; background: #0c0c0c; border-top: 1px solid var(--border); }
+body.nodata #dslice { display: none; }
+#inter { left: var(--inter-x, 0px); top: var(--inter-y, 75%); width: var(--inter-w, 100%); height: var(--inter-h, 25%);
   display: none; flex-direction: column; background: var(--panel); border-top: 1px solid var(--border); }
-#split { left: var(--split-x, 0px); top: var(--split-y, 0px); width: var(--split-w, 0px); height: var(--split-h, 0px);
-  display: none; cursor: col-resize; touch-action: none; background: var(--border); }
-#split:hover { background: var(--accent); }
-body.layout-columns #split { display: block; }
-/* Tabs: terminal and data share one rect; the segmented control picks. */
-body.layout-tabs.tab-terminal #dslice, body.layout-tabs.tab-data #wrap { visibility: hidden; }
-body.layout-tabs.tab-data .zoom { display: none; }
-body.layout-columns .tabs, body.layout-tabs .dhead { display: none; }
 .ctl { flex: none; height: var(--ctl-h, 44px); display: flex; align-items: center; gap: 6px; overflow: hidden;
   padding: 0 max(10px, env(safe-area-inset-right)) 0 max(10px, env(safe-area-inset-left)); }
 .ctl button { white-space: nowrap; flex: none; }
@@ -79,12 +73,6 @@ body.layout-columns .tabs, body.layout-tabs .dhead { display: none; }
 .ctl form button[type=submit] { width: auto; padding: 4px 10px; background: var(--panel);
   color: var(--fg); border-color: var(--border); }
 .spacer { flex: 1; }
-.tabs { display: flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; flex: none; }
-.tabs button { border: 0; border-radius: 0; background: var(--panel); padding: 4px 12px; position: relative; }
-body.tab-terminal .tabs [data-tab="0"], body.tab-data .tabs [data-tab="1"] { background: var(--accent); color: #fff; }
-.dot { display: none; width: 8px; height: 8px; border-radius: 50%; background: var(--bad);
-  position: absolute; top: 4px; right: 3px; }
-body.badge .dot { display: block; }
 /* Status line: project · viewer state · input mode · session state. */
 .statusline { flex: none; height: var(--status-h, 20px); line-height: var(--status-h, 20px); font-size: 12px;
   color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -98,9 +86,15 @@ body.badge .dot { display: block; }
   width: calc(100% - env(safe-area-inset-left) - env(safe-area-inset-right)); height: 100%;
   touch-action: none; -webkit-user-select: none; user-select: none;
   -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
-body.layout-columns #data { left: 0; width: calc(100% - env(safe-area-inset-right)); }
-.dhead { flex: none; height: calc(var(--ctl-h, 36px) + var(--head-pad, 0px)); padding: var(--head-pad, 0px) 12px 0;
-  display: flex; align-items: center; font-weight: 600; background: var(--panel); border-bottom: 1px solid var(--border); }
+/* The Data slice: its header strip (title, summary, Clear, Hide/Show) and
+   the canvas below it, which has height only while the slice is open. */
+.dhead { flex: none; height: var(--dhead-h, 30px); display: flex; align-items: center; gap: 8px; overflow: hidden;
+  padding: 0 max(10px, env(safe-area-inset-right)) 0 max(10px, env(safe-area-inset-left));
+  background: var(--panel); white-space: nowrap; }
+.dhead button { flex: none; padding: 2px 10px; }
+.dsum { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+.dsum.bad { color: var(--bad); font-weight: 600; }
+body.dempty .dclear, body.dempty .dtoggle, body.dcollapsed .dhide, body:not(.dcollapsed) .dshow { display: none; }
 #dwrap { flex: 1; position: relative; min-height: 0; }
 /* Interaction slice: the input box (16px text: smaller makes iOS zoom on
    focus), its note line, and the buttons; --pad-b clears the home indicator. */
@@ -118,11 +112,11 @@ body.mode-keys #box { background: var(--panel); border-style: dashed; color: var
 #keys { flex: none; margin-top: auto; display: grid; gap: 6px;
   padding: 6px max(6px, env(safe-area-inset-right)) calc(6px + var(--pad-b, 0px)) max(6px, env(safe-area-inset-left));
   grid-template-columns: repeat(var(--cols, 8), minmax(0, 1fr)); grid-auto-rows: var(--btn-h, 44px); }
-#keys button { height: var(--btn-h, 44px); min-width: 0; padding: 0 2px; font-weight: 600;
+#keys button { height: var(--btn-h, 44px); min-width: 0; padding: 0 2px; font-weight: 600; font-size: 18px;
   touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 #keys button:active { background: var(--accent); color: #fff; }
 #keys .send { background: var(--accent); border-color: var(--accent); color: #fff; }
-body:not(.touch) #keys { grid-template-columns: repeat(var(--cols, 8), minmax(0, 110px)); justify-content: end; }
+body:not(.touch) #keys { grid-template-columns: repeat(var(--cols, 8), minmax(0, 130px)); justify-content: center; }
 @media (pointer: coarse) {
   .ctl button { min-height: 36px; min-width: 44px; }
 }

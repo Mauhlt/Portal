@@ -113,7 +113,37 @@ pub fn Feed(comptime Payload: type) type {
             if (f.unseen != 0) f.dirty = true;
             f.unseen = 0;
         }
+
+        /// The user cleared the slice (its Clear button): every item goes,
+        /// and the slice shrinks back to its header strip.
+        pub fn clear(f: *Self, gpa: std.mem.Allocator) void {
+            for (f.items.items) |it| if (it.data) |d| d.deinit(gpa);
+            f.items.clearRetainingCapacity();
+            f.unseen = 0;
+            f.dirty = true;
+        }
     };
+}
+
+// ------------------------------------------------------------ slice size
+
+/// Most of the height between the top bar and the interaction slice that
+/// an open Data slice takes (the terminal keeps the rest).
+pub const max_share: f64 = 0.38;
+
+/// The Data slice's height on every device (docs/layout-design.md): it
+/// sits under the terminal as a thin header strip ("Data · nothing yet")
+/// and grows when there is something to show, to what its newest items
+/// want (`content`, under the header) but at most `max_share` of `avail`
+/// (the height the terminal and the Data slice share). Collapsed by the
+/// user (F2 / its Hide button) or empty: the header strip only. Units are
+/// the caller's (logical or CSS pixels); the result is whole.
+pub fn sliceHeight(avail: f64, header: f64, content: f64, collapsed: bool) f64 {
+    const room = if (std.math.isFinite(avail)) @max(0, avail) else 0;
+    const head = @min(@round(if (std.math.isFinite(header)) @max(0, header) else 0), room);
+    if (collapsed or !(content > 0)) return head;
+    const cap = @max(head, @floor(room * max_share));
+    return @min(@round(head + @min(content, room)), cap);
 }
 
 // ------------------------------------------------------------------ tests
@@ -167,4 +197,37 @@ test "payloads are bounded, oldest dropped first" {
     try testing.expect(!f.attach(gpa, .image, 3, try bytesOf(gpa, 200), 100)); // never fits
     try testing.expect(!f.attach(gpa, .image, 99, try bytesOf(gpa, 1), 100)); // unknown id: freed
     try testing.expect(f.payloadBytes() <= 100);
+}
+
+test "clear empties the feed and its payloads" {
+    const gpa = testing.allocator;
+    var f: Feed(Bytes) = .{};
+    defer f.deinit(gpa);
+    _ = try f.add(gpa, .image, 1, 1, 1, false);
+    try testing.expect(f.attach(gpa, .image, 1, try bytesOf(gpa, 8), 100));
+    f.dirty = false;
+    f.clear(gpa);
+    try testing.expectEqual(@as(usize, 0), f.items.items.len);
+    try testing.expectEqual(@as(u32, 0), f.unseen);
+    try testing.expect(f.dirty);
+    // Ids seen before the clear count as new again.
+    try testing.expect(try f.add(gpa, .image, 1, 1, 1, true) != null);
+}
+
+test "slice height: a header strip, growing with content up to its share" {
+    // Empty or collapsed: the header strip only.
+    try testing.expectEqual(@as(f64, 28), sliceHeight(600, 28, 0, false));
+    try testing.expectEqual(@as(f64, 28), sliceHeight(600, 28, 400, true));
+    // A small item: just what it needs.
+    try testing.expectEqual(@as(f64, 28 + 90), sliceHeight(600, 28, 90, false));
+    // A big one: capped at the share of the room.
+    try testing.expectEqual(@floor(600 * max_share), sliceHeight(600, 28, 2000, false));
+    // A tiny window never gets less than the header (if it fits at all).
+    try testing.expectEqual(@as(f64, 28), sliceHeight(40, 28, 500, false));
+    try testing.expectEqual(@as(f64, 10), sliceHeight(10, 28, 500, false));
+    // Hostile input stays finite and in range.
+    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -5 }) |x| {
+        const h = sliceHeight(x, x, x, false);
+        try testing.expect(std.math.isFinite(h) and h >= 0);
+    }
 }
