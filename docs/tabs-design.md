@@ -45,6 +45,21 @@ never open or close projects. That stays desk-only: Ctrl+T folder picker, or
    the agent ring BEL, and vt.zig counts BEL per session. Also a settings
    change, so it too needs the owner's approval.
 
+## Recent projects per device (owner's decision, 2026-11-11)
+
+* The desktop keeps a recent-projects list for each paired device: the
+  projects that device viewed, with name, colour and last-used time. It is
+  stored server-side alongside the device record, so the phone needs no
+  browser storage (no extra JS) and the list survives cache clears.
+* A device sees its own list. Projects that are currently open are jumpable
+  (switch tab). Closed ones are shown greyed out as history only.
+* **Devices never reopen or start projects** (owner chose "switch open tabs
+  only"). Reopening a closed project is desk-only: Ctrl+T, `portal open
+  <dir>`, or the desk's own recent list. No protocol message can create a
+  session.
+* Unpairing a device deletes its recent-projects list. It is metadata, not
+  training data.
+
 ## Protocol changes (v2)
 
 * `hello` lists sessions: `{id, name, color, state}`. A new `tabs` message
