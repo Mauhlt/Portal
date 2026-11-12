@@ -66,12 +66,13 @@ watching, and every login attempt and viewer connection is written to
 ### 1. Build a release
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\release.ps1
+zig build release
 ```
 
 This runs the tests, builds `ReleaseSafe` (runtime safety checks stay on), and
-promotes the result. Put `bin\` on your PATH, or call `bin\portal.cmd`
-directly.
+promotes the result. It also installs a small launcher as
+`%LOCALAPPDATA%\Portal\bin\portal.exe` that always runs the current release.
+Put `%LOCALAPPDATA%\Portal\bin` on your PATH once, then type `portal`.
 
 ### 2. Create the access token
 
@@ -117,20 +118,38 @@ delete it, with the exact source and Zig version that produced it:
 ```
 %LOCALAPPDATA%\Portal\releases\
   20261111-185919_zig-0.18.0-dev.4+5a23bf4b2\  portal.exe  portal.pdb  BUILD-INFO.txt  source\
-  current.txt      the release bin\portal.cmd runs
+  current.txt      the release the launcher runs
   known-good.txt   the release you confirmed works end to end
   history.txt      every promotion
+%LOCALAPPDATA%\Portal\bin\portal.exe   the launcher (put this folder on PATH)
+```
+
+```powershell
+zig build release          # test, build, promote, install the launcher, prune
+zig build mark-good        # current -> known-good, after testing from the laptop
+zig build rollback         # current -> known-good (running it twice is harmless)
+zig build release-status   # current, known-good, history, and their zig versions
 ```
 
 * The binary you run never depends on the installed compiler, so upgrading Zig
-  cannot break it.
-* `release.ps1` promotes only if `zig build test` passes with the new compiler.
-  That step runs the unit tests and also compiles the whole program in Debug
-  and ReleaseSafe. On failure the current release is left untouched.
-* After testing a release from the laptop, run `scripts\mark-good.ps1`.
-  `scripts\rollback.ps1` always returns to known-good (running it twice is
-  harmless). Known-good, and the newest build for each Zig version, are never
-  pruned.
+  cannot break it. The launcher only reads `current.txt` (validated against
+  the release id format) and runs that release's `portal.exe`, passing your
+  arguments through and returning its exit code.
+* `zig build release` promotes only if `zig build test` passes with the
+  compiler running the build. That step runs the unit tests and also compiles
+  the whole program in Debug and ReleaseSafe. The new binary must also run
+  `portal version`. On any failure the current release is left untouched.
+  Pointer files are replaced atomically.
+* After testing a release from the laptop, run `zig build mark-good`.
+  `zig build rollback` always returns to known-good. Pruning never removes
+  current, known-good, or the newest build for each Zig version, and keeps the
+  4 newest others. A release whose `portal.exe` is running or locked is
+  skipped, and pruning problems never fail a release.
+* The release tooling is Zig too: `src\tools\release.zig` (`portal-release`)
+  and `src\tools\launcher.zig` (`portal-launcher`).
+* For testing only, `PORTAL_RELEASES_DIR` (an absolute path) overrides the
+  releases folder for both the tools and the launcher; the launcher is then
+  installed into the `bin` folder next to it. Both print a note when it is set.
 * `src\win32.zig` declares its own Win32 bindings, and `build.zig` tolerates the
   0.17 to 0.18 build API change, to reduce breakage from std churn.
 * ZVC can vet new compilers against Portal before promoting them: add this
