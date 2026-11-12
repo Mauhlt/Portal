@@ -1,19 +1,55 @@
 # Image decoder findings (for the owner)
 
-Portal decodes inline images with your Image package, pinned to
-**Image@065e8ec** (`../Image-wt-portal`, a detached worktree, used
-read-only). Nothing in Image was changed. Portal wraps the decoder in
-`client/src/image/imgdec.zig`:
+Portal checks and decodes inline images with your Image package. It
+builds on branch **image-check** of your Image repo (worktree
+`../Image-wt-check`, see `build.zig.zon`); once you merge that branch into
+your Image branch, Portal's dependency becomes `../Image`, the de-facto
+Image, and every Portal build follows its latest commit. Image itself
+depends on `../Vulkan`.
 
-1. `pngcheck.validate` first (Portal's own code): signature; IHDR CRC,
-   legal depth/colour type, at most 8192 px per side and 32 Mpx; every
-   chunk inside the file with a valid CRC and an alphabetic tag; PLTE
-   before IDAT (required for palette images); consecutive IDATs; IEND;
-   unknown critical chunks rejected; at most 4096 chunks and 6 MiB.
-2. A cost check from the IHDR (inflated size, output, scratch) against a
-   budget before anything is allocated.
+The pre-decode checks now live in Image: **`Image.check`** (module
+"ImageCheck", `src/check`, std only, builds for wasm32). Portal's own
+`client/src/image/imgcheck.zig` only picks the format (PNG) and the limits.
+Portal wraps the decoder in `client/src/image/imgdec.zig`:
+
+1. `imgcheck.validate` = `Image.check.checkAs(.png, bytes, limits)`:
+   signature; IHDR CRC, legal depth/colour type, at most 8192 px per side
+   and 32 Mpx; every chunk inside the file with a valid CRC and an
+   alphabetic tag; PLTE before IDAT (required for palette images);
+   consecutive IDATs; IEND; unknown critical chunks rejected; at most 4096
+   chunks and 6 MiB. The server (`src/vt_gfx.zig`) runs the same check
+   before storing or forwarding an image.
+2. A cost check against a budget before anything is allocated:
+   `Image.check`'s `decode_bytes` (inflated rows, concatenated IDATs, a
+   zero row, the decoder's output) plus Portal's RGBA copy and scaler.
 3. `Image.PNG.info` + `Image.PNG.decodeInto` run on a bounded allocator
    capped at that budget.
+
+### `Image.check` in short
+
+```zig
+const check = @import("ImageCheck"); // or Image.check
+const info = try check.check(bytes, .{ .max_bytes = 8 << 20, .max_pixels = 16 << 20 });
+// info.format (.png, .jpg, .webp, ...), info.width, info.height,
+// info.channels, info.bits, info.decode_bytes; info.png for PNGs.
+```
+
+* `check` / `checkAs(format, ...)`: detect (or take) the format and walk
+  the whole structure; `checkHeader` / `checkHeaderAs`: size only.
+* `Limits`: `max_bytes`, `max_width`, `max_height`, `max_pixels`,
+  `max_decode_bytes`, `max_chunks` (defaults finite; `Limits.none`).
+* Precise errors: `UnknownFormat`, `UnsupportedFormat` (GIF, TIFF),
+  `UnsupportedFeature`, `Truncated`, `InvalidHeader`, `InvalidDimensions`,
+  `InvalidBitDepth`, `InvalidColorType`, `InvalidCompression`,
+  `InvalidFilterMethod`, `InvalidInterlaceMethod`, `InvalidChunk`,
+  `InvalidCrc`, `InvalidChunkOrder`, `MissingImageData`, `MissingEnd`,
+  `TooManyChunks`, `FileTooLarge`, `ImageTooLarge`, `DecodeTooLarge`.
+* Formats: PNG (full chunk walk; the PNG codec shares its IHDR rules and
+  CRC), JPEG (SOF0-3, segments to the first scan, DNL) and JPEG-LS, BMP,
+  WebP (VP8, VP8L, VP8X), QOI, TGA, PBM/PGM/PPM/PAM, HEIC (primary item's
+  `ispe` + `irot`), DDS, KTX2.
+* Tested: per-format cases, a fuzz over every format, and agreement with
+  the decoders on every file in Image's `src/Data/Read`.
 
 ## Fuzzing done
 
@@ -38,31 +74,15 @@ exactly that buffer. Malformed data comes back as errors.
 
 ## Findings
 
-### 1. `src/inflate/inflate.zig` does not compile for 32-bit targets (wasm32)
+### 1. `src/inflate/inflate.zig` did not compile for 32-bit targets (wasm32) - FIXED in image-check
 
-**Input:** none; this is a compile error. Build Image's PNG path for
-`wasm32-freestanding` (Portal's browser client).
-
-**Where:** three table lookups index arrays with the `u64` bit buffer
-(`buf: u64`, line 321):
-
-* line 184: `d.pre[b.buf & mask(pre_bits)]`
-* line 403: `lt[b.buf & mask(lit_bits)]`
-* line 473: `t.lit[buf & mask(lit_bits)]`
-
-The error is `expected type 'usize', found 'u64'` wherever `usize` is
-32 bits.
-
-**Effect in Portal:** the browser client can't decode PNGs. It draws a
-placeholder box with the image's pixel size instead
-(`src/wasm/proto.zig`, `decoder_available`), and the inflate code is
-never compiled into `app.wasm`. The window and `portal connect` decode
-normally.
-
-**Suggested fix:** cast the masked value at those three sites, for
-example `d.pre[@as(usize, @intCast(b.buf & mask(pre_bits)))]`. The mask
-keeps it far below 2^32, so `@truncate` works too. Once that is in a
-commit Portal pins, the browser decodes with no other change in Portal.
+Table lookups indexed arrays with the `u64` bit buffer (`d.pre[b.buf &
+mask(pre_bits)]` and 13 more sites), a compile error where `usize` is 32
+bits. image-check indexes through a `low(buf, n)` helper that truncates
+the masked value to `usize` (free on 64-bit). The PNG decoder now
+compiles for wasm32-freestanding, so the browser client decodes inline
+images like the window and `portal connect` do (`src/wasm/proto.zig`,
+`decoder_available`), within its 96 MiB / 1024 px budget.
 
 ### 2. A ~50-byte file can make the decoder try to allocate tens of GiB
 
@@ -85,12 +105,16 @@ attempts. On systems that overcommit, that can mean real memory pressure.
 Portal is not affected: it checks the IHDR first, then the budget, and
 uses a bounded allocator.
 
-**Suggested fix:** an optional limit in Image, e.g. `max_pixels` /
-`max_side` passed to `info`/`decode` (or a package-level default such as
-2^28 px) and checked in `header.decode`. Alternatively, document that
-callers must check `info()` dimensions before calling `decodeInto`.
+**Now:** `Image.check` is that limit: callers that decode untrusted files
+run `check.check(bytes, limits)` first and get `ImageTooLarge` /
+`DecodeTooLarge` before any allocation. `Image.decode` itself still
+trusts its input; a default `check` inside `decode` is a possible next
+step.
 
 ### 3. Note: the PNG decoder needs `vk.Format` (Vulkan bindings)
+
+(`Image.check` does not: it is std only. This note is about decoding.)
+
 
 `info.zig` and `root.zig` carry a `vk.Format` field, so decoding a PNG
 pulls in the `Vulkan` module. Natively Portal uses your published

@@ -4,7 +4,7 @@
 const std = @import("std");
 const vt = @import("vt.zig");
 const gfx = vt.gfx;
-const pngcheck = @import("pngcheck");
+const imgcheck = @import("imgcheck");
 const testing = std.testing;
 const gpa = testing.allocator;
 
@@ -36,7 +36,7 @@ fn kitty(out: *std.ArrayList(u8), keys: []const u8, png: []const u8, chunk: usiz
 }
 
 fn feedImage(t: *vt.Terminal, keys: []const u8, w: u32, h: u32, chunk: usize) !void {
-    const png = try pngcheck.testImage(gpa, w, h);
+    const png = try imgcheck.testImage(gpa, w, h);
     defer gpa.free(png);
     var seq: std.ArrayList(u8) = .empty;
     defer seq.deinit(gpa);
@@ -65,7 +65,7 @@ test "a=T places at the cursor and moves the cursor like kitty" {
     // Cursor: last row of the image, column after it.
     try testing.expectEqual(vt.Cursor{ .x = 6, .y = 1, .visible = true }, t.cursor());
     const png = t.imagePng(t.placements()[0].image).?;
-    try testing.expect(std.mem.startsWith(u8, png, &pngcheck.signature));
+    try testing.expect(std.mem.startsWith(u8, png, &imgcheck.signature));
     // Explicit c/r, chunked, C=1 keeps the cursor.
     try feedImage(&t, "a=T,f=100,c=10,r=3,C=1", 40, 40, 8);
     try expectPlacement(&t, 1, 6, 1, 10, 3);
@@ -89,7 +89,7 @@ test "default size is clamped to the screen keeping aspect" {
 test "OSC 7070 carrier with Portal anchor keys" {
     var t = try vt.Terminal.init(gpa, 30, 10);
     defer t.deinit();
-    const png = try pngcheck.testImage(gpa, 30, 30);
+    const png = try imgcheck.testImage(gpa, 30, 30);
     defer gpa.free(png);
     var seq: std.ArrayList(u8) = .empty;
     defer seq.deinit(gpa);
@@ -253,7 +253,7 @@ test "resize drops placements anchored outside" {
 test "unsupported commands are consumed without side effects" {
     var t = try vt.Terminal.init(gpa, 20, 4);
     defer t.deinit();
-    const png = try pngcheck.testImage(gpa, 8, 8);
+    const png = try imgcheck.testImage(gpa, 8, 8);
     defer gpa.free(png);
     const bad_keys = [_][]const u8{
         "a=T,f=32,s=8,v=8", // raw RGBA
@@ -299,7 +299,7 @@ test "unsupported commands are consumed without side effects" {
 test "CAN aborts and an interrupting command drops a chunked transmission" {
     var t = try vt.Terminal.init(gpa, 20, 4);
     defer t.deinit();
-    const png = try pngcheck.testImage(gpa, 8, 8);
+    const png = try imgcheck.testImage(gpa, 8, 8);
     defer gpa.free(png);
     var seq: std.ArrayList(u8) = .empty;
     defer seq.deinit(gpa);
@@ -332,7 +332,7 @@ test "limits: payload size, image count, total bytes, IHDR" {
             t.feed(&chunk);
             t.feed("\x1b\\");
         }
-        try testing.expect(t.images.pend.capacity <= pngcheck.max_file_bytes);
+        try testing.expect(t.images.pend.capacity <= imgcheck.max_file_bytes);
         t.feed("\x1b_Gm=0;\x1b\\");
         try testing.expectEqual(@as(usize, 0), t.images.images.items.len);
     }
@@ -348,9 +348,9 @@ test "limits: payload size, image count, total bytes, IHDR" {
     try testing.expectEqual(sum, t.images.total_bytes);
     // Total bytes: 12 images of ~5.9 MiB can't all stay.
     t.feed("\x1b_Ga=d,d=A\x1b\\");
-    const big = try pngcheck.testImage(gpa, 1250, 1180); // ~5.9 MB stored PNG
+    const big = try imgcheck.testImage(gpa, 1250, 1180); // ~5.9 MB stored PNG
     defer gpa.free(big);
-    try testing.expect(big.len <= pngcheck.max_file_bytes);
+    try testing.expect(big.len <= imgcheck.max_file_bytes);
     var seq: std.ArrayList(u8) = .empty;
     defer seq.deinit(gpa);
     try kitty(&seq, "a=t,f=100", big, 4096, false);
@@ -360,12 +360,12 @@ test "limits: payload size, image count, total bytes, IHDR" {
     // IHDR over the limits: refused before storing.
     const huge = try gpa.dupe(u8, big[0..@min(big.len, 4096)]);
     defer gpa.free(huge);
-    const small = try pngcheck.testImage(gpa, 4, 4);
+    const small = try imgcheck.testImage(gpa, 4, 4);
     defer gpa.free(small);
     const m = try gpa.dupe(u8, small);
     defer gpa.free(m);
     std.mem.writeInt(u32, m[16..20], 9000, .big);
-    pngcheck.fixCrcs(m);
+    imgcheck.fixCrcs(m);
     t.feed("\x1b_Ga=d,d=A\x1b\\");
     seq.clearRetainingCapacity();
     try kitty(&seq, "a=T,f=100", m, 0, false);
@@ -388,7 +388,7 @@ fn checkInvariants(t: *const vt.Terminal) !void {
     var sum: usize = 0;
     for (g.images.items) |im| {
         sum += im.png.len;
-        _ = try pngcheck.validate(im.png);
+        _ = try imgcheck.validate(im.png);
     }
     try testing.expectEqual(sum, g.total_bytes);
     for (g.screens) |s| {
@@ -399,7 +399,7 @@ fn checkInvariants(t: *const vt.Terminal) !void {
             try testing.expect(p.row + @as(i32, p.rows) > 0);
         }
     }
-    try testing.expect(g.pend.items.len <= pngcheck.max_file_bytes);
+    try testing.expect(g.pend.items.len <= imgcheck.max_file_bytes);
 }
 
 test "fuzz: random, truncated, oversized and interleaved graphics never panic" {
@@ -408,9 +408,9 @@ test "fuzz: random, truncated, oversized and interleaved graphics never panic" {
     var t = try vt.Terminal.init(gpa, 24, 8);
     defer t.deinit();
     const pngs = [_][]u8{
-        try pngcheck.testImage(gpa, 5, 3),
-        try pngcheck.testImage(gpa, 40, 25),
-        try pngcheck.testImage(gpa, 1, 1),
+        try imgcheck.testImage(gpa, 5, 3),
+        try imgcheck.testImage(gpa, 40, 25),
+        try imgcheck.testImage(gpa, 1, 1),
     };
     defer for (pngs) |p| gpa.free(p);
     const pieces = [_][]const u8{
@@ -460,7 +460,7 @@ test "fuzz: random, truncated, oversized and interleaved graphics never panic" {
 }
 
 test "byte-at-a-time feeding equals feeding all at once" {
-    const png = try pngcheck.testImage(gpa, 30, 30);
+    const png = try imgcheck.testImage(gpa, 30, 30);
     defer gpa.free(png);
     var seq: std.ArrayList(u8) = .empty;
     defer seq.deinit(gpa);

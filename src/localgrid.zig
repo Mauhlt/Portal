@@ -206,7 +206,7 @@ test "sync copies image placements and blobs" {
     _ = s.sync(gpa, &g, &term);
     try testing.expectEqual(@as(usize, 0), g.images.placements.items.len);
 
-    const png = try @import("pngcheck").testImage(gpa, 20, 20);
+    const png = try @import("imgcheck").testImage(gpa, 20, 20);
     defer gpa.free(png);
     const b64 = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
     defer gpa.free(b64);
