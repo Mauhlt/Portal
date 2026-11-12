@@ -4,9 +4,10 @@ Used by every client: the browser viewer, and the native Zig + Vulkan clients
 for Windows, Linux and macOS. Transport is HTTP/1.1 + WebSocket (RFC 6455)
 over the WireGuard tunnel, inside TLS 1.3 (HTTPS / WSS on the same port).
 The server certificate is issued by the desktop's private Portal CA; clients
-must trust that CA (`portal ca export`) or pin it, and must offer TLS 1.3
+must trust that CA (Export certificate in the Portal window, or `portalctl
+ca export`) or pin it, and must offer TLS 1.3
 with x25519 and ecdsa_secp256r1_sha256 (ALPN, if sent, must include
-`http/1.1`). `portal run --no-tls` serves plain HTTP for tests; replace
+`http/1.1`). `portal run --no-tls` (or `portalctl run --console --no-tls`) serves plain HTTP for tests; replace
 `https`/`wss` with `http`/`ws` and drop the `__Host-` cookie names below.
 
 ## 1. Pairing and sign-in (no passwords)
@@ -15,10 +16,10 @@ Every POST needs `Host` on the server's allowlist and `Origin: https://<that
 host>`, sent exactly; native clients must send both. POST bodies are empty
 (`Content-Length: 0`).
 
-**Pair (once per device), approved at the desk.** The owner runs `portal
-pair <name>` at the desktop (or opens a window from the Portal window),
-which opens a 2-minute window and asks the owner about every device that
-requests pairing. Nothing is typed on the device. The client sends:
+**Pair (once per device), approved at the desk.** The owner chooses Pair a
+device in the Portal window (or runs `portalctl pair <name>`), which opens
+a 2-minute window and asks the owner about every device that requests
+pairing. Nothing is typed on the device. The client sends:
 
 ```
 POST /pair HTTP/1.1
@@ -43,7 +44,11 @@ Cookie: __Host-portal_pairreq=<43 chars>
 
 * Waiting for the desk: `200`, an HTML page showing the 4-hex-digit
   request code that the desk also shows (browsers re-load it every 2 s
-  with `<meta http-equiv="refresh">`). Show the code to the user.
+  with `<meta http-equiv="refresh">`). The same code is in the header
+  `X-Portal-Request-Code: 7f3a`, for native clients, which read only the
+  response head. Show the code to the user. Native clients re-ask every
+  2 s (a real deadline, not a busy loop), back off on network errors, and
+  give up when the request's 10-minute lifetime is over.
 * Approved: `303`, `Location: /`, with three `Set-Cookie` headers:
   * `__Host-portal_device=<name>.<43 chars>; Path=/; HttpOnly; SameSite=Strict; Max-Age=7776000; Secure`
     is the device credential;
@@ -148,8 +153,8 @@ repeat n_rows:
 ### Inline images (`'I'` and `'P'` frames)
 
 Images appear only because a program running in the session emitted them
-(kitty graphics protocol, see `src/vt_gfx.zig`; `portal show <file.png>`
-does it from a shell or from the agent's Bash tool). There is no message or
+(kitty graphics protocol, see `src/vt_gfx.zig`; `portal-show <file.png>`
+does it from a shell or from the agent CLI's shell tool). There is no message or
 route a client can use to request an image, a file, or anything from disk.
 
 **Image blob**, sent at most once per image per viewer, always before the

@@ -7,6 +7,11 @@
 //!   current directory inside %LOCALAPPDATA%\Portal\releases
 //!                                    -> %USERPROFILE% (never start work
 //!                                       inside a release folder)
+//!
+//! The window (portal.exe, GUI subsystem) has no console to ask, so it
+//! decides by the directory it inherited (guiDefaultCwd): Explorer, the
+//! Start menu, shortcuts and the launcher leave it in Portal's own folder
+//! or the Windows folder, a terminal leaves it where the user is.
 
 const std = @import("std");
 
@@ -68,6 +73,19 @@ pub fn defaultCwd(has_parent_console: bool, cwd: ?[]const u8, userprofile: ?[]co
     return null;
 }
 
+/// The window's default when no directory is configured: the inherited
+/// one if it looks chosen by the user (a terminal's), else the home folder.
+/// It is not a user's choice if it is unknown, Portal's data folder
+/// (releases, bin) or below it, the folder of portal.exe itself, or the
+/// Windows folder (Run dialog, some shortcuts). Null: inherit `cwd`.
+pub fn guiDefaultCwd(cwd: ?[]const u8, exe_dir: ?[]const u8, data_dir: ?[]const u8, windir: ?[]const u8, userprofile: ?[]const u8) ?[]const u8 {
+    const home = userprofile orelse return null;
+    if (home.len == 0) return null;
+    const c = cwd orelse return home;
+    for ([_]?[]const u8{ data_dir, exe_dir, windir }) |p| if (p) |dir| if (pathInside(c, dir)) return home;
+    return null;
+}
+
 /// True if `child` is `parent` or below it. Windows rules: ASCII case
 /// folding, '/' and '\' equal, trailing separators ignored.
 pub fn pathInside(child: []const u8, parent_in: []const u8) bool {
@@ -116,6 +134,26 @@ test "default working directory" {
     try testing.expect(defaultCwd(false, "C:\\x", null, rel) == null);
     try testing.expect(defaultCwd(false, "C:\\x", "", rel) == null);
     try testing.expect(defaultCwd(true, rel, home, null) == null);
+}
+
+test "window's default working directory" {
+    const home = "C:\\Users\\me";
+    const data = "C:\\Users\\me\\AppData\\Local\\Portal";
+    const exe = "C:\\Users\\me\\code\\Portal\\zig-out\\bin";
+    const win = "C:\\Windows";
+    // Double-click on the launcher (cwd = bin) or a release: home.
+    try testing.expectEqualStrings(home, guiDefaultCwd(data ++ "\\bin", exe, data, win, home).?);
+    try testing.expectEqualStrings(home, guiDefaultCwd(data ++ "\\releases\\x", exe, data, win, home).?);
+    // Double-click on a dev build: home.
+    try testing.expectEqualStrings(home, guiDefaultCwd(exe, exe, data, win, home).?);
+    // Run dialog / shortcut without "Start in": home.
+    try testing.expectEqualStrings(home, guiDefaultCwd("C:\\Windows\\System32", exe, data, win, home).?);
+    try testing.expectEqualStrings(home, guiDefaultCwd(null, exe, data, win, home).?);
+    // From a terminal in a project: keep it.
+    try testing.expect(guiDefaultCwd("C:\\code\\proj", exe, data, win, home) == null);
+    try testing.expect(guiDefaultCwd(home, exe, data, win, home) == null);
+    // No home folder: inherit.
+    try testing.expect(guiDefaultCwd(data, exe, data, win, null) == null);
 }
 
 test "launcher variable is only trusted from the parent process" {

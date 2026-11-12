@@ -341,8 +341,22 @@ pub fn launcherBinDir(gpa: Allocator, releases_root: []const u8) Allocator.Error
     return std.fs.path.join(gpa, &.{ parent, "bin" });
 }
 
+/// The exes a release holds and the launchers stand in for, with the
+/// launcher build installed under each name.
+pub const release_exes = [_][]const u8{ "portal.exe", "portalctl.exe", "portal-show.exe" };
+
+/// stage\bin name of the launcher installed as `exe` (the window gets the
+/// GUI-subsystem launcher, the console tools the console one).
+pub fn launcherFor(exe: []const u8) []const u8 {
+    return if (std.ascii.eqlIgnoreCase(exe, "portal.exe")) "portal-launcher.exe" else "portal-launcher-console.exe";
+}
+
 pub fn isOldLauncherName(name: []const u8) bool {
-    return std.ascii.startsWithIgnoreCase(name, "portal.exe.") and std.ascii.endsWithIgnoreCase(name, ".old");
+    if (!std.ascii.endsWithIgnoreCase(name, ".old")) return false;
+    for (release_exes) |e| {
+        if (name.len > e.len + 1 and std.ascii.startsWithIgnoreCase(name, e) and name[e.len] == '.') return true;
+    }
+    return false;
 }
 
 /// `pid` in decimal, NUL-terminated, in `buf` (the launcher's
@@ -650,7 +664,7 @@ test "commandTail" {
         .{ "portal", "" },
         .{ "portal ", "" },
         .{ "portal version", "version" },
-        .{ "portal   run --listen 1.2.3.4:5 -- claude", "run --listen 1.2.3.4:5 -- claude" },
+        .{ "portal   run --listen 1.2.3.4:5 -- agent", "run --listen 1.2.3.4:5 -- agent" },
         .{ "\"C:\\Program Files\\portal.exe\" run \"a b\"", "run \"a b\"" },
         .{ "\"C:\\x y\\portal.exe\"", "" },
         .{ "\"C:\\x y\\portal.exe\"\t\tversion", "version" },
@@ -691,4 +705,10 @@ test "isOldLauncherName" {
     try testing.expect(isOldLauncherName("PORTAL.EXE.1.OLD"));
     try testing.expect(!isOldLauncherName("portal.exe"));
     try testing.expect(!isOldLauncherName("other.exe.1.old"));
+    try testing.expect(isOldLauncherName("portalctl.exe.20261111-185919.old"));
+    try testing.expect(isOldLauncherName("portal-show.exe.1.old"));
+    try testing.expect(!isOldLauncherName("portalctl.exe"));
+    try testing.expectEqualStrings("portal-launcher.exe", launcherFor("portal.exe"));
+    try testing.expectEqualStrings("portal-launcher-console.exe", launcherFor("portalctl.exe"));
+    try testing.expectEqualStrings("portal-launcher-console.exe", launcherFor("portal-show.exe"));
 }

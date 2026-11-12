@@ -11,4 +11,6 @@ test {
     _ = @import("net/watchdog.zig");
     _ = @import("net/pin.zig");
     _ = @import("net/client.zig");
+    _ = @import("remote.zig");
+    _ = @import("setup.zig");
 }

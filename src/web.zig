@@ -808,7 +808,7 @@ pub const Server = struct {
         else
             "";
         const hint: []const u8 = if (diag.received_alert) |a| switch (a) {
-            .bad_certificate, .unknown_ca, .certificate_unknown, .access_denied => " - that device does not trust the Portal CA yet (see `portal ca export`)",
+            .bad_certificate, .unknown_ca, .certificate_unknown, .access_denied => " - that device does not trust the Portal CA yet (Export certificate in the Portal window, or `portalctl ca export`)",
             else => "",
         } else "";
         srv.log.print("TLS handshake with {s} failed: {t}{s}{s} ({d} more since last report)", .{
@@ -1096,7 +1096,7 @@ pub const Server = struct {
     /// The fingerprint is Portal's own hex-and-colons text.
     fn fingerprintNote(srv: *const Server, buf: []u8) []const u8 {
         const fp = srv.cfg.ca_fingerprint orelse return "";
-        return std.fmt.bufPrint(buf, "<p class=\"hint\">Portal CA SHA-256 (it must match what <code>portal pair</code> printed at the desk):<br><code>{s}</code></p>", .{fp}) catch "";
+        return std.fmt.bufPrint(buf, "<p class=\"hint\">Portal CA SHA-256 (it must match what the desk shows while pairing):<br><code>{s}</code></p>", .{fp}) catch "";
     }
 
     fn pairPage(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request) !bool {
@@ -1104,13 +1104,13 @@ pub const Server = struct {
         // Memory only: the pairing watcher keeps `pair_view` current.
         const view = srv.pairingSnapshot(srv.nowUnix());
         const msg: []const u8 = if (std.mem.eql(u8, q, "e=closed"))
-            "<p class=\"error\">No pairing window is open. Run the command below at the desktop first.</p>"
+            "<p class=\"error\">No pairing window is open. Open one at the desktop first (see below).</p>"
         else if (std.mem.eql(u8, q, "e=revoked"))
             "<p class=\"error\">This device's credential was used from somewhere else, so it was revoked. Pair it again at the desktop.</p>"
         else if (std.mem.eql(u8, q, "e=denied"))
-            "<p class=\"error\">The desk did not approve this request. If that was a mistake, run <code>portal pair</code> again at the desktop.</p>"
+            "<p class=\"error\">The desk did not approve this request. If that was a mistake, open <strong>Pair a device</strong> again in the Portal window at the desktop.</p>"
         else if (std.mem.eql(u8, q, "e=expired"))
-            "<p class=\"error\">The pairing request expired, or the pairing window closed. Run <code>portal pair</code> again at the desktop.</p>"
+            "<p class=\"error\">The pairing request expired, or the pairing window closed. Open <strong>Pair a device</strong> again in the Portal window at the desktop.</p>"
         else if (std.mem.eql(u8, q, "e=busy"))
             "<p class=\"error\">Too many pairing requests are waiting. Answer them at the desk, then try again.</p>"
         else if (std.mem.eql(u8, q, "bye"))
@@ -1126,7 +1126,8 @@ pub const Server = struct {
                 "After you tap the button, approve this device at the desk.</p>" ++
                 "<button type=\"submit\">Pair this device</button></form>{s}", .{ view.?.name.get(), srv.fingerprintNote(&fp_buf) }) catch ""
         else
-            "<p>This device is not paired yet. At the desktop, run:</p><pre>portal pair &lt;name&gt;</pre>" ++
+            "<p>This device is not paired yet. At the desktop, in the Portal window, choose <strong>Pair a device</strong> " ++
+                "(Ctrl+Shift+P; in a terminal: <code>portalctl pair &lt;name&gt;</code>),</p>" ++
                 "<p>then reload this page within 2 minutes.</p>";
         const page = try srv.renderPair("", msg, action);
         defer srv.gpa.free(page);
@@ -1150,7 +1151,11 @@ pub const Server = struct {
         , .{ view.name.get(), r.ip.get(), &r.code, &r.code, srv.fingerprintNote(&fp_buf) });
         const page = try srv.renderPair(head, "", action);
         defer srv.gpa.free(page);
-        return srv.asset(conn, w, req, page, "text/html; charset=utf-8");
+        // The code also as a header, for native clients (portal connect),
+        // which read only the response head.
+        const keep = !req.connection_close;
+        try srv.respond(conn, w, .ok, page, "text/html; charset=utf-8", &.{.{ .name = "x-portal-request-code", .value = &r.code }}, keep);
+        return keep;
     }
 
     /// The pairing-time download listener (plain HTTP on port+1): the CA
@@ -1192,7 +1197,7 @@ pub const Server = struct {
             \\<a class="b" href="/ca.mobileconfig">iPhone / iPad / Mac: install profile</a>
             \\<a class="b" href="/ca.cer">Other devices: certificate (.cer)</a>
             \\<p><b>iPhone / iPad:</b> after downloading, open Settings &gt; General &gt; VPN &amp; Device Management, install the "Portal Local CA" profile, then Settings &gt; General &gt; About &gt; Certificate Trust Settings and enable full trust for it.</p>
-            \\<p>Check the fingerprint (SHA-256) matches what <code>portal ca export</code> prints on the desktop:<br><code>{s}</code></p>
+            \\<p>Check the fingerprint (SHA-256) matches what the desk shows (Pair a device or Export certificate in the Portal window):<br><code>{s}</code></p>
             \\<a class="b" href="https://{s}:{d}/pair">Continue to pairing (HTTPS)</a>
             \\</body></html>
         , .{ d.fingerprint, host, d.https_port }) catch return srv.fail(conn, w, .internal_server_error, "page too large\n");

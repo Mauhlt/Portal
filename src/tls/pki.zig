@@ -420,7 +420,7 @@ pub fn exportCa(gpa: Allocator, io: Io, ca: *const Ca, out_dir: []const u8) !Exp
 pub const iphone_steps =
     \\On an iPhone or iPad (once per device):
     \\  1. Open the profile (portal-ca.mobileconfig) on the device, e.g. from
-    \\     http://<desktop WireGuard IP>:<port+1>/ while `portal pair` is open,
+    \\     http://<desktop WireGuard IP>:<port+1>/ while pairing is open,
     \\     or AirDrop / Mail the file. Tap Allow.
     \\  2. Settings > General > VPN & Device Management > "Portal Local CA ..."
     \\     > Install (enter the passcode), then Install again.

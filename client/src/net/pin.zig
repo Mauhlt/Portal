@@ -59,6 +59,44 @@ pub fn serversDir(out: *[max_path]u8) Error![]const u8 {
     return r catch error.PathTooLong;
 }
 
+/// The file remembering the last server connected to (next to the
+/// servers directory): what `portal connect` with no --server uses.
+pub fn lastServerPath(out: *[max_path]u8) Error![]const u8 {
+    var dir_buf: [max_path]u8 = undefined;
+    const sdir = try serversDir(&dir_buf);
+    const parent = std.fs.path.dirname(sdir) orelse return error.NoConfigDir;
+    return std.fmt.bufPrint(out, "{s}" ++ std.fs.path.sep_str ++ "last-server.txt", .{parent}) catch error.PathTooLong;
+}
+
+/// The remembered server ("IP:PORT"), if any.
+pub fn loadLastServer(io: Io, out: *[64]u8) ?[]const u8 {
+    var pbuf: [max_path]u8 = undefined;
+    const p = lastServerPath(&pbuf) catch return null;
+    var fbuf: [128]u8 = undefined;
+    const data = Io.Dir.cwd().readFile(io, p, &fbuf) catch return null;
+    const t = std.mem.trim(u8, data, " \t\r\n");
+    if (t.len == 0 or t.len > out.len) return null;
+    @memcpy(out[0..t.len], t);
+    return out[0..t.len];
+}
+
+pub fn saveLastServer(io: Io, host: []const u8) !void {
+    var pbuf: [max_path]u8 = undefined;
+    const p = try lastServerPath(&pbuf);
+    if (std.fs.path.dirname(p)) |d| try Io.Dir.cwd().createDirPath(io, d);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = host });
+}
+
+/// Where the Portal window's "Export certificate" puts the CA by default
+/// (<home>/Downloads/Portal-CA/portal-ca.pem), to prefill the first-run
+/// screen when the file was copied over to the same place.
+pub fn defaultCaFile(out: *[max_path]u8) ?[]const u8 {
+    var env_buf: [max_path]u8 = undefined;
+    const home = (if (builtin.os.tag == .windows) envVar("USERPROFILE", &env_buf) else envVar("HOME", &env_buf)) orelse return null;
+    const sep = std.fs.path.sep_str;
+    return std.fmt.bufPrint(out, "{s}" ++ sep ++ "Downloads" ++ sep ++ "Portal-CA" ++ sep ++ "portal-ca.pem", .{home}) catch null;
+}
+
 /// "10.8.0.1:8420" -> "10.8.0.1_8420", "[fd00::1]:8420" -> "fd00--1_8420".
 pub fn fileStem(host: []const u8, out: []u8) Error![]const u8 {
     const last = std.mem.lastIndexOfScalar(u8, host, ':') orelse return error.PathTooLong;

@@ -1,6 +1,6 @@
-//! `portal show <file.png> [--cols N] [--stdout]`: shows a PNG inline in
-//! the terminal by writing a kitty graphics command, so a user, or the agent
-//! through its Bash tool, can put an image into the session.
+//! `portal-show <file.png> [--cols N] [--stdout]`: shows a PNG inline in
+//! the terminal by writing a kitty graphics command, so a user, or the agent CLI
+//! through its shell tool, can put an image into the session.
 //!
 //! It reads exactly the one local file it is given, and writes only to the
 //! terminal. Portal's viewers then see the image because a program inside
@@ -9,7 +9,7 @@
 //!
 //! Two output forms:
 //!   * Console (stdout is a console, or stdout is redirected and the
-//!     process still has one: the agent's Bash tool captures stdout): the
+//!     process still has one: the agent CLI's shell tool captures stdout): the
 //!     command goes to the console as OSC 7070 (Windows ConPTY drops APC
 //!     strings but passes unknown OSCs through). Under ConPTY the cursor
 //!     can't be trusted at the moment the OSC reaches Portal, so this form
@@ -25,7 +25,7 @@ const pngcheck = @import("pngcheck");
 const gfx = @import("vt_gfx.zig");
 
 const usage =
-    \\usage: portal show <file.png> [--cols N] [--stdout]
+    \\usage: portal-show <file.png> [--cols N] [--stdout]
     \\  Shows a PNG inline in the terminal (kitty graphics protocol).
     \\  --cols N   width in terminal columns (default: from the image size)
     \\  --stdout   write the plain kitty sequence to stdout
@@ -83,7 +83,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) u8 {
-    std.debug.print("portal show: " ++ fmt ++ "\n", args);
+    std.debug.print("portal-show: " ++ fmt ++ "\n", args);
     return 1;
 }
 

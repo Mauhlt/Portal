@@ -1,11 +1,20 @@
-//! portal-launcher: installed by `portal-release release` as
-//! %LOCALAPPDATA%\Portal\bin\portal.exe. Runs the currently promoted release:
+//! portal-launcher: installed by `portal-release release` into
+//! %LOCALAPPDATA%\Portal\bin. Two builds of this file:
+//!
+//!   GUI subsystem (portal-launcher.exe)        -> bin\portal.exe
+//!   console (portal-launcher-console.exe)      -> bin\portalctl.exe,
+//!                                                 bin\portal-show.exe
+//!
+//! so the launcher never opens a console for the window and never loses
+//! one for the console tools. Each runs the same-named exe of the currently
+//! promoted release:
 //!
 //!   1. reads <releases>\current.txt (never an inherited variable) and
 //!      validates the id against the release id pattern,
-//!   2. checks <releases>\<id>\portal.exe exists,
+//!   2. checks <releases>\<id>\<its own file name> exists (portal.exe,
+//!      portalctl.exe or portal-show.exe only),
 //!   3. runs it with this process's command line tail passed through verbatim,
-//!      sharing the console and standard handles,
+//!      sharing the console (if any) and standard handles,
 //!   4. exits with the child's full 32-bit exit code.
 //!
 //! <releases> is %LOCALAPPDATA%\Portal\releases, or PORTAL_RELEASES_DIR (an
@@ -18,6 +27,11 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const lib = @import("releases_lib.zig");
 const w = @import("win32_tools.zig");
+/// `gui`: the GUI-subsystem build (errors in a message box).
+const gui = @import("build_options").gui;
+
+/// The exes a launcher may stand in for.
+const targets = [_][]const u8{ "portal.exe", "portalctl.exe", "portal-show.exe" };
 
 pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag != .windows) @compileError("portal-launcher supports Windows only.");
@@ -50,10 +64,13 @@ pub fn main(init: std.process.Init) !void {
     );
     defer gpa.free(id);
 
-    const exe = try std.fs.path.join(gpa, &.{ releases, id, "portal.exe" });
+    var name_buf: [64]u8 = undefined;
+    const name = ownName(&name_buf) orelse
+        fail("this launcher must be named portal.exe, portalctl.exe or portal-show.exe.", .{});
+    const exe = try std.fs.path.join(gpa, &.{ releases, id, name });
     defer gpa.free(exe);
     const st = Io.Dir.cwd().statFile(io, exe, .{}) catch
-        fail("release {s} has no portal.exe ({s}). Run `zig build rollback` or `zig build release`.", .{ id, exe });
+        fail("release {s} has no {s} ({s}). Run `zig build rollback` or `zig build release`.", .{ id, name, exe });
     if (st.kind != .file) fail("{s} is not a file.", .{exe});
 
     const code = run(gpa, exe) catch |err| fail("could not start {s}: {t}", .{ exe, err });
@@ -62,7 +79,51 @@ pub fn main(init: std.process.Init) !void {
 
 fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print("portal: " ++ fmt ++ "\n", args);
+    if (gui) {
+        var buf: [1024]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, fmt, args) catch "Portal could not start.";
+        var wbuf: [1025:0]u16 = undefined;
+        const n = std.unicode.utf8ToUtf16Le(wbuf[0..1024], msg) catch 0;
+        wbuf[n] = 0;
+        _ = MessageBoxW(null, &wbuf, std.unicode.utf8ToUtf16LeStringLiteral("Portal"), 0x10); // MB_ICONERROR
+    }
     w.ExitProcess(1);
+}
+
+extern "user32" fn MessageBoxW(hwnd: ?*anyopaque, text: [*:0]const u16, caption: [*:0]const u16, flags: u32) callconv(.winapi) i32;
+extern "kernel32" fn GetModuleFileNameW(module: ?*anyopaque, buf: [*]u16, size: w.DWORD) callconv(.winapi) w.DWORD;
+
+/// This launcher's own file name, lower-cased, if it is one of `targets`.
+fn ownName(out: *[64]u8) ?[]const u8 {
+    var buf: [32768]u16 = undefined;
+    const n = GetModuleFileNameW(null, &buf, buf.len);
+    if (n == 0 or n >= buf.len) return null;
+    return matchTarget(buf[0..n], out);
+}
+
+/// The target whose name `path` (WTF-16) ends in, case-insensitively.
+fn matchTarget(path: []const u16, out: *[64]u8) ?[]const u8 {
+    var start: usize = path.len;
+    while (start > 0 and path[start - 1] != '\\' and path[start - 1] != '/') start -= 1;
+    const base = path[start..];
+    if (base.len > out.len) return null;
+    for (base, 0..) |c, i| {
+        if (c > 0x7f) return null;
+        out[i] = std.ascii.toLower(@intCast(c));
+    }
+    const s = out[0..base.len];
+    for (targets) |t| if (std.mem.eql(u8, s, t)) return t;
+    return null;
+}
+
+test "matchTarget" {
+    var out: [64]u8 = undefined;
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    try std.testing.expectEqualStrings("portal.exe", matchTarget(W("C:\\Users\\u\\AppData\\Local\\Portal\\bin\\Portal.EXE"), &out).?);
+    try std.testing.expectEqualStrings("portalctl.exe", matchTarget(W("portalctl.exe"), &out).?);
+    try std.testing.expectEqualStrings("portal-show.exe", matchTarget(W("D:/x/portal-show.exe"), &out).?);
+    try std.testing.expect(matchTarget(W("C:\\bin\\portal-launcher.exe"), &out) == null);
+    try std.testing.expect(matchTarget(W("C:\\bin\\evil.exe"), &out) == null);
 }
 
 /// Returns an owned copy of the validated id in current.txt, or null.
@@ -104,7 +165,7 @@ fn run(gpa: Allocator, exe: []const u8) !u32 {
     const cmd_z = try cmd.toOwnedSliceSentinel(gpa, 0);
     defer gpa.free(cmd_z);
 
-    _ = w.SetConsoleCtrlHandler(ignoreCtrl, 1);
+    if (!gui) _ = w.SetConsoleCtrlHandler(ignoreCtrl, 1);
     // Tells portal.exe that the launcher (not a terminal) shares its
     // console, so a double-clicked launcher still counts as "no terminal"
     // for the default working directory (src/workdir.zig). The value is our

@@ -1,8 +1,9 @@
-//! HTTP/1.1 pieces the client needs: device pairing (`POST /pair`), session
-//! refresh (`POST /auth/refresh`), the WebSocket upgrade request, and a
-//! strict parser for response heads (status, Location, Set-Cookie, upgrade
-//! fields). Pure functions over byte slices; responses are untrusted and
-//! never cause a panic.
+//! HTTP/1.1 pieces the client needs: device pairing (`POST /pair`, then
+//! `GET /pair/wait` until the desk answers), session refresh (`POST
+//! /auth/refresh`), the WebSocket upgrade request, and a strict parser for
+//! response heads (status, Location, Set-Cookie, upgrade fields, the
+//! pairing request code). Pure functions over byte slices; responses are
+//! untrusted and never cause a panic.
 
 const std = @import("std");
 
@@ -11,7 +12,7 @@ pub const max_headers = 64;
 /// Device cookie values are "<name>.<43-char secret>"; session values are 43.
 pub const max_cookie_value = 200;
 
-pub const CookieKind = enum { session, device };
+pub const CookieKind = enum { session, device, pairreq };
 
 const CookieName = struct { name: []const u8, kind: CookieKind };
 /// `__Host-` variants are what the server uses over HTTPS (its default);
@@ -21,6 +22,9 @@ pub const cookie_names = [_]CookieName{
     .{ .name = "__Host-portal", .kind = .session },
     .{ .name = "portal_device", .kind = .device },
     .{ .name = "__Host-portal_device", .kind = .device },
+    // The pairing request token (HttpOnly for browsers; memory only here).
+    .{ .name = "portal_pairreq", .kind = .pairreq },
+    .{ .name = "__Host-portal_pairreq", .kind = .pairreq },
 };
 
 /// A cookie value. The session cookie lives in memory only; the device
@@ -57,6 +61,7 @@ fn nameIndex(k: CookieKind, secure: bool) u8 {
     return switch (k) {
         .session => if (secure) 1 else 0,
         .device => if (secure) 3 else 2,
+        .pairreq => if (secure) 5 else 4,
     };
 }
 
@@ -85,6 +90,11 @@ fn validValue(k: CookieKind, v: []const u8) bool {
 pub fn writePairRequest(w: *std.Io.Writer, host: []const u8, secure: bool) !void {
     try w.print("POST /pair HTTP/1.1\r\nHost: {s}\r\nOrigin: {s}://{s}\r\n" ++
         "Content-Length: 0\r\nConnection: close\r\n\r\n", .{ host, scheme(secure), host });
+}
+
+/// Writes `GET /pair/wait` with the request token from `POST /pair`.
+pub fn writePairWaitRequest(w: *std.Io.Writer, host: []const u8, secure: bool, req: *const Cookie) !void {
+    try w.print("GET /pair/wait HTTP/1.1\r\nHost: {s}\r\nCookie: {s}={s}\r\nConnection: close\r\n\r\n", .{ host, cookieName(.pairreq, secure), req.value() });
 }
 
 /// Writes `POST /auth/refresh` with the stored device cookie, under the
@@ -125,6 +135,11 @@ pub const Response = struct {
     location: ?[]const u8 = null,
     session: ?Cookie = null,
     device: ?Cookie = null,
+    /// The pairing request token (`POST /pair`).
+    pairreq: ?Cookie = null,
+    /// `X-Portal-Request-Code` of the `/pair/wait` page: the code the desk
+    /// shows next to this request.
+    request_code: ?[4]u8 = null,
     /// A Set-Cookie that clears one of our cookies (Max-Age=0 or empty value).
     cookie_cleared: bool = false,
     upgrade_websocket: bool = false,
@@ -162,6 +177,7 @@ pub fn parseResponseHead(head: []const u8) ParseError!Response {
                 .set => |c| switch (c.kind()) {
                     .session => resp.session = c,
                     .device => resp.device = c,
+                    .pairreq => resp.pairreq = c,
                 },
                 .cleared => resp.cookie_cleared = true,
                 .other => {},
@@ -175,6 +191,16 @@ pub fn parseResponseHead(head: []const u8) ParseError!Response {
             }
         } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-accept")) {
             resp.accept = val;
+        } else if (std.ascii.eqlIgnoreCase(name, "x-portal-request-code")) {
+            if (val.len == 4) {
+                var code: [4]u8 = undefined;
+                var ok = true;
+                for (val, 0..) |ch, i| {
+                    ok = ok and ((ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f'));
+                    code[i] = ch;
+                }
+                if (ok) resp.request_code = code;
+            }
         } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             if (resp.content_length != null) return error.BadHeader;
             resp.content_length = std.fmt.parseInt(usize, val, 10) catch return error.BadHeader;
@@ -213,14 +239,49 @@ pub fn parseSetCookie(header: []const u8) SetCookieResult {
     return .{ .set = c };
 }
 
-pub const PairOutcome = enum { ok, closed, unexpected };
+pub const PairStart = enum {
+    /// Registered: `pairreq` holds the request token; poll /pair/wait.
+    requested,
+    /// No pairing window is open (or it already paired a device).
+    closed,
+    /// Too many requests are waiting at the desk.
+    busy,
+    /// The desk denied this address in this window.
+    denied,
+    unexpected,
+};
 
-/// `POST /pair`: 303 with both cookies, or 303 to /pair?e=closed.
-pub fn pairOutcome(r: *const Response) PairOutcome {
-    if (r.status == 303 or r.status == 302) {
-        if (r.device != null and r.session != null) return .ok;
-        if (r.location) |loc| if (std.mem.startsWith(u8, loc, "/pair")) return .closed;
-    }
+/// `POST /pair` (docs/protocol.md section 1): 303 to /pair/wait with the
+/// request cookie, or 303 to /pair?e=closed|busy|denied.
+pub fn pairStartOutcome(r: *const Response) PairStart {
+    if (r.status != 303 and r.status != 302) return .unexpected;
+    const loc = r.location orelse return .unexpected;
+    if (std.mem.eql(u8, loc, "/pair/wait")) return if (r.pairreq != null) .requested else .unexpected;
+    if (std.mem.eql(u8, loc, "/pair?e=busy")) return .busy;
+    if (std.mem.eql(u8, loc, "/pair?e=denied")) return .denied;
+    if (std.mem.startsWith(u8, loc, "/pair")) return .closed;
+    return .unexpected;
+}
+
+pub const PairWait = enum {
+    /// 200: still waiting for the desk (`request_code` is the code).
+    waiting,
+    /// 303 to / with the device credential and a session: paired.
+    paired,
+    denied,
+    /// Expired, unknown, used, from another address, or the window closed.
+    expired,
+    unexpected,
+};
+
+/// `GET /pair/wait`.
+pub fn pairWaitOutcome(r: *const Response) PairWait {
+    if (r.status == 200) return .waiting;
+    if (r.status != 303 and r.status != 302) return .unexpected;
+    const loc = r.location orelse return .unexpected;
+    if (std.mem.eql(u8, loc, "/")) return if (r.device != null and r.session != null) .paired else .unexpected;
+    if (std.mem.eql(u8, loc, "/pair?e=denied")) return .denied;
+    if (std.mem.startsWith(u8, loc, "/pair")) return .expired;
     return .unexpected;
 }
 
@@ -268,17 +329,42 @@ test "set-cookie parsing" {
 }
 
 test "pair and refresh responses" {
+    // POST /pair: the request is registered (token cookie), or refused.
+    const req = try parseResponseHead("HTTP/1.1 303 See Other\r\nLocation: /pair/wait\r\n" ++
+        "Set-Cookie: __Host-portal_pairreq=abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123-_6; Path=/; HttpOnly; SameSite=Strict; Max-Age=600; Secure\r\n\r\n");
+    try testing.expectEqual(PairStart.requested, pairStartOutcome(&req));
+    try testing.expectEqualStrings("__Host-portal_pairreq", req.pairreq.?.name());
+    const no_tok = try parseResponseHead("HTTP/1.1 303 See Other\r\nLocation: /pair/wait\r\n\r\n");
+    try testing.expectEqual(PairStart.unexpected, pairStartOutcome(&no_tok));
+    const closed = try parseResponseHead("HTTP/1.1 303 See Other\r\nLocation: /pair?e=closed\r\n\r\n");
+    try testing.expectEqual(PairStart.closed, pairStartOutcome(&closed));
+    const busy = try parseResponseHead("HTTP/1.1 303 See Other\r\nLocation: /pair?e=busy\r\n\r\n");
+    try testing.expectEqual(PairStart.busy, pairStartOutcome(&busy));
+    const denied = try parseResponseHead("HTTP/1.1 303 See Other\r\nLocation: /pair?e=denied\r\n\r\n");
+    try testing.expectEqual(PairStart.denied, pairStartOutcome(&denied));
+    try testing.expectEqual(PairStart.unexpected, pairStartOutcome(&(try parseResponseHead("HTTP/1.1 200 OK\r\n\r\n"))));
+
+    // GET /pair/wait.
+    const waiting = try parseResponseHead("HTTP/1.1 200 OK\r\nX-Portal-Request-Code: 7f3a\r\nContent-Length: 10\r\n\r\n");
+    try testing.expectEqual(PairWait.waiting, pairWaitOutcome(&waiting));
+    try testing.expectEqualStrings("7f3a", &waiting.request_code.?);
+    const bad_code = try parseResponseHead("HTTP/1.1 200 OK\r\nX-Portal-Request-Code: 7F3<\r\n\r\n");
+    try testing.expect(bad_code.request_code == null);
     const ok = try parseResponseHead("HTTP/1.1 303 See Other\r\nLocation: /\r\n" ++
         "Set-Cookie: portal_device=lap.abc; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000\r\n" ++
-        "Set-Cookie: portal_session=xyz; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200\r\ncontent-length: 0\r\n\r\n");
-    try testing.expectEqual(PairOutcome.ok, pairOutcome(&ok));
+        "Set-Cookie: portal_session=xyz; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200\r\n" ++
+        "Set-Cookie: portal_pairreq=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0\r\ncontent-length: 0\r\n\r\n");
+    try testing.expectEqual(PairWait.paired, pairWaitOutcome(&ok));
     try testing.expectEqualStrings("xyz", ok.session.?.value());
     try testing.expectEqualStrings("lap.abc", ok.device.?.value());
-    const closed = try parseResponseHead("HTTP/1.1 303 See Other\r\nLocation: /pair?e=closed\r\n\r\n");
-    try testing.expectEqual(PairOutcome.closed, pairOutcome(&closed));
+    try testing.expect(ok.cookie_cleared);
+    const wdenied = try parseResponseHead("HTTP/1.1 303 See Other\r\nLocation: /pair?e=denied\r\n\r\n");
+    try testing.expectEqual(PairWait.denied, pairWaitOutcome(&wdenied));
+    const expired = try parseResponseHead("HTTP/1.1 303 See Other\r\nLocation: /pair?e=expired\r\n\r\n");
+    try testing.expectEqual(PairWait.expired, pairWaitOutcome(&expired));
     // A session cookie alone is not a successful pairing.
     const half = try parseResponseHead("HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: portal_session=xyz\r\n\r\n");
-    try testing.expectEqual(PairOutcome.unexpected, pairOutcome(&half));
+    try testing.expectEqual(PairWait.unexpected, pairWaitOutcome(&half));
 
     const ref = try parseResponseHead("HTTP/1.1 204 No Content\r\n" ++
         "Set-Cookie: portal_device=lap.new; Path=/; HttpOnly; Max-Age=2592000\r\nSet-Cookie: portal_session=s2\r\n\r\n");
@@ -327,6 +413,13 @@ test "request building" {
     w = .fixed(&buf);
     try writePairRequest(&w, "10.8.0.1:8420", false);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nOrigin: http://10.8.0.1:8420\r\n") != null);
+    const tok = Cookie.fromValue(.pairreq, "tok123", true).?;
+    w = .fixed(&buf);
+    try writePairWaitRequest(&w, "10.8.0.1:8420", true, &tok);
+    try testing.expectEqualStrings("GET /pair/wait HTTP/1.1\r\nHost: 10.8.0.1:8420\r\nCookie: __Host-portal_pairreq=tok123\r\nConnection: close\r\n\r\n", w.buffered());
+    w = .fixed(&buf);
+    try writePairWaitRequest(&w, "10.8.0.1:8420", false, &tok);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nCookie: portal_pairreq=tok123\r\n") != null);
     // A credential from before TLS (plain name) goes out under the
     // __Host- name over HTTPS.
     const dev = Cookie.fromValue(.device, "lap.secret", false).?;

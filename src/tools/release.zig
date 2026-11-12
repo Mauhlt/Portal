@@ -12,11 +12,16 @@
 //! Releases live OUTSIDE the repo (so `git clean` can't delete the safety copy):
 //!     %LOCALAPPDATA%\Portal\releases\
 //!         20261111-183000_zig-0.18.0-dev.4+5a23bf4b2\
-//!             portal.exe, portal.pdb, BUILD-INFO.txt, source\
+//!             portal.exe (the window, GUI subsystem), portalctl.exe (the
+//!             console tool), portal-show.exe (images, runs in sessions),
+//!             their .pdb files, BUILD-INFO.txt, source\
 //!         current.txt     release the launcher runs
 //!         known-good.txt  release you confirmed works (mark-good)
 //!         history.txt     every promotion, newest last
-//!     %LOCALAPPDATA%\Portal\bin\portal.exe   the launcher (put bin on PATH)
+//!     %LOCALAPPDATA%\Portal\bin\   launchers (put bin on PATH):
+//!         portal.exe        GUI-subsystem launcher -> release's portal.exe
+//!         portalctl.exe     console launcher -> release's portalctl.exe
+//!         portal-show.exe   console launcher -> release's portal-show.exe
 //!
 //! PORTAL_RELEASES_DIR (absolute path) overrides the releases directory, for
 //! testing, when PORTAL_TESTING=1 is also set; the launcher is then
@@ -40,9 +45,10 @@ const usage =
     \\
     \\Usage:
     \\  portal-release release [--zig PATH] [--repo DIR]
-    \\      Run `zig build test`, build ReleaseSafe, check `portal version`,
-    \\      store it as a new release, make it current, install the launcher
-    \\      (portal.exe in the `bin` folder next to the releases folder) and
+    \\      Run `zig build test`, build ReleaseSafe, check `portalctl version`,
+    \\      store it as a new release, make it current, install the launchers
+    \\      (portal.exe, portalctl.exe and portal-show.exe in the `bin` folder
+    \\      next to the releases folder) and
     \\      prune old releases. On any failure before promotion, the current
     \\      release is left untouched.
     \\  portal-release mark-good
@@ -418,7 +424,9 @@ fn cmdRelease(ctx: Ctx, zig_arg: ?[]const u8, repo_arg: ?[]const u8) !void {
         if (code != 0) failRelease("build failed with zig {s} (exit code {d})", .{ zig_version, code });
     }
 
-    const staged_exe = try std.fs.path.join(gpa, &.{ stage, "bin", "portal.exe" });
+    // portal.exe is a GUI program (message boxes, no stdout): the version
+    // check runs the console tool built from the same code.
+    const staged_exe = try std.fs.path.join(gpa, &.{ stage, "bin", "portalctl.exe" });
     defer gpa.free(staged_exe);
     const version_out = blk: {
         const r = runCapture(gpa, io, &.{ staged_exe, "version" }, repo) catch |err|
@@ -527,10 +535,14 @@ fn populateRelease(ctx: Ctx, repo: []const u8, stage: []const u8, dest: []const 
     var dest_dir = try cwd.openDir(io, dest, .{});
     defer dest_dir.close(io);
 
-    try stage_dir.copyFile("portal.exe", dest_dir, "portal.exe", io, .{});
-    if (stage_dir.statFile(io, "portal.pdb", .{})) |_| {
-        try stage_dir.copyFile("portal.pdb", dest_dir, "portal.pdb", io, .{});
-    } else |_| {}
+    for (lib.release_exes) |exe| {
+        try stage_dir.copyFile(exe, dest_dir, exe, io, .{});
+        var pdb_buf: [64]u8 = undefined;
+        const pdb = try std.fmt.bufPrint(&pdb_buf, "{s}.pdb", .{exe[0 .. exe.len - 4]});
+        if (stage_dir.statFile(io, pdb, .{})) |_| {
+            try stage_dir.copyFile(pdb, dest_dir, pdb, io, .{});
+        } else |_| {}
+    }
 
     var repo_dir = try cwd.openDir(io, repo, .{});
     defer repo_dir.close(io);
@@ -567,29 +579,38 @@ fn copyTree(gpa: Allocator, io: Io, from_parent: Io.Dir, from_sub: []const u8, t
 
 // --------------------------------------------------------------- launcher
 
-/// Installs stage\bin\portal-launcher.exe as <bin_dir>\portal.exe. The old
-/// launcher may be running (it waits for portal.exe), so it is renamed
-/// aside first, which Windows allows for a running exe, then deleted if
-/// possible. Leftover *.old files are cleaned up when no longer in use.
+/// Installs the launchers: stage\bin\portal-launcher.exe (GUI subsystem)
+/// as <bin_dir>\portal.exe, stage\bin\portal-launcher-console.exe as
+/// portalctl.exe and portal-show.exe. An old launcher may be running (it
+/// waits for its child), so it is renamed aside first, which Windows allows
+/// for a running exe, then deleted if possible. Leftover *.old files are
+/// cleaned up when no longer in use.
 fn installLauncher(ctx: Ctx, stage: []const u8, bin_dir: []const u8, stamp: []const u8) void {
-    installLauncherInner(ctx, stage, bin_dir, stamp) catch |err|
-        warn("could not install the launcher into {s}: {t}. The previous launcher (if any) still works.", .{ bin_dir, err });
+    cleanup: {
+        Io.Dir.cwd().createDirPath(ctx.io, bin_dir) catch break :cleanup;
+        var bin = Io.Dir.cwd().openDir(ctx.io, bin_dir, .{ .iterate = true }) catch break :cleanup;
+        defer bin.close(ctx.io);
+        cleanOldLaunchers(ctx.gpa, ctx.io, bin);
+    }
+    for (lib.release_exes) |exe| {
+        installLauncherInner(ctx, stage, bin_dir, stamp, lib.launcherFor(exe), exe) catch |err|
+            warn("could not install the launcher {s} into {s}: {t}. The previous one (if any) still works.", .{ exe, bin_dir, err });
+    }
 }
 
-fn installLauncherInner(ctx: Ctx, stage: []const u8, bin_dir: []const u8, stamp: []const u8) !void {
+fn installLauncherInner(ctx: Ctx, stage: []const u8, bin_dir: []const u8, stamp: []const u8, launcher: []const u8, exe: []const u8) !void {
     const gpa = ctx.gpa;
     const io = ctx.io;
     const cwd = Io.Dir.cwd();
-    const src = try std.fs.path.join(gpa, &.{ stage, "bin", "portal-launcher.exe" });
+    const src = try std.fs.path.join(gpa, &.{ stage, "bin", launcher });
     defer gpa.free(src);
     if (!isFile(io, src)) return error.LauncherNotBuilt;
 
     try cwd.createDirPath(io, bin_dir);
     var bin = try cwd.openDir(io, bin_dir, .{ .iterate = true });
     defer bin.close(io);
-    cleanOldLaunchers(gpa, io, bin);
 
-    const dest = try std.fs.path.join(gpa, &.{ bin_dir, "portal.exe" });
+    const dest = try std.fs.path.join(gpa, &.{ bin_dir, exe });
     defer gpa.free(dest);
     const old = try std.fmt.allocPrint(gpa, "{s}.{s}.old", .{ dest, stamp });
     defer gpa.free(old);
@@ -599,7 +620,7 @@ fn installLauncherInner(ctx: Ctx, stage: []const u8, bin_dir: []const u8, stamp:
         renamed = true;
     }
 
-    cwd.copyFile(src, bin, "portal.exe", io, .{}) catch |err| {
+    cwd.copyFile(src, bin, exe, io, .{}) catch |err| {
         if (renamed) moveNoReplace(gpa, old, dest) catch {};
         return err;
     };
