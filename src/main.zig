@@ -453,6 +453,8 @@ test {
     _ = @import("console.zig");
     _ = @import("session.zig");
     _ = @import("log.zig");
+    _ = @import("vt.zig");
+    _ = @import("web.zig"); // also pulls in http1.zig tests
 }
 
 test "parseListen" {

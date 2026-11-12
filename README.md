@@ -41,15 +41,22 @@ watching, and every login attempt and viewer connection is written to
    Bind it to your WireGuard interface address. Only devices holding a
    WireGuard key can reach it; WireGuard encrypts everything.
 2. **Token**: a 256-bit random access token, generated on the desktop. Only
-   its SHA-256 is stored. Constant-time comparison; 5 failures in 15 minutes
-   lock logins for 15 minutes.
+   its SHA-256 is stored. Constant-time comparison. Every failed attempt
+   costs 500 ms, and 5 failures in 15 minutes reject further *wrong* tokens
+   for 15 minutes. The correct token always works, so nobody can lock you
+   out by guessing.
 3. **Session cookie**: random, HttpOnly, SameSite=Strict, 12 h idle / 7 day
    absolute lifetime, held in memory only (restarting Portal logs everyone
    out). Open WebSockets are closed within 5 s of sign-out or expiry.
 4. **Browser hardening**: Host allowlist (blocks DNS rebinding), Origin checks
    on every POST and on the WebSocket upgrade (blocks CSRF and cross-site
    WebSocket hijacking), strict Content-Security-Policy, no framing.
-5. **Process hygiene**: the child runs in a Windows job object, so if Portal
+5. **Robustness**: Portal parses HTTP and WebSocket itself, strictly, instead
+   of using `std.http` (which had remotely reachable crashes). Every
+   connection has read/idle/send timeouts, and unauthenticated connections
+   are capped per address, so idle or slow connections can't lock out a
+   real viewer.
+6. **Process hygiene**: the child runs in a Windows job object, so if Portal
    dies, the agent and anything it spawned die too, leaving no unobserved
    session. Programs are resolved to absolute paths from PATH only, never
    the current directory.
