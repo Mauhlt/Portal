@@ -10,6 +10,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Browser client: Zig compiled to wasm32-freestanding (src/wasm), with
+    // the bundled font embedded, itself embedded into portal.exe and served
+    // at /static/app.wasm. No WASI, no libc: the module's only imports are
+    // the host functions in src/web/app.js (checked by a test in web.zig).
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const wasm = b.addExecutable(.{
+        .name = "portal-app",
+        .root_module = clientModule(b, "src/wasm/main.zig", wasm_target, .ReleaseSmall),
+    });
+    wasm.entry = .disabled; // a library of exports, no _start
+    wasm.rdynamic = true; // keep every `export fn`
+    root.addAnonymousImport("app_wasm", .{ .root_source_file = wasm.getEmittedBin() });
+    b.step("wasm", "Build the browser client (zig-out/web/app.wasm)").dependOn(
+        &b.addInstallFile(wasm.getEmittedBin(), "web/app.wasm").step,
+    );
+
     const exe = b.addExecutable(.{ .name = "portal", .root_module = root });
     b.installArtifact(exe);
 
@@ -77,11 +93,29 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
+    exe_safe.root_module.addAnonymousImport("app_wasm", .{ .root_source_file = wasm.getEmittedBin() });
     test_step.dependOn(&exe_safe.step);
+    // Browser client: its pure logic (decoder, layout, keys, reconnects,
+    // font parser, rasteriser, renderer) runs natively in Debug, where
+    // safety checks catch what would be a wasm trap or silent corruption.
+    const client_tests = b.addTest(.{ .root_module = clientModule(b, "src/wasm/tests.zig", target, .Debug) });
+    test_step.dependOn(&b.addRunArtifact(client_tests).step);
+    test_step.dependOn(&wasm.step);
     // Release tooling: unit tests (release.zig pulls in releases_lib.zig's)
     // and full compiles of both tools.
     const tool_tests = b.addTest(.{ .root_module = release_mod });
     test_step.dependOn(&b.addRunArtifact(tool_tests).step);
     test_step.dependOn(&release_exe.step);
     test_step.dependOn(&launcher_exe.step);
+}
+
+/// The browser client's module graph: `vt` (src/vt.zig, for the colour
+/// sentinels, cell widths and, in tests, real server frames) and the
+/// bundled fonts as `font_regular` / `font_bold`.
+fn clientModule(b: *std.Build, root_src: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const m = b.createModule(.{ .root_source_file = b.path(root_src), .target = target, .optimize = optimize });
+    m.addImport("vt", b.createModule(.{ .root_source_file = b.path("src/vt.zig"), .target = target, .optimize = optimize }));
+    m.addAnonymousImport("font_regular", .{ .root_source_file = b.path("src/web/fonts/DejaVuSansMono.ttf") });
+    m.addAnonymousImport("font_bold", .{ .root_source_file = b.path("src/web/fonts/DejaVuSansMono-Bold.ttf") });
+    return m;
 }

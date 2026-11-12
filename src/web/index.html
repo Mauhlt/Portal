@@ -4,7 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Portal">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="referrer" content="no-referrer">
 <title>Portal</title>
 <link rel="stylesheet" href="/static/app.css">
@@ -13,33 +15,14 @@
 <header>
   <span id="status" class="status">connecting…</span>
   <span id="mode" class="mode"></span>
-  <nav id="keys" class="answer-keys" aria-label="Quick answers">
-    <button data-key="1">1</button>
-    <button data-key="2">2</button>
-    <button data-key="3">3</button>
-    <button data-key="4">4</button>
-    <button data-key="y">Yes</button>
-    <button data-key="n">No</button>
-    <button data-key="enter">Enter</button>
-    <button data-key="esc">Esc</button>
-  </nav>
   <span class="spacer"></span>
-  <button id="fit" title="Fit terminal to window">Fit</button>
-  <button id="smaller" title="Smaller text">A−</button>
-  <button id="bigger" title="Larger text">A+</button>
-  <form method="post" action="/logout"><button type="submit">Sign out</button></form>
+  <button type="button" data-cmd="1" title="Fit terminal to window">Fit</button>
+  <button type="button" data-cmd="2" title="Smaller text">A−</button>
+  <button type="button" data-cmd="3" title="Larger text">A+</button>
+  <form method="post" action="/logout"><button type="submit" title="Forget this device">Unpair</button></form>
 </header>
-<div id="wrap"><div id="screen" aria-live="off"><div id="cursor"></div></div></div>
-<nav id="answers" class="answer-keys" aria-label="Answer the agent" hidden>
-  <button data-key="1">1</button>
-  <button data-key="2">2</button>
-  <button data-key="3">3</button>
-  <button data-key="4">4</button>
-  <button data-key="y">Yes</button>
-  <button data-key="n">No</button>
-  <button data-key="enter">Enter</button>
-  <button data-key="esc">Esc</button>
-</nav>
+<!-- The terminal and the answer bar are drawn by the wasm client (src/wasm). -->
+<main id="wrap"><canvas id="screen" aria-label="Terminal"></canvas></main>
 <script src="/static/app.js"></script>
 </body>
 </html>
