@@ -56,7 +56,10 @@ rest of your laptop's browsing is unaffected.
 
 Forward **UDP 51820** to the desktop's LAN IP. Give the desktop a DHCP
 reservation so that IP doesn't change. Do **not** forward 8420; Portal is
-only reachable through the tunnel.
+only reachable through the tunnel. Disable UPnP on the router.
+
+Use a separate WireGuard key pair for each device, so you can revoke one
+(e.g. a lost laptop) by deleting its `[Peer]` block.
 
 ## 4. Windows firewall on the desktop
 
@@ -64,15 +67,24 @@ Allow Portal's port only from the laptop's tunnel address:
 
 ```powershell
 New-NetFirewallRule -DisplayName "Portal (WireGuard only)" -Direction Inbound `
-  -Protocol TCP -LocalPort 8420 -LocalAddress 10.8.0.1 -RemoteAddress 10.8.0.2 -Action Allow
+  -Protocol TCP -LocalPort 8420 -LocalAddress 10.8.0.1 -RemoteAddress 10.8.0.2 `
+  -InterfaceAlias "<your tunnel name>" -Action Allow
 ```
 
-The WireGuard app adds its own rule for UDP 51820. If Windows asks whether to
-let `portal.exe` through the firewall, choose **Private** networks only.
+Each release has its own `portal.exe` path, so Windows may prompt for every
+new release. Do **not** click Cancel: that silently creates a *Block* rule for
+that exe, and block rules override the allow rule above. Tick **Private
+networks** only and click Allow. To list stale per-release rules later:
+`Get-NetFirewallApplicationFilter | Where-Object Program -like '*Portal\releases*'`.
+The WireGuard app adds its own rule for UDP 51820.
+
+From another machine on your home LAN, confirm `http://<desktop LAN IP>:8420/`
+does **not** connect.
 
 ## 5. Keep the desktop reachable
 
-* Set the WireGuard tunnel to start automatically.
+* Set the WireGuard tunnel to start automatically, and start `portal run`
+  only after the tunnel is up (otherwise binding 10.8.0.1 fails).
 * Settings, System, Power: set sleep to **Never** while plugged in (or Portal
   disappears when the desktop sleeps).
 

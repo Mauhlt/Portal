@@ -57,6 +57,10 @@ fn isBatch(path: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(path, ".cmd") or std.ascii.endsWithIgnoreCase(path, ".bat");
 }
 
+fn batchSafe(arg: []const u8) bool {
+    return std.mem.indexOfAny(u8, arg, "&|<>^%!\"()\r\n") == null;
+}
+
 fn hasDirPart(name: []const u8) bool {
     return std.mem.indexOfAny(u8, name, "\\/:") != null;
 }
@@ -106,6 +110,11 @@ pub fn resolve(
     var line_utf8: []u8 = undefined;
     if (isBatch(program)) {
         // .cmd/.bat (e.g. an npm-installed `claude.cmd`) must run under cmd.exe.
+        // cmd.exe ignores MSVCRT `\"` escaping and expands %VAR% even inside
+        // quotes ("BatBadBut"), so no quoting scheme is safe: refuse any
+        // character cmd.exe treats specially instead.
+        if (!batchSafe(program)) return error.UnsafeBatchArgument;
+        for (argv[1..]) |a| if (!batchSafe(a)) return error.UnsafeBatchArgument;
         const root = system_root orelse "C:\\Windows";
         app_utf8 = try std.fmt.allocPrint(gpa, "{s}\\System32\\cmd.exe", .{root});
         errdefer gpa.free(app_utf8);
@@ -150,6 +159,16 @@ test "quoting follows CommandLineToArgvW rules" {
     try expectJoined(&.{"C:\\dir with space\\"}, "\"C:\\dir with space\\\\\"");
     try expectJoined(&.{"a\\\\\"b"}, "\"a\\\\\\\\\\\"b\"");
     try expectJoined(&.{"C:\\no\\space"}, "C:\\no\\space");
+}
+
+test "batch argument safety" {
+    try testing.expect(batchSafe("--model"));
+    try testing.expect(batchSafe("C:\\Program Files\\x"));
+    try testing.expect(!batchSafe("a&calc"));
+    try testing.expect(!batchSafe("x \" & calc"));
+    try testing.expect(!batchSafe("%PATH%"));
+    try testing.expect(!batchSafe("a|b"));
+    try testing.expect(!batchSafe("line\nbreak"));
 }
 
 test "batch detection" {

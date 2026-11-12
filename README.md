@@ -20,15 +20,16 @@ laptop browser ──WireGuard tunnel──▶ desktop 10.8.0.1:8420 ──▶ p
 
 `--input` policies:
 
+* `keys` (default): digits, y/n, Enter, and a single Esc. Enough to answer
+  the agent's numbered "1 / 2 / 3" prompts and nothing else. Arrows and
+  Backspace are deliberately excluded: at an empty prompt, Up+Enter would
+  resubmit an older prompt from history.
 * `none`: view only.
-* `keys`: digits, y/n, Enter, Esc, Backspace, arrows. Enough to answer the agent's
-  "1 / 2 / 3" permission prompts and nothing else.
-* `text` (default): typing allowed. **Be clear about what this means.** Text
-  typed into the agent is a prompt, and a line starting with `!` runs a
-  shell command. Anyone holding a logged-in browser session can therefore
-  make the agent do whatever the agent's own permission settings allow. Portal
-  prevents *new* sessions, not instructions to the existing one. Use `keys`
-  if you only need to approve prompts.
+* `text`: **full remote control of the program.** Typed text is an agent
+  prompt, `!` runs shell commands, slash commands and Shift+Tab change modes,
+  Ctrl+C exits. Anyone holding a logged-in browser session could start new
+  work. This contradicts "no new projects from the laptop", so it is opt-in
+  and Portal warns loudly when you use it.
 
 The desktop console title shows `N REMOTE VIEWER(S) CONNECTED` while anyone is
 watching, and every login attempt and viewer connection is written to
@@ -67,11 +68,17 @@ directly.
 
 ### 2. Create the access token
 
+In a plain terminal (**not** through the agent or any tool that records
+output):
+
 ```powershell
 portal token
+cls
 ```
 
 Store the printed token in your password manager. It is shown only once.
+Portal refuses to print it when output is redirected. A running `portal run`
+keeps accepting the old token until it is restarted.
 
 ### 3. WireGuard (free, open source)
 
@@ -89,7 +96,7 @@ See [docs/wireguard.md](docs/wireguard.md) for the full walk-through. In short:
 On the desktop, in the project you want to work on:
 
 ```powershell
-portal run --listen 10.8.0.1:8420 -- claude
+portal run --listen 10.8.0.1:8420 -- claude          # --input keys is the default
 ```
 
 On the laptop, with the tunnel up, open `http://10.8.0.1:8420/` and sign in
@@ -97,25 +104,31 @@ with the token.
 
 ## Upgrading Zig safely
 
-Each release lives in its own folder with the exact source and Zig version
-that produced it:
+Each release lives in its own folder, outside the repo so `git clean` can't
+delete it, with the exact source and Zig version that produced it:
 
 ```
-releases\
-  20261111-185919_zig-0.18.0-dev.4+5a23bf4b2\  portal.exe  BUILD-INFO.txt  source\
-  current.txt    -> the release bin\portal.cmd runs
-  previous.txt   -> the last known-good fallback
+%LOCALAPPDATA%\Portal\releases\
+  20261111-185919_zig-0.18.0-dev.4+5a23bf4b2\  portal.exe  portal.pdb  BUILD-INFO.txt  source\
+  current.txt      the release bin\portal.cmd runs
+  known-good.txt   the release you confirmed works end to end
+  history.txt      every promotion
 ```
 
 * The binary you run never depends on the installed compiler, so upgrading Zig
   cannot break it.
-* `release.ps1` promotes only if `zig build test` and the build pass with the
-  new compiler; on failure the current release is left untouched.
-* `scripts\rollback.ps1` swaps current and previous.
+* `release.ps1` promotes only if `zig build test` passes with the new compiler.
+  That step runs the unit tests and also compiles the whole program in Debug
+  and ReleaseSafe. On failure the current release is left untouched.
+* After testing a release from the laptop, run `scripts\mark-good.ps1`.
+  `scripts\rollback.ps1` always returns to known-good (running it twice is
+  harmless). Known-good, and the newest build for each Zig version, are never
+  pruned.
 * `src\win32.zig` declares its own Win32 bindings, and `build.zig` tolerates the
   0.17 to 0.18 build API change, to reduce breakage from std churn.
 * ZVC can vet new compilers against Portal before promoting them: add this
-  folder to `test_projects` in ZVC's `src/main.zig`.
+  folder to `test_projects` in ZVC's `src/main.zig`. Because `zig build test`
+  compiles the full exe, a compiler that can't build Portal is rejected.
 
 ## Development
 
