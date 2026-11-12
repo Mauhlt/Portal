@@ -1,5 +1,6 @@
 //! The one terminal session Portal exposes: PTY output fan-out to the local
-//! console and any number of web viewers, and serialised keystroke input.
+//! window (or console) and any number of web viewers, and serialised
+//! keystroke input.
 
 const std = @import("std");
 const Io = std.Io;
@@ -13,8 +14,15 @@ const Policy = keymap.Policy;
 pub const Session = struct {
     io: Io,
     pty: *Pty,
+    /// The desktop console in `portal run --console`; a detached no-op
+    /// Console in the GUI (web.zig sets its title on viewer changes).
     console: *Console,
     policy: Policy,
+    /// Optional change hook: the local GUI uses it to wake its message loop
+    /// on output, resize, close or a viewer change. Set before any thread
+    /// starts; called after `mutex` is released, on the changing thread.
+    notify_ctx: ?*anyopaque = null,
+    notify_fn: ?*const fn (ctx: *anyopaque) void = null,
 
     /// Guards everything below except `input_mutex`'s domain.
     mutex: Io.Mutex = .init,
@@ -48,6 +56,11 @@ pub const Session = struct {
         s.term.feed(data);
         s.mutex.unlock(s.io);
         s.cond.broadcast(s.io);
+        s.notify();
+    }
+
+    fn notify(s: *Session) void {
+        if (s.notify_fn) |f| if (s.notify_ctx) |c| f(c);
     }
 
     /// A key pressed in a web viewer, by protocol name. Portal generates the
@@ -77,7 +90,7 @@ pub const Session = struct {
         s.pty.write(clean) catch {};
     }
 
-    /// Keystrokes from the desktop's own console: unfiltered.
+    /// Keystrokes from the desktop's own console or window: unfiltered.
     pub fn writeInput(s: *Session, data: []const u8) void {
         if (data.len == 0) return;
         s.input_mutex.lockUncancelable(s.io);
@@ -86,8 +99,8 @@ pub const Session = struct {
         s.pty.write(data) catch {};
     }
 
-    /// Called by the local console resize poller. The desktop window decides
-    /// the terminal size; web viewers adapt to it.
+    /// Called by the local console resize poller or the GUI window. The
+    /// desktop decides the terminal size; web viewers adapt to it.
     pub fn setSize(s: *Session, size: Size) void {
         s.mutex.lockUncancelable(s.io);
         const changed = size.cols != s.size.cols or size.rows != s.size.rows;
@@ -100,7 +113,10 @@ pub const Session = struct {
             } else |_| {}
         }
         s.mutex.unlock(s.io);
-        if (changed) s.cond.broadcast(s.io);
+        if (changed) {
+            s.cond.broadcast(s.io);
+            s.notify();
+        }
     }
 
     /// Shuts the pseudo console down safely with respect to the resize
@@ -129,14 +145,17 @@ pub const Session = struct {
         s.exit_code = code;
         s.mutex.unlock(s.io);
         s.cond.broadcast(s.io);
+        s.notify();
     }
 
     pub fn viewerDelta(s: *Session, delta: i32) u32 {
         s.mutex.lockUncancelable(s.io);
-        defer s.mutex.unlock(s.io);
         // Saturating both ways; @abs avoids overflow negating minInt(i32).
         if (delta > 0) s.viewers +|= @abs(delta) else s.viewers -|= @abs(delta);
-        return s.viewers;
+        const n = s.viewers;
+        s.mutex.unlock(s.io);
+        s.notify();
+        return n;
     }
 };
 

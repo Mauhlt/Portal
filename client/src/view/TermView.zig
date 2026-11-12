@@ -1,8 +1,12 @@
 //! TermView: a terminal grid view in its own window, drawn with the
 //! Renderer's Instanced2D. Owns the window/surface, fonts, glyph atlas,
-//! theme, fit/zoom, cursor, answer bar and status line. Knows nothing about
-//! networking: hosts feed it a `Grid` snapshot plus an `Overlay` describing
-//! the chrome, and receive input through an `InputSink`.
+//! theme, fit/zoom, cursor, selection highlight, top bar, answer bar and
+//! status line. Knows nothing about networking or PTYs: hosts feed it a
+//! `Grid` snapshot plus an `Overlay` describing the chrome, and receive
+//! input through an `InputSink`.
+//!
+//! Layout, top to bottom: top bar (optional, `Overlay.top_bar`), grid,
+//! answer bar (optional), status line.
 //!
 //!     var tv = try TermView.init(gpa, io, .{ .title = "Portal" });
 //!     defer tv.deinit();
@@ -45,9 +49,39 @@ pub const StatusLine = struct {
     right: []const u8 = "",
 };
 
+/// The strip above the grid. Today it shows one session's title and the
+/// remote-viewer badge; it is the reserved slot for a tab strip (one tab per
+/// session, coloured per project), which would replace `drawTopBar`.
+pub const TopBar = struct {
+    title: []const u8 = "",
+    /// Coloured strip at the left edge (a per-project colour later).
+    accent: ?Rgb = null,
+    right: []const u8 = "",
+    right_tone: Tone = .muted,
+    /// Draw `right` as a filled, high-contrast badge (someone is watching).
+    right_badge: bool = false,
+};
+
+/// A linear (reading-order) cell selection, inclusive, start <= end.
+pub const Selection = struct {
+    start_col: u16,
+    start_row: u16,
+    end_col: u16,
+    end_row: u16,
+
+    pub fn contains(s: Selection, col: usize, row: usize) bool {
+        if (row < s.start_row or row > s.end_row) return false;
+        if (row == s.start_row and col < s.start_col) return false;
+        if (row == s.end_row and col > s.end_col) return false;
+        return true;
+    }
+};
+
 pub const Overlay = struct {
     /// `.grid` draws the grid (if it has cells); `.message` a centred notice.
     screen: union(enum) { grid, message: Message } = .grid,
+    top_bar: ?TopBar = null,
+    selection: ?Selection = null,
     show_answers: bool = false,
     status: StatusLine = .{},
 };
@@ -100,6 +134,8 @@ dirty: bool = true,
 /// Cells that fit the window at the current font size (fixed_em sizing).
 capacity: [2]u16 = .{ 0, 0 },
 reported_capacity: [2]u16 = .{ 0, 0 },
+/// Where the last built grid was drawn (pixels), for mouse -> cell.
+layout: struct { ox: f32 = 0, oy: f32 = 0, cw: f32 = 1, ch: f32 = 1, cols: u16 = 0, rows: u16 = 0 } = .{},
 live_ctx: ?*anyopaque = null,
 live_fn: ?platform.LiveFn = null,
 
@@ -178,25 +214,96 @@ pub fn pollEvents(tv: *TermView, sink: input.InputSink) bool {
             .close => open = false,
             .key => |k| sink.key(k.key, k.mods),
             .char => |c| sink.char(c.cp, c.mods),
-            .mouse_down => |m| for (tv.buttons[0..tv.n_buttons]) |b| {
-                if (m.x >= b.x and m.x < b.x + b.w and m.y >= b.y and m.y < b.y + b.h) {
-                    switch (b.action) {
-                        .answer => |a| sink.answer(a),
-                        .button => |id| sink.button(id),
+            .mouse_down => |m| {
+                var hit = false;
+                if (m.button == .left) for (tv.buttons[0..tv.n_buttons]) |b| {
+                    if (m.x >= b.x and m.x < b.x + b.w and m.y >= b.y and m.y < b.y + b.h) {
+                        switch (b.action) {
+                            .answer => |a| sink.answer(a),
+                            .button => |id| sink.button(id),
+                        }
+                        hit = true;
+                        break;
                     }
-                    break;
-                }
+                };
+                if (!hit) sink.mouse(tv.mouseAt(.down, m.button, m.x, m.y, m.mods));
             },
+            .mouse_move => |m| sink.mouse(tv.mouseAt(.move, .left, m.x, m.y, .{})),
+            .mouse_up => |m| sink.mouse(tv.mouseAt(.up, m.button, m.x, m.y, .{})),
             else => tv.handleViewEvent(e),
         }
         tv.dirty = true;
     }
+    tv.reportCapacity(sink);
+    return open;
+}
+
+/// Tells the sink if the cells that fit the window changed since the last
+/// report. pollEvents calls it; hosts may also call it from a live redraw
+/// (during a modal resize) so the PTY follows the drag.
+pub fn reportCapacity(tv: *TermView, sink: input.InputSink) void {
+    if (tv.capacity[0] == 0 or tv.capacity[1] == 0) return;
     if (tv.capacity[0] != tv.reported_capacity[0] or tv.capacity[1] != tv.reported_capacity[1]) {
         tv.reported_capacity = tv.capacity;
         const fb = tv.window.framebufferSize();
         sink.resized(fb[0], fb[1], tv.capacity[0], tv.capacity[1]);
     }
-    return open;
+}
+
+/// Maps a window pixel to a grid cell of the last built frame.
+fn mouseAt(tv: *const TermView, action: @FieldType(input.Mouse, "action"), button: input.MouseButton, x: f32, y: f32, mods: input.Mods) input.Mouse {
+    const l = tv.layout;
+    const fx = (x - l.ox) / l.cw;
+    const fy = (y - l.oy) / l.ch;
+    const inside = l.cols > 0 and l.rows > 0 and fx >= 0 and fy >= 0 and
+        fx < @as(f32, @floatFromInt(l.cols)) and fy < @as(f32, @floatFromInt(l.rows));
+    return .{
+        .action = action,
+        .button = button,
+        .col = clampCell(fx, l.cols),
+        .row = clampCell(fy, l.rows),
+        .inside = inside,
+        .mods = mods,
+    };
+}
+
+fn clampCell(f: f32, n: u16) u16 {
+    if (n == 0 or !(f > 0)) return 0; // also catches NaN
+    const max: f32 = @floatFromInt(n - 1);
+    return @intFromFloat(@min(@floor(f), max));
+}
+
+/// How many cells of `cell_w` x `cell_h` pixels fit in `w` x `h` pixels
+/// with `pad` pixels on every side. At least 1 x 1, at most 1000 x 1000.
+pub fn fitCells(w: f32, h: f32, cell_w: u32, cell_h: u32, pad: f32) [2]u16 {
+    const cw: f32 = @floatFromInt(@max(cell_w, 1));
+    const ch: f32 = @floatFromInt(@max(cell_h, 1));
+    return .{ fitCount((w - 2 * pad) / cw), fitCount((h - 2 * pad) / ch) };
+}
+
+fn fitCount(f: f32) u16 {
+    if (!(f >= 1)) return 1; // also NaN
+    if (f >= 1000) return 1000;
+    return @intFromFloat(@floor(f));
+}
+
+test "fitCells" {
+    try std.testing.expectEqual([2]u16{ 80, 24 }, fitCells(808, 488, 10, 20, 4));
+    try std.testing.expectEqual([2]u16{ 79, 23 }, fitCells(807, 487, 10, 20, 4));
+    try std.testing.expectEqual([2]u16{ 1, 1 }, fitCells(0, 0, 10, 20, 4));
+    try std.testing.expectEqual([2]u16{ 1, 1 }, fitCells(-50, std.math.nan(f32), 10, 20, 4));
+    try std.testing.expectEqual([2]u16{ 1000, 1000 }, fitCells(1e9, 1e9, 1, 1, 0));
+    try std.testing.expectEqual([2]u16{ 100, 50 }, fitCells(100, 50, 0, 0, 0));
+}
+
+test "selection contains" {
+    const s: Selection = .{ .start_col = 5, .start_row = 1, .end_col = 2, .end_row = 3 };
+    try std.testing.expect(!s.contains(4, 1));
+    try std.testing.expect(s.contains(5, 1));
+    try std.testing.expect(s.contains(0, 2));
+    try std.testing.expect(s.contains(2, 3));
+    try std.testing.expect(!s.contains(3, 3));
+    try std.testing.expect(!s.contains(0, 0));
 }
 
 fn handleViewEvent(tv: *TermView, e: input.Event) void {
@@ -309,22 +416,67 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
     const ui = tv.fonts.metrics(@round(13 * s));
     const status_h: f32 = @round(@as(f32, @floatFromInt(ui.cell_h)) * 1.6);
     const bar_h: f32 = if (overlay.show_answers) @round(@as(f32, @floatFromInt(ui.cell_h)) * 2.4) else 0;
-    const grid_h = @max(0, H - status_h - bar_h);
+    const top_h: f32 = if (overlay.top_bar != null) topBarHeight(ui) else 0;
+    const grid_h = @max(0, H - status_h - bar_h - top_h);
 
+    tv.layout.cols = 0;
+    tv.layout.rows = 0;
     switch (overlay.screen) {
         .grid => {
             const m = tv.cellMetrics(grid, W, grid_h, s);
-            const pad = 4 * s;
-            tv.capacity = .{
-                @intFromFloat(@max(1, @floor((W - 2 * pad) / @as(f32, @floatFromInt(m.cell_w))))),
-                @intFromFloat(@max(1, @floor((grid_h - 2 * pad) / @as(f32, @floatFromInt(m.cell_h))))),
-            };
-            if (grid.cols > 0 and grid.rows > 0) tv.drawGrid(grid, m, W, grid_h, s);
+            tv.capacity = fitCells(W, grid_h, m.cell_w, m.cell_h, 4 * s);
+            if (grid.cols > 0 and grid.rows > 0) tv.drawGrid(grid, overlay.selection, m, W, top_h, grid_h, s);
         },
-        .message => |msg| tv.drawMessage(ui, msg, W, grid_h, s),
+        .message => |msg| tv.drawMessage(ui, msg, W, top_h, grid_h, s),
     }
-    if (overlay.show_answers) tv.drawAnswerBar(ui, grid_h, W, bar_h, s);
+    if (overlay.top_bar) |tb| tv.drawTopBar(ui, tb, W, top_h, s);
+    if (overlay.show_answers) tv.drawAnswerBar(ui, top_h + grid_h, W, bar_h, s);
     tv.drawStatus(ui, overlay.status, H - status_h, W, status_h, s);
+}
+
+fn topBarHeight(ui: fontset.Metrics) f32 {
+    return @round(@as(f32, @floatFromInt(ui.cell_h)) * 1.8);
+}
+
+/// The top bar (see `TopBar`): the hook a tab strip would replace.
+fn drawTopBar(tv: *TermView, ui: fontset.Metrics, tb: TopBar, W: f32, h: f32, s: f32) void {
+    tv.rect(0, 0, W, h, ui_bg);
+    const pad = @round(8 * s);
+    var x: f32 = pad;
+    if (tb.accent) |a| {
+        tv.rect(0, 0, @round(4 * s), h, a);
+        x += @round(4 * s);
+    }
+    const ty = @round((h - @as(f32, @floatFromInt(ui.cell_h))) / 2);
+    var right_w: f32 = 0;
+    if (tb.right.len > 0) {
+        const tw = textWidth(ui, tb.right);
+        if (tb.right_badge) {
+            const bw = tw + 2 * pad;
+            const bh = @round(h * 0.8);
+            const bx = W - pad - bw;
+            const color = toneColor(tb.right_tone);
+            tv.rect(bx, @round((h - bh) / 2), bw, bh, color);
+            _ = tv.text(ui, bx + pad, ty, tb.right, ui_bg, true);
+            right_w = bw + pad;
+        } else {
+            _ = tv.text(ui, W - pad - tw, ty, tb.right, toneColor(tb.right_tone), false);
+            right_w = tw + pad;
+        }
+    }
+    // Title, cut to the space left of the right-hand text.
+    const avail = W - x - right_w - 2 * pad;
+    var cut: usize = 0;
+    var used: f32 = 0;
+    var it = (std.unicode.Utf8View.init(tb.title) catch return).iterator();
+    while (it.nextCodepointSlice()) |cs| {
+        const cp = std.unicode.utf8Decode(cs) catch break;
+        const cw: f32 = @floatFromInt(wcwidth.of(cp) * ui.cell_w);
+        if (used + cw > avail) break;
+        used += cw;
+        cut = it.i;
+    }
+    _ = tv.text(ui, x, ty, tb.title[0..cut], button_fg, true);
 }
 
 fn zoomed(tv: *const TermView, em: f32) f32 {
@@ -356,14 +508,16 @@ fn cellMetrics(tv: *TermView, grid: *const Grid, w: f32, h: f32, s: f32) fontset
     return m;
 }
 
-fn drawGrid(tv: *TermView, g: *const Grid, m: fontset.Metrics, W: f32, H: f32, s: f32) void {
+fn drawGrid(tv: *TermView, g: *const Grid, sel: ?Selection, m: fontset.Metrics, W: f32, y0: f32, area_h: f32, s: f32) void {
     const cw: f32 = @floatFromInt(m.cell_w);
     const ch: f32 = @floatFromInt(m.cell_h);
     const gw = cw * @as(f32, @floatFromInt(g.cols));
     const gh = ch * @as(f32, @floatFromInt(g.rows));
     // Centre when it fits; pin to the top-left when zoomed past the window.
     const ox = @round(@max(4 * s, (W - gw) / 2));
-    const oy = @round(@max(4 * s, (H - gh) / 2));
+    const oy = y0 + @round(@max(4 * s, (area_h - gh) / 2));
+    const H = y0 + area_h;
+    tv.layout = .{ .ox = ox, .oy = oy, .cw = cw, .ch = ch, .cols = g.cols, .rows = g.rows };
     const t = tv.theme;
     for (0..g.rows) |y| {
         const py = oy + ch * @as(f32, @floatFromInt(y));
@@ -378,7 +532,9 @@ fn drawGrid(tv: *TermView, g: *const Grid, m: fontset.Metrics, W: f32, H: f32, s
             if (g.cursor_visible and x == g.cursor_x and y == g.cursor_y) {
                 fg = t.bg;
                 bg = t.cursor;
-            }
+            } else if (sel) |sl| if (sl.contains(x, y)) {
+                bg = t.selection;
+            };
             if (c.attrs.dim) fg = mix(fg, bg);
             const wpx = cw * @as(f32, @floatFromInt(cells));
             // Clip the last row/column to the grid area (zoomed past the window).
@@ -404,10 +560,10 @@ fn centreX(w: f32, tw: f32) f32 {
     return @round(@max(0, (w - tw) / 2));
 }
 
-fn drawMessage(tv: *TermView, ui: fontset.Metrics, msg: Message, W: f32, H: f32, s: f32) void {
+fn drawMessage(tv: *TermView, ui: fontset.Metrics, msg: Message, W: f32, y0: f32, H: f32, s: f32) void {
     const big = tv.fonts.metrics(@round(20 * s));
     const lh: f32 = @floatFromInt(ui.cell_h);
-    var y = @round(H * 0.28);
+    var y = y0 + @round(H * 0.28);
     _ = tv.text(big, centreX(W, textWidth(big, msg.title)), y, msg.title, toneColor(msg.title_tone), true);
     y += @as(f32, @floatFromInt(big.cell_h)) + lh;
     for (msg.lines) |l| {

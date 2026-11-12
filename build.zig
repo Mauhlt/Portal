@@ -10,6 +10,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const gui_mods = addGuiModules(b, root, target, optimize);
+
     const exe = b.addExecutable(.{ .name = "portal", .root_module = root });
     b.installArtifact(exe);
 
@@ -78,10 +80,43 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&exe_safe.step);
+    _ = addGuiModules(b, exe_safe.root_module, target, .ReleaseSafe);
+    // The shared GUI modules' own unit tests (client/src/view, client/src).
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.view })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.client })).step);
     // Release tooling: unit tests (release.zig pulls in releases_lib.zig's)
     // and full compiles of both tools.
     const tool_tests = b.addTest(.{ .root_module = release_mod });
     test_step.dependOn(&b.addRunArtifact(tool_tests).step);
     test_step.dependOn(&release_exe.step);
     test_step.dependOn(&launcher_exe.step);
+}
+
+// ---- GUI modules (shared with client/, which still builds on its own) ----
+
+const GuiModules = struct { view: *std.Build.Module, client: *std.Build.Module };
+
+/// Adds "view" (client/src/view: window, Vulkan drawing via the owner's
+/// Renderer, fonts; used by `portal run`'s window) and "client"
+/// (client/src: the remote viewer behind `portal connect`) to `mod`.
+fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) GuiModules {
+    const renderer = b.dependency("Renderer", .{ .target = target, .optimize = optimize, .demo = false });
+    const link_libc = target.result.os.tag != .windows; // dlopen off Windows
+    const view = b.createModule(.{
+        .root_source_file = b.path("client/src/view/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+        .imports = &.{.{ .name = "Renderer", .module = renderer.module("Renderer") }},
+    });
+    const client = b.createModule(.{
+        .root_source_file = b.path("client/src/connect.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+        .imports = &.{.{ .name = "view", .module = view }},
+    });
+    mod.addImport("view", view);
+    mod.addImport("client", client);
+    return .{ .view = view, .client = client };
 }

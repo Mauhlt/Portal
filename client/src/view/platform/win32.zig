@@ -93,8 +93,14 @@ const WM_NCCREATE = 0x0081;
 const WM_KEYDOWN = 0x0100;
 const WM_CHAR = 0x0102;
 const WM_SYSKEYDOWN = 0x0104;
+const WM_SYSCHAR = 0x0106;
 const WM_TIMER = 0x0113;
+const WM_MOUSEMOVE = 0x0200;
 const WM_LBUTTONDOWN = 0x0201;
+const WM_LBUTTONUP = 0x0202;
+const WM_RBUTTONDOWN = 0x0204;
+const WM_MBUTTONDOWN = 0x0207;
+const MK_LBUTTON = 0x0001;
 const WM_ENTERSIZEMOVE = 0x0231;
 const WM_EXITSIZEMOVE = 0x0232;
 const WM_DPICHANGED = 0x02E0;
@@ -265,10 +271,38 @@ pub const Window = struct {
                 self.queue.push(.{ .scale = self.scale() });
                 return 0;
             },
-            WM_LBUTTONDOWN => {
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lp)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lp)) >> 16)));
-                self.queue.push(.{ .mouse_down = .{ .x = @floatFromInt(x), .y = @floatFromInt(y) } });
+            WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN => {
+                const p = mousePos(lp);
+                const button: input.MouseButton = switch (msg) {
+                    WM_LBUTTONDOWN => .left,
+                    WM_RBUTTONDOWN => .right,
+                    else => .middle,
+                };
+                // Keep receiving moves (and the up) while dragging outside.
+                if (button == .left) _ = SetCapture(hwnd);
+                self.queue.push(.{ .mouse_down = .{ .x = p[0], .y = p[1], .button = button, .mods = currentMods() } });
+                return 0;
+            },
+            WM_LBUTTONUP => {
+                const p = mousePos(lp);
+                _ = ReleaseCapture();
+                self.queue.push(.{ .mouse_up = .{ .x = p[0], .y = p[1] } });
+                return 0;
+            },
+            WM_MOUSEMOVE => {
+                // Only drags matter to hosts; plain hovering is not queued.
+                if (wp & MK_LBUTTON == 0) return 0;
+                const p = mousePos(lp);
+                self.queue.push(.{ .mouse_move = .{ .x = p[0], .y = p[1], .left_held = true } });
+                return 0;
+            },
+            WM_SYSCHAR => {
+                // Alt+character: deliver it (hosts send ESC + char) instead
+                // of letting DefWindowProc beep. Alt+Space still opens the
+                // system menu.
+                const unit: u16 = @truncate(wp);
+                if (unit < 0x20 or unit == ' ' or unit == 0x7f or (unit >= 0xD800 and unit <= 0xDFFF)) return null;
+                self.queue.push(.{ .char = .{ .cp = unit, .mods = .{ .alt = true } } });
                 return 0;
             },
             WM_KEYDOWN, WM_SYSKEYDOWN => {
@@ -316,11 +350,28 @@ pub const Window = struct {
             0x21 => .page_up,
             0x22 => .page_down,
             0x2E => .delete,
+            0x2D => .insert,
+            0x70 => .f1,
+            0x71 => .f2,
+            0x72 => .f3,
+            0x73 => .f4,
+            0x74 => .f5,
+            0x75 => .f6,
+            0x76 => .f7,
+            0x77 => .f8,
+            0x78 => .f9,
+            0x79 => .f10,
+            0x7A => .f11,
+            0x7B => .f12,
             else => null,
         };
         if (key) |k| {
+            // Alt+F4 stays with DefWindowProc (closes the window).
+            if (k == .f4 and mods.alt) return false;
             self.queue.push(.{ .key = .{ .key = k, .mods = mods } });
-            return false; // still translate (WM_CHAR for these is filtered)
+            // F-keys are consumed (F10 would otherwise enter menu mode);
+            // the others are still translated (their WM_CHAR is filtered).
+            return @intFromEnum(k) >= @intFromEnum(input.Key.f1);
         }
         if (mods.ctrl and !mods.alt) {
             switch (vk) {
@@ -328,13 +379,111 @@ pub const Window = struct {
                 0xBD, 0x6D => self.queue.push(.{ .zoom = .out }),
                 0x30, 0x60 => self.queue.push(.{ .zoom = .reset }),
                 'A'...'Z' => self.queue.push(.{ .char = .{ .cp = vk + 32, .mods = mods } }),
+                // Ctrl+[ \ ] Space / (US layout positions): ESC, FS, GS, NUL, US.
+                0xDB => self.queue.push(.{ .char = .{ .cp = '[', .mods = mods } }),
+                0xDC => self.queue.push(.{ .char = .{ .cp = '\\', .mods = mods } }),
+                0xDD => self.queue.push(.{ .char = .{ .cp = ']', .mods = mods } }),
+                0x20 => self.queue.push(.{ .char = .{ .cp = ' ', .mods = mods } }),
+                0xBF => self.queue.push(.{ .char = .{ .cp = '/', .mods = mods } }),
                 else => return false,
             }
             return true;
         }
         return false;
     }
+
+    // ------------------------------------------------------------ clipboard
+
+    /// Puts UTF-8 text on the clipboard as CF_UNICODETEXT. False on failure
+    /// (invalid UTF-8, clipboard busy, out of memory).
+    pub fn setClipboardText(self: *Window, utf8: []const u8) bool {
+        const units = std.unicode.calcUtf16LeLen(utf8) catch return false;
+        const mem = GlobalAlloc(GMEM_MOVEABLE, (units + 1) * 2) orelse return false;
+        var handed_over = false;
+        defer if (!handed_over) {
+            _ = GlobalFree(mem);
+        };
+        {
+            const p = GlobalLock(mem) orelse return false;
+            defer _ = GlobalUnlock(mem);
+            const dst: [*]align(1) u16 = @ptrCast(p);
+            var i: usize = 0;
+            var it = (std.unicode.Utf8View.init(utf8) catch return false).iterator();
+            while (it.nextCodepoint()) |cp| {
+                if (cp >= 0x10000) {
+                    if (i + 2 > units) break;
+                    const v = cp - 0x10000;
+                    dst[i] = @intCast(0xD800 + (v >> 10));
+                    dst[i + 1] = @intCast(0xDC00 + (v & 0x3FF));
+                    i += 2;
+                } else {
+                    if (i + 1 > units) break;
+                    dst[i] = @intCast(cp);
+                    i += 1;
+                }
+            }
+            dst[i] = 0;
+        }
+        if (OpenClipboard(self.hwnd) == 0) return false;
+        defer _ = CloseClipboard();
+        if (EmptyClipboard() == 0) return false;
+        if (SetClipboardData(CF_UNICODETEXT, mem) == null) return false;
+        handed_over = true; // the clipboard owns it now
+        return true;
+    }
+
+    /// Clipboard text as UTF-8 (unpaired surrogates become U+FFFD), at most
+    /// `max_units` UTF-16 units. Caller frees. Null if there is none.
+    pub fn clipboardText(self: *Window, gpa: std.mem.Allocator, max_units: usize) ?[]u8 {
+        if (OpenClipboard(self.hwnd) == 0) return null;
+        defer _ = CloseClipboard();
+        const h = GetClipboardData(CF_UNICODETEXT) orelse return null;
+        const p = GlobalLock(h) orelse return null;
+        defer _ = GlobalUnlock(h);
+        const src: [*]align(1) const u16 = @ptrCast(p);
+        const cap = @min(GlobalSize(h) / 2, max_units);
+        var n: usize = 0;
+        while (n < cap and src[n] != 0) n += 1;
+        const out = gpa.alloc(u8, n * 3) catch return null;
+        var o: usize = 0;
+        var i: usize = 0;
+        while (i < n) {
+            var cp: u21 = 0xFFFD;
+            const u = src[i];
+            if (u >= 0xD800 and u <= 0xDBFF and i + 1 < n and src[i + 1] >= 0xDC00 and src[i + 1] <= 0xDFFF) {
+                cp = 0x10000 + ((@as(u21, u) - 0xD800) << 10) + (src[i + 1] - 0xDC00);
+                i += 2;
+            } else {
+                if (u < 0xD800 or u > 0xDFFF) cp = u;
+                i += 1;
+            }
+            // A 4-byte sequence always comes from 2 units (6 bytes reserved).
+            o += std.unicode.utf8Encode(cp, out[o..]) catch 0;
+        }
+        return gpa.realloc(out, o) catch out[0..o];
+    }
 };
+
+fn mousePos(lp: LPARAM) [2]f32 {
+    const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lp)))));
+    const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lp)) >> 16)));
+    return .{ @floatFromInt(x), @floatFromInt(y) };
+}
+
+extern "user32" fn SetCapture(HWND) callconv(WINAPI) ?HWND;
+extern "user32" fn ReleaseCapture() callconv(WINAPI) BOOL;
+extern "user32" fn OpenClipboard(?HWND) callconv(WINAPI) BOOL;
+extern "user32" fn CloseClipboard() callconv(WINAPI) BOOL;
+extern "user32" fn EmptyClipboard() callconv(WINAPI) BOOL;
+extern "user32" fn SetClipboardData(UINT, ?*anyopaque) callconv(WINAPI) ?*anyopaque;
+extern "user32" fn GetClipboardData(UINT) callconv(WINAPI) ?*anyopaque;
+extern "kernel32" fn GlobalAlloc(UINT, usize) callconv(WINAPI) ?*anyopaque;
+extern "kernel32" fn GlobalLock(*anyopaque) callconv(WINAPI) ?*anyopaque;
+extern "kernel32" fn GlobalUnlock(*anyopaque) callconv(WINAPI) BOOL;
+extern "kernel32" fn GlobalFree(*anyopaque) callconv(WINAPI) ?*anyopaque;
+extern "kernel32" fn GlobalSize(*anyopaque) callconv(WINAPI) usize;
+const CF_UNICODETEXT: UINT = 13;
+const GMEM_MOVEABLE: UINT = 0x0002;
 
 extern "user32" fn ValidateRect(HWND, ?*const RECT) callconv(WINAPI) BOOL;
 

@@ -7,8 +7,13 @@ away from home.
 ```
 laptop browser ──WireGuard tunnel──▶ desktop 10.8.0.1:8420 ──▶ portal ──ConPTY──▶ claude
                  (encrypted, only                              │
-                  your devices)                                └──▶ your desktop console (still usable)
+                  your devices)                                └──▶ Portal's own window on the desktop
 ```
+
+`portal run` opens its own terminal window (drawn with Vulkan by the shared
+view module in `client/src/view`); the person at the desk types into it with
+full control. `portal connect --server IP:PORT` is the native remote viewer
+in the same executable.
 
 ## What the web side can and cannot do
 
@@ -31,9 +36,10 @@ laptop browser ──WireGuard tunnel──▶ desktop 10.8.0.1:8420 ──▶ p
   work. This contradicts "no new projects from the laptop", so it is opt-in
   and Portal warns loudly when you use it.
 
-The desktop console title shows `N REMOTE VIEWER(S) CONNECTED` while anyone is
-watching, and every login attempt and viewer connection is written to
-`%LOCALAPPDATA%\Portal\portal.log`.
+The Portal window shows `N REMOTE VIEWER(S) WATCHING` as an amber badge (and
+`— N REMOTE VIEWER(S)` in its title bar) while anyone is watching
+(`--console` mode: the console title), and every login attempt and viewer
+connection is written to `%LOCALAPPDATA%\Portal\portal.log`.
 
 ## Security layers
 
@@ -96,7 +102,23 @@ On the desktop, in the project you want to work on:
 
 ```powershell
 portal run --listen 10.8.0.1:8420 -- claude          # --input keys is the default
+portal run --cwd C:\code\proj --listen 10.8.0.1:8420 # start somewhere else
+portal run --console --listen 10.8.0.1:8420          # old mode: inside this console
 ```
+
+This opens the Portal window; closing it ends the session (like the program
+exiting). Started from a terminal, the session starts in that terminal's
+directory and the terminal waits until the session ends; started without one
+(double-click, shortcut) it starts in your home folder. In the window:
+selection with the mouse, Ctrl+Shift+C / Ctrl+Shift+V or right-click to copy
+/ paste (bracketed when the program asks for it), Ctrl+= / Ctrl+- / Ctrl+0
+to zoom. Resizing the window resizes the session; remote viewers adapt.
+There is no scrollback yet.
+
+Portal is a console-subsystem program (so `portal pair`, `devices` etc.
+print and return exit codes normally); `portal run` frees its console once
+the window is up. Double-clicking it therefore shows a console window for a
+moment; a shortcut set to "Run: Minimized" avoids that.
 
 ### 4. Pair each device once (at the desk)
 
@@ -167,3 +189,9 @@ zig build release-status   # current, known-good, history, and their zig version
 zig build test     # unit tests
 zig build          # debug build in zig-out\bin
 ```
+
+The build needs the owner's Renderer next to this repo (`build.zig.zon`:
+`../Renderer-wt-portal` for now, `../Renderer` once that branch is merged).
+`client/` still builds the standalone `portal-client` on its own (for Linux
+and macOS laptops); its `src/view` and `src/connect.zig` are also the
+"view" and "client" modules of the root build.

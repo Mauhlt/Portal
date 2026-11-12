@@ -1,6 +1,6 @@
 //! Grid snapshot: the plain cell model TermView draws. Filled either from
-//! remote 'G' frames (../gframe.zig) or, later, from Portal's local
-//! src/vt.zig Terminal. The model mirrors vt.zig: `Kind` = vt `Wide`
+//! remote 'G' frames (../gframe.zig) or from Portal's local src/vt.zig
+//! Terminal (src/localgrid.zig). The model mirrors vt.zig: `Kind` = vt `Wide`
 //! (narrow/lead/cont), `Attrs` = vt's wire attrs (bold 1, dim 2, italic 4,
 //! underline 8, strikethrough 16) with inverse already applied, and colours
 //! are 0x00RRGGBB or the vt.zig sentinels below.
@@ -89,6 +89,8 @@ pub const Theme = struct {
     fg: Rgb = .{ 0xD8, 0xDC, 0xE2 },
     bg: Rgb = .{ 0x16, 0x18, 0x1D },
     cursor: Rgb = .{ 0xE8, 0xB0, 0x4C },
+    /// Background of selected cells.
+    selection: Rgb = .{ 0x2F, 0x4B, 0x78 },
 
     fn rgb(v: u32) Rgb {
         return .{ @truncate(v >> 16), @truncate(v >> 8), @truncate(v) };

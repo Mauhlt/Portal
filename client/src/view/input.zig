@@ -22,6 +22,32 @@ pub const Key = enum {
     page_up,
     page_down,
     delete,
+    insert,
+    f1,
+    f2,
+    f3,
+    f4,
+    f5,
+    f6,
+    f7,
+    f8,
+    f9,
+    f10,
+    f11,
+    f12,
+};
+
+pub const MouseButton = enum { left, right, middle };
+
+/// Mouse input in grid cells, for hosts (selection, paste). `col`/`row` are
+/// clamped to the grid; `inside` is false when the pointer is outside it.
+pub const Mouse = struct {
+    action: enum { down, move, up },
+    button: MouseButton,
+    col: u16,
+    row: u16,
+    inside: bool,
+    mods: Mods = .{},
 };
 
 pub const Mods = packed struct(u8) {
@@ -42,7 +68,10 @@ pub const Event = union(enum) {
     /// Typed text. Control characters are never delivered here; Ctrl+letter
     /// arrives as the lowercase letter with `mods.ctrl`.
     char: struct { cp: u21, mods: Mods = .{} },
-    mouse_down: struct { x: f32, y: f32 },
+    mouse_down: struct { x: f32, y: f32, button: MouseButton = .left, mods: Mods = .{} },
+    /// Pointer moved; `left_held` while dragging with the left button.
+    mouse_move: struct { x: f32, y: f32, left_held: bool = false },
+    mouse_up: struct { x: f32, y: f32, button: MouseButton = .left },
     zoom: enum { in, out, reset },
 };
 
@@ -75,6 +104,9 @@ pub const InputSink = struct {
         /// The drawable area changed. `cols`/`rows` is how many cells fit at
         /// the current font size, for hosts that size a PTY to the window.
         resized: *const fn (ctx: *anyopaque, width_px: u32, height_px: u32, cols: u16, rows: u16) void,
+        /// Mouse input over the grid (optional; the remote client ignores
+        /// it). Left-button downs that hit a TermView button are not sent.
+        mouse: ?*const fn (ctx: *anyopaque, m: Mouse) void = null,
     };
 
     pub fn key(s: InputSink, k: Key, m: Mods) void {
@@ -91,5 +123,8 @@ pub const InputSink = struct {
     }
     pub fn resized(s: InputSink, w: u32, h: u32, cols: u16, rows: u16) void {
         s.vtable.resized(s.ctx, w, h, cols, rows);
+    }
+    pub fn mouse(s: InputSink, m: Mouse) void {
+        if (s.vtable.mouse) |f| f(s.ctx, m);
     }
 };
