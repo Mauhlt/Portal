@@ -18,6 +18,8 @@ pub const Session = struct {
     /// Console in the GUI (web.zig sets its title on viewer changes).
     console: *Console,
     policy: Policy,
+    /// `--project NAME` (gui.validProject), sent to viewers in hello.
+    project: ?[]const u8 = null,
     /// Optional change hook: the local GUI uses it to wake its message loop
     /// on output, resize, close or a viewer change. Set before any thread
     /// starts; called after `mutex` is released, on the changing thread.

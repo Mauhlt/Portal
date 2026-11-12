@@ -106,7 +106,8 @@ const usage =
     \\                         --listen 10.8.0.1:8420. Wildcard and public
     \\                         addresses are refused.
     \\      --host NAME[:PORT] Extra Host header value to accept (repeatable).
-    \\      --input MODE       none | keys | instruct | text   (default: keys)
+    \\      --input MODE       none | keys | instruct | text   (default:
+    \\                         instruct; keys when the program is a shell)
     \\                           none: view only
     \\                           keys: digits, y/n, Enter, single Esc
     \\                                 (enough to answer prompts). At an
@@ -118,7 +119,9 @@ const usage =
     \\                           instruct: keys, plus whole instruction
     \\                                 lines that Portal checks first: no
     \\                                 ! shell escape, no / slash commands,
-    \\                                 no # memory, no control characters
+    \\                                 no # memory, no control characters.
+    \\                                 The browser's input box (typing or
+    \\                                 dictation) sends these lines
     \\                           text: FULL REMOTE CONTROL: new prompts,
     \\                                 slash commands, permission-mode
     \\                                 changes, Ctrl+C exit (a leading ! a
@@ -1130,9 +1133,11 @@ const no_tls_warning =
 const RunOptions = struct {
     listen: ?[]const u8 = null,
     hosts: std.ArrayList([]const u8) = .empty,
-    /// `keys` unless chosen (here or in settings): a remote viewer can
-    /// answer prompts but cannot start new work. `text` (full remote
-    /// control) must be chosen explicitly.
+    /// `instruct` unless chosen (here or in settings): a paired device
+    /// answers prompts and sends checked instruction lines (no shell escape,
+    /// slash commands or memory shortcut). For a shell the default drops to
+    /// `keys` (see `defaultPolicy`). `text` (full remote control) must be
+    /// chosen explicitly.
     policy: ?keymap.Policy = null,
     /// `--console`: the pre-GUI mode, drawn by this process's console
     /// (portalctl only).
@@ -1198,11 +1203,13 @@ fn parseRunArgs(gpa: Allocator, args: []const []const u8) !RunOptions {
 }
 
 /// The session's configuration: the command line over settings.txt over
-/// the built-in defaults (listen address and `keys` input only: there is
+/// the built-in defaults (listen address and input mode only: there is
 /// no default program).
 const RunConfig = struct {
     listen: []const u8 = default_listen,
-    policy: keymap.Policy = .keys,
+    policy: keymap.Policy = .instruct,
+    /// The default `instruct` was lowered to `keys` for a shell.
+    fell_back: bool = false,
     project: ?[]const u8 = null,
     command: ?[]const []const u8 = null,
     cwd: ?[]const u8 = null,
@@ -1216,7 +1223,6 @@ const RunConfig = struct {
 fn mergeConfig(cfg: *RunConfig, cli: *const RunOptions, s: *const settings.Settings) ?[]const u8 {
     var problem: ?[]const u8 = null;
     cfg.listen = cli.listen orelse s.listen.get() orelse default_listen;
-    cfg.policy = cli.policy orelse s.input orelse .keys;
     cfg.project = cli.project orelse s.project.get();
     cfg.cwd = cli.cwd orelse s.cwd.get();
     cfg.command = cli.command;
@@ -1230,6 +1236,14 @@ fn mergeConfig(cfg: *RunConfig, cli: *const RunOptions, s: *const settings.Setti
             error.EmptyCommand => null,
         };
     };
+    // After the command is known: the default depends on it.
+    if (cli.policy orelse s.input) |p| {
+        cfg.policy = p;
+        cfg.fell_back = false;
+    } else {
+        cfg.policy = defaultPolicy(cfg.command, cli.allow_remote_shell);
+        cfg.fell_back = cfg.policy != .instruct;
+    }
     return problem;
 }
 
@@ -1307,6 +1321,20 @@ fn policyNote(policy: keymap.Policy) []const u8 {
     };
 }
 
+/// The input policy when neither the command line nor settings chose one.
+/// `instruct` is remote typing, so for a shell it falls back to `keys`
+/// unless --allow-remote-shell. A chosen mode is never lowered (prepare
+/// refuses typing modes for a shell instead).
+fn defaultPolicy(command: ?[]const []const u8, allow_remote_shell: bool) keymap.Policy {
+    if (command) |c| if (c.len > 0 and isShellProgram(c[0]) and !allow_remote_shell) return .keys;
+    return .instruct;
+}
+
+/// Shown next to the input mode when the default was lowered for a shell.
+fn fallbackNote(cfg: *const RunConfig) []const u8 {
+    return if (cfg.fell_back) " (instruct is the default, but not for a shell without --allow-remote-shell)" else "";
+}
+
 /// True if `program` (argv[0], any path/extension/case) is an interactive
 /// shell. Remote typing into a shell would be a remote shell, so instruct
 /// and text input are refused for these unless --allow-remote-shell.
@@ -1338,7 +1366,7 @@ const text_warning =
     \\  *  WARNING: --input text gives anyone logged in to the web page *
     \\  *  FULL REMOTE CONTROL of this session: new prompts, ! shell    *
     \\  *  commands, slash commands, permission-mode changes, Ctrl+C    *
-    \\  *  exit. Use --input keys (the default) to only answer prompts. *
+    \\  *  exit. Use --input keys to only answer prompts.              *
     \\  *****************************************************************
     \\
     \\
@@ -1611,7 +1639,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     if (cfg.policy == .text) std.debug.print(text_warning, .{});
     var url_buf: [160]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "{s}://{s}/", .{ if (opts.no_tls) "http" else "https", listen_host }) catch listen_host;
-    std.debug.print("portal: sharing '{s}' on {s}  (input: {t}{s})\n", .{ command[0], url, cfg.policy, policyNote(cfg.policy) });
+    std.debug.print("portal: sharing '{s}' on {s}  (input: {t}{s}{s})\n", .{ command[0], url, cfg.policy, policyNote(cfg.policy), fallbackNote(&cfg) });
 
     // ---- GUI / console split (see gui.zig) ----------------------------
     // GUI (portal.exe): no console at all; the window decides the PTY size.
@@ -1647,6 +1675,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .pty = &pty,
         .console = &console,
         .policy = cfg.policy,
+        .project = cfg.project,
         // Owned by the session for the life of the process (exit is via
         // ExitProcess, so it is never freed explicitly).
         .term = vt.Terminal.init(gpa, initial.cols, initial.rows) catch fatal("out of memory", .{}),
@@ -1724,8 +1753,8 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         server.pairing_notify_fn = gui.LocalHost.pairingNotify;
     }
 
-    log.print("start: v{s} zig {s}, listening on {s}, input={t}{s}, command={s}", .{
-        portal_version, builtin.zig_version_string, cfg.listen, cfg.policy, policyNote(cfg.policy), command[0],
+    log.print("start: v{s} zig {s}, listening on {s}, input={t}{s}{s}, command={s}", .{
+        portal_version, builtin.zig_version_string, cfg.listen, cfg.policy, policyNote(cfg.policy), fallbackNote(&cfg), command[0],
     });
 
     if (opts.console) {
@@ -1932,13 +1961,36 @@ test "withPort and host splitting" {
     try std.testing.expectEqualStrings("desk", hostOnly("desk"));
 }
 
-test "run defaults to keys input" {
+test "run defaults to instruct input; keys for a shell" {
     var o = try parseRunArgs(std.testing.allocator, &.{});
     defer o.hosts.deinit(std.testing.allocator);
     try std.testing.expect(o.policy == null);
     var cfg: RunConfig = .{};
     try std.testing.expect(mergeConfig(&cfg, &o, &.{}) == null);
-    try std.testing.expectEqual(keymap.Policy.keys, cfg.policy);
+    try std.testing.expectEqual(keymap.Policy.instruct, cfg.policy);
+    try std.testing.expect(!cfg.fell_back);
+    {
+        var sh = try parseRunArgs(std.testing.allocator, &.{ "--", "cmd.exe", "/k" });
+        defer sh.hosts.deinit(std.testing.allocator);
+        try std.testing.expect(mergeConfig(&cfg, &sh, &.{}) == null);
+        try std.testing.expectEqual(keymap.Policy.keys, cfg.policy);
+        try std.testing.expect(cfg.fell_back);
+        // A saved shell program gets the same fallback.
+        var s: settings.Settings = .{};
+        _ = s.program.set("powershell.exe -NoLogo");
+        try std.testing.expect(mergeConfig(&cfg, &o, &s) == null);
+        try std.testing.expectEqual(keymap.Policy.keys, cfg.policy);
+        var ok = try parseRunArgs(std.testing.allocator, &.{ "--allow-remote-shell", "--", "pwsh" });
+        defer ok.hosts.deinit(std.testing.allocator);
+        try std.testing.expect(mergeConfig(&cfg, &ok, &.{}) == null);
+        try std.testing.expectEqual(keymap.Policy.instruct, cfg.policy);
+        // A chosen mode is never lowered (prepare refuses it for a shell).
+        var ex = try parseRunArgs(std.testing.allocator, &.{ "--input", "instruct", "--", "cmd.exe" });
+        defer ex.hosts.deinit(std.testing.allocator);
+        try std.testing.expect(mergeConfig(&cfg, &ex, &.{}) == null);
+        try std.testing.expectEqual(keymap.Policy.instruct, cfg.policy);
+        try std.testing.expect(!cfg.fell_back);
+    }
     try std.testing.expect(!o.console);
     var c = try parseRunArgs(std.testing.allocator, &.{ "--console", "--", "cmd.exe" });
     defer c.hosts.deinit(std.testing.allocator);

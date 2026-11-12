@@ -87,9 +87,9 @@ rest of your laptop's browsing is unaffected.
    `https://10.8.0.1:8420/` (trust the Portal CA first: see the README, "HTTPS certificates"). Optional: Share, then **Add to Home Screen**, for a
    full-screen icon.
 
-On the phone, Portal shows a row of large answer buttons (1–4, Yes, No, Enter,
-Esc) and does not open the keyboard. Use the default `--input keys` mode: you
-can approve or decline what the agent asks, but not give it new instructions.
+On the phone, Portal shows the terminal, an input box (Apple dictation works
+there) and answer buttons (Yes, No, 1–3, Esc, Enter, Send). The default
+`--input instruct` mode answers prompts and sends checked instruction lines.
 If the phone is lost, delete its `[Peer]` block on the desktop; that revokes
 it instantly without affecting the laptop.
 

@@ -35,7 +35,14 @@ All three are built from the same source (`zig build`); `portal.exe` and
 
 Input modes (`--input`, or Remote input in the window's Settings):
 
-* `keys` (default): digits, y/n, Enter, and a single Esc. Enough to answer
+* `instruct` (default): answer keys **plus whole instruction lines**,
+  which Portal checks before typing. A line is refused if it starts with
+  `!` (the session program would run it in a shell), `/` (slash commands
+  can change permissions or folders) or `#` (memory), or contains control
+  characters or line breaks. The program still asks permission before
+  running anything; you answer with the buttons. If the session program is
+  a shell, the default is `keys` instead (see below).
+* `keys`: digits, y/n, Enter, and a single Esc. Enough to answer
   numbered "1 / 2 / 3" prompts. Be aware that at an idle input prompt
   these keys are typed like any other text, so a device can submit a line
   made only of digits and y/n (for example "1", Enter) as a prompt to the
@@ -45,7 +52,6 @@ Input modes (`--input`, or Remote input in the window's Settings):
   is also rate limited per connection, and a key sent right after an Esc
   is held back 50 ms so the two can't be read as Alt+key.
 * `none`: view only.
-* `instruct`: answer keys **plus whole instruction lines**, which Portal checks before typing. A line is refused if it starts with `!` (the agent CLI would run it in a shell), `/` (slash commands can change permissions or folders) or `#` (memory), or contains control characters or line breaks. The session program still asks permission before running anything; you answer with the buttons.
 * `text`: **full remote control of the program.** Typed text is a prompt
   for the session program, slash commands and Shift+Tab change modes,
   Ctrl+C exits. A `!` typed by a device at the start of a line is dropped
@@ -57,8 +63,9 @@ Input modes (`--input`, or Remote input in the window's Settings):
 **No breaking out to a shell.** Portal runs the session program directly,
 not inside a shell, so if it exits the session ends instead of dropping
 anyone at a prompt. If the session program *is* a shell (cmd, PowerShell,
-pwsh, bash, wsl…), `instruct` and `text` are refused at startup, because
-remote typing into a shell is a remote shell. Only `keys`/`none` are
+pwsh, bash, wsl…), a chosen `instruct` or `text` is refused at startup and
+the default drops to `keys`, because remote
+typing into a shell is a remote shell. Only `keys`/`none` are
 allowed there, unless you pass `--allow-remote-shell` deliberately. Devices
 never send raw bytes, so escape sequences can't come from them either.
 
@@ -166,7 +173,7 @@ program is not found), the same screen comes back with the reason.
 Command-line options override the saved settings for one run:
 
 ```powershell
-portal run --listen 10.8.0.1:8420 -- agent --some-flag   # --input keys is the default
+portal run --listen 10.8.0.1:8420 -- agent --some-flag   # --input instruct is the default
 portal run --cwd C:\code\proj                           # start somewhere else
 portalctl run --console --listen 10.8.0.1:8420 -- agent  # a session in this console instead
 ```
@@ -289,8 +296,8 @@ trust the new one.
 The page a browser (including iPhone Safari) shows is written in Zig and
 compiled to `wasm32-freestanding` (`src/wasm/`): protocol decoding, layout
 and fit-to-width, a TrueType parser and antialiasing rasteriser, drawing into
-an RGBA framebuffer, the answer bar and its tap targets, key mapping and
-reconnect logic. It embeds DejaVu Sans Mono (`src/web/fonts/`, Bitstream Vera
+an RGBA framebuffer, key mapping, reconnect logic, the page layout and
+what the input box sends. It embeds DejaVu Sans Mono (`src/web/fonts/`, Bitstream Vera
 licence), because a phone page cannot use system fonts. `zig build` compiles
 it and embeds the `.wasm` in `portal.exe`, served at `/static/app.wasm`.
 
@@ -298,6 +305,47 @@ Browsers can only start WebAssembly from JavaScript, so `src/web/app.js` is a
 small bridge with no application logic: it instantiates the module, forwards
 events to it and wraps a handful of browser APIs (WebSocket, putImageData,
 timers). The CSP allows `'wasm-unsafe-eval'` for exactly this; see `web.zig`.
+
+The page is made of **slices**, the same on every platform:
+
+* **Terminal**: the live terminal (fit to width, A−/A+ zoom, drag or
+  scroll to pan) under a status line: project name (`--project`), viewer
+  state, input mode, and the session state (working / waiting for you /
+  done; a placeholder until the program reports it, see
+  `docs/protocol.md`).
+* **Interaction**: the input box and buttons, described below.
+* **Data**: what the session pushed, newest first. Today that is every
+  inline image it showed (a card with its size; the browser build has no
+  PNG decoder yet, so previews show only where pixels were decoded);
+  tables and charts can be added as further kinds in `src/wasm/data.zig`.
+
+On a phone (narrow) the interaction slice is pinned at the bottom and the
+area above switches between Terminal and Data with a segmented control;
+the Data tab shows a dot when something new arrives. From 900 px wide
+(laptop, desktop, iPad landscape) Data is a right-hand column; drag the
+divider to resize it. The interaction slice:
+
+* **an input box**, a native `<textarea>`, so the iPhone keyboard's
+   dictation mic fills it, and so does Win+H on Windows. Enter sends,
+   Shift+Enter adds a line (sent as a space: an instruction is one line).
+   If the text is an *answer word*, Send presses that key instead: "yes",
+   "yeah", "yep", "y" → `y`; "no", "nope", "n" → `n`; "zero"…"nine" or
+   "0"…"9" (also "option two", "number 3") → that digit; "escape", "esc",
+   "cancel" → Esc; "enter", "ok", "okay" → Enter. Case, full-width forms
+   and the punctuation dictation adds ("Yes.", "Two!") are ignored.
+   Anything else is sent as an instruction line; if it would be refused
+   the reason shows under the box and the text stays. In `keys` mode the
+   box takes answer words only;
+* **buttons**: Yes, No, 1, 2, 3, Esc, Enter, Send.
+
+On the iPhone, voice is Apple's keyboard dictation into the input box;
+Portal never records or sends audio from the phone.
+
+The slices follow the visible viewport, so when the iPhone keyboard opens,
+the box and buttons sit right above it (the header is hidden if space is
+short) and the safe areas (notch, home indicator) are respected. The
+layout math is `src/wasm/slices.zig`, the input decisions
+`src/wasm/inputbox.zig`.
 
 ## Upgrading Zig safely
 

@@ -123,6 +123,7 @@ pub fn modeText(p: proto.Policy) []const u8 {
     return switch (p) {
         .none => "view only",
         .keys => "answer keys",
+        .instruct => "instructions",
         .text => "typing allowed",
     };
 }
@@ -190,4 +191,5 @@ test "stale events are ignored" {
     try testing.expectEqual(Effect.none, c.onClose());
     try testing.expectEqualStrings("view only", modeText(.none));
     try testing.expectEqualStrings("answer keys", modeText(.keys));
+    try testing.expectEqualStrings("instructions", modeText(.instruct));
 }

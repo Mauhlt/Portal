@@ -1,6 +1,7 @@
-//! Screen layout in device pixels: canvas size, terminal viewport, cell
-//! size (fit-to-width or a manual zoom), pan limits, the answer bar and
-//! hit testing for taps. Pure math, no state beyond its inputs.
+//! Terminal canvas layout in device pixels: canvas size, cell size
+//! (fit-to-width or a manual zoom) and pan limits. Pure math, no state
+//! beyond its inputs. The page around the canvas (input box, buttons) is
+//! panes.zig.
 //!
 //! All inputs come from the browser (via the bridge) and are sanitised
 //! here: NaN, negative or absurd sizes must not reach an @intFromFloat.
@@ -41,14 +42,11 @@ pub const Zoom = struct {
 
 pub const max_side: u32 = 8192;
 pub const max_pixels: u64 = 16 << 20;
-pub const button_count = 8;
 
 pub const Input = struct {
     css_w: f64,
     css_h: f64,
     dpr: f64,
-    touch: bool,
-    show_bar: bool,
     cols: u16,
     rows: u16,
     zoom: Zoom,
@@ -61,10 +59,6 @@ pub const Layout = struct {
     h: u32 = 1,
     dpr: f32 = 1,
     term: Rect = .{},
-    bar: Rect = .{},
-    buttons: [button_count]Rect = @splat(.{}),
-    /// Answer bar label size in device pixels (em).
-    label_em: f32 = 14,
     /// Cell size in device pixels, and the glyph em that matches it.
     cw: u32 = 8,
     ch: u32 = 16,
@@ -81,13 +75,6 @@ pub const Layout = struct {
     pub fn clampPan(l: Layout, pan: [2]i32) [2]i32 {
         const m = l.panMax();
         return .{ std.math.clamp(pan[0], 0, m[0]), std.math.clamp(pan[1], 0, m[1]) };
-    }
-
-    /// Index of the answer button under a device-pixel point.
-    pub fn hitButton(l: Layout, px: i32, py: i32) ?usize {
-        if (l.bar.h == 0 or !l.bar.contains(px, py)) return null;
-        for (l.buttons, 0..) |b, i| if (b.contains(px, py)) return i;
-        return null;
     }
 };
 
@@ -120,26 +107,7 @@ pub fn compute(in: Input) Layout {
     const W: i32 = @intCast(l.w);
     const H: i32 = @intCast(l.h);
 
-    // Answer bar along the bottom: big two-row grid on touch screens,
-    // one compact row with a pointer.
-    if (in.show_bar) {
-        const pad = dev(if (in.touch) 8 else 4, dpr);
-        const gap = pad;
-        const bh = dev(if (in.touch) 48 else 28, dpr);
-        const per_row: i32 = if (in.touch) 4 else 8;
-        const n_rows: i32 = @divExact(button_count, per_row);
-        l.bar = .{ .x = 0, .w = W, .h = @min(H, pad * 2 + n_rows * bh + (n_rows - 1) * gap) };
-        l.bar.y = H - l.bar.h;
-        const max_bw = if (in.touch) W else dev(72, dpr);
-        const bw = std.math.clamp(@divFloor(W - pad * 2 - gap * (per_row - 1), per_row), 1, @max(1, max_bw));
-        for (&l.buttons, 0..) |*b, i| {
-            const col: i32 = @intCast(i % @as(usize, @intCast(per_row)));
-            const row: i32 = @intCast(i / @as(usize, @intCast(per_row)));
-            b.* = .{ .x = pad + col * (bw + gap), .y = l.bar.y + pad + row * (bh + gap), .w = bw, .h = bh };
-        }
-        l.label_em = @floatCast(sane(@as(f64, @floatFromInt(dev(if (in.touch) 18 else 13, dpr))), 4, 400));
-    }
-    l.term = .{ .x = 0, .y = 0, .w = W, .h = @max(0, H - l.bar.h) };
+    l.term = .{ .x = 0, .y = 0, .w = W, .h = H };
 
     // Cell size. Fit: the widest cell that shows every column; otherwise
     // the zoom's font size. Either way the em is derived back from the
@@ -186,7 +154,7 @@ pub fn zoomStep(z: Zoom, l: Layout, dir: i32) Zoom {
 const testing = std.testing;
 
 fn base() Input {
-    return .{ .css_w = 390, .css_h = 664, .dpr = 3, .touch = true, .show_bar = true, .cols = 120, .rows = 30, .zoom = .{} };
+    return .{ .css_w = 390, .css_h = 664, .dpr = 3, .cols = 120, .rows = 30, .zoom = .{} };
 }
 
 test "fit to width on an iPhone" {
@@ -197,10 +165,8 @@ test "fit to width on an iPhone" {
     try testing.expect(@as(i32, 120) * @as(i32, @intCast(l.cw)) + 2 * l.pad <= l.term.w);
     try testing.expectEqual(@as(u32, 9), l.cw);
     try testing.expectEqual(@as(i32, 0), l.panMax()[0]);
-    // Bar: 2 rows of 48 css px + 3 gaps of 8, at the bottom.
-    try testing.expectEqual(@as(i32, (8 * 3 + 48 * 2) * 3), l.bar.h);
-    try testing.expectEqual(@as(i32, @intCast(l.h)), l.bar.bottom());
-    try testing.expectEqual(l.bar.y, l.term.h);
+    // The canvas is all terminal (the buttons are HTML, panes.zig).
+    try testing.expectEqual(@as(i32, @intCast(l.h)), l.term.h);
 }
 
 test "fit never overflows across many sizes" {
@@ -244,34 +210,6 @@ test "manual zoom and pan" {
     try testing.expectEqual(@round(fitted.em / fitted.dpr) + 1, z.font_px);
     try testing.expectEqual(Zoom.max_px, zoomStep(.{ .fit = false, .font_px = 40 }, l, 1).font_px);
     try testing.expectEqual(Zoom.min_px, zoomStep(.{ .fit = false, .font_px = 4 }, l, -1).font_px);
-}
-
-test "hit testing the answer bar" {
-    const l = compute(base());
-    for (l.buttons, 0..) |b, i| {
-        try testing.expectEqual(@as(?usize, i), l.hitButton(b.x + 1, b.y + 1));
-        try testing.expectEqual(@as(?usize, i), l.hitButton(b.x + b.w - 1, b.y + b.h - 1));
-    }
-    // Gaps and the terminal area hit nothing.
-    try testing.expectEqual(@as(?usize, null), l.hitButton(l.buttons[0].right(), l.buttons[0].y + 2));
-    try testing.expectEqual(@as(?usize, null), l.hitButton(10, 10));
-    try testing.expectEqual(@as(?usize, null), l.hitButton(-1, -1));
-    // Touch: 4 per row, top row 1 2 3 4, bottom Yes No Enter Esc.
-    try testing.expectEqual(l.buttons[0].y, l.buttons[3].y);
-    try testing.expect(l.buttons[4].y > l.buttons[0].y);
-    // Desktop: one compact row.
-    var in = base();
-    in.touch = false;
-    in.css_w = 1200;
-    in.dpr = 1;
-    const d = compute(in);
-    try testing.expectEqual(d.buttons[0].y, d.buttons[7].y);
-    try testing.expect(d.buttons[0].w <= 72);
-    // No bar in view-only mode.
-    in.show_bar = false;
-    const v = compute(in);
-    try testing.expectEqual(@as(i32, 0), v.bar.h);
-    try testing.expectEqual(@as(?usize, null), v.hitButton(5, @as(i32, @intCast(v.h)) - 2));
 }
 
 test "hostile sizes from the browser" {

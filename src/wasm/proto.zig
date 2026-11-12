@@ -383,12 +383,34 @@ pub const Utf8Iter = struct {
 
 // ------------------------------------------------------------ JSON control
 
-pub const Policy = enum { none, keys, text };
+pub const Policy = @import("inputbox.zig").Policy;
+
+/// Longest project name the server sends (gui.max_project_bytes).
+pub const max_project = 64;
+
+pub const Hello = struct {
+    policy: Policy,
+    /// `portal run --project NAME`, if given.
+    project_buf: [max_project]u8 = undefined,
+    project_len: u8 = 0,
+
+    pub fn project(h: *const Hello) []const u8 {
+        return h.project_buf[0..h.project_len];
+    }
+};
+
+/// What the session program is doing (planned: from its OSC 7501 status,
+/// sent as {"t":"state","state":...}; docs/protocol.md §3).
+pub const SessionState = enum { unknown, working, waiting, done };
 
 pub const Control = union(enum) {
-    hello: Policy,
+    hello: Hello,
     exit: i64,
     logout,
+    /// An `l:` line was refused; the reason (a keymap.LineError name)
+    /// points into the message.
+    rejected: []const u8,
+    state: SessionState,
     unknown,
 };
 
@@ -399,13 +421,45 @@ pub fn parseControl(text: []const u8) Control {
     const t = stringField(text, "t") orelse return .unknown;
     if (std.mem.eql(u8, t, "hello")) {
         const input = stringField(text, "input") orelse "none";
-        if (std.mem.eql(u8, input, "keys")) return .{ .hello = .keys };
-        if (std.mem.eql(u8, input, "text")) return .{ .hello = .text };
-        return .{ .hello = .none };
+        var h: Hello = .{ .policy = std.meta.stringToEnum(Policy, input) orelse .none };
+        if (escapedField(text, "project", &h.project_buf)) |p| h.project_len = @intCast(p.len);
+        return .{ .hello = h };
     }
     if (std.mem.eql(u8, t, "exit")) return .{ .exit = intField(text, "code") orelse 0 };
     if (std.mem.eql(u8, t, "logout")) return .logout;
+    if (std.mem.eql(u8, t, "rejected")) return .{ .rejected = stringField(text, "reason") orelse "" };
+    if (std.mem.eql(u8, t, "state")) {
+        const v = stringField(text, "state") orelse "";
+        return .{ .state = std.meta.stringToEnum(SessionState, v) orelse .unknown };
+    }
     return .unknown;
+}
+
+/// A string value that may contain `\"` and `\\` (the only escapes the
+/// server writes), unescaped into `out`. Null if absent, malformed, using
+/// another escape, longer than `out`, or not valid UTF-8.
+fn escapedField(text: []const u8, name: []const u8, out: []u8) ?[]const u8 {
+    var p = fieldValue(text, name) orelse return null;
+    if (p >= text.len or text[p] != '"') return null;
+    p += 1;
+    var n: usize = 0;
+    while (p < text.len) : (p += 1) {
+        var c = text[p];
+        if (c == '"') {
+            if (!std.unicode.utf8ValidateSlice(out[0..n])) return null;
+            return out[0..n];
+        }
+        if (c == '\\') {
+            p += 1;
+            if (p >= text.len) return null;
+            c = text[p];
+            if (c != '"' and c != '\\') return null;
+        }
+        if (n >= out.len) return null;
+        out[n] = c;
+        n += 1;
+    }
+    return null;
 }
 
 /// Position just after `"name"` followed by optional spaces and a colon.
@@ -782,10 +836,37 @@ test "frames produced by the server's own emulator decode identically" {
 }
 
 test "control messages" {
-    try testing.expectEqual(Control{ .hello = .keys }, parseControl("{\"t\":\"hello\",\"input\":\"keys\"}"));
-    try testing.expectEqual(Control{ .hello = .text }, parseControl("{\"t\": \"hello\", \"input\": \"text\"}"));
-    try testing.expectEqual(Control{ .hello = .none }, parseControl("{\"t\":\"hello\",\"input\":\"none\"}"));
-    try testing.expectEqual(Control{ .hello = .none }, parseControl("{\"t\":\"hello\",\"input\":\"bogus\"}"));
+    try testing.expectEqual(Policy.keys, parseControl("{\"t\":\"hello\",\"input\":\"keys\"}").hello.policy);
+    try testing.expectEqual(Policy.text, parseControl("{\"t\": \"hello\", \"input\": \"text\"}").hello.policy);
+    try testing.expectEqual(Policy.none, parseControl("{\"t\":\"hello\",\"input\":\"none\"}").hello.policy);
+    try testing.expectEqual(Policy.none, parseControl("{\"t\":\"hello\",\"input\":\"bogus\"}").hello.policy);
+    try testing.expectEqual(Policy.instruct, parseControl("{\"t\":\"hello\",\"input\":\"instruct\"}").hello.policy);
+    // Unknown extra fields are ignored.
+    try testing.expectEqual(Policy.keys, parseControl("{\"t\":\"hello\",\"input\":\"keys\",\"x\":1}").hello.policy);
+    // Project names, with the escapes the server writes.
+    try testing.expectEqualStrings("", parseControl("{\"t\":\"hello\",\"input\":\"keys\"}").hello.project());
+    try testing.expectEqualStrings("Portal", parseControl("{\"t\":\"hello\",\"input\":\"keys\",\"project\":\"Portal\"}").hello.project());
+    try testing.expectEqualStrings("a \"b\" \\c 中", parseControl("{\"t\":\"hello\",\"input\":\"keys\",\"project\":\"a \\\"b\\\" \\\\c 中\"}").hello.project());
+    for ([_][]const u8{ "\"x\\n\"", "\"unterminated", "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", "\"bad\xff\"", "7" }) |v| {
+        var buf: [160]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&buf, "{{\"t\":\"hello\",\"input\":\"text\",\"project\":{s}}}", .{v});
+        const h = parseControl(msg).hello;
+        try testing.expectEqual(Policy.text, h.policy);
+        try testing.expectEqualStrings("", h.project());
+    }
+    // Session state (planned server message).
+    try testing.expectEqual(Control{ .state = .working }, parseControl("{\"t\":\"state\",\"state\":\"working\"}"));
+    try testing.expectEqual(Control{ .state = .waiting }, parseControl("{\"t\":\"state\",\"state\":\"waiting\"}"));
+    try testing.expectEqual(Control{ .state = .done }, parseControl("{\"t\":\"state\",\"state\":\"done\"}"));
+    try testing.expectEqual(Control{ .state = .unknown }, parseControl("{\"t\":\"state\",\"state\":\"dancing\"}"));
+    switch (parseControl("{\"t\":\"rejected\",\"reason\":\"ShellEscape\"}")) {
+        .rejected => |r| try testing.expectEqualStrings("ShellEscape", r),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (parseControl("{\"t\":\"rejected\"}")) {
+        .rejected => |r| try testing.expectEqualStrings("", r),
+        else => return error.TestUnexpectedResult,
+    }
     try testing.expectEqual(Control{ .exit = 3 }, parseControl("{\"t\":\"exit\",\"code\":3}"));
     try testing.expectEqual(Control{ .exit = -1073741510 }, parseControl("{\"t\":\"exit\",\"code\":-1073741510}"));
     try testing.expectEqual(Control{ .exit = 0 }, parseControl("{\"t\":\"exit\",\"code\":99999999999999999999999}"));

@@ -1,4 +1,4 @@
-//! Keyboard and answer-bar input → protocol frames (docs/protocol.md §4).
+//! Keyboard input at the terminal → protocol frames (docs/protocol.md §4).
 //!
 //! Mirrors what the old app.js did, exactly: the browser's `KeyboardEvent.key`
 //! string plus modifier bits come in, and a key *name* (`k:<name>`) or, only
@@ -63,7 +63,9 @@ pub fn fromKeyboard(policy: Policy, key: []const u8, mods: Mods) Action {
             };
             return .none;
         },
-        .keys => {
+        // Instruction lines come from the input box (inputbox.zig); keys
+        // typed at the terminal are answer keys, as in keys mode.
+        .keys, .instruct => {
             if (mods.ctrl or key.len != 1) return .none;
             const lower = std.ascii.toLower(key[0]);
             for (answer_keys) |name| if (name[0] == lower) return .{ .key = name };
@@ -71,19 +73,6 @@ pub fn fromKeyboard(policy: Policy, key: []const u8, mods: Mods) Action {
         },
     }
 }
-
-/// The answer bar, in display order: label and key name.
-pub const Button = struct { label: []const u8, name: []const u8 };
-pub const answer_bar = [_]Button{
-    .{ .label = "1", .name = "1" },
-    .{ .label = "2", .name = "2" },
-    .{ .label = "3", .name = "3" },
-    .{ .label = "4", .name = "4" },
-    .{ .label = "Yes", .name = "y" },
-    .{ .label = "No", .name = "n" },
-    .{ .label = "Enter", .name = "enter" },
-    .{ .label = "Esc", .name = "esc" },
-};
 
 /// Formats a frame into `buf`; null if it would not fit.
 pub fn frame(buf: []u8, action: Action) ?[]const u8 {
@@ -151,6 +140,13 @@ test "text mode" {
     try testing.expectEqual(Action.none, fromKeyboard(.text, "x", .{ .ctrl = true }));
     try testing.expectEqual(Action.none, fromKeyboard(.text, "Shift", m));
     try testing.expectEqual(Action.none, fromKeyboard(.text, "F5", m));
+}
+
+test "instruct mode: the terminal takes answer keys only" {
+    try expectKey("y", fromKeyboard(.instruct, "y", .{}));
+    try expectKey("enter", fromKeyboard(.instruct, "Enter", .{}));
+    try testing.expectEqual(Action.none, fromKeyboard(.instruct, "a", .{}));
+    try testing.expectEqual(Action.none, fromKeyboard(.instruct, "ArrowUp", .{}));
 }
 
 test "view only sends nothing" {
