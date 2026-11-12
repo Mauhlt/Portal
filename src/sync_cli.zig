@@ -49,7 +49,7 @@ fn describe(err: anyerror) []const u8 {
         error.TooLarge => "the package is over the size limit",
         error.TooManyFiles => "too many files (at most 4096)",
         error.NotPublished => "no such published version",
-        error.SyncStoreBusy => "the sync store is locked by another Portal process; try again",
+        error.SyncStoreBusy => "the sync store is held open by an older Portal process; close it and try again",
         else => @errorName(err),
     };
 }
@@ -161,9 +161,9 @@ fn listPublished(gpa: Allocator, io: Io, paths: sync.Paths) !void {
     }
 }
 
-pub fn cmdUnpublish(gpa: Allocator, io: Io, paths: sync.Paths, args: []const []const u8) !void {
+pub fn cmdUnpublish(io: Io, paths: sync.Paths, args: []const []const u8) !void {
     if (args.len != 2) fatal("usage: portalctl unpublish <package> <version>", .{});
-    sync.unpublish(gpa, io, paths, args[0], args[1]) catch |err| fatal("unpublish failed: {s}", .{describe(err)});
+    sync.unpublish(io, paths, args[0], args[1]) catch |err| fatal("unpublish failed: {s}", .{describe(err)});
     std.debug.print("Unpublished {s} {s}. Devices keep what they installed; the name and sequence are never reused.\n", .{ args[0], args[1] });
 }
 
@@ -256,8 +256,9 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
     const der = client.pin.readCaFile(io, ca_path, &ca_buf) catch |err| fatal("cannot use {s} as the Portal CA: {t}", .{ ca_path, err });
 
     var shared: client.net_client.Shared = .{};
+    // GET /pair/wait is a long poll (the server answers when the desk
+    // does): no client-side poll interval to tune here.
     var c = Client.init(gpa, io, &shared, host, .{ .tls = der }) catch fatal("bad --server", .{});
-    c.pair_poll_ms = 200;
 
     if (pair) {
         std.debug.print("sync-device: asking the desk to pair\n", .{});

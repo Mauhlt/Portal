@@ -18,7 +18,7 @@
 const std = @import("std");
 const Io = std.Io;
 const keymap = @import("keymap.zig");
-const w = @import("win32.zig");
+const fsutil = @import("fsutil.zig");
 
 pub const file_name = "settings.txt";
 
@@ -105,16 +105,11 @@ pub fn save(gpa: std.mem.Allocator, io: Io, dir: []const u8, s: *const Settings)
     try s.format(&out);
     const path = try std.fs.path.join(gpa, &.{ dir, file_name });
     defer gpa.free(path);
-    const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
-    defer gpa.free(tmp);
     try Io.Dir.cwd().createDirPath(io, dir);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = out.buffered() });
-    const tmp_w = try std.unicode.wtf8ToWtf16LeAllocZ(gpa, tmp);
-    defer gpa.free(tmp_w);
-    const path_w = try std.unicode.wtf8ToWtf16LeAllocZ(gpa, path);
-    defer gpa.free(path_w);
-    if (w.MoveFileExW(tmp_w.ptr, path_w.ptr, w.MOVEFILE_REPLACE_EXISTING | w.MOVEFILE_WRITE_THROUGH) == 0)
-        return error.SettingsWriteFailed;
+    fsutil.writeAtomic(gpa, io, path, out.buffered()) catch |err| return switch (err) {
+        error.ReplaceFailed => error.SettingsWriteFailed,
+        else => err,
+    };
 }
 
 pub const SplitError = error{ EmptyCommand, UnterminatedQuote, TooManyArguments, CommandTooLong };

@@ -39,6 +39,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const auth = @import("auth.zig");
 const w = @import("win32.zig");
+const fsutil = @import("fsutil.zig");
 
 pub const max_devices = 16;
 pub const max_name = 32;
@@ -654,7 +655,7 @@ pub fn describeError(err: anyerror) []const u8 {
         error.BadDeviceFile => "the device list (devices.txt in %LOCALAPPDATA%\\Portal) is damaged or from a newer Portal. " ++
             "To recover: close Portal, move devices.txt somewhere else (keep it if you want to report the problem), " ++
             "start Portal again, and re-pair every device (Pair a device in the Portal window)",
-        error.DeviceStoreBusy => "the device list is locked by another Portal process; try again",
+        error.DeviceStoreBusy => "the device list is held open by an older Portal process; close it and try again",
         error.DeviceStoreWriteFailed => "could not replace devices.txt (disk full, or the file is locked by another program)",
         else => "could not access the device list in %LOCALAPPDATA%\\Portal",
     };
@@ -662,97 +663,38 @@ pub fn describeError(err: anyerror) []const u8 {
 
 // ------------------------------------------------------------- file access
 
-pub const Paths = struct {
-    /// %LOCALAPPDATA%\Portal
-    dir: []const u8,
-
-    fn join(p: Paths, buf: []u8, name: []const u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "{s}\\{s}", .{ p.dir, name });
-    }
-};
-
-fn wide(gpa: Allocator, s: []const u8) ![:0]u16 {
-    return std.unicode.utf8ToUtf16LeAllocZ(gpa, s);
-}
-
-const CREATE_ALWAYS: w.DWORD = 2;
-extern "kernel32" fn FlushFileBuffers(h: w.HANDLE) callconv(.winapi) w.BOOL;
-
-/// Writes `data` to `path_w` and flushes it to disk before returning, so the
-/// atomic rename that follows can never publish an empty or partial file.
-fn writeFlushed(path_w: [:0]const u16, data: []const u8) !void {
-    const h = w.validHandle(w.CreateFileW(path_w.ptr, w.GENERIC_WRITE, 0, null, CREATE_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null)) orelse
-        return error.DeviceStoreWriteFailed;
-    defer _ = w.CloseHandle(h);
-    var off: usize = 0;
-    while (off < data.len) {
-        var n: w.DWORD = 0;
-        const chunk: w.DWORD = @intCast(@min(data.len - off, 1 << 20));
-        if (w.WriteFile(h, data[off..].ptr, chunk, &n, null) == 0 or n == 0) return error.DeviceStoreWriteFailed;
-        off += n;
-    }
-    if (FlushFileBuffers(h) == 0) return error.DeviceStoreWriteFailed;
-}
-
-/// The pause between attempts to open a busy lock file. A cancelation that
-/// lands here is re-armed before it is returned: callers in the web server
-/// turn store errors into HTTP responses, so without re-arming the request
-/// would be consumed and the connection's next read would block forever,
-/// with the supervisor stuck waiting in `worker.cancel` (a pre-auth DoS that
-/// leaks the connection slot).
-pub fn lockRetrySleep(io: Io) error{Canceled}!void {
-    io.sleep(.fromMilliseconds(10), .awake) catch |err| switch (err) {
-        error.Canceled => {
-            io.recancel();
-            return error.Canceled;
-        },
-    };
-}
+/// %LOCALAPPDATA%\Portal
+pub const Paths = fsutil.DataDir;
 
 /// Locked read-modify-write of the device store. `op(ctx, *Store)` returns
 /// whether it changed the store; if so the file is replaced atomically
-/// (written, flushed to disk, then renamed over the old one).
-/// The lock is an exclusively opened `devices.lock`, shared with any other
-/// Portal process (the running server and the `pair`/`unpair` commands).
+/// (written, flushed to disk, then renamed over the old one). The lock is
+/// `devices.lock`, shared with every other Portal process (the running
+/// server and the `pair`/`unpair` commands); waiting for it blocks without
+/// polling, and a cancel during the wait is returned and stays armed
+/// (fsutil.FileLock).
 pub fn withStore(gpa: Allocator, io: Io, paths: Paths, now: i64, ctx: anytype, comptime op: anytype) !void {
-    var pbuf: [1024]u8 = undefined;
-    const lock_w = try wide(gpa, try paths.join(&pbuf, "devices.lock"));
-    defer gpa.free(lock_w);
-    var lock: ?w.HANDLE = null;
-    var tries: usize = 0;
-    while (tries < 200) : (tries += 1) {
-        lock = w.validHandle(w.CreateFileW(lock_w.ptr, w.GENERIC_WRITE, 0, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null));
-        if (lock != null) break;
-        try lockRetrySleep(io);
-    }
-    const lock_h = lock orelse return error.DeviceStoreBusy;
-    defer _ = w.CloseHandle(lock_h);
-
-    const path = try paths.join(&pbuf, "devices.txt");
-    var store: Store = blk: {
-        const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch |err| switch (err) {
-            error.FileNotFound => break :blk .{},
-            else => return err,
-        };
-        defer gpa.free(text);
-        break :blk try Store.parse(text); // corrupt file: fail closed
+    var lb: [1024]u8 = undefined;
+    var pb: [1024]u8 = undefined;
+    const Ctx = struct { gpa: Allocator, now: i64, inner: @TypeOf(ctx) };
+    fsutil.update(gpa, io, try paths.join(&lb, &.{"devices.lock"}), try paths.join(&pb, &.{"devices.txt"}), 64 * 1024, Ctx{
+        .gpa = gpa,
+        .now = now,
+        .inner = ctx,
+    }, struct {
+        fn edit(c: Ctx, old: ?[]const u8, out: *std.ArrayList(u8)) !bool {
+            var store: Store = if (old) |text| try Store.parse(text) else .{}; // corrupt file: fail closed
+            var dirty = store.expire(c.now);
+            if (try op(c.inner, &store)) dirty = true;
+            if (!dirty) return false;
+            try store.format(c.gpa, out);
+            return true;
+        }
+    }.edit) catch |err| return switch (err) {
+        error.LockBusy => error.DeviceStoreBusy,
+        error.ReplaceFailed => error.DeviceStoreWriteFailed,
+        else => err,
     };
-    var dirty = store.expire(now);
-    if (try op(ctx, &store)) dirty = true;
-    if (!dirty) return;
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(gpa);
-    try store.format(gpa, &out);
-    var tbuf: [1024]u8 = undefined;
-    const tmp = try paths.join(&tbuf, "devices.txt.tmp");
-    const tmp_w = try wide(gpa, tmp);
-    defer gpa.free(tmp_w);
-    try writeFlushed(tmp_w, out.items);
-    const path_w = try wide(gpa, path);
-    defer gpa.free(path_w);
-    if (w.MoveFileExW(tmp_w.ptr, path_w.ptr, w.MOVEFILE_REPLACE_EXISTING | w.MOVEFILE_WRITE_THROUGH) == 0)
-        return error.DeviceStoreWriteFailed;
 }
 
 // ------------------------------------------------------ desk approval API
@@ -839,41 +781,13 @@ pub fn pairedRequest(p: *const Pairing) ?Request {
 
 // --------------------------------------------------- change notification
 
-pub const WAIT_OBJECT_0: w.DWORD = 0;
-pub const WAIT_TIMEOUT: w.DWORD = 258;
-const FILE_NOTIFY_CHANGE_FILE_NAME: w.DWORD = 0x1;
-extern "kernel32" fn FindFirstChangeNotificationW(path: [*:0]const u16, subtree: w.BOOL, filter: w.DWORD) callconv(.winapi) ?w.HANDLE;
-extern "kernel32" fn FindNextChangeNotification(h: w.HANDLE) callconv(.winapi) w.BOOL;
-extern "kernel32" fn FindCloseChangeNotification(h: w.HANDLE) callconv(.winapi) w.BOOL;
-pub extern "kernel32" fn WaitForMultipleObjects(n: w.DWORD, handles: [*]const w.HANDLE, all: w.BOOL, ms: w.DWORD) callconv(.winapi) w.DWORD;
-
 /// Signalled whenever a file in the data directory is created, renamed or
 /// deleted. Every store change ends in a rename (see `withStore`), so this
 /// wakes every Portal process sharing the directory, however many there
 /// are, without anyone polling. Log appends do not trigger it.
-pub const DirWatch = struct {
-    h: ?w.HANDLE = null,
-
-    pub fn open(gpa: Allocator, paths: Paths) DirWatch {
-        const dir_w = wide(gpa, paths.dir) catch return .{};
-        defer gpa.free(dir_w);
-        return .{ .h = w.validHandle(FindFirstChangeNotificationW(dir_w.ptr, 0, FILE_NOTIFY_CHANGE_FILE_NAME)) };
-    }
-
-    /// Re-arms after a wake. Call before re-reading the store, so a change
-    /// made while reading signals again.
-    pub fn rearm(d: *DirWatch) void {
-        if (d.h) |h| if (FindNextChangeNotification(h) == 0) {
-            _ = FindCloseChangeNotification(h);
-            d.h = null;
-        };
-    }
-
-    pub fn close(d: *DirWatch) void {
-        if (d.h) |h| _ = FindCloseChangeNotification(h);
-        d.h = null;
-    }
-};
+pub fn watchStore(gpa: Allocator, paths: Paths) !fsutil.DirWatch {
+    return fsutil.DirWatch.open(gpa, paths.dir, .{});
+}
 
 /// Milliseconds to wait (for WaitForMultipleObjects) until unix second
 /// `deadline_s`, plus a little slack; INFINITE for none.
@@ -1295,7 +1209,7 @@ test "v1 files still load (prev secret becomes the ring; v1 windows are dropped)
 
 test "Desk: begin, see a request, approve, collect, cancel (on a real store file)" {
     const io = testing.io;
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var pbuf: [256]u8 = undefined;
     const dir = try std.fmt.bufPrint(&pbuf, ".zig-cache\\tmp\\{s}", .{&tmp.sub_path});
@@ -1326,10 +1240,11 @@ test "Desk: begin, see a request, approve, collect, cancel (on a real store file
     try desk.cancel(43);
     try testing.expect((try desk.get(43)) == null);
     // The tmp file was flushed and renamed; nothing is left behind.
-    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "devices.txt.tmp", .{}));
+    var it = tmp.dir.iterate();
+    while (try it.next(io)) |e| try testing.expect(!std.mem.endsWith(u8, e.name, ".tmp"));
 }
 
-test "withStore: a cancel during the busy-lock retry is returned and stays armed" {
+test "withStore: a cancel while waiting for the lock is returned and stays armed" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1337,12 +1252,10 @@ test "withStore: a cancel during the busy-lock retry is returned and stays armed
     const dir = try std.fmt.bufPrint(&pbuf, ".zig-cache\\tmp\\{s}", .{&tmp.sub_path});
     const paths: Paths = .{ .dir = dir };
 
-    // Hold the lock so withStore keeps retrying.
+    // Hold the lock (as another Portal process would) so withStore waits.
     var lbuf: [1024]u8 = undefined;
-    const lock_w = try wide(testing.allocator, try paths.join(&lbuf, "devices.lock"));
-    defer testing.allocator.free(lock_w);
-    const held = w.validHandle(w.CreateFileW(lock_w.ptr, w.GENERIC_WRITE, 0, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null)) orelse return error.SkipZigTest;
-    defer _ = w.CloseHandle(held);
+    const held = try fsutil.FileLock.acquire(io, try paths.join(&lbuf, &.{"devices.lock"}));
+    defer held.release(io);
 
     const Task = struct {
         /// Like the web handlers: the store error is turned into something
@@ -1362,7 +1275,7 @@ test "withStore: a cancel during the busy-lock retry is returned and stays armed
     var started: Io.Event = .unset;
     var fut = io.concurrent(Task.run, .{ io, paths, &started }) catch return error.SkipZigTest;
     try started.wait(io);
-    try io.sleep(.fromMilliseconds(30), .awake); // let it reach the retry loop
+    try io.sleep(.fromMilliseconds(30), .awake); // let it block on the lock
     const res = fut.cancel(io);
     try testing.expectError(error.Canceled, res.store);
     try testing.expectError(error.Canceled, res.next);

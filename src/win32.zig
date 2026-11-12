@@ -15,6 +15,8 @@ pub const HPCON = *anyopaque;
 pub const INVALID_HANDLE_VALUE: usize = @bitCast(@as(isize, -1));
 pub const INFINITE: DWORD = 0xFFFFFFFF;
 pub const WAIT_OBJECT_0: DWORD = 0;
+pub const WAIT_TIMEOUT: DWORD = 258;
+pub const WAIT_FAILED: DWORD = 0xFFFFFFFF;
 
 pub const STARTF_USESTDHANDLES: DWORD = 0x00000100;
 pub const STD_INPUT_HANDLE: DWORD = @bitCast(@as(i32, -10));
@@ -152,6 +154,7 @@ pub extern "kernel32" fn CreateProcessW(
 pub extern "kernel32" fn ResumeThread(h: HANDLE) callconv(.winapi) DWORD;
 pub extern "kernel32" fn TerminateProcess(h: HANDLE, code: u32) callconv(.winapi) BOOL;
 pub extern "kernel32" fn WaitForSingleObject(h: HANDLE, ms: DWORD) callconv(.winapi) DWORD;
+pub extern "kernel32" fn WaitForMultipleObjects(n: DWORD, handles: [*]const HANDLE, all: BOOL, ms: DWORD) callconv(.winapi) DWORD;
 pub extern "kernel32" fn GetExitCodeProcess(h: HANDLE, code: *DWORD) callconv(.winapi) BOOL;
 /// Used instead of std.process.exit, which only takes a u8: Windows exit
 /// codes are 32 bits and Portal passes the child's code through unchanged.
@@ -193,6 +196,13 @@ pub extern "kernel32" fn CreateFileW(
     flags: DWORD,
     template: ?HANDLE,
 ) callconv(.winapi) ?HANDLE;
+// Directory change notifications (fsutil.DirWatch).
+pub const FILE_NOTIFY_CHANGE_FILE_NAME: DWORD = 0x1;
+pub const FILE_NOTIFY_CHANGE_DIR_NAME: DWORD = 0x2;
+pub extern "kernel32" fn FindFirstChangeNotificationW(path: [*:0]const u16, subtree: BOOL, filter: DWORD) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn FindNextChangeNotification(h: HANDLE) callconv(.winapi) BOOL;
+pub extern "kernel32" fn FindCloseChangeNotification(h: HANDLE) callconv(.winapi) BOOL;
+
 pub extern "kernel32" fn GetFileSizeEx(h: HANDLE, size: *i64) callconv(.winapi) BOOL;
 pub extern "kernel32" fn MoveFileExW(from: [*:0]const u16, to: [*:0]const u16, flags: DWORD) callconv(.winapi) BOOL;
 

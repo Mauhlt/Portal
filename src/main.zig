@@ -43,6 +43,7 @@ const Console = console_mod.Console;
 const Session = @import("session.zig").Session;
 const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
+const fsutil = @import("fsutil.zig");
 const w = @import("win32.zig");
 const web = @import("web.zig");
 const gui = @import("gui.zig");
@@ -238,7 +239,7 @@ pub fn main(init: std.process.Init) !void {
         const sp: sync.Paths = .{ .dir = paths.dir };
         if (cmd[0] == 's') return sync_cli.cmdSync(gpa, io, sp, args[1..]);
         if (cmd[0] == 'p') return sync_cli.cmdPublish(gpa, io, sp, args[1..]);
-        return sync_cli.cmdUnpublish(gpa, io, sp, args[1..]);
+        return sync_cli.cmdUnpublish(io, sp, args[1..]);
     }
     if (std.mem.eql(u8, cmd, "sync-device")) return sync_cli.cmdSyncDevice(gpa, io, args[1..], portal_version);
     if (std.mem.eql(u8, cmd, "version")) {
@@ -487,7 +488,8 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     const pid = GetCurrentProcessId();
 
     // Watch before opening the window, so no change is missed.
-    var dw = devices.DirWatch.open(gpa, paths);
+    var dw = devices.watchStore(gpa, paths) catch |err|
+        fatal("cannot watch {s} for changes ({t}), so this command could not see the device ask; nothing was opened", .{ paths.dir, err });
     defer dw.close();
 
     // `portalctl pair` is a thin console wrapper over devices.Desk, the same
@@ -551,7 +553,10 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     var ca_hint_done = false;
     var first = true;
     while (true) {
-        if (!first) dw.rearm();
+        if (!first) dw.rearm() catch {
+            endWindow(gpa, io, paths, nonce);
+            fatal("lost the change watch on {s}; the pairing window is closed. Run `portalctl pair` again.", .{paths.dir});
+        };
         first = false;
         const now = nowUnix(io);
 
@@ -680,18 +685,11 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
             }
         }
 
-        var handles: [2]w.HANDLE = undefined;
-        var n_h: w.DWORD = 0;
-        handles[n_h] = lines.ready_ev;
-        n_h += 1;
-        if (dw.h) |h| {
-            handles[n_h] = h;
-            n_h += 1;
-        }
+        const handles = [2]w.HANDLE{ lines.ready_ev, dw.h };
         var ms = devices.waitMs(now, expires);
-        if (p.ca == .unknown and !ca_hint_done) ms = @min(ms, 3000);
-        if (dw.h == null) ms = @min(ms, 1000); // no change notification: re-check each second
-        _ = devices.WaitForMultipleObjects(n_h, &handles, 0, ms);
+        // One real deadline: the "no running Portal picked this up" hint.
+        if (p.ca == .unknown and !ca_hint_done) ms = @min(ms, @as(w.DWORD, @intCast(@max(0, start_s + 3 - now) * 1000 + 250)));
+        _ = w.WaitForMultipleObjects(handles.len, &handles, 0, ms);
     }
 }
 
@@ -1008,6 +1006,9 @@ fn sanEql(a: x509.SanEntry, b: x509.SanEntry) bool {
 ///     squatting the port) is logged loudly and reported as failed.
 const PairWatch = struct {
     srv: *web.Server,
+    /// The data directory's change watch, opened before the thread starts
+    /// (Portal refuses to run without it).
+    dw: ?fsutil.DirWatch,
     /// The certificate download server; null with --no-tls.
     ca_srv: ?*web.Server,
     ca_addr: std.Io.net.IpAddress,
@@ -1038,10 +1039,25 @@ const PairWatch = struct {
         }.op) catch |err| pw.srv.noteStoreError(err);
     }
 
+    /// Re-arms the change watch; if that fails, re-opens it once. Losing
+    /// it is logged as an error: changes made by `portalctl` (pair,
+    /// unpair) are then not seen until Portal restarts, while the
+    /// window's own desk actions still are.
+    fn rearm(pw: *PairWatch) void {
+        var d = pw.dw orelse return;
+        d.rearm() catch {
+            d.close();
+            pw.dw = devices.watchStore(pw.gpa, pw.paths) catch |err| {
+                pw.dw = null;
+                pw.srv.log.print("ERROR: lost the change watch on {s} ({t}): `portalctl pair`/`unpair` changes are not seen until Portal restarts", .{ pw.paths.dir, err });
+                return;
+            };
+            pw.srv.log.print("change watch on {s} was lost and has been re-opened", .{pw.paths.dir});
+        };
+    }
+
     fn watch(pw: *PairWatch) void {
         const io = pw.io;
-        var dw = devices.DirWatch.open(pw.gpa, pw.paths);
-        if (dw.h == null) pw.srv.log.print("WARNING: cannot watch {s} for changes; re-reading the device list every 2 s instead", .{pw.paths.dir});
         var where_buf: [80]u8 = undefined;
         const where = std.fmt.bufPrint(&where_buf, "{f}", .{pw.ca_addr}) catch "?";
         var active: ?Io.Future(void) = null;
@@ -1052,7 +1068,7 @@ const PairWatch = struct {
         var first = true;
         while (true) {
             _ = pw.srv.pairwatch_wakes.fetchAdd(1, .monotonic);
-            if (!first) dw.rearm(); // before reading: a change made meanwhile signals again
+            if (!first) pw.rearm(); // before reading: a change made meanwhile signals again
             first = false;
             const read_start = pw.srv.realNowMs();
             const now = nowUnix(io);
@@ -1120,8 +1136,8 @@ const PairWatch = struct {
 
             var handles: [2]w.HANDLE = undefined;
             var n: w.DWORD = 0;
-            if (dw.h) |h| {
-                handles[n] = h;
+            if (pw.dw) |d| {
+                handles[n] = d.h;
                 n += 1;
             }
             const proc_slot = n;
@@ -1129,13 +1145,16 @@ const PairWatch = struct {
                 handles[n] = h;
                 n += 1;
             };
-            var ms = devices.waitMs(now, if (open) |p| p.expires else null);
-            if (dw.h == null) ms = @min(ms, 2000);
+            // Events only; the one timeout is a real deadline (the open
+            // window's expiry).
+            const ms = devices.waitMs(now, if (open) |p| p.expires else null);
             const r = if (n == 0) blk: {
-                io.sleep(.fromMilliseconds(ms), .awake) catch {};
-                break :blk devices.WAIT_TIMEOUT;
-            } else devices.WaitForMultipleObjects(n, &handles, 0, ms);
-            if (n > proc_slot and r == devices.WAIT_OBJECT_0 + proc_slot) {
+                // Only after the watch was lost (logged as an error).
+                const left: Io.Timeout = if (ms == w.INFINITE) .none else .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
+                left.sleep(io) catch {};
+                break :blk w.WAIT_TIMEOUT;
+            } else w.WaitForMultipleObjects(n, &handles, 0, ms);
+            if (n > proc_slot and r == w.WAIT_OBJECT_0 + proc_slot) {
                 // `portalctl pair` exited (Ctrl+C, closed console, killed):
                 // the window closes now, not at its expiry.
                 gone_nonce = proc_nonce;
@@ -1161,17 +1180,6 @@ const SyncWatch = struct {
     io: Io,
     gpa: Allocator,
 
-    const FILE_NOTIFY_CHANGE_FILE_NAME: w.DWORD = 0x1;
-    const FILE_NOTIFY_CHANGE_DIR_NAME: w.DWORD = 0x2;
-    extern "kernel32" fn FindFirstChangeNotificationW(path: [*:0]const u16, subtree: w.BOOL, filter: w.DWORD) callconv(.winapi) ?w.HANDLE;
-    extern "kernel32" fn FindNextChangeNotification(h: w.HANDLE) callconv(.winapi) w.BOOL;
-
-    fn open(sw: *SyncWatch, dir: []const u8, subtree: bool) ?w.HANDLE {
-        const dw = std.unicode.wtf8ToWtf16LeAllocZ(sw.gpa, dir) catch return null;
-        defer sw.gpa.free(dw);
-        return w.validHandle(FindFirstChangeNotificationW(dw.ptr, @intFromBool(subtree), FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME));
-    }
-
     fn refresh(sw: *SyncWatch) void {
         const subs = sync.readSubs(sw.gpa, sw.io, sw.paths) catch |err| {
             sw.srv.log.print("sync: subscriptions unreadable ({t}); keeping the last state", .{err});
@@ -1196,27 +1204,24 @@ const SyncWatch = struct {
 
     fn watch(sw: *SyncWatch) void {
         var pb: [1024]u8 = undefined;
-        const publish_dir = std.fmt.bufPrint(&pb, "{s}\\publish", .{sw.paths.dir}) catch return;
+        const publish_dir = sw.paths.join(&pb, &.{"publish"}) catch return;
         Io.Dir.cwd().createDirPath(sw.io, publish_dir) catch {};
-        var handles: [2]w.HANDLE = undefined;
-        var n: w.DWORD = 0;
-        if (sw.open(sw.paths.dir, false)) |h| {
-            handles[n] = h;
-            n += 1;
-        }
-        if (sw.open(publish_dir, true)) |h| {
-            handles[n] = h;
-            n += 1;
-        }
-        if (n < 2) sw.srv.log.print("sync: cannot watch {s} for changes; devices learn about new packages when they reconnect", .{sw.paths.dir});
+        var watches: [2]fsutil.DirWatch = undefined;
+        watches[0] = fsutil.DirWatch.open(sw.gpa, sw.paths.dir, .{ .dirs = true }) catch |err| return sw.lost(err);
+        watches[1] = fsutil.DirWatch.open(sw.gpa, publish_dir, .{ .dirs = true, .subtree = true }) catch |err| return sw.lost(err);
+        const handles = [2]w.HANDLE{ watches[0].h, watches[1].h };
         sw.refresh();
-        while (n > 0) {
-            const r = devices.WaitForMultipleObjects(n, &handles, 0, w.INFINITE);
-            if (r >= devices.WAIT_OBJECT_0 + n) return;
+        while (true) {
+            const r = w.WaitForMultipleObjects(handles.len, &handles, 0, w.INFINITE);
+            if (r >= w.WAIT_OBJECT_0 + handles.len) return sw.lost(error.WaitFailed);
             // Re-arm before re-reading, so a change made meanwhile signals again.
-            if (FindNextChangeNotification(handles[r - devices.WAIT_OBJECT_0]) == 0) return;
+            watches[r - w.WAIT_OBJECT_0].rearm() catch |err| return sw.lost(err);
             sw.refresh();
         }
+    }
+
+    fn lost(sw: *SyncWatch, err: anyerror) void {
+        sw.srv.log.print("ERROR: sync: cannot watch {s} for changes ({t}); devices learn about new packages only when they reconnect", .{ sw.paths.dir, err });
     }
 };
 
@@ -1864,6 +1869,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     }
     var pair_watch: PairWatch = .{
         .srv = &server,
+        // Unpair from `portalctl` must end sessions: no watch, no run.
+        .dw = devices.watchStore(gpa, paths) catch |err|
+            fatal("cannot watch {s} for changes ({t}); Portal needs it to notice pairing and unpairing", .{ paths.dir, err }),
         .ca_srv = if (ca_listener_on) &ca_server else null,
         .ca_addr = ca_addr,
         .paths = paths,
@@ -2011,6 +2019,7 @@ test {
     _ = @import("tls/pki.zig");
     _ = @import("sync.zig");
     _ = @import("sync_cli.zig");
+    _ = @import("fsutil.zig");
 }
 
 test "isYes" {
