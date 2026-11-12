@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const net = @import("net.zig");
+const tlsnet = @import("tlsnet.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Header = struct { name: []const u8, value: []const u8 };
@@ -60,11 +61,11 @@ pub const Response = struct {
     }
 };
 
-pub const Error = error{ BadResponse, Closed } || net.Error || Allocator.Error;
+pub const Error = error{ BadResponse, Closed } || tlsnet.Error;
 
-/// Reads one response from `sock`, which must carry a content-length (every
+/// Reads one response from `sock` (a net.Socket or tlsnet.Stream), which must carry a content-length (every
 /// Portal response does; a 101 has no body). Bytes after it are discarded.
-pub fn readResponse(gpa: Allocator, sock: *net.Socket, timeout_ms: u32) Error!Response {
+pub fn readResponse(gpa: Allocator, sock: anytype, timeout_ms: u32) Error!Response {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
     const deadline = net.now() + timeout_ms;
@@ -145,6 +146,8 @@ pub const Request = struct {
     body: ?[]const u8 = null,
     extra: []const Header = &.{},
     source: ?[4]u8 = null,
+    /// HTTPS, trusting only this CA; null is plain HTTP.
+    tls: ?*tlsnet.Trust = null,
 };
 
 pub fn format(gpa: Allocator, req: Request) Allocator.Error![]u8 {
@@ -163,7 +166,7 @@ pub fn format(gpa: Allocator, req: Request) Allocator.Error![]u8 {
 
 /// One request on a fresh connection.
 pub fn request(gpa: Allocator, port: u16, req: Request) Error!Response {
-    var sock = try net.Socket.connect(port, .{ .source = req.source });
+    var sock = try tlsnet.Stream.connect(gpa, port, .{ .source = req.source }, req.tls);
     defer sock.close();
     const bytes = try format(gpa, req);
     defer gpa.free(bytes);
