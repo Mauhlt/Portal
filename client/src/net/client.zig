@@ -91,6 +91,9 @@ pub const Status = enum {
     /// This side's network is down (no route to the desktop).
     network_error,
     store_unavailable,
+    /// The app is off screen (iOS background): the connection is dropped
+    /// until it comes back (Client.setPaused).
+    paused,
 };
 
 /// What a failed connection attempt says about the desktop.
@@ -157,6 +160,12 @@ pub const Shared = struct {
     /// (connect.forgetDesktop) and says why. Never set by a transient
     /// error.
     desktop_gone: std.atomic.Value(bool) = .init(false),
+    /// The app is off screen: no connection (Client.setPaused). Also the
+    /// stream's abort flag, so pausing drops a live stream at once.
+    paused: std.atomic.Value(bool) = .init(false),
+    /// Set when the pause ends: wakes the paused loop and cuts a backoff
+    /// sleep short, so a returning app reconnects at once.
+    resume_wake: Io.Event = .unset,
 
     pub fn detail(s: *const Shared) []const u8 {
         return s.detail_buf[0..s.detail_len];
@@ -303,7 +312,31 @@ pub const Client = struct {
     /// task): nothing cancels that thread, so there is no cancelation to
     /// swallow here.
     fn sleepMs(c: *Client, ms: i64) void {
-        c.io.sleep(.fromMilliseconds(ms), .awake) catch {};
+        if (ms <= 0) return;
+        // A resume (setPaused(false)) ends the wait early.
+        c.shared.resume_wake.reset();
+        if (c.shared.paused.load(.acquire)) return;
+        c.shared.resume_wake.waitTimeout(c.io, .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } }) catch {};
+    }
+
+    /// Any thread. Paused: drop the stream now and make no connection
+    /// until resumed (the UI is off screen: iOS background). The session
+    /// stays in memory; resuming reconnects at once (signing in again if
+    /// the desktop asks).
+    pub fn setPaused(c: *Client, paused: bool) void {
+        if (c.shared.paused.swap(paused, .acq_rel) == paused) return;
+        if (paused) c.wd.poke(); // the stream's watchdog aborts on `paused`
+        c.shared.resume_wake.set(c.io);
+    }
+
+    /// Network thread: sleeps (event-driven) while paused.
+    fn waitWhilePaused(c: *Client) void {
+        if (!c.shared.paused.load(.acquire)) return;
+        c.setStatus(.paused, "paused while Portal is in the background", .{});
+        while (c.shared.paused.load(.acquire)) {
+            c.shared.resume_wake.wait(c.io) catch {};
+            c.shared.resume_wake.reset();
+        }
     }
 
     /// Prints connection errors to stderr once per distinct error.
@@ -324,6 +357,7 @@ pub const Client = struct {
         var session: ?http.Cookie = null;
         defer if (session) |*s| s.wipe();
         while (true) {
+            c.waitWhilePaused();
             if (session == null) {
                 session = c.authenticate(&backoff);
                 if (session == null) continue;
@@ -334,6 +368,8 @@ pub const Client = struct {
             // a bare "connecting".
             if (!c.quietAttempt()) c.setStatus(.connecting, "opening stream", .{});
             const result = c.runStream(&session.?, &backoff);
+            // Dropped because the app left the screen: not an error.
+            if (c.shared.paused.load(.acquire)) continue;
             c.streamEnded(result, &session, &backoff);
         }
     }
@@ -744,6 +780,9 @@ pub const Client = struct {
 
     pub fn runStream(c: *Client, session: *const http.Cookie, backoff: *i64) StreamResult {
         c.wd.extend(connect_timeout_ms);
+        // setPaused(true) ends the stream through the watchdog.
+        c.wd.abort = &c.shared.paused;
+        defer c.wd.abort = null;
         const r = c.wd.run(streamTask, .{ c, session, backoff }, .{ .ctx = c, .f = pingTick });
         if (c.wd.expired.load(.acquire)) {
             c.logError(error.TimedOut);

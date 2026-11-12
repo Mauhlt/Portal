@@ -10,12 +10,16 @@ const TermView = view.TermView;
 const form = view.form;
 const input = view.input;
 const x509check = @import("net/x509check.zig");
+const pairqr = @import("shared").pairqr;
 
 pub const id_server: u32 = 100;
 pub const id_cert: u32 = 101;
 pub const id_pair: u32 = 1;
+pub const id_scan: u32 = 2;
 
-pub const Event = enum { none, submit, paste };
+/// `scan`: the user asked to scan the desk's pairing QR code (only offered
+/// where the platform has a camera scanner, `Setup.scan_offered`).
+pub const Event = enum { none, submit, paste, scan };
 
 /// How the certificate field reads.
 pub const Cert = union(enum) {
@@ -41,6 +45,8 @@ pub const Setup = struct {
     focus: form.Focus = .{ .index = 0, .count = 3 },
     note_buf: [300]u8 = undefined,
     note_len: usize = 0,
+    /// Show "Scan QR code" (the iPhone app; see connect.Platform).
+    scan_offered: bool = false,
 
     pub fn init(server: []const u8, cert: []const u8) Setup {
         var s: Setup = .{};
@@ -112,26 +118,52 @@ pub const Setup = struct {
             id_server => s.focus.index = 0,
             id_cert => s.focus.index = 1,
             id_pair => return .submit,
+            id_scan => if (s.scan_offered) return .scan,
             else => {},
         }
         return .none;
     }
 
+    /// Fills the form from a scanned pairing QR code (shared/pairqr.zig):
+    /// the address and the CA's SHA-256, which connect.zig then checks
+    /// like typed ones. False (with a note) if it is not Portal's.
+    pub fn fromQr(s: *Setup, text: []const u8) bool {
+        const p = pairqr.parse(text) catch |err| {
+            s.setNote("{s}", .{switch (err) {
+                error.NotPortal => "That QR code is not a Portal pairing code. Scan the one in Pair a device on the desk.",
+                error.UnsupportedVersion => "That pairing code is from a newer Portal; update this app.",
+                error.Malformed => "That pairing code is damaged; scan it again.",
+            }});
+            return false;
+        };
+        s.server.set(p.server);
+        s.cert.set(p.ca_sha256);
+        s.focus.index = 2;
+        s.note_len = 0;
+        return true;
+    }
+
     pub const Bufs = struct {
         fields: [2]TermView.PanelField = undefined,
-        buttons: [1]TermView.PanelButton = undefined,
+        buttons: [2]TermView.PanelButton = undefined,
     };
 
     pub fn panel(s: *const Setup, b: *Bufs) TermView.Panel {
         b.fields[0] = .{ .label = "Desktop address (IP:PORT inside the tunnel)", .value = s.server.text(), .hint = "e.g. 10.8.0.1:8420", .id = id_server, .focused = s.focus.index == 0 };
         b.fields[1] = .{ .label = "Portal certificate: a portal-ca.pem / .cer file, or its SHA-256", .value = s.cert.text(), .hint = "path to portal-ca.pem, or AB:CD:... as the desk shows it (empty: the one trusted before)", .id = id_cert, .focused = s.focus.index == 1 };
-        b.buttons[0] = .{ .label = "Pair", .id = id_pair, .focused = s.focus.index == 2, .tone = .good };
+        var nb: usize = 0;
+        if (s.scan_offered) {
+            b.buttons[nb] = .{ .label = "Scan QR code", .id = id_scan };
+            nb += 1;
+        }
+        b.buttons[nb] = .{ .label = "Pair", .id = id_pair, .focused = s.focus.index == 2, .tone = .good };
+        nb += 1;
         return .{
             .title = "Connect to a Portal",
             .lines = &lines,
             .fields = &b.fields,
             .note = .{ .text = s.note_buf[0..s.note_len], .tone = .bad },
-            .buttons = &b.buttons,
+            .buttons = b.buttons[0..nb],
         };
     }
 
@@ -168,4 +200,20 @@ test "setup form" {
     const p = s.panel(&b);
     try testing.expect(p.fields[0].focused);
     try testing.expectEqual(@as(usize, 1), p.buttons.len);
+    try testing.expectEqual(Event.none, s.button(id_scan)); // not offered
+}
+
+test "setup from a scanned pairing QR code" {
+    var s = Setup.init("", "");
+    s.scan_offered = true;
+    try testing.expectEqual(Event.scan, s.button(id_scan));
+    var b: Setup.Bufs = .{};
+    try testing.expectEqual(@as(usize, 2), s.panel(&b).buttons.len);
+    try testing.expect(!s.fromQr("https://example.com/"));
+    try testing.expect(s.note_len > 0);
+    const fp = "00070E151C232A31383F464D545B626970777E858C939AA1A8AFB6BDC4CBD2D9";
+    try testing.expect(s.fromQr("portal-pair 1 10.8.0.1:8420 " ++ fp));
+    try testing.expectEqualStrings("10.8.0.1:8420", s.server.text());
+    try testing.expect(classify(s.cert.text()) == .sha256);
+    try testing.expectEqual(@as(usize, 0), s.note_len);
 }

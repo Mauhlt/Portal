@@ -51,6 +51,27 @@ pub const x509check_mod = x509check;
 /// confirmation). portal.exe shows a message box: it has no console.
 pub var report_fn: ?*const fn (text: []const u8) void = null;
 
+/// What the device section around this shared viewer provides. The
+/// defaults are the desktop/laptop behaviour; the iPhone app (client/src/
+/// ios) sets its own before calling `main`. Only device glue lives behind
+/// these hooks: what the viewer does with them is shared.
+pub const Platform = struct {
+    /// Run the Portal sync worker (TLS only). Off on the iPhone, which
+    /// installs no packages.
+    sync: bool = true,
+    /// UI thread: the view went off screen (the connection is dropped
+    /// meanwhile) / came back (the device may ask for Face ID first).
+    on_suspend: ?*const fn () void = null,
+    on_resume: ?*const fn () void = null,
+    /// UI thread: start scanning the desk's pairing QR code (a camera
+    /// view). The text arrives through `take_scanned`; the device wakes
+    /// the window when it has one.
+    scan_qr: ?*const fn () void = null,
+    /// UI thread: a scanned QR text, copied into `buf`, at most once.
+    take_scanned: ?*const fn (buf: []u8) ?[]const u8 = null,
+};
+pub var platform: Platform = .{};
+
 const usage =
     \\usage: {s} [--server IP:PORT] [--ca FILE | --ca-sha256 HEX] [--forget]
     \\
@@ -264,6 +285,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
                 if (std.Io.Dir.cwd().statFile(io, p, .{})) |_| cert_prefill = p else |_| {}
             };
             var st = setup_mod.Setup.init(server orelse "", cert_prefill);
+            st.scan_offered = platform.scan_qr != null;
             if (first_note.len > 0) st.setNote("{s}", .{first_note});
             while (true) {
                 if (!runSetup(tv, &st)) std.process.exit(0); // window closed
@@ -308,7 +330,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     // Portal sync (docs/sync-design.md): a worker that runs a pass on
     // every (re)connect and {"t":"updates"}; only over TLS, where the
     // release key was pinned at pairing.
-    if (transport == .tls) {
+    if (transport == .tls and platform.sync) {
         if (std.Thread.spawn(.{}, SyncState.run, .{sync_state})) |t| t.detach() else |_| {}
     }
     switch (transport) {
@@ -332,7 +354,15 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     thread.detach();
 
     var gone_handled = false;
+    var suspended = false;
     while (tv.pollEvents(host_ui.sink.sink())) {
+        // Off screen (iOS background): no connection until the view is
+        // back; the device glue may lock the UI meanwhile.
+        if (tv.isSuspended() != suspended) {
+            suspended = tv.isSuspended();
+            client.setPaused(suspended);
+            if (if (suspended) platform.on_suspend else platform.on_resume) |f| f();
+        }
         // The desktop no longer has this device: forget it here too (the
         // sync worker does it between operations; without TLS there is no
         // worker and no sync store, so here).
@@ -815,6 +845,7 @@ fn runSetup(tv: *TermView, st: *setup_mod.Setup) bool {
             switch (e) {
                 .none => {},
                 .submit => c.submitted = true,
+                .scan => if (platform.scan_qr) |f| f(),
                 .paste => {
                     const raw = c.tv.window.clipboardText(std.heap.page_allocator, 4096) orelse return;
                     defer std.heap.page_allocator.free(raw);
@@ -845,6 +876,11 @@ fn runSetup(tv: *TermView, st: *setup_mod.Setup) bool {
     var bufs: setup_mod.Setup.Bufs = .{};
     while (true) {
         if (!tv.pollEvents(sink)) return false;
+        if (platform.take_scanned) |take| {
+            var qbuf: [256]u8 = undefined;
+            // A good scan fills the form and pairs at once.
+            if (take(&qbuf)) |text| if (st.fromQr(text)) return true;
+        }
         if (ctx.submitted) return true;
         tv.build(&empty, .{
             .status = .{ .tone = .warn, .label = "not connected" },

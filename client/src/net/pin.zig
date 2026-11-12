@@ -45,7 +45,9 @@ pub fn serversDir(out: *[max_path]u8) Error![]const u8 {
             const appdata = envVar("APPDATA", &env_buf) orelse return error.NoConfigDir;
             break :blk std.fmt.bufPrint(out, "{s}" ++ sep ++ "Portal" ++ sep ++ "servers", .{appdata});
         },
-        .macos => blk: {
+        // iOS: HOME is the app container; Library/Application Support
+        // is private to the app and backed up (only public data here).
+        .macos, .ios => blk: {
             const home = envVar("HOME", &env_buf) orelse return error.NoConfigDir;
             break :blk std.fmt.bufPrint(out, "{s}/Library/Application Support/Portal/servers", .{home});
         },

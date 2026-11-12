@@ -4,6 +4,16 @@
 //!            CRED_TYPE_GENERIC, persisted for this user on this machine)
 //!   macOS    Keychain generic password via Security.framework, loaded with
 //!            dlopen (no SDK needed to build)
+//!   iOS      the same Keychain code (Security.framework is dlopen'd from
+//!            the dyld shared cache), with the item bound to this device
+//!            and to Face ID: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+//!            (never in iCloud Keychain or a backup) plus a SecAccessControl
+//!            with kSecAccessControlBiometryCurrentSet, so every read asks
+//!            for Face ID and re-enrolling a face invalidates it. Reads use
+//!            the app's last LAContext (`apple_auth_context`) when it has
+//!            one, so unlocking the app and signing in take one Face ID.
+//!            Saving deletes and re-adds (an update would need a Face ID
+//!            prompt of its own).
 //!   Linux    Secret Service over D-Bus via libsecret-1.so.0 (dlopen); if
 //!            it is not installed or no keyring is running, this fails with
 //!            error.Unavailable and the client refuses to pair rather than
@@ -31,9 +41,15 @@ pub fn targetName(host: []const u8, plain: bool, buf: *[max_target]u8) []const u
 
 const impl = switch (builtin.os.tag) {
     .windows => windows,
-    .macos => macos,
+    .macos, .ios => apple,
     else => linux,
 };
+
+/// iOS: an evaluated LAContext (LocalAuthentication) to pass as
+/// kSecUseAuthenticationContext, so a Keychain read right after the app's
+/// own Face ID check does not ask again. Set by the iPhone section
+/// (client/src/ios); unused elsewhere.
+pub var apple_auth_context: std.atomic.Value(?*anyopaque) = .init(null);
 
 /// Copies the stored secret into `out` and returns it, or null if none.
 pub fn load(target: []const u8, out: []u8) Error!?[]u8 {
@@ -129,9 +145,12 @@ const windows = struct {
     }
 };
 
-// ------------------------------------------------------------------ macOS
+// ------------------------------------------------------- macOS and iOS
 
-const macos = struct {
+const apple = struct {
+    const ios = builtin.os.tag == .ios;
+    /// kSecAccessControlBiometryCurrentSet.
+    const biometry_current_set: usize = 1 << 3;
     const CFTypeRef = *anyopaque;
     const OSStatus = i32;
     const errSecItemNotFound: OSStatus = -25300;
@@ -160,6 +179,10 @@ const macos = struct {
         kSecMatchLimit: CFTypeRef,
         kSecMatchLimitOne: CFTypeRef,
         kCFBooleanTrue: CFTypeRef,
+        SecAccessControlCreateWithFlags: *const fn (?*anyopaque, CFTypeRef, usize, ?*?*anyopaque) callconv(.c) ?CFTypeRef,
+        kSecAttrAccessControl: CFTypeRef,
+        kSecAttrAccessibleWhenUnlockedThisDeviceOnly: CFTypeRef,
+        kSecUseAuthenticationContext: CFTypeRef,
     };
 
     var api: ?Api = null;
@@ -218,7 +241,11 @@ const macos = struct {
         defer a.CFRelease(service);
         const account = try str(a, "portal-client");
         defer a.CFRelease(account);
-        const q = try query(a, service, account, &.{ a.kSecReturnData, a.kSecMatchLimit }, &.{ a.kCFBooleanTrue, a.kSecMatchLimitOne });
+        const ctx: ?CFTypeRef = if (ios) apple_auth_context.load(.acquire) else null;
+        const q = if (ctx) |c|
+            try query(a, service, account, &.{ a.kSecReturnData, a.kSecMatchLimit, a.kSecUseAuthenticationContext }, &.{ a.kCFBooleanTrue, a.kSecMatchLimitOne, c })
+        else
+            try query(a, service, account, &.{ a.kSecReturnData, a.kSecMatchLimit }, &.{ a.kCFBooleanTrue, a.kSecMatchLimitOne });
         defer a.CFRelease(q);
         var result: ?CFTypeRef = null;
         const st = a.SecItemCopyMatching(q, &result);
@@ -240,6 +267,21 @@ const macos = struct {
         defer a.CFRelease(account);
         const data = a.CFDataCreate(null, secret.ptr, @intCast(secret.len)) orelse return error.Failed;
         defer a.CFRelease(data);
+        if (ios) {
+            // This device only, Face ID on every read; replaced by
+            // delete + add (deleting needs no authentication).
+            const old = try query(a, service, account, &.{}, &.{});
+            defer a.CFRelease(old);
+            const del = a.SecItemDelete(old);
+            if (del != 0 and del != errSecItemNotFound) return error.Failed;
+            const acl = a.SecAccessControlCreateWithFlags(null, a.kSecAttrAccessibleWhenUnlockedThisDeviceOnly, biometry_current_set, null) orelse
+                return error.Unavailable; // no Face ID / Touch ID enrolled
+            defer a.CFRelease(acl);
+            const add = try query(a, service, account, &.{ a.kSecValueData, a.kSecAttrAccessControl }, &.{ data, acl });
+            defer a.CFRelease(add);
+            if (a.SecItemAdd(add, null) != 0) return error.Failed;
+            return;
+        }
         const add = try query(a, service, account, &.{a.kSecValueData}, &.{data});
         defer a.CFRelease(add);
         var st = a.SecItemAdd(add, null);

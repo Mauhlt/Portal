@@ -196,6 +196,7 @@ fn statusWord(st: client_mod.Status) []const u8 {
         .desktop_offline => "desktop offline",
         .network_error => "network error",
         .store_unavailable => "credential store unavailable",
+        .paused => "paused",
     };
 }
 

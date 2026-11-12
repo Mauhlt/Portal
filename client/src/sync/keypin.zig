@@ -100,7 +100,9 @@ pub fn syncRoot(out: *[pin.max_path]u8) ![]const u8 {
             const base = pin.envVar("LOCALAPPDATA", &env_buf) orelse return error.NoConfigDir;
             break :blk std.fmt.bufPrint(out, "{s}\\Portal\\sync", .{base});
         },
-        .macos => blk: {
+        // iOS: HOME is the app container; Library/Application Support
+        // is private to the app and backed up (only public data here).
+        .macos, .ios => blk: {
             const home = pin.envVar("HOME", &env_buf) orelse return error.NoConfigDir;
             break :blk std.fmt.bufPrint(out, "{s}/Library/Application Support/Portal/sync", .{home});
         },

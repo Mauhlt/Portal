@@ -113,13 +113,21 @@ pub const PanelRow = struct {
     button: ?PanelButton = null,
 };
 
+/// A QR code to show in a panel: `size` x `size` modules, row-major, 1 =
+/// dark (drawn with a light quiet zone).
+pub const PanelQr = struct {
+    size: u16,
+    modules: []const u8,
+};
+
 /// A modal box drawn over everything else (pairing approval, device list,
-/// first-run settings). Layout, top to bottom: title, lines, rows, fields,
-/// after, note, buttons.
+/// first-run settings). Layout, top to bottom: title, lines, qr, rows,
+/// fields, after, note, buttons.
 pub const Panel = struct {
     title: []const u8,
     title_tone: Tone = .normal,
     lines: []const PanelText = &.{},
+    qr: ?PanelQr = null,
     rows: []const PanelRow = &.{},
     fields: []const PanelField = &.{},
     after: []const PanelText = &.{},
@@ -325,6 +333,37 @@ img: images.Layer,
 /// Host events (keys, text, mouse, close) that arrived during a modal
 /// move/size loop, kept for the next pollEvents instead of being dropped.
 deferred: Window.Queue = .{},
+/// The app is off screen (Window `.background`, iOS): nothing is drawn
+/// until `.foreground` (a GPU submit in the background gets an iOS app
+/// killed).
+suspended: bool = false,
+/// The focused text field of the last built frame (pixels), for the
+/// platform's native text field (Window.showTextInput: iOS, so dictation
+/// and the system keyboard work). Null when none is focused.
+text_slot: ?TextSlot = null,
+/// The id of the slot the native field last showed (focus moves raise the
+/// keyboard).
+native_id: ?u32 = null,
+/// What the native field is known to contain (the last text exchanged
+/// with it), to turn its edits into key presses for the host.
+native_buf: [text_slot_cap]u8 = undefined,
+native_len: usize = 0,
+/// False once the window said it has no native text field (desktops).
+native_supported: bool = true,
+
+const text_slot_cap = 1024;
+
+const TextSlot = struct {
+    rect: Rect,
+    id: u32,
+    font_px: f32,
+    value_buf: [text_slot_cap]u8 = undefined,
+    value_len: usize = 0,
+
+    fn value(t: *const TextSlot) []const u8 {
+        return t.value_buf[0..t.value_len];
+    }
+};
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*TermView {
     const self = try gpa.create(TermView);
@@ -382,8 +421,8 @@ fn liveThunk(ctx: *anyopaque) void {
 /// Inside a modal loop: apply view events now, keep host events for later.
 fn liveEvent(tv: *TermView, e: input.Event) void {
     switch (e) {
-        .resize, .scale, .expose, .zoom, .scroll => tv.handleViewEvent(e),
-        .close, .key, .char, .mouse_down, .mouse_move, .mouse_up => tv.deferred.push(e),
+        .resize, .scale, .expose, .zoom, .scroll, .insets, .background, .foreground => tv.handleViewEvent(e),
+        .close, .key, .char, .mouse_down, .mouse_move, .mouse_up, .text_input => tv.deferred.push(e),
     }
 }
 
@@ -403,7 +442,7 @@ pub const forever = Window.forever;
 /// Sleeps until window input, a wake() from any thread, or the timeout
 /// (`forever`: no timeout). Returns at once if a redraw is pending.
 pub fn waitEvents(tv: *TermView, timeout_ms: u32) void {
-    tv.window.waitEvents(if (tv.dirty) 0 else timeout_ms);
+    tv.window.waitEvents(if (tv.dirty and !tv.suspended) 0 else timeout_ms);
 }
 
 /// Tears down the swapchain and GPU device cleanly (waits for the GPU to go
@@ -418,9 +457,16 @@ pub fn setTitle(tv: *TermView, title: []const u8) void {
     tv.window.setTitle(title);
 }
 
-/// True if the view itself needs a redraw (input, resize, zoom).
+/// True if the view itself needs a redraw (input, resize, zoom). Never
+/// while suspended.
 pub fn needsRedraw(tv: *const TermView) bool {
-    return tv.dirty;
+    return tv.dirty and !tv.suspended;
+}
+
+/// True while the app is off screen (iOS background): hosts may drop
+/// their connection meanwhile; present() draws nothing.
+pub fn isSuspended(tv: *const TermView) bool {
+    return tv.suspended;
 }
 
 /// Pumps window events. Returns false once the user closed the window.
@@ -449,6 +495,12 @@ pub fn pollEvents(tv: *TermView, sink: input.InputSink) bool {
             .mouse_up => |m| sink.mouse(tv.mouseAt(.up, m.button, m.x, m.y, .{})),
             // No scrollback in the view yet: wheel input needs no redraw.
             .scroll => continue,
+            // The native text field (iOS): its edits become the same key
+            // presses a keyboard would make, so hosts need nothing new.
+            .text_input => |t| {
+                tv.nativeTextChanged(sink);
+                if (t == .submit) sink.key(.enter, .{});
+            },
             else => tv.handleViewEvent(e),
         }
         tv.dirty = true;
@@ -530,6 +582,8 @@ test "selection contains" {
 fn handleViewEvent(tv: *TermView, e: input.Event) void {
     tv.dirty = true;
     switch (e) {
+        .background => tv.suspended = true,
+        .foreground => tv.suspended = false,
         .resize => |r| if (tv.renderer) |ren| ren.resize(r.width, r.height),
         .zoom => |z| tv.zoom_steps = switch (z) {
             .in => @min(tv.zoom_steps + 1, 20),
@@ -615,6 +669,7 @@ pub fn build(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
 
 /// Uploads new glyphs and presents the last built frame.
 pub fn present(tv: *TermView) void {
+    if (tv.suspended) return;
     const renderer = tv.renderer orelse return;
     if (tv.atlas.takeDirty()) |d| {
         renderer.updateTexture(d.x, d.y, d.w, d.h, d.bytes) catch |err| std.log.warn("atlas upload failed: {t}", .{err});
@@ -631,6 +686,126 @@ pub fn present(tv: *TermView) void {
         1,
     }, tv.instances.items) catch |err| std.log.warn("draw failed: {t}", .{err});
     tv.dirty = false;
+    tv.syncNativeField();
+}
+
+// ------------------------------------------------------ native text field
+
+/// Places (or hides) the platform's native text field over the focused
+/// field of the frame just presented, and pushes the host's text into it
+/// when the host changed it (cleared after a send, a refused line put
+/// back). Desktops have none: the first refusal turns this off.
+fn syncNativeField(tv: *TermView) void {
+    if (!tv.native_supported) return;
+    const slot = if (tv.text_slot) |*t| t else {
+        if (tv.native_id != null) tv.window.hideTextInput();
+        tv.native_id = null;
+        return;
+    };
+    const moved = tv.native_id != null and tv.native_id.? != slot.id;
+    if (!tv.window.showTextInput(.{
+        .x = slot.rect.x,
+        .y = slot.rect.y,
+        .w = slot.rect.w,
+        .h = slot.rect.h,
+        .font_px = slot.font_px,
+        .fg = button_fg,
+        .bg = field_bg,
+        .focus = moved,
+    })) {
+        tv.native_supported = false;
+        return;
+    }
+    if (moved or tv.native_id == null or !std.mem.eql(u8, slot.value(), tv.native_buf[0..tv.native_len])) {
+        tv.window.setTextInputText(slot.value());
+        @memcpy(tv.native_buf[0..slot.value_len], slot.value());
+        tv.native_len = slot.value_len;
+    }
+    tv.native_id = slot.id;
+}
+
+/// The native field's text changed: hand the difference to the host as
+/// Backspaces and characters (the input lines only edit at the end).
+fn nativeTextChanged(tv: *TermView, sink: input.InputSink) void {
+    var buf: [text_slot_cap]u8 = undefined;
+    const now = tv.window.textInputText(&buf);
+    const old = tv.native_buf[0..tv.native_len];
+    const edit = textEdit(old, now);
+    for (0..edit.deletes) |_| sink.key(.backspace, .{});
+    var it = (std.unicode.Utf8View.init(edit.insert) catch return).iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp < 0x20 or cp == 0x7f) continue;
+        sink.char(cp, .{});
+    }
+    @memcpy(tv.native_buf[0..now.len], now);
+    tv.native_len = now.len;
+}
+
+/// Turning `old` into `new` by editing at the end: how many code points
+/// to delete from `old`, then what to append.
+pub fn textEdit(old: []const u8, new: []const u8) struct { deletes: usize, insert: []const u8 } {
+    var p: usize = 0;
+    while (p < old.len and p < new.len and old[p] == new[p]) p += 1;
+    // Back to a code point boundary in both.
+    while (p > 0 and ((p < old.len and (old[p] & 0xC0) == 0x80) or (p < new.len and (new[p] & 0xC0) == 0x80))) p -= 1;
+    const removed = std.unicode.utf8CountCodepoints(old[p..]) catch old.len - p;
+    return .{ .deletes = removed, .insert = new[p..] };
+}
+
+test "textEdit: append, delete, replace in the middle, multibyte" {
+    var e = textEdit("ab", "abc");
+    try std.testing.expectEqual(@as(usize, 0), e.deletes);
+    try std.testing.expectEqualStrings("c", e.insert);
+    e = textEdit("abc", "ab");
+    try std.testing.expectEqual(@as(usize, 1), e.deletes);
+    try std.testing.expectEqualStrings("", e.insert);
+    e = textEdit("hello world", "help world");
+    try std.testing.expectEqual(@as(usize, 8), e.deletes);
+    try std.testing.expectEqualStrings("p world", e.insert);
+    e = textEdit("caf\u{e9}", "caf\u{e8}");
+    try std.testing.expectEqual(@as(usize, 1), e.deletes);
+    try std.testing.expectEqualStrings("\u{e8}", e.insert);
+    e = textEdit("", "");
+    try std.testing.expectEqual(@as(usize, 0), e.deletes);
+}
+
+/// Remembers the focused text field being drawn (see text_slot).
+fn noteTextField(tv: *TermView, r: Rect, id: u32, value: []const u8, font_px: f32) void {
+    var t: TextSlot = .{ .rect = r, .id = id, .font_px = font_px };
+    const n = @min(value.len, t.value_buf.len);
+    @memcpy(t.value_buf[0..n], value[0..n]);
+    t.value_len = n;
+    tv.text_slot = t;
+}
+
+/// Moves everything built this frame by (dx, dy): the frame is laid out
+/// in the area inside the window's insets (iOS safe area and keyboard),
+/// then shifted into place.
+fn shiftFrame(tv: *TermView, dx: f32, dy: f32) void {
+    if (dx == 0 and dy == 0) return;
+    for (tv.instances.items) |*i| {
+        i.rect[0] += dx;
+        i.rect[1] += dy;
+    }
+    for (tv.buttons[0..tv.n_buttons]) |*b| {
+        b.x += dx;
+        b.y += dy;
+    }
+    const rs = [_]*Rect{ &tv.regions.top, &tv.regions.terminal, &tv.regions.bottom, &tv.regions.status, &tv.regions.data };
+    for (rs) |r| {
+        r.x += dx;
+        r.y += dy;
+    }
+    for (tv.regions.panes[0..tv.regions.n_panes]) |*r| {
+        r.x += dx;
+        r.y += dy;
+    }
+    tv.layout.ox += dx;
+    tv.layout.oy += dy;
+    if (tv.text_slot) |*t| {
+        t.rect.x += dx;
+        t.rect.y += dy;
+    }
 }
 
 pub fn draw(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
@@ -642,9 +817,13 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
     tv.atlas_full = false;
     tv.instances.clearRetainingCapacity();
     tv.n_buttons = 0;
+    tv.text_slot = null;
     const size = tv.window.framebufferSize();
-    const W: f32 = @floatFromInt(size[0]);
-    const H: f32 = @floatFromInt(size[1]);
+    // Lay out inside the insets (all zero on desktops), then shift.
+    const ins = tv.window.insets();
+    defer tv.shiftFrame(ins.left, ins.top);
+    const W: f32 = @max(0, @as(f32, @floatFromInt(size[0])) - ins.left - ins.right);
+    const H: f32 = @max(0, @as(f32, @floatFromInt(size[1])) - ins.top - ins.bottomClear());
     if (W < 1 or H < 1) return;
     const s = tv.window.scale();
     const ui = tv.fonts.metrics(@round(13 * s));
@@ -716,8 +895,9 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
     for (panes[0..n_panes], 0..) |p, i| tv.drawPane(act, p, tv.regions.panes[i], s);
     tv.drawStatus(ui, overlay.status, H - status_h, W, status_h, s);
     if (overlay.panel) |p| {
-        // Modal: buttons under the panel stop reacting.
+        // Modal: buttons (and the text field) under the panel stop reacting.
         tv.n_buttons = 0;
+        tv.text_slot = null;
         tv.drawPanel(ui, p, W, H, s);
     }
 }
@@ -1261,6 +1441,7 @@ fn panelBody(tv: *TermView, ui: fontset.Metrics, big: fontset.Metrics, p: Panel,
     y += tv.wrapped(big, x, y, w, .{ .text = p.title, .tone = p.title_tone, .bold = true }, paint);
     y += @round(lh * 0.4);
     for (p.lines) |l| y += tv.wrapped(ui, x, y, w, l, paint);
+    if (p.qr) |q| y += tv.drawQr(q, x, y, w, lh, paint);
     // Rows: text on the left, an optional button on the right.
     if (p.rows.len > 0) {
         y += @round(lh * 0.4);
@@ -1303,6 +1484,7 @@ fn panelBody(tv: *TermView, ui: fontset.Metrics, big: fontset.Metrics, p: Panel,
                 if (f.focused) tv.rect(end, ty, @max(2, @round(2 * s)), lh, focus_edge); // caret
             }
             tv.registerButton(x, y, w, fh, f.id);
+            if (f.focused and !f.choice) tv.noteTextField(.{ .x = x, .y = y, .w = w, .h = fh }, f.id, f.value, lh);
         }
         y += fh + @round(lh * 0.5);
     }
@@ -1323,6 +1505,40 @@ fn panelBody(tv: *TermView, ui: fontset.Metrics, big: fontset.Metrics, p: Panel,
         y += bh;
     }
     return y - y0;
+}
+
+/// A QR code centred in a `w` wide column at `y`, whole pixels per module,
+/// light quiet zone of 4 modules. Returns the height used.
+fn drawQr(tv: *TermView, q: PanelQr, x: f32, y: f32, w: f32, lh: f32, paint: bool) f32 {
+    if (q.size == 0 or q.modules.len < @as(usize, q.size) * q.size) return 0;
+    const n: f32 = @floatFromInt(q.size + 8);
+    const side_max = @min(w, lh * 14);
+    const m = @max(1, @floor(side_max / n));
+    const side = m * n;
+    const gap = @round(lh * 0.4);
+    if (paint) {
+        const ox = x + @round((w - side) / 2);
+        const oy = y + gap;
+        tv.rect(ox, oy, side, side, .{ 0xFF, 0xFF, 0xFF });
+        const qs: usize = q.size;
+        for (0..qs) |r| {
+            // One quad per run of dark modules.
+            var c: usize = 0;
+            while (c < qs) {
+                if (q.modules[r * qs + c] == 0) {
+                    c += 1;
+                    continue;
+                }
+                const start = c;
+                while (c < qs and q.modules[r * qs + c] != 0) c += 1;
+                const fx: f32 = @floatFromInt(start + 4);
+                const fy: f32 = @floatFromInt(r + 4);
+                const run: f32 = @floatFromInt(c - start);
+                tv.rect(ox + fx * m, oy + fy * m, run * m, m, .{ 0, 0, 0 });
+            }
+        }
+    }
+    return gap + side + gap;
 }
 
 fn drawPanel(tv: *TermView, ui: fontset.Metrics, p: Panel, W: f32, H: f32, s: f32) void {
@@ -1398,6 +1614,7 @@ fn drawPane(tv: *TermView, ui: fontset.Metrics, p: Pane, r: Rect, s: f32) void {
                 if (f.focused) tv.rect(end, ty, @max(2, @round(2 * s)), lh, focus_edge);
             }
             tv.registerButton(box.x, box.y, box.w, box.h, f.id);
+            if (f.focused) tv.noteTextField(box, f.id, f.value, @floatFromInt(ui.cell_h));
         },
     }
 }
