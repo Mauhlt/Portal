@@ -35,7 +35,6 @@ const usage =
 /// base64 characters per chunk, as kitty recommends.
 const chunk_b64 = 4096;
 
-extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 
 pub fn main(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var path: ?[]const u8 = null;
@@ -212,7 +211,7 @@ const Console = struct {
         // Let ConPTY render (and scroll) those lines before the image
         // arrives: it passes OSCs through immediately but paints text on
         // its own schedule.
-        Sleep(150);
+        w.Sleep(150);
 
         out.clearRetainingCapacity();
         var keys_buf: [128]u8 = undefined;

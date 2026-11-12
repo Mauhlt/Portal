@@ -88,41 +88,12 @@ pub const Desk = struct {
 
 pub const Ended = enum { window_closed, child_exited };
 
-/// Longest `--project` name, in bytes.
-pub const max_project_bytes = 64;
-
-/// True if `s` may be shown as the project name: 1..max_project_bytes bytes
-/// of valid UTF-8 on a single line, with no control characters (C0, DEL,
-/// C1), line/paragraph separators or bidi overrides (which could make the
-/// title read differently from what it is).
-pub fn validProject(s: []const u8) bool {
-    if (s.len == 0 or s.len > max_project_bytes) return false;
-    const v = std.unicode.Utf8View.init(s) catch return false;
-    var it = v.iterator();
-    while (it.nextCodepoint()) |cp| switch (cp) {
-        0x00...0x1F, 0x7F...0x9F, 0x2028, 0x2029, 0x202A...0x202E, 0x2066...0x2069, 0x200E, 0x200F, 0x061C, 0xFEFF => return false,
-        else => {},
-    };
-    return std.mem.trim(u8, s, " ").len > 0;
-}
-
-/// "Portal — <project>" or "Portal — No project". Program-set titles (OSC
-/// 0/2) are never shown: they leak paths such as
-/// "Administrator: C:\Windows\system32\cmd.exe". Not derived from the
-/// working directory either (by default the home folder: the user name).
-pub fn windowLabel(project: ?[]const u8, buf: []u8) []const u8 {
-    const p = project orelse "No project";
-    return std.fmt.bufPrint(buf, "Portal \u{2014} {s}", .{p}) catch "Portal";
-}
-
-/// The window title: the label, plus " — N REMOTE VIEWER(S)" while anyone
-/// watches.
-pub fn windowTitle(project: ?[]const u8, viewers: u32, buf: []u8) []const u8 {
-    var lbuf: [max_project_bytes + 16]u8 = undefined;
-    const label = windowLabel(project, &lbuf);
-    if (viewers == 0) return std.fmt.bufPrint(buf, "{s}", .{label}) catch "Portal";
-    return std.fmt.bufPrint(buf, "{s} \u{2014} {d} REMOTE VIEWER{s}", .{ label, viewers, if (viewers == 1) "" else "S" }) catch "Portal";
-}
+const title = @import("title.zig");
+const win32 = @import("win32.zig");
+const windowLabel = title.windowLabel;
+const windowTitle = title.windowTitle;
+const max_project_bytes = title.max_project_bytes;
+const validProject = title.validProject;
 
 /// Cell selection being made with the mouse (anchor = where the drag began).
 const Select = struct {
@@ -191,7 +162,7 @@ pub const LocalHost = struct {
     /// runSetup: the panel was submitted.
     setup_submitted: bool = false,
 
-    const title_max = max_project_bytes + 64;
+    const title_max = title.max_title_bytes;
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, child_done: *const std.atomic.Value(bool)) !*LocalHost {
         const tv = try TermView.init(gpa, io, .{
@@ -825,21 +796,18 @@ pub fn checkListen(text: []const u8) ?[]const u8 {
     return null;
 }
 
-const FILETIME = extern struct { lo: u32, hi: u32 };
-const SYSTEMTIME = extern struct { year: u16, month: u16, dow: u16, day: u16, hour: u16, minute: u16, second: u16, ms: u16 };
-extern "kernel32" fn FileTimeToLocalFileTime(ft: *const FILETIME, local: *FILETIME) callconv(.winapi) i32;
-extern "kernel32" fn FileTimeToSystemTime(ft: *const FILETIME, st: *SYSTEMTIME) callconv(.winapi) i32;
 
 /// Unix time `t` as local "HH:MM" (empty if it can't be converted).
 fn localClock(t: i64, buf: []u8) []const u8 {
     if (t <= 0) return buf[0..0];
     const ticks: u64 = (@as(u64, @intCast(t)) + 11644473600) * 10_000_000;
-    const ft: FILETIME = .{ .lo = @truncate(ticks), .hi = @truncate(ticks >> 32) };
-    var local: FILETIME = undefined;
-    var st: SYSTEMTIME = undefined;
-    if (FileTimeToLocalFileTime(&ft, &local) == 0 or FileTimeToSystemTime(&local, &st) == 0) return buf[0..0];
-    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ st.hour, st.minute }) catch buf[0..0];
+    const ft: win32.FILETIME = .fromU64(ticks);
+    var local: win32.FILETIME = undefined;
+    var st: win32.SYSTEMTIME = undefined;
+    if (win32.FileTimeToLocalFileTime(&ft, &local) == 0 or win32.FileTimeToSystemTime(&local, &st) == 0) return buf[0..0];
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ st.wHour, st.wMinute }) catch buf[0..0];
 }
+
 
 test "selection range normalises drag direction" {
     var s: Select = .{ .anchor = .{ 5, 3 }, .head = .{ 2, 1 }, .active = true };
@@ -852,40 +820,6 @@ test "selection range normalises drag direction" {
     try std.testing.expect(s.range() == null);
 }
 
-test "window title never shows the program's title" {
-    var buf: [LocalHost.title_max]u8 = undefined;
-    try std.testing.expectEqualStrings("Portal \u{2014} No project", windowTitle(null, 0, &buf));
-    try std.testing.expectEqualStrings("Portal \u{2014} acme-api", windowTitle("acme-api", 0, &buf));
-    try std.testing.expectEqualStrings("Portal \u{2014} acme-api \u{2014} 1 REMOTE VIEWER", windowTitle("acme-api", 1, &buf));
-    try std.testing.expectEqualStrings("Portal \u{2014} No project \u{2014} 3 REMOTE VIEWERS", windowTitle(null, 3, &buf));
-    // The longest valid project with a huge viewer count still fits.
-    const long: [max_project_bytes]u8 = @splat('p');
-    try std.testing.expect(std.mem.endsWith(u8, windowTitle(&long, std.math.maxInt(u32), &buf), "4294967295 REMOTE VIEWERS"));
-    var lbuf: [max_project_bytes + 16]u8 = undefined;
-    try std.testing.expectEqualStrings("Portal \u{2014} No project", windowLabel(null, &lbuf));
-    try std.testing.expectEqualStrings("Portal \u{2014} " ++ long, windowLabel(&long, &lbuf));
-}
-
-test "validProject" {
-    try std.testing.expect(validProject("acme-api"));
-    try std.testing.expect(validProject("Kundenportal \u{e9}t\u{e9} 2"));
-    const max: [max_project_bytes]u8 = @splat('p');
-    const over: [max_project_bytes + 1]u8 = @splat('p');
-    try std.testing.expect(validProject(&max));
-    try std.testing.expect(!validProject(&over));
-    try std.testing.expect(!validProject(""));
-    try std.testing.expect(!validProject("   "));
-    try std.testing.expect(!validProject("a\nb"));
-    try std.testing.expect(!validProject("a\rb"));
-    try std.testing.expect(!validProject("a\tb"));
-    try std.testing.expect(!validProject("a\x1b]0;x\x07"));
-    try std.testing.expect(!validProject("a\x7f"));
-    try std.testing.expect(!validProject("a\u{85}b")); // C1 NEL
-    try std.testing.expect(!validProject("a\u{2028}b"));
-    try std.testing.expect(!validProject("abc\u{202e}gpj.exe")); // RLO
-    try std.testing.expect(!validProject("a\u{2067}b"));
-    try std.testing.expect(!validProject("bad\xff"));
-}
 
 test "viewer text" {
     var buf: [64]u8 = undefined;

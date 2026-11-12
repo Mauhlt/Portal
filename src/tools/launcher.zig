@@ -26,7 +26,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const lib = @import("releases_lib.zig");
-const w = @import("win32_tools.zig");
+const w = @import("win32");
 /// `gui`: the GUI-subsystem build (errors in a message box).
 const gui = @import("build_options").gui;
 
@@ -85,18 +85,16 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
         var wbuf: [1025:0]u16 = undefined;
         const n = std.unicode.utf8ToUtf16Le(wbuf[0..1024], msg) catch 0;
         wbuf[n] = 0;
-        _ = MessageBoxW(null, &wbuf, std.unicode.utf8ToUtf16LeStringLiteral("Portal"), 0x10); // MB_ICONERROR
+        _ = w.MessageBoxW(null, &wbuf, std.unicode.utf8ToUtf16LeStringLiteral("Portal"), 0x10); // MB_ICONERROR
     }
     w.ExitProcess(1);
 }
 
-extern "user32" fn MessageBoxW(hwnd: ?*anyopaque, text: [*:0]const u16, caption: [*:0]const u16, flags: u32) callconv(.winapi) i32;
-extern "kernel32" fn GetModuleFileNameW(module: ?*anyopaque, buf: [*]u16, size: w.DWORD) callconv(.winapi) w.DWORD;
 
 /// This launcher's own file name, lower-cased, if it is one of `targets`.
 fn ownName(out: *[64]u8) ?[]const u8 {
     var buf: [32768]u16 = undefined;
-    const n = GetModuleFileNameW(null, &buf, buf.len);
+    const n = w.GetModuleFileNameW(null, &buf, buf.len);
     if (n == 0 or n >= buf.len) return null;
     return matchTarget(buf[0..n], out);
 }
@@ -143,8 +141,6 @@ fn ignoreCtrl(ctrl_type: w.DWORD) callconv(.winapi) w.BOOL {
     return @intFromBool(ctrl_type == w.CTRL_C_EVENT or ctrl_type == w.CTRL_BREAK_EVENT);
 }
 
-extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) w.BOOL;
-extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) w.DWORD;
 
 fn run(gpa: Allocator, exe: []const u8) !u32 {
     const exe_w = try std.unicode.wtf8ToWtf16LeAllocZ(gpa, exe);
@@ -172,7 +168,7 @@ fn run(gpa: Allocator, exe: []const u8) !u32 {
     // pid: portal.exe trusts it only if we are its parent, then deletes it
     // from its own environment so its session child does not inherit it.
     var pid_buf: [16]u16 = undefined;
-    _ = SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("PORTAL_VIA_LAUNCHER"), lib.pidWide(GetCurrentProcessId(), &pid_buf));
+    _ = w.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("PORTAL_VIA_LAUNCHER"), lib.pidWide(w.GetCurrentProcessId(), &pid_buf));
 
     var si: w.STARTUPINFOW = .{ .cb = @sizeOf(w.STARTUPINFOW) };
     var pi: w.PROCESS_INFORMATION = undefined;

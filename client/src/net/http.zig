@@ -89,6 +89,14 @@ pub fn writeRefreshRequest(w: *std.Io.Writer, host: []const u8, secure: bool, de
         "Content-Length: 0\r\nConnection: close\r\n\r\n", .{ host, scheme(secure), host, cookieName(.device, secure), device.value() });
 }
 
+/// `POST /device/forget` with the session: asks the desktop to remove this
+/// device (Forget this desktop). The desktop takes the device from the
+/// session, never from the request.
+pub fn writeForgetRequest(w: *std.Io.Writer, host: []const u8, secure: bool, session: *const Cookie) !void {
+    try w.print("POST /device/forget HTTP/1.1\r\nHost: {s}\r\nOrigin: {s}://{s}\r\nCookie: {s}={s}\r\n" ++
+        "Content-Length: 0\r\nConnection: close\r\n\r\n", .{ host, scheme(secure), host, cookieName(.session, secure), session.value() });
+}
+
 pub fn writeUpgradeRequest(w: *std.Io.Writer, host: []const u8, secure: bool, session: *const Cookie, key: []const u8) !void {
     try w.print("GET /ws HTTP/1.1\r\nHost: {s}\r\nOrigin: {s}://{s}\r\nCookie: {s}={s}\r\n" ++
         "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {s}\r\n" ++
@@ -124,6 +132,9 @@ pub const Response = struct {
     request_code: ?[4]u8 = null,
     /// A Set-Cookie that clears one of our cookies (Max-Age=0 or empty value).
     cookie_cleared: bool = false,
+    /// `X-Portal-Device: gone`: the desktop says, unambiguously, that it no
+    /// longer has this device paired (docs/protocol.md section 1).
+    device_gone: bool = false,
     upgrade_websocket: bool = false,
     connection_upgrade: bool = false,
     accept: ?[]const u8 = null,
@@ -182,6 +193,8 @@ pub fn parseResponseHead(head: []const u8) ParseError!Response {
             while (it.next()) |tok| {
                 if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, tok, " \t"), "upgrade")) resp.connection_upgrade = true;
             }
+        } else if (std.ascii.eqlIgnoreCase(name, "x-portal-device")) {
+            if (std.ascii.eqlIgnoreCase(val, "gone")) resp.device_gone = true;
         } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-accept")) {
             resp.accept = val;
         } else if (std.ascii.eqlIgnoreCase(name, "x-portal-request-code")) {
@@ -274,13 +287,39 @@ pub fn pairWaitOutcome(r: *const Response) PairWait {
     return .unexpected;
 }
 
-pub const RefreshOutcome = enum { ok, revoked, unexpected };
+pub const RefreshOutcome = enum {
+    ok,
+    /// 401 with `X-Portal-Device: gone`: the desktop no longer has this
+    /// device (unpaired at the desk, forgotten, revoked): forget it.
+    gone,
+    /// Any other 401 (e.g. the credential presented from another address).
+    revoked,
+    unexpected,
+};
 
 /// `POST /auth/refresh`: 204 with a rotated device cookie and a fresh session
-/// cookie; 401 means the device is revoked or unknown.
+/// cookie; 401 means refused, and with `X-Portal-Device: gone` that the
+/// desktop no longer has this device.
 pub fn refreshOutcome(r: *const Response) RefreshOutcome {
-    if (r.status == 401) return .revoked;
+    if (r.status == 401) return if (r.device_gone) .gone else .revoked;
     if ((r.status == 204 or r.status == 200) and r.device != null and r.session != null) return .ok;
+    return .unexpected;
+}
+
+pub const ForgetOutcome = enum {
+    /// The desktop removed this device.
+    forgotten,
+    /// The desktop no longer had it (or this session).
+    already_gone,
+    /// No live session: sign in first (or the desktop will say gone then).
+    need_session,
+    unexpected,
+};
+
+/// `POST /device/forget`: 204 when removed; 401 without a live session.
+pub fn forgetOutcome(r: *const Response) ForgetOutcome {
+    if (r.status == 204 or r.status == 200) return .forgotten;
+    if (r.status == 401) return if (r.device_gone) .already_gone else .need_session;
     return .unexpected;
 }
 
@@ -361,6 +400,15 @@ test "pair and refresh responses" {
     try testing.expectEqualStrings("lap.new", ref.device.?.value());
     const revoked = try parseResponseHead("HTTP/1.1 401 Unauthorized\r\n\r\n");
     try testing.expectEqual(RefreshOutcome.revoked, refreshOutcome(&revoked));
+    const gone = try parseResponseHead("HTTP/1.1 401 Unauthorized\r\nX-Portal-Device: gone\r\n\r\n");
+    try testing.expectEqual(RefreshOutcome.gone, refreshOutcome(&gone));
+    // Only a 401 says gone: the header on anything else changes nothing.
+    const err500 = try parseResponseHead("HTTP/1.1 500 Internal Server Error\r\nx-portal-device: gone\r\n\r\n");
+    try testing.expectEqual(RefreshOutcome.unexpected, refreshOutcome(&err500));
+    const fg = try parseResponseHead("HTTP/1.1 204 No Content\r\nx-portal-device: gone\r\n\r\n");
+    try testing.expectEqual(ForgetOutcome.forgotten, forgetOutcome(&fg));
+    try testing.expectEqual(ForgetOutcome.already_gone, forgetOutcome(&gone));
+    try testing.expectEqual(ForgetOutcome.need_session, forgetOutcome(&revoked));
     const odd = try parseResponseHead("HTTP/1.1 500 Internal Server Error\r\n\r\n");
     try testing.expectEqual(RefreshOutcome.unexpected, refreshOutcome(&odd));
 }

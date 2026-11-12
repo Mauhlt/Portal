@@ -11,8 +11,8 @@
 //!      session cookie
 //!
 //! Pairing needs desk approval (devices.zig): POST /pair only registers a
-//! request; the device's page (GET /pair/wait, a plain meta refresh) gets
-//! its credential once the owner answers "y" in `portal pair`. Requests
+//! request; the device's page (GET /pair/wait, a long poll: see `pairWait`)
+//! gets its credential once the owner answers "y" at the desk. Requests
 //! before sign-in never touch the device file except to create or collect
 //! a request: the pairing window is read from `pair_view`, which the
 //! pairing watcher (main.zig) refreshes when the file changes. Every log
@@ -63,8 +63,9 @@ const sync = @import("sync.zig");
 const sync_manifest = @import("client").sync.manifest;
 const sync_keypin = @import("client").sync.keypin;
 const keymap = @import("keymap.zig");
+const title = @import("title.zig");
+const win32 = @import("win32.zig");
 
-extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 
 const index_html = @embedFile("web/index.html");
 const pair_html = @embedFile("web/pair.html");
@@ -106,8 +107,16 @@ const revoke_grace_ms = 10_000;
 const no_deadline = std.math.maxInt(i64);
 /// Pre-auth log lines: at most `burst` per this interval per kind.
 const pre_auth_log_interval_ms = 10_000;
-/// The waiting page re-asks for its outcome this often (meta refresh).
-const pair_wait_refresh_s = 2;
+/// GET /pair/wait for a request still pending, whose waiting page this
+/// device has already been shown, is held until the request's window
+/// changes (or at most this long): a long poll, so neither the page nor a
+/// native client needs a poll interval.
+pub const pair_wait_hold_ms: i64 = 25_000;
+/// The connection deadline while a /pair/wait is held: the hold plus
+/// room to send the answer.
+const pair_wait_slack_ms: i64 = 5_000;
+/// Waiting pages remembered (by request token) for the long poll.
+const pair_seen_slots = 2 * devices.max_requests;
 /// Per-WebSocket input limits (messages and bytes per second, with bursts
 /// twice that). Answering prompts needs a few per second; more is dropped.
 pub const input_msgs_per_s = 40;
@@ -272,30 +281,7 @@ pub const LogLimiter = struct {
     }
 };
 
-/// Token bucket in milli-units: `rate` per second, holding at most `burst`.
-pub const Bucket = struct {
-    rate: i64,
-    burst: i64,
-    level_m: i64,
-    last_ms: ?i64 = null,
-
-    pub fn init(rate: i64, burst: i64) Bucket {
-        return .{ .rate = rate, .burst = burst, .level_m = burst * 1000 };
-    }
-
-    fn refill(b: *Bucket, now_ms: i64) void {
-        if (b.last_ms) |last| {
-            // A clock that went back refills nothing; a long gap refills fully.
-            const dt = std.math.clamp(now_ms -| last, 0, 3_600_000);
-            b.level_m = @min(b.burst * 1000, b.level_m +| dt *| b.rate);
-        }
-        b.last_ms = now_ms;
-    }
-
-    fn has(b: *const Bucket, n: i64) bool {
-        return b.level_m >= n *| 1000;
-    }
-};
+const Bucket = @import("bucket.zig").Bucket;
 
 /// Per-connection input limit: a message must fit both buckets.
 pub const InputLimit = struct {
@@ -307,9 +293,7 @@ pub const InputLimit = struct {
         l.bytes.refill(now_ms);
         const n: i64 = @intCast(len);
         if (!l.msgs.has(1) or !l.bytes.has(n)) return false;
-        l.msgs.level_m -= 1000;
-        l.bytes.level_m -= n * 1000;
-        return true;
+        return l.msgs.take(1) and l.bytes.take(n);
     }
 };
 
@@ -379,6 +363,11 @@ pub const Server = struct {
 
     auth_mutex: Io.Mutex = .init,
     sessions: auth.Sessions = .{},
+    /// Guarded by auth_mutex. Device records whose sessions were ended
+    /// because the record itself went away, and why: what a WebSocket's
+    /// {"t":"logout"} then says (`reason`). Memory only, oldest dropped.
+    ended: [ended_slots]?Ended = @splat(null),
+    ended_next: usize = 0,
 
     conn_mutex: Io.Mutex = .init,
     conns: ConnTable = .{},
@@ -404,6 +393,15 @@ pub const Server = struct {
     pair_view: ?devices.Pairing = null,
     /// A window whose `portal pair` process has exited: treated as closed.
     pair_dead_nonce: ?u64 = null,
+    /// Guarded by pair_mutex. Bumped whenever `pair_view` or
+    /// `pair_dead_nonce` is set; `pair_cond` is broadcast then, which ends
+    /// held GET /pair/wait long polls.
+    pair_gen: u64 = 0,
+    pair_cond: Io.Condition = .init,
+    /// Guarded by pair_mutex. Request tokens (hashed) that were already
+    /// answered "still waiting": their next GET /pair/wait is held.
+    pair_seen: [pair_seen_slots]?auth.Hash = @splat(null),
+    pair_seen_next: usize = 0,
     /// Times the pairing watcher woke up (for the wakeup measurement).
     pairwatch_wakes: std.atomic.Value(u32) = .init(0),
     /// Optional hook, like Session.notify_fn: called whenever the pairing
@@ -424,6 +422,29 @@ pub const Server = struct {
     /// Makes `run` return (the pairing-time download listener is stopped
     /// this way, together with cancelling its accept).
     stop: std.atomic.Value(bool) = .init(false),
+
+    /// Why a device record's sessions ended (docs/protocol.md section 3,
+    /// `logout`). `unpaired`: the record was removed (unpaired at the desk,
+    /// forgotten by the device, revoked): the device should forget this
+    /// desktop. `replaced`: another pairing under its name or address
+    /// replaced it: the device signs in again and learns from that
+    /// answer whether it is still paired.
+    pub const EndReason = enum { unpaired, replaced };
+    const Ended = struct { id: auth.DeviceId, reason: EndReason };
+    const ended_slots = 32;
+
+    /// Caller holds auth_mutex. The first reason recorded for `id` stays.
+    fn noteEnded(srv: *Server, id: auth.DeviceId, reason: EndReason) void {
+        if (srv.endedReason(id) != null) return;
+        srv.ended[srv.ended_next] = .{ .id = id, .reason = reason };
+        srv.ended_next = (srv.ended_next + 1) % ended_slots;
+    }
+
+    /// Caller holds auth_mutex.
+    fn endedReason(srv: *const Server, id: auth.DeviceId) ?EndReason {
+        for (srv.ended) |slot| if (slot) |e| if (std.mem.eql(u8, &e.id, &id)) return e.reason;
+        return null;
+    }
 
     fn cookieName(srv: *const Server) []const u8 {
         return http_names.cookieName(.session, srv.cfg.secure_cookie);
@@ -479,13 +500,18 @@ pub const Server = struct {
         for (&srv.conn_wake) |*e| e.set(srv.io);
     }
 
+    /// `lim.check` under `note_mutex`: the number of suppressed lines if
+    /// this one should be logged, else null.
+    fn limited(srv: *Server, lim: *LogLimiter, interval_ms: i64) ?u32 {
+        srv.note_mutex.lockUncancelable(srv.io);
+        defer srv.note_mutex.unlock(srv.io);
+        return lim.check(srv.nowMs(), interval_ms);
+    }
+
     /// Logs a line a peer can cause before signing in, at most `lim.burst`
     /// per interval, noting how many were suppressed.
     fn notePreAuth(srv: *Server, lim: *LogLimiter, comptime fmt: []const u8, args: anytype) void {
-        srv.note_mutex.lockUncancelable(srv.io);
-        const n = lim.check(srv.nowMs(), pre_auth_log_interval_ms);
-        srv.note_mutex.unlock(srv.io);
-        const suppressed = n orelse return;
+        const suppressed = srv.limited(lim, pre_auth_log_interval_ms) orelse return;
         if (suppressed == 0) {
             srv.log.print(fmt, args);
         } else {
@@ -500,11 +526,15 @@ pub const Server = struct {
     pub fn setPairing(srv: *Server, p: ?devices.Pairing) void {
         srv.pair_mutex.lockUncancelable(srv.io);
         srv.pair_view = p;
+        srv.pair_gen +%= 1;
         srv.pair_mutex.unlock(srv.io);
         srv.notifyPairing();
     }
 
+    /// The pairing view may have changed: held /pair/wait long polls
+    /// re-check, and the Portal window's hook runs.
     fn notifyPairing(srv: *Server) void {
+        srv.pair_cond.broadcast(srv.io);
         if (srv.pairing_notify_fn) |f| if (srv.pairing_notify_ctx) |c| f(c);
     }
 
@@ -512,8 +542,51 @@ pub const Server = struct {
     pub fn pairingProcessGone(srv: *Server, nonce: u64) void {
         srv.pair_mutex.lockUncancelable(srv.io);
         srv.pair_dead_nonce = nonce;
+        srv.pair_gen +%= 1;
         srv.pair_mutex.unlock(srv.io);
         srv.notifyPairing();
+    }
+
+    const PairWaitView = struct {
+        view: ?devices.Pairing,
+        gen: u64,
+        /// This request token was already answered "still waiting".
+        seen: bool,
+    };
+
+    /// `pairingSnapshot` plus what a held /pair/wait needs, in one look.
+    fn pairWaitView(srv: *Server, now_s: i64, token: auth.Hash) PairWaitView {
+        const view = srv.pairingSnapshot(now_s);
+        srv.pair_mutex.lockUncancelable(srv.io);
+        defer srv.pair_mutex.unlock(srv.io);
+        var seen = false;
+        for (srv.pair_seen) |s| if (s) |h| {
+            seen = seen or std.crypto.timing_safe.eql(auth.Hash, h, token);
+        };
+        return .{ .view = view, .gen = srv.pair_gen, .seen = seen };
+    }
+
+    fn markPairSeen(srv: *Server, token: auth.Hash) void {
+        srv.pair_mutex.lockUncancelable(srv.io);
+        defer srv.pair_mutex.unlock(srv.io);
+        for (srv.pair_seen) |s| if (s) |h| if (std.crypto.timing_safe.eql(auth.Hash, h, token)) return;
+        srv.pair_seen[srv.pair_seen_next] = token;
+        srv.pair_seen_next = (srv.pair_seen_next + 1) % srv.pair_seen.len;
+    }
+
+    /// Blocks until the pairing view changes from generation `gen`, or
+    /// `ms` pass. Cancelable: the connection's supervisor can always end
+    /// it (error.Canceled is returned, never swallowed).
+    fn waitPairChange(srv: *Server, gen: u64, ms: i64) Io.Cancelable!void {
+        const timeout: Io.Timeout = (Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(@max(ms, 1)), .clock = .awake } }).toDeadline(srv.io);
+        srv.pair_mutex.lockUncancelable(srv.io);
+        defer srv.pair_mutex.unlock(srv.io);
+        while (srv.pair_gen == gen) {
+            srv.pair_cond.waitTimeout(srv.io, &srv.pair_mutex, timeout) catch |err| switch (err) {
+                error.Timeout => return,
+                error.Canceled => return error.Canceled,
+            };
+        }
     }
 
     // ------------------------------------------- desk approval, in-process
@@ -546,7 +619,7 @@ pub const Server = struct {
         var b: [8]u8 = undefined;
         try srv.io.randomSecure(&b);
         const nonce = std.mem.readInt(u64, &b, .little) | 1;
-        _ = try srv.desk().begin(name, window_s, nonce, GetCurrentProcessId());
+        _ = try srv.desk().begin(name, window_s, nonce, win32.GetCurrentProcessId());
         srv.log.print("pairing window opened for '{s}' ({d} s) from the Portal window", .{ name, window_s });
         srv.refreshPairing();
         return nonce;
@@ -593,11 +666,13 @@ pub const Server = struct {
     pub fn applyStore(srv: *Server, st: *const devices.Store, read_start_ms: i64) void {
         srv.setPairing(st.pairing);
         srv.auth_mutex.lockUncancelable(srv.io);
+        var ended: [auth.Sessions.max_sessions]auth.DeviceId = undefined;
         const n = srv.sessions.revokeUnpaired(read_start_ms, st, struct {
-            fn paired(s: *const devices.Store, tag: []const u8) bool {
-                return s.find(tag) != null;
+            fn paired(s: *const devices.Store, id: auth.DeviceId) bool {
+                return s.findId(id) != null;
             }
-        }.paired);
+        }.paired, &ended);
+        for (ended[0..n]) |id| srv.noteEnded(id, .unpaired);
         srv.auth_mutex.unlock(srv.io);
         if (n > 0) {
             srv.log.print("ended {d} session(s) of devices that are no longer paired", .{n});
@@ -647,12 +722,13 @@ pub const Server = struct {
         if (!std.mem.eql(u8, req.path, "/sync/key") and !std.mem.eql(u8, req.path, "/sync/index") and
             !std.mem.startsWith(u8, req.path, "/sync/pkg/")) return srv.fail(conn, w, .not_found, "not found\n");
         const cookie = h.cookie orelse return srv.fail(conn, w, .unauthorized, "login required\n");
-        var tag_buf: [auth.Sessions.max_tag]u8 = undefined;
-        const device = blk: {
-            srv.auth_mutex.lockUncancelable(srv.io);
-            defer srv.auth_mutex.unlock(srv.io);
-            break :blk srv.sessions.liveTag(cookie, srv.realMs(), true, &tag_buf);
-        } orelse return srv.fail(conn, w, .unauthorized, "login required\n");
+        const who = srv.sessionOwner(cookie, true);
+        const owner = switch (who) {
+            .none => return srv.fail(conn, w, .unauthorized, "login required\n"),
+            .anonymous => return srv.fail(conn, w, .forbidden, "not a paired device\n"),
+            .device => |d| d,
+        };
+        const device = owner.name();
         if (!devices.validName(device)) return srv.fail(conn, w, .forbidden, "not a paired device\n");
         const key = srv.cfg.sync_key orelse return srv.fail(conn, w, .not_found, "not found\n");
         const paths: sync.Paths = .{ .dir = srv.cfg.devices.dir };
@@ -946,10 +1022,7 @@ pub const Server = struct {
             error.EndOfStream, error.ReadFailed, error.WriteFailed => return,
             else => {},
         }
-        srv.note_mutex.lockUncancelable(srv.io);
-        const n = srv.tls_fail_log.check(srv.nowMs(), 10_000);
-        srv.note_mutex.unlock(srv.io);
-        const suppressed = n orelse return;
+        const suppressed = srv.limited(&srv.tls_fail_log, 10_000) orelse return;
         var abuf: [64]u8 = undefined;
         // Never `{t}` a peer-supplied alert: it may have no name.
         const alert: []const u8 = if (diag.received_alert) |a|
@@ -1090,10 +1163,7 @@ pub const Server = struct {
     }
 
     fn noteHostRejected(srv: *Server, peer: []const u8, host: ?[]const u8) void {
-        srv.note_mutex.lockUncancelable(srv.io);
-        const n = srv.host_reject_log.check(srv.nowMs(), 10_000);
-        srv.note_mutex.unlock(srv.io);
-        const suppressed = n orelse return;
+        const suppressed = srv.limited(&srv.host_reject_log, 10_000) orelse return;
         const h = host orelse "(none)";
         srv.log.print("rejected request from {s}: Host '{s}' not allowed ({d} more since last report)", .{
             peer, h[0..@min(h.len, 80)], suppressed,
@@ -1155,6 +1225,7 @@ pub const Server = struct {
                     return srv.deviceSignIn(conn, w, req, d, .api);
                 }
                 if (std.mem.eql(u8, path, "/logout")) return srv.logout(conn, w, req, h);
+                if (std.mem.eql(u8, path, "/device/forget")) return srv.deviceForget(conn, w, h);
             },
             .other => return srv.fail(conn, w, .method_not_allowed, "method not allowed\n"),
         }
@@ -1258,6 +1329,8 @@ pub const Server = struct {
         const view = srv.pairingSnapshot(srv.nowUnix());
         const msg: []const u8 = if (std.mem.eql(u8, q, "e=closed"))
             "<p class=\"error\">No pairing window is open. Open one at the desktop first (see below).</p>"
+        else if (std.mem.eql(u8, q, "e=gone"))
+            "<p class=\"error\">This device is no longer paired with this desktop (it was unpaired at the desk, or forgot this desktop). Pair it again at the desktop.</p>"
         else if (std.mem.eql(u8, q, "e=revoked"))
             "<p class=\"error\">This device's credential was used from somewhere else, so it was revoked. Pair it again at the desktop.</p>"
         else if (std.mem.eql(u8, q, "e=denied"))
@@ -1288,10 +1361,13 @@ pub const Server = struct {
     }
 
     /// The device's page while its request waits for the desk: shows the
-    /// request code the desk sees and reloads itself (no script).
+    /// request code the desk sees and reloads itself at once, with no
+    /// script. That reload is a held GET /pair/wait (the long poll in
+    /// `pairWait`), so the browser keeps showing this page until the desk
+    /// answers; it is not a timer.
     fn pairWaitPage(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, view: *const devices.Pairing, r: *const devices.Request) !bool {
-        var head_buf: [96]u8 = undefined;
-        const head = try std.fmt.bufPrint(&head_buf, "<meta http-equiv=\"refresh\" content=\"{d}\">", .{pair_wait_refresh_s});
+        srv.markPairSeen(r.token);
+        const head = "<meta http-equiv=\"refresh\" content=\"0\">";
         var fp_buf: [256]u8 = undefined;
         var action_buf: [1024]u8 = undefined;
         // Name, address and code are validated by devices.zig ([a-z0-9-],
@@ -1372,17 +1448,18 @@ pub const Server = struct {
         session: []const u8 = "",
     };
 
-    /// Builds Set-Cookie values for a device credential and a new session.
-    fn issueCookies(srv: *Server, name: []const u8, device_secret: []const u8, out: *CookiePair) !void {
+    /// Builds Set-Cookie values for a device credential and a new session
+    /// of device record `device`.
+    fn issueCookies(srv: *Server, device: auth.Device, device_secret: []const u8, out: *CookiePair) !void {
         var session_val: [auth.encoded_len]u8 = undefined;
         try srv.newSecret(&session_val);
         defer std.crypto.secureZero(u8, &session_val);
         srv.auth_mutex.lockUncancelable(srv.io);
-        srv.sessions.createTagged(&session_val, srv.realMs(), name);
+        srv.sessions.createFor(&session_val, srv.realMs(), device);
         srv.auth_mutex.unlock(srv.io);
         const secure = if (srv.cfg.secure_cookie) "; Secure" else "";
         out.device = try std.fmt.bufPrint(&out.device_buf, "{s}={s}.{s}; Path=/; HttpOnly; SameSite=Strict; Max-Age={d}{s}", .{
-            srv.deviceCookieName(), name, device_secret, devices.unused_expiry_s, secure,
+            srv.deviceCookieName(), device.name(), device_secret, devices.unused_expiry_s, secure,
         });
         out.session = try std.fmt.bufPrint(&out.session_buf, "{s}={s}; Path=/; HttpOnly; SameSite=Strict; Max-Age={d}{s}", .{
             srv.cookieName(), &session_val, @divTrunc(srv.sessions.absolute_timeout_ms, 1000), secure,
@@ -1404,6 +1481,98 @@ pub const Server = struct {
 
     fn noteStoreFailure(srv: *Server, what: []const u8, peer: []const u8, err: anyerror) void {
         srv.notePreAuth(&srv.store_log, "{s} from {s} failed: {t}: {s}", .{ what, peer, err, devices.describeError(err) });
+    }
+
+    /// Who session `cookie` belongs to (memory only).
+    fn sessionOwner(srv: *Server, cookie: []const u8, refresh: bool) auth.Sessions.Live {
+        srv.auth_mutex.lockUncancelable(srv.io);
+        defer srv.auth_mutex.unlock(srv.io);
+        return srv.sessions.live(cookie, srv.realMs(), refresh);
+    }
+
+    /// Ends every session of device record `id` (which the store no longer
+    /// has, for `reason`) and wakes every viewer and supervisor so open
+    /// WebSockets of it are told (`logout` with the reason) and close.
+    /// Returns how many sessions ended.
+    fn endDeviceSessions(srv: *Server, id: auth.DeviceId, reason: EndReason) usize {
+        srv.auth_mutex.lockUncancelable(srv.io);
+        const n = srv.sessions.revokeDevice(id);
+        srv.noteEnded(id, reason);
+        srv.auth_mutex.unlock(srv.io);
+        srv.wakeViewers();
+        return n;
+    }
+
+    /// The {"t":"logout"} message for a session that is no longer live.
+    fn logoutMessage(srv: *Server, device: ?auth.Device) []const u8 {
+        const d = device orelse return "{\"t\":\"logout\"}";
+        srv.auth_mutex.lockUncancelable(srv.io);
+        defer srv.auth_mutex.unlock(srv.io);
+        return switch (srv.endedReason(d.id) orelse return "{\"t\":\"logout\"}") {
+            .unpaired => "{\"t\":\"logout\",\"reason\":\"unpaired\"}",
+            .replaced => "{\"t\":\"logout\",\"reason\":\"replaced\"}",
+        };
+    }
+
+    /// A stale or wrong credential was presented: the store already
+    /// removed the record; end its sessions and say so.
+    fn deviceRevoked(srv: *Server, gone: auth.Device, peer: []const u8) void {
+        const n = srv.endDeviceSessions(gone.id, .unpaired);
+        srv.log.print("DEVICE REVOKED '{s}': stale or wrong credential presented from {s} (copied credential?); {d} session(s) ended. Re-pair required.", .{ gone.name(), peer, n });
+    }
+
+    const CredentialUse = enum { sign_in, unpair };
+
+    const CredentialCheck = struct {
+        outcome: SignInOutcome = .unknown,
+        /// The record signed in to, removed (unpair) or revoked.
+        device: ?auth.Device = null,
+    };
+
+    /// One locked store update for a presented `<name>.<secret>` device
+    /// credential from `ip`: verified against the record's bound address;
+    /// valid ones rotate to `new_hash` (sign-in) or remove the record
+    /// (unpair); a stale or wrong secret revokes the record (see
+    /// devices.zig). Callers report `.revoked` with `deviceRevoked`.
+    fn checkCredential(srv: *Server, presented: []const u8, ip: []const u8, use: CredentialUse, new_hash: auth.Hash) !CredentialCheck {
+        var res: CredentialCheck = .{};
+        const now = srv.nowUnix();
+        const Ctx = struct { presented: []const u8, ip: []const u8, use: CredentialUse, hash: auth.Hash, now: i64, res: *CredentialCheck };
+        try devices.withStore(srv.gpa, srv.io, srv.cfg.devices, now, Ctx{
+            .presented = presented,
+            .ip = ip,
+            .use = use,
+            .hash = new_hash,
+            .now = now,
+            .res = &res,
+        }, struct {
+            fn op(c: Ctx, st: *devices.Store) !bool {
+                switch (st.authenticate(c.presented, c.ip, c.now)) {
+                    .ok => |idx| {
+                        c.res.* = .{ .outcome = .ok, .device = st.devices[idx].?.ref() };
+                        switch (c.use) {
+                            .sign_in => st.rotate(idx, c.hash, c.now),
+                            .unpair => st.devices[idx] = null,
+                        }
+                        return true;
+                    },
+                    .revoked => |d| {
+                        c.res.* = .{ .outcome = .revoked, .device = d };
+                        return true;
+                    },
+                    .wrong_address => {
+                        c.res.outcome = .wrong_address;
+                        return false;
+                    },
+                    .gone => {
+                        c.res.outcome = .gone;
+                        return false;
+                    },
+                    .unknown => return false,
+                }
+            }
+        }.op);
+        return res;
     }
 
     /// POST /pair: registers a pairing request from this device's address,
@@ -1479,148 +1648,128 @@ pub const Server = struct {
         return srv.redirect(conn, w, req, "/pair/wait", &.{cookie});
     }
 
-    /// GET /pair/wait: the requesting device asks for its outcome (its page
-    /// reloads itself). Pending: the waiting page. Approved at the desk:
-    /// the device credential and a session, once, to the same address and
-    /// request token only. Denied or gone: back to /pair with the reason.
+    /// GET /pair/wait: the requesting device asks for its outcome. A long
+    /// poll (docs/protocol.md section 1):
+    ///   * Pending, first ask with this request token: the waiting page at
+    ///     once (it carries the request code, also as X-Portal-Request-Code).
+    ///   * Pending, asked again: held until the pairing window changes
+    ///     (a request answered, the window closed or replaced, its
+    ///     `portalctl pair` gone, its expiry) or `pair_wait_hold_ms`
+    ///     pass, then answered exactly like a fresh ask: the outcome
+    ///     below, or the same waiting page if still pending. Clients
+    ///     re-ask at once; there is no poll interval.
+    ///   * Approved at the desk: the device credential and a session, once,
+    ///     to the same address and request token only.
+    ///   * Denied or gone: back to /pair with the reason.
     fn pairWait(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, h: Headers) !bool {
         const peer = conn.peer();
         const ip = devices.ipOnly(peer);
-        const now = srv.nowUnix();
         var clear_buf: [128]u8 = undefined;
         const clear = try srv.clearPairReq(&clear_buf);
         const tok = h.pairreq orelse return srv.redirect(conn, w, req, "/pair?e=expired", &.{});
         const tok_hash = auth.hashSecret(tok);
-        const view = srv.pairingSnapshot(now) orelse return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear});
-        const i = view.findToken(tok_hash) orelse return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear});
-        const r = view.requests[i].?;
-        if (!std.mem.eql(u8, r.ip.get(), ip)) return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear});
+        const hold_until = srv.nowMs() +| pair_wait_hold_ms;
+        var now: i64 = undefined;
+        var view: devices.Pairing = undefined;
+        var r: devices.Request = undefined;
+        while (true) {
+            now = srv.nowUnix();
+            const look = srv.pairWaitView(now, tok_hash);
+            view = look.view orelse return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear});
+            const i = view.findToken(tok_hash) orelse return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear});
+            r = view.requests[i].?;
+            if (!std.mem.eql(u8, r.ip.get(), ip)) return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear});
+            if (r.state != .pending) break;
+            const left = @min(hold_until -| srv.nowMs(), (view.expires -| now +| 1) *| 1000);
+            if (!look.seen or left <= 0) return srv.pairWaitPage(conn, w, req, &view, &r);
+            // Hold. The window's expiry and every change to it bump the
+            // generation (the pairing watcher re-reads the store at the
+            // expiry), so this sleeps until something can have changed.
+            conn.setDeadline(srv.nowMs() +| left +| pair_wait_slack_ms);
+            try srv.waitPairChange(look.gen, left);
+        }
         switch (r.state) {
-            .pending => return srv.pairWaitPage(conn, w, req, &view, &r),
+            .pending => unreachable, // the loop above answers those
             .denied => return srv.redirect(conn, w, req, "/pair?e=denied", &.{clear}),
             .done => return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear}),
             .approved => {},
         }
 
-        // Approved at the desk: collect the credential.
+        // Approved at the desk: collect the credential, as a new device
+        // record with a new random id.
         var secret: [auth.encoded_len]u8 = undefined;
         srv.newSecret(&secret) catch return srv.fail(conn, w, .internal_server_error, "no entropy\n");
         defer std.crypto.secureZero(u8, &secret);
-        const Outcome = enum { pending, denied, unknown, paired };
-        var outcome: Outcome = .unknown;
-        var name_buf: [devices.max_name]u8 = undefined;
-        var name_len: usize = 0;
-        const Ctx = struct { srv: *Server, token: auth.Hash, ip: []const u8, hash: auth.Hash, now: i64, outcome: *Outcome, name: *[devices.max_name]u8, len: *usize };
+        var new_id: auth.DeviceId = undefined;
+        srv.io.randomSecure(&new_id) catch return srv.fail(conn, w, .internal_server_error, "no entropy\n");
+        var result: devices.ClaimResult = .unknown;
+        const Ctx = struct { srv: *Server, token: auth.Hash, ip: []const u8, id: auth.DeviceId, hash: auth.Hash, now: i64, result: *devices.ClaimResult };
         devices.withStore(srv.gpa, srv.io, srv.cfg.devices, now, Ctx{
             .srv = srv,
             .token = tok_hash,
             .ip = ip,
+            .id = new_id,
             .hash = auth.hashSecret(&secret),
             .now = now,
-            .outcome = &outcome,
-            .name = &name_buf,
-            .len = &name_len,
+            .result = &result,
         }, struct {
             fn op(c: Ctx, st: *devices.Store) !bool {
                 defer c.srv.setPairing(st.pairing);
-                switch (try st.claim(c.token, c.ip, c.hash, c.now)) {
-                    .paired => |n| {
-                        @memcpy(c.name[0..n.len], n);
-                        c.len.* = n.len;
-                        c.outcome.* = .paired;
-                        return true;
-                    },
-                    .pending => c.outcome.* = .pending,
-                    .denied => c.outcome.* = .denied,
-                    .unknown => c.outcome.* = .unknown,
-                }
-                return false;
+                c.result.* = try st.claim(c.token, c.ip, c.id, c.hash, c.now);
+                return c.result.* == .paired;
             }
         }.op) catch |err| {
             srv.noteStoreFailure("pairing", peer, err);
             return srv.fail(conn, w, .internal_server_error, if (err == error.TooManyDevices) "too many paired devices: unpair one at the desk\n" else "device store unavailable\n");
         };
-        switch (outcome) {
-            .paired => {},
+        const paired = switch (result) {
+            .paired => |p| p,
             .pending => return srv.pairWaitPage(conn, w, req, &view, &r),
             .denied => return srv.redirect(conn, w, req, "/pair?e=denied", &.{clear}),
             .unknown => return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear}),
+        };
+        // Re-pair: the records this one replaced are gone from the store;
+        // end every one of their sessions (and so their WebSockets, input
+        // and /sync access) before the new credential exists.
+        for (paired.replaced.items()) |old| {
+            const n = srv.endDeviceSessions(old.id, .replaced);
+            srv.log.print("re-pair: previous device record '{s}' removed; {d} of its session(s) ended", .{ old.name(), n });
         }
-        const name = name_buf[0..name_len];
-        srv.log.print("PAIRED device '{s}' at {s} (request {s}, approved at the desk)", .{ name, ip, &r.code });
+        srv.log.print("PAIRED device '{s}' at {s} (request {s}, approved at the desk)", .{ paired.device.name(), ip, &r.code });
         var cookies: CookiePair = .{};
-        try srv.issueCookies(name, &secret, &cookies);
+        try srv.issueCookies(paired.device, &secret, &cookies);
         return srv.redirect(conn, w, req, "/", &.{ cookies.device, cookies.session, clear });
     }
 
     const SignInMode = enum { page, api };
-    const SignInOutcome = enum { ok, wrong_address, revoked, unknown };
+    const SignInOutcome = enum { ok, wrong_address, revoked, gone, unknown };
+
+    /// On a refused native sign-in (`POST /auth/refresh`) and
+    /// `POST /device/forget`: says, unambiguously, that this desktop no
+    /// longer has the device (its record was removed, or its credential
+    /// matches no record). A device that gets it forgets this desktop.
+    /// Never sent for a store error (500) or a known device presented from
+    /// another address.
+    const device_gone_header: http1.Header = .{ .name = "x-portal-device", .value = "gone" };
 
     /// A paired device presents its credential: verify it against the
     /// device's bound address, rotate it, and start a session. A stale or
     /// wrong secret revokes the device (see devices.zig).
     fn deviceSignIn(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, presented: []const u8, mode: SignInMode) !bool {
         const peer = conn.peer();
-        const ip = devices.ipOnly(peer);
         var secret: [auth.encoded_len]u8 = undefined;
         srv.newSecret(&secret) catch return srv.fail(conn, w, .internal_server_error, "no entropy\n");
         defer std.crypto.secureZero(u8, &secret);
 
-        var outcome: SignInOutcome = .unknown;
-        var name_buf: [devices.max_name]u8 = undefined;
-        var name_len: usize = 0;
-        const now = srv.nowUnix();
-        const Ctx = struct {
-            presented: []const u8,
-            ip: []const u8,
-            hash: auth.Hash,
-            now: i64,
-            outcome: *SignInOutcome,
-            name: *[devices.max_name]u8,
-            len: *usize,
-        };
-        devices.withStore(srv.gpa, srv.io, srv.cfg.devices, now, Ctx{
-            .presented = presented,
-            .ip = ip,
-            .hash = auth.hashSecret(&secret),
-            .now = now,
-            .outcome = &outcome,
-            .name = &name_buf,
-            .len = &name_len,
-        }, struct {
-            fn op(c: Ctx, st: *devices.Store) !bool {
-                switch (st.authenticate(c.presented, c.ip, c.now)) {
-                    .ok => |idx| {
-                        const n = st.devices[idx].?.name.get();
-                        @memcpy(c.name[0..n.len], n);
-                        c.len.* = n.len;
-                        st.rotate(idx, c.hash, c.now);
-                        c.outcome.* = .ok;
-                        return true;
-                    },
-                    .revoked => |n| {
-                        const m = @min(n.len, devices.max_name);
-                        @memcpy(c.name[0..m], n[0..m]);
-                        c.len.* = m;
-                        c.outcome.* = .revoked;
-                        return true;
-                    },
-                    .wrong_address => {
-                        c.outcome.* = .wrong_address;
-                        return false;
-                    },
-                    .unknown => return false,
-                }
-            }
-        }.op) catch |err| {
+        const res = srv.checkCredential(presented, devices.ipOnly(peer), .sign_in, auth.hashSecret(&secret)) catch |err| {
             srv.noteStoreFailure("device sign-in", peer, err);
             return srv.fail(conn, w, .internal_server_error, "device store unavailable\n");
         };
-        const name = name_buf[0..name_len];
+        const outcome = res.outcome;
         switch (outcome) {
             .ok => {
                 var cookies: CookiePair = .{};
-                try srv.issueCookies(name, &secret, &cookies);
+                try srv.issueCookies(res.device.?, &secret, &cookies);
                 switch (mode) {
                     .page => return srv.redirect(conn, w, req, "/", &.{ cookies.device, cookies.session }),
                     .api => {
@@ -1633,24 +1782,72 @@ pub const Server = struct {
                     },
                 }
             },
-            .revoked => {
-                srv.auth_mutex.lockUncancelable(srv.io);
-                srv.sessions.revokeTag(name);
-                srv.auth_mutex.unlock(srv.io);
-                srv.wakeViewers();
-                srv.log.print("DEVICE REVOKED '{s}': stale or wrong credential presented from {s} (copied credential?). Re-pair required.", .{ name, peer });
-            },
+            .revoked => srv.deviceRevoked(res.device.?, peer),
             // Logged here only: the response is the same for both, so a
             // peer can't use it to learn which device names exist.
             .wrong_address => srv.notePreAuth(&srv.signin_log, "device credential presented from unexpected address {s}; rejected", .{peer}),
+            .gone => srv.notePreAuth(&srv.signin_log, "credential of a removed device presented from {s}; told it is no longer paired", .{peer}),
             .unknown => srv.notePreAuth(&srv.signin_log, "device credential from {s} matches no paired device; rejected", .{peer}),
         }
         var clear_buf: [2][128]u8 = undefined;
         const clear = try srv.clearCookies(&clear_buf);
         switch (mode) {
-            .page => return srv.redirect(conn, w, req, if (outcome == .revoked) "/pair?e=revoked" else "/pair", &clear),
-            .api => return srv.fail(conn, w, .unauthorized, "not paired\n"),
+            .page => return srv.redirect(conn, w, req, switch (outcome) {
+                .revoked => "/pair?e=revoked",
+                .gone => "/pair?e=gone",
+                else => "/pair",
+            }, &clear),
+            .api => {
+                const gone = [_]http1.Header{device_gone_header};
+                try srv.respond(conn, w, .unauthorized, "not paired\n", "text/plain; charset=utf-8", if (outcome == .wrong_address) &.{} else &gone, false);
+                return false;
+            },
         }
+    }
+
+    /// POST /device/forget: the device forgets this desktop ("Forget this
+    /// desktop" in portal connect, `connect --forget`, `sync-device
+    /// --forget`) and asks it to forget the device too. The device is the
+    /// one its live session belongs to (never anything in the request):
+    /// its record is removed (secrets kept as tombstones), all its
+    /// sessions end (WebSockets get logout/unpaired), and the desk's
+    /// Devices panel refreshes. 204 when done; 401 with
+    /// `X-Portal-Device: gone` without a live device session.
+    fn deviceForget(srv: *Server, conn: *Conn, w: *Io.Writer, h: Headers) !bool {
+        const peer = conn.peer();
+        const gone = [_]http1.Header{device_gone_header};
+        const cookie = h.cookie orelse {
+            try srv.respond(conn, w, .unauthorized, "login required\n", "text/plain; charset=utf-8", &.{}, false);
+            return false;
+        };
+        const d = switch (srv.sessionOwner(cookie, false)) {
+            .device => |d| d,
+            .anonymous => return srv.fail(conn, w, .forbidden, "not a paired device\n"),
+            .none => {
+                // No live session: it may have ended because the device
+                // is gone; the device signs in to find out.
+                try srv.respond(conn, w, .unauthorized, "login required\n", "text/plain; charset=utf-8", &.{}, false);
+                return false;
+            },
+        };
+        var removed = false;
+        const Ctx = struct { id: auth.DeviceId, removed: *bool };
+        devices.withStore(srv.gpa, srv.io, srv.cfg.devices, srv.nowUnix(), Ctx{ .id = d.id, .removed = &removed }, struct {
+            fn op(c: Ctx, st: *devices.Store) !bool {
+                c.removed.* = st.removeId(c.id);
+                return c.removed.*;
+            }
+        }.op) catch |err| {
+            srv.noteStoreFailure("forget", peer, err);
+            return srv.fail(conn, w, .internal_server_error, "device store unavailable: the device was NOT forgotten\n");
+        };
+        const n = srv.endDeviceSessions(d.id, .unpaired);
+        srv.log.print("device '{s}' forgot this desktop from {s}: its record was removed{s}; {d} session(s) ended", .{
+            d.name(), peer, if (removed) "" else " (already gone)", n,
+        });
+        srv.notifyPairing(); // the desk's Devices panel re-reads the list
+        try srv.respond(conn, w, .no_content, "", "text/plain; charset=utf-8", &gone, false);
+        return false;
     }
 
     /// POST /logout ("Unpair this device"): removes the device and its
@@ -1658,80 +1855,48 @@ pub const Server = struct {
     /// identifies the device (checked like a sign-in, then removed).
     fn logout(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, h: Headers) !bool {
         const peer = conn.peer();
-        var tag_buf: [auth.Sessions.max_tag]u8 = undefined;
-        var name: []const u8 = "";
+        // A live session names its device record exactly (by id): remove
+        // that record only, so a newer pairing under the same name stays.
+        var owner: ?auth.Device = null;
         if (h.cookie) |c| {
             srv.auth_mutex.lockUncancelable(srv.io);
-            name = srv.sessions.liveTag(c, srv.realMs(), false, &tag_buf) orelse "";
+            owner = srv.sessions.liveDevice(c, srv.realMs(), false);
             srv.sessions.revoke(c);
             srv.auth_mutex.unlock(srv.io);
         }
-        const Outcome = enum { none, removed, revoked };
-        var outcome: Outcome = .none;
-        var name_buf: [devices.max_name]u8 = undefined;
-        var name_len: usize = 0;
-        const Ctx = struct { name: []const u8, device: ?[]const u8, ip: []const u8, now: i64, outcome: *Outcome, out: *[devices.max_name]u8, len: *usize };
-        devices.withStore(srv.gpa, srv.io, srv.cfg.devices, srv.nowUnix(), Ctx{
-            .name = name,
-            .device = h.device,
-            .ip = devices.ipOnly(peer),
-            .now = srv.nowUnix(),
-            .outcome = &outcome,
-            .out = &name_buf,
-            .len = &name_len,
-        }, struct {
-            fn op(c: Ctx, st: *devices.Store) !bool {
-                if (c.name.len > 0) {
-                    const n = @min(c.name.len, devices.max_name);
-                    @memcpy(c.out[0..n], c.name[0..n]);
-                    c.len.* = n;
-                    _ = st.remove(c.name); // already gone counts as unpaired too
-                    c.outcome.* = .removed;
-                    return true;
+        var res: CredentialCheck = .{};
+        if (owner) |d| {
+            devices.withStore(srv.gpa, srv.io, srv.cfg.devices, srv.nowUnix(), d.id, struct {
+                fn op(id: auth.DeviceId, st: *devices.Store) !bool {
+                    return st.removeId(id); // already gone counts as unpaired too
                 }
-                const d = c.device orelse return false;
-                switch (st.authenticate(d, c.ip, c.now)) {
-                    .ok => |idx| {
-                        const n = st.devices[idx].?.name.get();
-                        @memcpy(c.out[0..n.len], n);
-                        c.len.* = n.len;
-                        st.devices[idx] = null;
-                        c.outcome.* = .removed;
-                        return true;
-                    },
-                    .revoked => |n| {
-                        const m = @min(n.len, devices.max_name);
-                        @memcpy(c.out[0..m], n[0..m]);
-                        c.len.* = m;
-                        c.outcome.* = .revoked;
-                        return true;
-                    },
-                    .wrong_address, .unknown => return false,
-                }
-            }
-        }.op) catch |err| {
-            srv.noteStoreFailure("unpair", peer, err);
-            return srv.fail(conn, w, .internal_server_error, "device store unavailable: the device was NOT unpaired\n");
-        };
-        const removed_name = name_buf[0..name_len];
-        if (removed_name.len > 0) {
-            srv.auth_mutex.lockUncancelable(srv.io);
-            srv.sessions.revokeTag(removed_name);
-            srv.auth_mutex.unlock(srv.io);
-            srv.wakeViewers();
+            }.op) catch |err| {
+                srv.noteStoreFailure("unpair", peer, err);
+                return srv.fail(conn, w, .internal_server_error, "device store unavailable: the device was NOT unpaired\n");
+            };
+            res = .{ .outcome = .ok, .device = d };
+        } else if (h.device) |presented| {
+            // No live session: the device credential identifies it
+            // (checked like a sign-in, then removed).
+            res = srv.checkCredential(presented, devices.ipOnly(peer), .unpair, undefined) catch |err| {
+                srv.noteStoreFailure("unpair", peer, err);
+                return srv.fail(conn, w, .internal_server_error, "device store unavailable: the device was NOT unpaired\n");
+            };
         }
         var clear_buf: [2][128]u8 = undefined;
         const clear = try srv.clearCookies(&clear_buf);
-        switch (outcome) {
-            .removed => {
-                srv.log.print("device '{s}' unpaired itself from {s}", .{ removed_name, peer });
+        switch (res.outcome) {
+            .ok => {
+                const d = res.device.?;
+                _ = srv.endDeviceSessions(d.id, .unpaired);
+                srv.log.print("device '{s}' unpaired itself from {s}", .{ d.name(), peer });
                 return srv.redirect(conn, w, req, "/pair?bye", &clear);
             },
             .revoked => {
-                srv.log.print("DEVICE REVOKED '{s}': stale or wrong credential presented from {s} (copied credential?). Re-pair required.", .{ removed_name, peer });
+                srv.deviceRevoked(res.device.?, peer);
                 return srv.redirect(conn, w, req, "/pair?e=revoked", &clear);
             },
-            .none => return srv.redirect(conn, w, req, "/pair", &clear),
+            .wrong_address, .gone, .unknown => return srv.redirect(conn, w, req, "/pair", &clear),
         }
     }
 
@@ -1745,8 +1910,8 @@ pub const Server = struct {
         close_sent: bool = false,
         dead: std.atomic.Value(bool) = .init(false),
         cookie: [auth.encoded_len]u8,
-        device: [auth.Sessions.max_tag]u8 = undefined,
-        device_len: u8 = 0,
+        /// The session's device record (null: an untagged session).
+        device: ?auth.Device = null,
         /// Reader only: per-connection input rate limit.
         limit: InputLimit = .{},
         /// Writer loop iterations (for the wakeup measurement in the log).
@@ -1801,11 +1966,9 @@ pub const Server = struct {
 
         var ws: WsConn = .{ .conn = conn, .w = w, .cookie = undefined };
         @memcpy(&ws.cookie, cookie);
-        {
-            srv.auth_mutex.lockUncancelable(srv.io);
-            defer srv.auth_mutex.unlock(srv.io);
-            const tag = srv.sessions.liveTag(cookie, srv.realMs(), false, &ws.device) orelse "";
-            ws.device_len = @intCast(tag.len);
+        switch (srv.sessionOwner(cookie, false)) {
+            .device => |d| ws.device = d,
+            else => {},
         }
         @memcpy(&conn.ws_cookie, cookie);
         conn.ws_active.store(true, .release);
@@ -1836,13 +1999,11 @@ pub const Server = struct {
         reader.cancel(srv.io);
     }
 
+    /// The console's title in `portalctl run --console` (a no-op in the
+    /// window, which titles itself the same way): title.zig.
     fn updateTitle(srv: *Server, viewers: u32) void {
-        var buf: [96]u8 = undefined;
-        const title = if (viewers == 0)
-            "Portal - no remote viewers"
-        else
-            std.fmt.bufPrint(&buf, "Portal - {d} REMOTE VIEWER{s} CONNECTED", .{ viewers, if (viewers == 1) "" else "S" }) catch "Portal";
-        srv.session.console.setTitle(title);
+        var buf: [title.max_title_bytes]u8 = undefined;
+        srv.session.console.setTitle(title.windowTitle(srv.session.project, viewers, &buf));
     }
 
     fn wsWriteLoop(srv: *Server, ws: *WsConn) void {
@@ -1853,7 +2014,7 @@ pub const Server = struct {
         var rows: std.ArrayList(u16) = .empty;
         defer rows.deinit(srv.gpa);
         // Inline images: 'I' blobs and 'P' placements (web_images.zig).
-        var images: web_images.Sender = .{ .last_ms = srv.nowMs() };
+        var images: web_images.Sender = .{};
         defer images.deinit(srv.gpa);
 
         var hello_buf: [256]u8 = undefined;
@@ -1861,7 +2022,7 @@ pub const Server = struct {
         if (!ws.send(srv, hello, .text)) return;
         // Sync announcements: {"t":"updates"} when this device's index
         // changes (devices also look on every connect).
-        const ws_device = ws.device[0..ws.device_len];
+        const ws_device: []const u8 = if (ws.device) |*d| d.name() else "";
         var sync_seen = srv.sync_gen.load(.acquire);
         var sync_digest = srv.syncDigestFor(ws_device);
 
@@ -1883,8 +2044,9 @@ pub const Server = struct {
             {
                 s.cond.waitTimeout(srv.io, &s.mutex, .{ .duration = .{
                     // Until the session expires, or sooner while an image
-                    // blob is waiting for this viewer's byte budget.
-                    .raw = .fromMilliseconds(if (images.pending) @min(expires_in, web_images.retry_ms) else expires_in),
+                    // blob waits for this viewer's byte budget: exactly
+                    // when the budget will have refilled enough for it.
+                    .raw = .fromMilliseconds(if (images.wait_ms) |ms| @min(expires_in, @max(ms, 1)) else expires_in),
                     .clock = .awake,
                 } }) catch |err| switch (err) {
                     error.Timeout => {},
@@ -1957,7 +2119,7 @@ pub const Server = struct {
             // ends its sessions and wakes this loop) ends the stream.
             // Checked on every wake; memory only.
             if (!srv.sessionLive(&ws.cookie, false)) {
-                _ = ws.send(srv, "{\"t\":\"logout\"}", .text);
+                _ = ws.send(srv, srv.logoutMessage(ws.device), .text);
                 return;
             }
             // Coalesce bursts of output into at most ~30 frames per second.
@@ -2049,7 +2211,7 @@ pub const Server = struct {
 
 /// `{"t":"hello","input":...}`, plus `"project"` when `portal run
 /// --project` was given (docs/protocol.md section 3). The name is printable
-/// (gui.validProject); `"` and `\` are escaped.
+/// (title.validProject); `"` and `\` are escaped.
 fn helloMessage(buf: []u8, policy: keymap.Policy, project: ?[]const u8) ![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
     try w.print("{{\"t\":\"hello\",\"input\":\"{t}\"", .{policy});

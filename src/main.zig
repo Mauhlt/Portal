@@ -41,11 +41,14 @@ const conpty = @import("conpty.zig");
 const console_mod = @import("console.zig");
 const Console = console_mod.Console;
 const Session = @import("session.zig").Session;
+const LocalInput = @import("session.zig").LocalInput;
 const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
+const fsutil = @import("fsutil.zig");
 const w = @import("win32.zig");
 const web = @import("web.zig");
 const gui = @import("gui.zig");
+const title = @import("title.zig");
 const workdir = @import("workdir.zig");
 const tls_server = @import("tls/server.zig");
 const x509 = @import("tls/x509.zig");
@@ -238,7 +241,7 @@ pub fn main(init: std.process.Init) !void {
         const sp: sync.Paths = .{ .dir = paths.dir };
         if (cmd[0] == 's') return sync_cli.cmdSync(gpa, io, sp, args[1..]);
         if (cmd[0] == 'p') return sync_cli.cmdPublish(gpa, io, sp, args[1..]);
-        return sync_cli.cmdUnpublish(gpa, io, sp, args[1..]);
+        return sync_cli.cmdUnpublish(io, sp, args[1..]);
     }
     if (std.mem.eql(u8, cmd, "sync-device")) return sync_cli.cmdSyncDevice(gpa, io, args[1..], portal_version);
     if (std.mem.eql(u8, cmd, "version")) {
@@ -262,7 +265,7 @@ fn guiMain(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     }
     if (std.mem.eql(u8, cmd, "show")) {
         // Old habit inside a session: run it on the session's console.
-        if (AttachConsole(ATTACH_PARENT_PROCESS) != 0) std.process.exit(@import("show.zig").main(gpa, io, args[1..]));
+        if (w.AttachConsole(w.ATTACH_PARENT_PROCESS) != 0) std.process.exit(@import("show.zig").main(gpa, io, args[1..]));
         fatal("`show` runs inside a session: use portal-show <file.png>.", .{});
     }
     if (std.mem.eql(u8, cmd, "version")) {
@@ -282,8 +285,6 @@ fn guiMain(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     w.ExitProcess(2);
 }
 
-const ATTACH_PARENT_PROCESS: w.DWORD = 0xFFFFFFFF;
-extern "kernel32" fn AttachConsole(pid: w.DWORD) callconv(.winapi) w.BOOL;
 
 /// An information box (the GUI program's stdout).
 fn messageBox(text: []const u8) void {
@@ -294,7 +295,7 @@ fn showBox(text: []const u8, flags: u32) void {
     var wbuf: [2049:0]u16 = undefined;
     const n = std.unicode.utf8ToUtf16Le(wbuf[0..2048], text[0..@min(text.len, 2048)]) catch 0;
     wbuf[n] = 0;
-    _ = MessageBoxW(null, &wbuf, std.unicode.utf8ToUtf16LeStringLiteral("Portal"), flags);
+    _ = w.MessageBoxW(null, &wbuf, std.unicode.utf8ToUtf16LeStringLiteral("Portal"), flags);
 }
 
 fn printUsage() void {
@@ -322,7 +323,6 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     w.ExitProcess(1);
 }
 
-extern "user32" fn MessageBoxW(hwnd: ?*anyopaque, text: [*:0]const u16, caption: [*:0]const u16, flags: u32) callconv(.winapi) i32;
 
 // ------------------------------------------------------------- data paths
 
@@ -349,13 +349,6 @@ fn openLog(gpa: Allocator, paths: devices.Paths, io: Io) ?Log {
 
 // ---------------------------------------------------------------- devices
 
-const SYNCHRONIZE: w.DWORD = 0x00100000;
-extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) w.DWORD;
-extern "kernel32" fn OpenProcess(access: w.DWORD, inherit: w.BOOL, pid: w.DWORD) callconv(.winapi) ?w.HANDLE;
-extern "kernel32" fn CreateEventW(sa: ?*anyopaque, manual: w.BOOL, initial: w.BOOL, name: ?[*:0]const u16) callconv(.winapi) ?w.HANDLE;
-extern "kernel32" fn SetEvent(h: w.HANDLE) callconv(.winapi) w.BOOL;
-extern "kernel32" fn ResetEvent(h: w.HANDLE) callconv(.winapi) w.BOOL;
-extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (w.DWORD) callconv(.winapi) w.BOOL, add: w.BOOL) callconv(.winapi) w.BOOL;
 
 /// SHA-256 of the Portal CA, if one exists yet (never creates one).
 fn caFingerprint(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, out: *[95]u8) ?[]const u8 {
@@ -401,14 +394,14 @@ const ConsoleLines = struct {
             c.len = len;
             n = 0;
             c.ready.store(true, .release);
-            _ = SetEvent(c.ready_ev);
+            _ = w.SetEvent(c.ready_ev);
             _ = w.WaitForSingleObject(c.taken_ev, w.INFINITE);
         }
     }
 
     fn finish(c: *ConsoleLines) void {
         c.eof.store(true, .release);
-        _ = SetEvent(c.ready_ev);
+        _ = w.SetEvent(c.ready_ev);
     }
 
     /// The next typed line, if one is waiting (copied into `out`).
@@ -417,8 +410,8 @@ const ConsoleLines = struct {
         const n = @min(c.len, out.len);
         @memcpy(out[0..n], c.buf[0..n]);
         c.ready.store(false, .release);
-        _ = ResetEvent(c.ready_ev);
-        _ = SetEvent(c.taken_ev);
+        _ = w.ResetEvent(c.ready_ev);
+        _ = w.SetEvent(c.taken_ev);
         return out[0..n];
     }
 };
@@ -484,10 +477,11 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     var nonce_bytes: [8]u8 = undefined;
     io.randomSecure(&nonce_bytes) catch fatal("no entropy", .{});
     const nonce = std.mem.readInt(u64, &nonce_bytes, .little) | 1;
-    const pid = GetCurrentProcessId();
+    const pid = w.GetCurrentProcessId();
 
     // Watch before opening the window, so no change is missed.
-    var dw = devices.DirWatch.open(gpa, paths);
+    var dw = devices.watchStore(gpa, paths) catch |err|
+        fatal("cannot watch {s} for changes ({t}), so this command could not see the device ask; nothing was opened", .{ paths.dir, err });
     defer dw.close();
 
     // `portalctl pair` is a thin console wrapper over devices.Desk, the same
@@ -503,7 +497,7 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
         @memcpy(replaced_buf[0..t.len], t.get());
     }
     pair_cleanup = .{ .gpa = gpa, .io = io, .paths = paths, .nonce = nonce };
-    _ = SetConsoleCtrlHandler(&pairCtrlHandler, 1);
+    _ = w.SetConsoleCtrlHandler(&pairCtrlHandler, 1);
     pairLog(gpa, paths, io, "pairing window opened for '{s}' ({d} min); requests need approval at the desk", .{ name, minutes });
 
     if (replaced_len > 0) std.debug.print("(Replaced the open pairing window for '{s}'.)\n", .{replaced_buf[0..replaced_len]});
@@ -536,8 +530,8 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     , .{});
 
     var lines: ConsoleLines = .{
-        .ready_ev = CreateEventW(null, 1, 0, null) orelse fatal("cannot create an event", .{}),
-        .taken_ev = CreateEventW(null, 0, 0, null) orelse fatal("cannot create an event", .{}),
+        .ready_ev = w.CreateEventW(null, 1, 0, null) orelse fatal("cannot create an event", .{}),
+        .taken_ev = w.CreateEventW(null, 0, 0, null) orelse fatal("cannot create an event", .{}),
     };
     const reader = std.Thread.spawn(.{}, ConsoleLines.reader, .{&lines}) catch fatal("cannot start the input thread", .{});
     reader.detach();
@@ -551,7 +545,10 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     var ca_hint_done = false;
     var first = true;
     while (true) {
-        if (!first) dw.rearm();
+        if (!first) dw.rearm() catch {
+            endWindow(gpa, io, paths, nonce);
+            fatal("lost the change watch on {s}; the pairing window is closed. Run `portalctl pair` again.", .{paths.dir});
+        };
         first = false;
         const now = nowUnix(io);
 
@@ -680,18 +677,11 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
             }
         }
 
-        var handles: [2]w.HANDLE = undefined;
-        var n_h: w.DWORD = 0;
-        handles[n_h] = lines.ready_ev;
-        n_h += 1;
-        if (dw.h) |h| {
-            handles[n_h] = h;
-            n_h += 1;
-        }
+        const handles = [2]w.HANDLE{ lines.ready_ev, dw.h };
         var ms = devices.waitMs(now, expires);
-        if (p.ca == .unknown and !ca_hint_done) ms = @min(ms, 3000);
-        if (dw.h == null) ms = @min(ms, 1000); // no change notification: re-check each second
-        _ = devices.WaitForMultipleObjects(n_h, &handles, 0, ms);
+        // One real deadline: the "no running Portal picked this up" hint.
+        if (p.ca == .unknown and !ca_hint_done) ms = @min(ms, @as(w.DWORD, @intCast(@max(0, start_s + 3 - now) * 1000 + 250)));
+        _ = w.WaitForMultipleObjects(handles.len, &handles, 0, ms);
     }
 }
 
@@ -1008,6 +998,9 @@ fn sanEql(a: x509.SanEntry, b: x509.SanEntry) bool {
 ///     squatting the port) is logged loudly and reported as failed.
 const PairWatch = struct {
     srv: *web.Server,
+    /// The data directory's change watch, opened before the thread starts
+    /// (Portal refuses to run without it).
+    dw: ?fsutil.DirWatch,
     /// The certificate download server; null with --no-tls.
     ca_srv: ?*web.Server,
     ca_addr: std.Io.net.IpAddress,
@@ -1038,10 +1031,25 @@ const PairWatch = struct {
         }.op) catch |err| pw.srv.noteStoreError(err);
     }
 
+    /// Re-arms the change watch; if that fails, re-opens it once. Losing
+    /// it is logged as an error: changes made by `portalctl` (pair,
+    /// unpair) are then not seen until Portal restarts, while the
+    /// window's own desk actions still are.
+    fn rearm(pw: *PairWatch) void {
+        var d = pw.dw orelse return;
+        d.rearm() catch {
+            d.close();
+            pw.dw = devices.watchStore(pw.gpa, pw.paths) catch |err| {
+                pw.dw = null;
+                pw.srv.log.print("ERROR: lost the change watch on {s} ({t}): `portalctl pair`/`unpair` changes are not seen until Portal restarts", .{ pw.paths.dir, err });
+                return;
+            };
+            pw.srv.log.print("change watch on {s} was lost and has been re-opened", .{pw.paths.dir});
+        };
+    }
+
     fn watch(pw: *PairWatch) void {
         const io = pw.io;
-        var dw = devices.DirWatch.open(pw.gpa, pw.paths);
-        if (dw.h == null) pw.srv.log.print("WARNING: cannot watch {s} for changes; re-reading the device list every 2 s instead", .{pw.paths.dir});
         var where_buf: [80]u8 = undefined;
         const where = std.fmt.bufPrint(&where_buf, "{f}", .{pw.ca_addr}) catch "?";
         var active: ?Io.Future(void) = null;
@@ -1052,7 +1060,7 @@ const PairWatch = struct {
         var first = true;
         while (true) {
             _ = pw.srv.pairwatch_wakes.fetchAdd(1, .monotonic);
-            if (!first) dw.rearm(); // before reading: a change made meanwhile signals again
+            if (!first) pw.rearm(); // before reading: a change made meanwhile signals again
             first = false;
             const read_start = pw.srv.realNowMs();
             const now = nowUnix(io);
@@ -1071,7 +1079,7 @@ const PairWatch = struct {
                 if (p.nonce != proc_nonce) {
                     if (proc_h) |h| _ = w.CloseHandle(h);
                     proc_nonce = p.nonce;
-                    proc_h = OpenProcess(SYNCHRONIZE, 0, p.pid);
+                    proc_h = w.OpenProcess(w.SYNCHRONIZE, 0, p.pid);
                     if (proc_h == null) {
                         gone_nonce = p.nonce;
                         pw.srv.pairingProcessGone(p.nonce);
@@ -1120,8 +1128,8 @@ const PairWatch = struct {
 
             var handles: [2]w.HANDLE = undefined;
             var n: w.DWORD = 0;
-            if (dw.h) |h| {
-                handles[n] = h;
+            if (pw.dw) |d| {
+                handles[n] = d.h;
                 n += 1;
             }
             const proc_slot = n;
@@ -1129,13 +1137,16 @@ const PairWatch = struct {
                 handles[n] = h;
                 n += 1;
             };
-            var ms = devices.waitMs(now, if (open) |p| p.expires else null);
-            if (dw.h == null) ms = @min(ms, 2000);
+            // Events only; the one timeout is a real deadline (the open
+            // window's expiry).
+            const ms = devices.waitMs(now, if (open) |p| p.expires else null);
             const r = if (n == 0) blk: {
-                io.sleep(.fromMilliseconds(ms), .awake) catch {};
-                break :blk devices.WAIT_TIMEOUT;
-            } else devices.WaitForMultipleObjects(n, &handles, 0, ms);
-            if (n > proc_slot and r == devices.WAIT_OBJECT_0 + proc_slot) {
+                // Only after the watch was lost (logged as an error).
+                const left: Io.Timeout = if (ms == w.INFINITE) .none else .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
+                left.sleep(io) catch {};
+                break :blk w.WAIT_TIMEOUT;
+            } else w.WaitForMultipleObjects(n, &handles, 0, ms);
+            if (n > proc_slot and r == w.WAIT_OBJECT_0 + proc_slot) {
                 // `portalctl pair` exited (Ctrl+C, closed console, killed):
                 // the window closes now, not at its expiry.
                 gone_nonce = proc_nonce;
@@ -1161,17 +1172,6 @@ const SyncWatch = struct {
     io: Io,
     gpa: Allocator,
 
-    const FILE_NOTIFY_CHANGE_FILE_NAME: w.DWORD = 0x1;
-    const FILE_NOTIFY_CHANGE_DIR_NAME: w.DWORD = 0x2;
-    extern "kernel32" fn FindFirstChangeNotificationW(path: [*:0]const u16, subtree: w.BOOL, filter: w.DWORD) callconv(.winapi) ?w.HANDLE;
-    extern "kernel32" fn FindNextChangeNotification(h: w.HANDLE) callconv(.winapi) w.BOOL;
-
-    fn open(sw: *SyncWatch, dir: []const u8, subtree: bool) ?w.HANDLE {
-        const dw = std.unicode.wtf8ToWtf16LeAllocZ(sw.gpa, dir) catch return null;
-        defer sw.gpa.free(dw);
-        return w.validHandle(FindFirstChangeNotificationW(dw.ptr, @intFromBool(subtree), FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME));
-    }
-
     fn refresh(sw: *SyncWatch) void {
         const subs = sync.readSubs(sw.gpa, sw.io, sw.paths) catch |err| {
             sw.srv.log.print("sync: subscriptions unreadable ({t}); keeping the last state", .{err});
@@ -1196,27 +1196,24 @@ const SyncWatch = struct {
 
     fn watch(sw: *SyncWatch) void {
         var pb: [1024]u8 = undefined;
-        const publish_dir = std.fmt.bufPrint(&pb, "{s}\\publish", .{sw.paths.dir}) catch return;
+        const publish_dir = sw.paths.join(&pb, &.{"publish"}) catch return;
         Io.Dir.cwd().createDirPath(sw.io, publish_dir) catch {};
-        var handles: [2]w.HANDLE = undefined;
-        var n: w.DWORD = 0;
-        if (sw.open(sw.paths.dir, false)) |h| {
-            handles[n] = h;
-            n += 1;
-        }
-        if (sw.open(publish_dir, true)) |h| {
-            handles[n] = h;
-            n += 1;
-        }
-        if (n < 2) sw.srv.log.print("sync: cannot watch {s} for changes; devices learn about new packages when they reconnect", .{sw.paths.dir});
+        var watches: [2]fsutil.DirWatch = undefined;
+        watches[0] = fsutil.DirWatch.open(sw.gpa, sw.paths.dir, .{ .dirs = true }) catch |err| return sw.lost(err);
+        watches[1] = fsutil.DirWatch.open(sw.gpa, publish_dir, .{ .dirs = true, .subtree = true }) catch |err| return sw.lost(err);
+        const handles = [2]w.HANDLE{ watches[0].h, watches[1].h };
         sw.refresh();
-        while (n > 0) {
-            const r = devices.WaitForMultipleObjects(n, &handles, 0, w.INFINITE);
-            if (r >= devices.WAIT_OBJECT_0 + n) return;
+        while (true) {
+            const r = w.WaitForMultipleObjects(handles.len, &handles, 0, w.INFINITE);
+            if (r >= w.WAIT_OBJECT_0 + handles.len) return sw.lost(error.WaitFailed);
             // Re-arm before re-reading, so a change made meanwhile signals again.
-            if (FindNextChangeNotification(handles[r - devices.WAIT_OBJECT_0]) == 0) return;
+            watches[r - w.WAIT_OBJECT_0].rearm() catch |err| return sw.lost(err);
             sw.refresh();
         }
+    }
+
+    fn lost(sw: *SyncWatch, err: anyerror) void {
+        sw.srv.log.print("ERROR: sync: cannot watch {s} for changes ({t}); devices learn about new packages only when they reconnect", .{ sw.paths.dir, err });
     }
 };
 
@@ -1253,7 +1250,7 @@ const RunOptions = struct {
     no_tls: bool = false,
     /// Allow instruct/text input when the session program is a shell.
     allow_remote_shell: bool = false,
-    /// `--project`: shown in the window title (gui.validProject).
+    /// `--project`: shown in the window title (title.validProject).
     project: ?[]const u8 = null,
     /// `--allow-elevated`: run even with an administrator token.
     allow_elevated: bool = false,
@@ -1289,7 +1286,7 @@ fn parseRunArgs(gpa: Allocator, args: []const []const u8) !RunOptions {
             o.allow_elevated = true;
         } else if (std.mem.eql(u8, a, "--project")) {
             i += 1;
-            if (!gui.validProject(args[i])) fatal("--project must be 1-{d} bytes of printable text on one line", .{gui.max_project_bytes});
+            if (!title.validProject(args[i])) fatal("--project must be 1-{d} bytes of printable text on one line", .{title.max_project_bytes});
             o.project = args[i];
         } else if (std.mem.eql(u8, a, "--no-tls")) {
             o.no_tls = true;
@@ -1386,8 +1383,8 @@ fn prepare(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, cfg: *co
         "Enter the program to run in this window."
     else
         "no program: pass -- <program> [args...] (or save one in the Portal window's first-run screen, settings.txt `program = ...`)" };
-    if (cfg.project) |p| if (!gui.validProject(p))
-        return fail_(err_buf, "The project name must be 1-{d} bytes of printable text on one line.", .{gui.max_project_bytes});
+    if (cfg.project) |p| if (!title.validProject(p))
+        return fail_(err_buf, "The project name must be 1-{d} bytes of printable text on one line.", .{title.max_project_bytes});
     // Remote typing into a shell is a remote shell: refuse unless explicit.
     if ((cfg.policy == .instruct or cfg.policy == .text) and isShellProgram(command[0]) and !allow_remote_shell)
         return fail_(err_buf, "Refusing {t} input for a shell ({s}): remote typing would be a remote shell. Choose keys input, or pass --allow-remote-shell if you really mean it.", .{ cfg.policy, command[0] });
@@ -1485,7 +1482,13 @@ const max_read_failures = 1000;
 
 /// How long shutdown waits for ClosePseudoConsole plus the output drain
 /// before exiting anyway (process exit closes the job, which kills the child).
+/// Also how long a program gets to exit after the window was closed.
 const shutdown_timeout_ms = 10_000;
+/// After ending a program that did not exit in time (the job), how long
+/// to wait for it to be gone.
+const terminate_timeout_ms = 5_000;
+/// How long viewers get to receive the exit notice and disconnect.
+const viewer_goodbye_ms = 2_000;
 
 /// Set by each shutdown step as it finishes (output drained, pseudo console
 /// closed, child exited), so the main thread sleeps until one finishes or
@@ -1529,7 +1532,7 @@ const Threads = struct {
             };
             failures = 0;
             if (n == 0) return;
-            console.write(buf[0..n]);
+            console.mirror(buf[0..n]);
             session.appendOutput(buf[0..n]);
         }
     }
@@ -1541,7 +1544,7 @@ const Threads = struct {
     /// change before the window has finished growing, and growing the
     /// window alone sends no event. With nothing happening it waits forever.
     fn consoleInput(session: *Session, console: *Console) void {
-        var buf: [4 * 1024]u8 = undefined;
+        var buf: [Console.events_buf_len]u8 = undefined;
         session.setSize(console.size());
         var settle_pending = false;
         while (true) {
@@ -1567,9 +1570,10 @@ const Threads = struct {
     }
 
     /// GUI mode: the main thread runs the window, so the child is waited
-    /// for here.
+    /// for here. This thread owns the process handle (Pty.waitExit closes
+    /// it); shutdown only ever touches the job.
     fn waitChild(io: Io, pty: *conpty.Pty, code: *std.atomic.Value(u32), done: *std.atomic.Value(bool), host: *gui.LocalHost) void {
-        code.store(pty.wait(), .release);
+        code.store(pty.waitExit(), .release);
         shutdownStepDone(io, done);
         host.wakeChildExited(); // the GUI loop sleeps until woken
     }
@@ -1605,7 +1609,7 @@ fn childCwd(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, data_di
             // launcher, the current directory is Portal's own folder (or
             // System32); from a terminal it is the terminal's.
             var exe_buf: [32768]u16 = undefined;
-            const n = GetModuleFileNameW(null, &exe_buf, exe_buf.len);
+            const n = w.GetModuleFileNameW(null, &exe_buf, exe_buf.len);
             const exe_path: ?[]u8 = if (n > 0 and n < exe_buf.len) std.unicode.wtf16LeToWtf8Alloc(gpa, exe_buf[0..n]) catch null else null;
             defer if (exe_path) |p| gpa.free(p);
             const exe_dir: ?[]const u8 = if (exe_path) |p| std.fs.path.dirname(p) else null;
@@ -1623,9 +1627,6 @@ fn childCwd(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, data_di
     return std.unicode.wtf8ToWtf16LeAllocZ(gpa, chosen) catch fatal("bad directory name '{s}'", .{chosen});
 }
 
-extern "kernel32" fn GetModuleFileNameW(module: ?*anyopaque, buf: [*]u16, size: w.DWORD) callconv(.winapi) w.DWORD;
-extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buf: ?[*]u16, size: w.DWORD) callconv(.winapi) w.DWORD;
-extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) w.BOOL;
 
 /// Puts the folder of this exe first on PATH in Portal's own environment,
 /// which the session inherits (conpty.zig passes no environment block), so
@@ -1633,20 +1634,20 @@ extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]
 /// inside the session. Only this process and its children see the change.
 fn prependOwnDirToPath(gpa: Allocator) void {
     var exe_buf: [32768]u16 = undefined;
-    const n = GetModuleFileNameW(null, &exe_buf, exe_buf.len);
+    const n = w.GetModuleFileNameW(null, &exe_buf, exe_buf.len);
     if (n == 0 or n >= exe_buf.len) return;
     var end: usize = n;
     while (end > 0 and exe_buf[end - 1] != '\\' and exe_buf[end - 1] != '/') end -= 1;
     if (end <= 1) return;
     const dir = exe_buf[0 .. end - 1];
     const name = std.unicode.utf8ToUtf16LeStringLiteral("PATH");
-    const old_len = GetEnvironmentVariableW(name, null, 0);
+    const old_len = w.GetEnvironmentVariableW(name, null, 0);
     const old = gpa.alloc(u16, old_len + 1) catch return;
     defer gpa.free(old);
-    const got: usize = if (old_len == 0) 0 else GetEnvironmentVariableW(name, old.ptr, @intCast(old.len));
+    const got: usize = if (old_len == 0) 0 else w.GetEnvironmentVariableW(name, old.ptr, @intCast(old.len));
     const new = std.mem.concatWithSentinel(gpa, u16, &.{ dir, &[_]u16{';'}, old[0..@min(got, old.len)] }, 0) catch return;
     defer gpa.free(new);
-    _ = SetEnvironmentVariableW(name, new.ptr);
+    _ = w.SetEnvironmentVariableW(name, new.ptr);
 }
 
 fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
@@ -1816,6 +1817,10 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .term = vt.Terminal.init(gpa, initial.cols, initial.rows) catch fatal("out of memory", .{}),
         .size = initial,
     };
+    // Desktop input reaches the PTY through its own writer thread.
+    const local_input = gpa.create(LocalInput) catch fatal("out of memory", .{});
+    local_input.* = .{ .gpa = gpa, .io = io, .session = &session };
+    session.local = local_input;
     if (host) |h| h.attach(&session);
 
     var server: web.Server = .{
@@ -1864,6 +1869,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     }
     var pair_watch: PairWatch = .{
         .srv = &server,
+        // Unpair from `portalctl` must end sessions: no watch, no run.
+        .dw = devices.watchStore(gpa, paths) catch |err|
+            fatal("cannot watch {s} for changes ({t}); Portal needs it to notice pairing and unpairing", .{ paths.dir, err }),
         .ca_srv = if (ca_listener_on) &ca_server else null,
         .ca_addr = ca_addr,
         .paths = paths,
@@ -1896,7 +1904,10 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     if (opts.console) {
         console.enableRaw() catch fatal("could not switch console to raw mode", .{});
         raw_console = &console;
-        console.setTitle("Portal - no remote viewers");
+        // Project name only, never the program's title or a path; web.zig
+        // keeps it current with the viewer count (title.zig).
+        var tb: [title.max_title_bytes]u8 = undefined;
+        console.setTitle(title.windowTitle(cfg.project, 0, &tb));
     }
 
     // ------------------------------------------------------------------
@@ -1907,6 +1918,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     const out_thread = std.Thread.spawn(.{}, Threads.ptyOutput, .{ &session, &console, &pty, io, &out_done }) catch |err|
         fatal("cannot start output thread: {t}", .{err});
     out_thread.detach(); // waited for via out_done, with a timeout
+    const input_thread = std.Thread.spawn(.{}, LocalInput.run, .{local_input}) catch |err|
+        fatal("cannot start input writer thread: {t}", .{err});
+    input_thread.detach(); // ends when shutdownPty closes the queue
     if (opts.console) {
         const in_thread = std.Thread.spawn(.{}, Threads.consoleInput, .{ &session, &console }) catch |err|
             fatal("cannot start input thread: {t}", .{err});
@@ -1927,12 +1941,20 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         t.detach();
     }
 
-    var code: u32 = undefined;
+    // Two ways the session ends, kept apart:
+    //   * the program exits (either mode): the pseudo console is closed
+    //     at once, its remaining output drains to EOF, viewers get the
+    //     program's exit code;
+    //   * the window is closed while the program runs (GUI): closing the
+    //     pseudo console is the program's cue to exit (its console goes
+    //     away), and Portal WAITS for it to exit, up to
+    //     shutdown_timeout_ms; only a program still running then is ended
+    //     through its job. The waiter thread owns the process handle
+    //     throughout, so no wait races a close.
     var window_closed = false;
     if (host) |h| {
         // GUI: the window owns the main thread; a waiter thread watches
-        // the child. Closing the window ends the session the same way the
-        // child exiting does (below): ClosePseudoConsole ends the child.
+        // the child.
         const waiter = std.Thread.spawn(.{}, Threads.waitChild, .{ io, &pty, &child_code, &child_done, h }) catch |err|
             fatal("cannot start child waiter thread: {t}", .{err});
         waiter.detach();
@@ -1941,21 +1963,21 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .window_closed => {
                 window_closed = true;
                 h.hide();
-                log.print("local window closed: ending the session", .{});
+                log.print("local window closed: asking the program to exit and waiting for it", .{});
             },
         }
         log.print("local window: {d} wake-ups, {d} frames presented", .{ h.wakeups, h.presents }); // [fix2/desk]
-        code = child_code.load(.acquire);
     } else {
-        code = pty.wait();
+        child_code.store(pty.waitExit(), .release);
+        child_done.store(true, .release);
     }
-    // Let trailing output drain before tearing down the pseudo console.
-    if (!window_closed) io.sleep(.fromMilliseconds(200), .awake) catch {};
 
     // ClosePseudoConsole can block (pre-24H2 it waits for conhost to flush),
     // so run it on its own thread and stop waiting after a timeout rather
     // than leaving the user's console hung. Session.shutdownPty stops resizes
     // and writes first, so nothing touches the freed HPCON or input pipe.
+    // The output thread keeps draining meanwhile: everything the program
+    // wrote reaches the terminal (and viewers) before EOF.
     var close_done: std.atomic.Value(bool) = .init(false);
     if (std.Thread.spawn(.{}, Threads.closePty, .{ &session, &close_done })) |t| {
         t.detach();
@@ -1963,18 +1985,27 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         Threads.closePty(&session, &close_done);
     }
     // One deadline for the whole shutdown; each step wakes this thread.
-    const shutdown_deadline = Io.Clock.awake.now(io).toMilliseconds() + shutdown_timeout_ms;
-    const clean = waitShutdown(io, &.{ &close_done, &out_done }, shutdown_deadline);
-    if (window_closed) {
-        // The child was ended by closing its pseudo console; report its
-        // own exit code if it has gone within the remaining time.
-        code = if (waitShutdown(io, &.{&child_done}, shutdown_deadline)) child_code.load(.acquire) else 1;
+    var shutdown_deadline = Io.Clock.awake.now(io).toMilliseconds() + shutdown_timeout_ms;
+    var ended_by_portal = false;
+    if (window_closed and !waitShutdown(io, &.{&child_done}, shutdown_deadline)) {
+        log.print("the program did not exit within {d} s of the window closing: ending it", .{shutdown_timeout_ms / 1000});
+        pty.terminate();
+        ended_by_portal = true;
+        shutdown_deadline = Io.Clock.awake.now(io).toMilliseconds() + terminate_timeout_ms;
+        _ = waitShutdown(io, &.{&child_done}, shutdown_deadline);
     }
+    const clean = waitShutdown(io, &.{ &close_done, &out_done }, shutdown_deadline);
+    const code: u32 = if (child_done.load(.acquire)) child_code.load(.acquire) else 1;
 
     session.markClosed(code);
-    log.print("stop: child exited with code {d}{s}", .{ code, if (clean) "" else " (pseudo console did not close in time)" });
-    // Give viewers a moment to receive the exit notice.
-    io.sleep(.fromMilliseconds(500), .awake) catch {};
+    log.print("stop: child exited with code {d}{s}{s}", .{
+        code,
+        if (ended_by_portal) " (ended by Portal after the window closed)" else "",
+        if (clean) "" else " (pseudo console did not close in time)",
+    });
+    // Viewers receive the exit notice, then disconnect: wait for that
+    // (event-driven), at most viewer_goodbye_ms.
+    session.waitViewersGone(Io.Clock.awake.now(io).toMilliseconds() + viewer_goodbye_ms);
     // Do NOT close the listener: the accept thread is blocked on it and std
     // hits `unreachable` on the cancelled accept. Process exit reclaims it.
     console.restore();
@@ -2010,6 +2041,9 @@ test {
     _ = @import("tls/pki.zig");
     _ = @import("sync.zig");
     _ = @import("sync_cli.zig");
+    _ = @import("fsutil.zig");
+    _ = @import("bucket.zig");
+    _ = @import("title.zig");
 }
 
 test "isYes" {

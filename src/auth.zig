@@ -6,8 +6,10 @@
 //!   * Devices are paired at the desk (devices.zig); a paired device's
 //!     rotating credential creates a session here.
 //!   * The browser holds a random session id in an HttpOnly cookie. Only
-//!     hashes of session ids are kept in memory, tagged with the device name
-//!     so unpairing a device ends its sessions.
+//!     hashes of session ids are kept in memory, tagged with the paired
+//!     device's random record id (and its name, for display and sync), so
+//!     unpairing or re-pairing a device ends exactly that record's
+//!     sessions: a new device under the same name never inherits them.
 //!   * Sessions live in memory only; restarting Portal ends them, and paired
 //!     devices silently get new ones on their next visit.
 
@@ -40,6 +42,32 @@ pub fn verify(stored: Hash, presented: []const u8) bool {
 
 // ------------------------------------------------------------------ sessions
 
+/// A paired device record's identity: random, issued at pairing, never
+/// reused. A re-pair under the same name gets a new one.
+pub const device_id_len = 16;
+pub const DeviceId = [device_id_len]u8;
+
+/// Which paired device a session belongs to.
+pub const Device = struct {
+    pub const max_name = 32;
+
+    id: DeviceId,
+    name_buf: [max_name]u8 = undefined,
+    name_len: u8 = 0,
+
+    pub fn init(id: DeviceId, device_name: []const u8) Device {
+        var d: Device = .{ .id = id };
+        const n = @min(device_name.len, max_name);
+        @memcpy(d.name_buf[0..n], device_name[0..n]);
+        d.name_len = @intCast(n);
+        return d;
+    }
+
+    pub fn name(d: *const Device) []const u8 {
+        return d.name_buf[0..d.name_len];
+    }
+};
+
 pub const Sessions = struct {
     pub const max_sessions = 8;
 
@@ -47,24 +75,25 @@ pub const Sessions = struct {
     absolute_timeout_ms: i64 = 7 * std.time.ms_per_day,
     slots: [max_sessions]?Slot = @splat(null),
 
-    pub const max_tag = 32;
-
     const Slot = struct {
         id_hash: Hash,
         created_ms: i64,
         last_seen_ms: i64,
-        tag: [max_tag]u8 = undefined,
-        tag_len: u8 = 0,
+        device: ?Device = null,
     };
 
-    /// Register a new session id (the encoded cookie value). Evicts the
-    /// least-recently-used session when full.
+    /// Register a new session id (the encoded cookie value) that belongs
+    /// to no device. Evicts the least-recently-used session when full.
     pub fn create(s: *Sessions, cookie_value: []const u8, now_ms: i64) void {
-        s.createTagged(cookie_value, now_ms, "");
+        s.put(cookie_value, now_ms, null);
     }
 
-    /// Like `create`, remembering `tag` (the paired device's name).
-    pub fn createTagged(s: *Sessions, cookie_value: []const u8, now_ms: i64, tag: []const u8) void {
+    /// Like `create`, for a session of paired device `device`.
+    pub fn createFor(s: *Sessions, cookie_value: []const u8, now_ms: i64, device: Device) void {
+        s.put(cookie_value, now_ms, device);
+    }
+
+    fn put(s: *Sessions, cookie_value: []const u8, now_ms: i64, device: ?Device) void {
         s.expire(now_ms);
         var target: usize = 0;
         var oldest: i64 = std.math.maxInt(i64);
@@ -75,11 +104,7 @@ pub const Sessions = struct {
                 target = i;
             }
         }
-        var slot: Slot = .{ .id_hash = hashSecret(cookie_value), .created_ms = now_ms, .last_seen_ms = now_ms };
-        const n = @min(tag.len, max_tag);
-        @memcpy(slot.tag[0..n], tag[0..n]);
-        slot.tag_len = @intCast(n);
-        s.slots[target] = slot;
+        s.slots[target] = .{ .id_hash = hashSecret(cookie_value), .created_ms = now_ms, .last_seen_ms = now_ms, .device = device };
     }
 
     /// Returns true and refreshes the idle timer if the cookie is a live session.
@@ -97,23 +122,44 @@ pub const Sessions = struct {
         return s.find(cookie_value) != null;
     }
 
-    /// Copies the tag of a live session into `out`. Null if not live.
-    pub fn liveTag(s: *Sessions, cookie_value: []const u8, now_ms: i64, refresh: bool, out: *[max_tag]u8) ?[]const u8 {
+    pub const Live = union(enum) {
+        /// No such live session.
+        none,
+        /// Live, but belongs to no paired device.
+        anonymous,
+        device: Device,
+    };
+
+    /// Whose session `cookie_value` is, if it is live.
+    pub fn live(s: *Sessions, cookie_value: []const u8, now_ms: i64, refresh: bool) Live {
         s.expire(now_ms);
-        const idx = s.find(cookie_value) orelse return null;
+        const idx = s.find(cookie_value) orelse return .none;
         const slot = &s.slots[idx].?;
         if (refresh) slot.last_seen_ms = now_ms;
-        @memcpy(out[0..slot.tag_len], slot.tag[0..slot.tag_len]);
-        return out[0..slot.tag_len];
+        return if (slot.device) |d| .{ .device = d } else .anonymous;
     }
 
-    /// Ends every session belonging to device `tag`.
-    pub fn revokeTag(s: *Sessions, tag: []const u8) void {
+    /// The paired device a live session belongs to; null if not live or
+    /// untagged.
+    pub fn liveDevice(s: *Sessions, cookie_value: []const u8, now_ms: i64, refresh: bool) ?Device {
+        return switch (s.live(cookie_value, now_ms, refresh)) {
+            .device => |d| d,
+            else => null,
+        };
+    }
+
+    /// Ends every session of device record `id`. Returns how many.
+    pub fn revokeDevice(s: *Sessions, id: DeviceId) usize {
+        var n: usize = 0;
         for (&s.slots) |*slot| {
-            if (slot.*) |v| if (std.mem.eql(u8, v.tag[0..v.tag_len], tag)) {
+            const v = slot.* orelse continue;
+            const d = v.device orelse continue;
+            if (std.mem.eql(u8, &d.id, &id)) {
                 slot.* = null;
-            };
+                n += 1;
+            }
         }
+        return n;
     }
 
     /// When the session `cookie_value` will expire if not refreshed (the
@@ -126,17 +172,20 @@ pub const Sessions = struct {
         return @min(v.last_seen_ms +| s.idle_timeout_ms, v.created_ms +| s.absolute_timeout_ms);
     }
 
-    /// Ends the sessions of devices for which `paired(ctx, tag)` is false.
-    /// Sessions created at or after `since_ms` are kept: the caller's view
-    /// of the device list may predate them. Untagged sessions are kept.
-    /// Returns how many were ended.
-    pub fn revokeUnpaired(s: *Sessions, since_ms: i64, ctx: anytype, comptime paired: fn (@TypeOf(ctx), []const u8) bool) usize {
+    /// Ends the sessions of device records for which `paired(ctx, id)` is
+    /// false. Sessions created at or after `since_ms` are kept: the
+    /// caller's view of the device list may predate them. Untagged
+    /// sessions are kept. Returns how many were ended; `ended[0..n]` are
+    /// their device ids.
+    pub fn revokeUnpaired(s: *Sessions, since_ms: i64, ctx: anytype, comptime paired: fn (@TypeOf(ctx), DeviceId) bool, ended: *[max_sessions]DeviceId) usize {
         var n: usize = 0;
         for (&s.slots) |*slot| {
             const v = slot.* orelse continue;
-            if (v.tag_len == 0 or v.created_ms >= since_ms) continue;
-            if (!paired(ctx, v.tag[0..v.tag_len])) {
+            const d = v.device orelse continue;
+            if (v.created_ms >= since_ms) continue;
+            if (!paired(ctx, d.id)) {
                 slot.* = null;
+                ended[n] = d.id;
                 n += 1;
             }
         }
@@ -253,17 +302,41 @@ test "sessions: eviction when full keeps newest" {
     try testing.expect(s.isLive(&cookies[Sessions.max_sessions], 10));
 }
 
-test "sessions: tags" {
+fn testId(fill: u8) DeviceId {
+    return @splat(fill);
+}
+
+test "sessions: device tags" {
     var s: Sessions = .{};
     const a = testCookie(1);
     const b = testCookie(2);
-    s.createTagged(&a, 0, "laptop");
-    s.createTagged(&b, 0, "phone");
-    var buf: [Sessions.max_tag]u8 = undefined;
-    try testing.expectEqualStrings("laptop", s.liveTag(&a, 1, false, &buf).?);
-    s.revokeTag("laptop");
-    try testing.expect(s.liveTag(&a, 2, false, &buf) == null);
-    try testing.expectEqualStrings("phone", s.liveTag(&b, 2, false, &buf).?);
+    const c = testCookie(3);
+    s.createFor(&a, 0, .init(testId(1), "laptop"));
+    s.createFor(&b, 0, .init(testId(2), "phone"));
+    s.create(&c, 0);
+    try testing.expectEqualStrings("laptop", s.liveDevice(&a, 1, false).?.name());
+    try testing.expect(s.live(&c, 1, false) == .anonymous);
+    try testing.expect(s.live(&testCookie(9), 1, false) == .none);
+    try testing.expectEqual(@as(usize, 1), s.revokeDevice(testId(1)));
+    try testing.expect(s.liveDevice(&a, 2, false) == null);
+    try testing.expectEqualStrings("phone", s.liveDevice(&b, 2, false).?.name());
+}
+
+test "sessions: a re-paired name does not inherit or keep the old record's sessions" {
+    var s: Sessions = .{};
+    const old_a = testCookie(1);
+    const old_b = testCookie(2);
+    const new = testCookie(3);
+    // Two sessions of the old "laptop" record (two tabs).
+    s.createFor(&old_a, 0, .init(testId(1), "laptop"));
+    s.createFor(&old_b, 0, .init(testId(1), "laptop"));
+    // Re-paired: the old record's sessions go, then the new one is issued.
+    try testing.expectEqual(@as(usize, 2), s.revokeDevice(testId(1)));
+    s.createFor(&new, 1, .init(testId(7), "laptop"));
+    try testing.expect(!s.isLive(&old_a, 2) and !s.isLive(&old_b, 2));
+    // Revoking the old record again (late watcher pass) spares the new one.
+    try testing.expectEqual(@as(usize, 0), s.revokeDevice(testId(1)));
+    try testing.expect(std.mem.eql(u8, &s.liveDevice(&new, 2, false).?.id, &testId(7)));
 }
 
 test "sessions: clock going backwards fails closed" {
@@ -293,16 +366,18 @@ test "sessions: revokeUnpaired keeps new and untagged sessions" {
     const b = testCookie(2);
     const c = testCookie(3);
     const d = testCookie(4);
-    s.createTagged(&a, 0, "gone");
-    s.createTagged(&b, 0, "kept");
+    s.createFor(&a, 0, .init(testId(1), "laptop"));
+    s.createFor(&b, 0, .init(testId(2), "laptop")); // same name, the record that is kept
     s.create(&d, 0);
-    s.createTagged(&c, 50, "gone"); // created after the device list was read
+    s.createFor(&c, 50, .init(testId(1), "laptop")); // created after the device list was read
+    var ended: [Sessions.max_sessions]DeviceId = undefined;
     const n = s.revokeUnpaired(40, {}, struct {
-        fn f(_: void, tag: []const u8) bool {
-            return std.mem.eql(u8, tag, "kept");
+        fn f(_: void, id: DeviceId) bool {
+            return std.mem.eql(u8, &id, &testId(2));
         }
-    }.f);
+    }.f, &ended);
     try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(testId(1), ended[0]);
     try testing.expect(!s.isLive(&a, 60));
     try testing.expect(s.isLive(&b, 60) and s.isLive(&c, 60) and s.isLive(&d, 60));
 }

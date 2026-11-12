@@ -133,18 +133,68 @@ pub fn desktopRoot(host: []const u8, key: Key, out: *[pin.max_path]u8) ![]const 
     return std.fmt.bufPrint(out, "{s}" ++ std.fs.path.sep_str ++ "desktops" ++ std.fs.path.sep_str ++ "{s}", .{ root, name }) catch error.PathTooLong;
 }
 
-/// True if the shared, un-namespaced store of earlier builds exists
-/// (<sync root>\packages or \current). It is never read or written any
-/// more: its pointers could have been written by any desktop.
-pub fn legacyStorePresent(io: Io) bool {
+/// What the shared, un-namespaced store of earlier builds left directly
+/// under the sync root. It is never read or written any more (its pointers
+/// could have been written by any desktop), so it is deleted on start.
+pub const legacy_entries = [_][]const u8{ "packages", "current", "previous" };
+
+/// Deletes the shared store of earlier builds (`legacy_entries` under the
+/// sync root), the same way `deleteDesktopFolders` deletes a desktop: each
+/// entry is renamed to <sync root>\.trash-<random>, then deleted, so a
+/// half-deleted one is never mistaken for a store. Anything still in use
+/// (a running program) stays and is counted in `kept`; leftover .trash-*
+/// entries from an earlier attempt are retried. Never touches desktops\.
+pub fn removeLegacyStore(io: Io) !Dropped {
     var rb: [pin.max_path]u8 = undefined;
-    const root = syncRoot(&rb) catch return false;
-    for ([_][]const u8{ "packages", "current" }) |d| {
-        var pb: [pin.max_path + 16]u8 = undefined;
-        const p = std.fmt.bufPrint(&pb, "{s}" ++ std.fs.path.sep_str ++ "{s}", .{ root, d }) catch continue;
-        if (Io.Dir.cwd().access(io, p, .{})) |_| return true else |_| {}
+    return removeLegacyStoreAt(io, try syncRoot(&rb));
+}
+
+pub fn removeLegacyStoreAt(io: Io, root: []const u8) !Dropped {
+    var r: Dropped = .{};
+    var names: [16][96]u8 = undefined;
+    var lens: [16]usize = undefined;
+    var n: usize = 0;
+    {
+        var dir = Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return r,
+            else => |e| return e,
+        };
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |e| {
+            if (n == names.len) break;
+            var legacy = std.mem.startsWith(u8, e.name, ".trash-");
+            for (legacy_entries) |l| legacy = legacy or std.mem.eql(u8, e.name, l);
+            if (!legacy or e.name.len > 96) continue;
+            @memcpy(names[n][0..e.name.len], e.name);
+            lens[n] = e.name.len;
+            n += 1;
+        }
     }
-    return false;
+    for (names[0..n], lens[0..n]) |*name_buf, len| {
+        const name = name_buf[0..len];
+        var fb: [pin.max_path + 128]u8 = undefined;
+        const full = std.fmt.bufPrint(&fb, "{s}" ++ std.fs.path.sep_str ++ "{s}", .{ root, name }) catch continue;
+        var target = full;
+        var tb: [pin.max_path + 128]u8 = undefined;
+        const retry = std.mem.startsWith(u8, name, ".trash-");
+        if (!retry) {
+            var rnd: [8]u8 = undefined;
+            io.random(&rnd);
+            var hb: [16]u8 = undefined;
+            const t = std.fmt.bufPrint(&tb, "{s}" ++ std.fs.path.sep_str ++ ".trash-{s}", .{ root, manifest.hexLower(&rnd, &hb) }) catch continue;
+            if (Io.Dir.rename(Io.Dir.cwd(), full, Io.Dir.cwd(), t, io)) |_| {
+                target = t;
+            } else |_| {}
+        }
+        Io.Dir.cwd().deleteTree(io, target) catch {};
+        if (Io.Dir.cwd().access(io, target, .{})) |_| {
+            r.kept += 1;
+        } else |_| {
+            if (!retry) r.removed += 1;
+        }
+    }
+    return r;
 }
 
 pub const Dropped = struct {
@@ -224,6 +274,28 @@ test "desktop folder names: host stem and key fingerprint" {
     try std.testing.expect(!std.mem.eql(u8, name, try desktopFolderName("10.8.0.2:8420", k, &b2)));
     try std.testing.expect(!std.mem.eql(u8, name, try desktopFolderName("10.8.0.1:8420", @splat(0xac), &b2)));
     try std.testing.expectEqualStrings("fd00--1_8420-", (try desktopFolderName("[fd00::1]:8420", k, &b2))[0..13]);
+}
+
+test "removeLegacyStoreAt deletes the old shared store, never desktops\\" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "packages" ++ std.fs.path.sep_str ++ "stt-model" ++ std.fs.path.sep_str ++ "1");
+    try tmp.dir.writeFile(io, .{ .sub_path = "current", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "previous", .data = "y" });
+    try tmp.dir.createDirPath(io, "desktops" ++ std.fs.path.sep_str ++ "10.8.0.1_8420-0011223344556677" ++ std.fs.path.sep_str ++ "packages");
+    try tmp.dir.createDirPath(io, ".trash-0123456789abcdef");
+    var rb: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&rb, ".zig-cache" ++ std.fs.path.sep_str ++ "tmp" ++ std.fs.path.sep_str ++ "{s}", .{&tmp.sub_path});
+    const r = try removeLegacyStoreAt(io, root);
+    try std.testing.expectEqual(@as(usize, 3), r.removed);
+    try std.testing.expectEqual(@as(usize, 0), r.kept);
+    for ([_][]const u8{ "packages", "current", "previous", ".trash-0123456789abcdef" }) |gone|
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, gone, .{}));
+    try tmp.dir.access(io, "desktops" ++ std.fs.path.sep_str ++ "10.8.0.1_8420-0011223344556677" ++ std.fs.path.sep_str ++ "packages", .{});
+    // Nothing left: a second run finds nothing.
+    const again = try removeLegacyStoreAt(io, root);
+    try std.testing.expectEqual(@as(usize, 0), again.removed + again.kept);
 }
 
 test "key text round trip and strictness" {

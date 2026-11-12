@@ -220,8 +220,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
         const s = server orelse fatal(prog, "--forget needs --server IP:PORT", .{});
         var hb: [64]u8 = undefined;
         const host = http.canonicalHost(s, &hb) catch fatal(prog, "bad --server '{s}' (want a literal IP:PORT such as 10.8.0.1:8420)", .{s});
-        const r = forgetDesktop(io, host);
-        var mb: [400]u8 = undefined;
+        const r = forgetHost(gpa, io, host, null);
+        var mb: [600]u8 = undefined;
         var w: std.Io.Writer = .fixed(&mb);
         r.describe(&w, host) catch {};
         report("{s}: {s}", .{ prog, w.buffered() });
@@ -330,7 +330,26 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     const thread = std.Thread.spawn(.{}, client_mod.Client.run, .{client}) catch fatal(prog, "cannot start the network thread", .{});
     thread.detach();
 
+    var gone_handled = false;
     while (tv.pollEvents(host_ui.sink.sink())) {
+        // The desktop no longer has this device: forget it here too (the
+        // sync worker does it between operations; without TLS there is no
+        // worker and no sync store, so here).
+        if (!gone_handled and shared.desktop_gone.load(.acquire)) {
+            gone_handled = true;
+            if (transport == .tls) {
+                sync_state.forget_gone.store(true, .release);
+                sync_state.pending.store(@intFromEnum(SyncState.Op.forget), .release);
+                shared.sync_wake.set(io);
+            } else {
+                var r = forgetDesktop(io, client.host());
+                r.remote = .gone_by_desktop;
+                var w: std.Io.Writer = .fixed(&sync_state.dropped_msg_buf);
+                r.describe(&w, client.host()) catch {};
+                sync_state.dropped_msg_len = w.buffered().len;
+                sync_state.dropped.store(true, .release);
+            }
+        }
         if (sync_state.dropped.load(.acquire)) {
             tv.deinit();
             report("{s}: {s}", .{ prog, sync_state.dropped_msg_buf[0..sync_state.dropped_msg_len] });
@@ -373,8 +392,11 @@ const SyncState = struct {
     /// Set by the worker once Forget this desktop has run: the main loop
     /// tells the user and exits.
     dropped: std.atomic.Value(bool) = .init(false),
-    dropped_msg_buf: [400]u8 = undefined,
+    dropped_msg_buf: [600]u8 = undefined,
     dropped_msg_len: usize = 0,
+    /// The posted forget is because the desktop no longer has this device
+    /// (Shared.desktop_gone): nothing to ask the desktop.
+    forget_gone: std.atomic.Value(bool) = .init(false),
 
     const Op = enum(u8) { none = 0, rollback = 1, revoke = 2, forget = 3 };
 
@@ -392,14 +414,19 @@ const SyncState = struct {
             return null;
         };
         s.store_key = pinned;
-        if (!s.legacy_noted and sync.keypin.legacyStorePresent(s.io())) {
+        if (!s.legacy_noted) {
+            // The shared store of earlier builds is never used: delete it.
             s.legacy_noted = true;
+            const r = sync.keypin.removeLegacyStore(s.io()) catch sync.keypin.Dropped{};
             var rb: [pin_mod.max_path]u8 = undefined;
             const old = sync.keypin.syncRoot(&rb) catch "";
-            std.debug.print("portal connect: sync: the shared folder of earlier versions ({s}\\packages, \\current, \\previous) is no longer used; each desktop now has its own folder under {s}\\desktops. Delete the old folders once nothing runs from them.\n", .{ old, old });
-            s.mutex.lockUncancelable(s.io());
-            s.ui.setNote("Packages from before per-desktop folders (in {s}) are no longer used; delete them once nothing runs from them.", .{old});
-            s.mutex.unlock(s.io());
+            if (r.removed > 0 or r.kept > 0)
+                std.debug.print("portal connect: sync: removed the shared store of earlier versions in {s} ({d} removed, {d} still in use: retried on a later start)\n", .{ old, r.removed, r.kept });
+            if (r.kept > 0) {
+                s.mutex.lockUncancelable(s.io());
+                s.ui.setNote("Some packages from before per-desktop folders (in {s}) are still in use; they are removed on a later start.", .{old});
+                s.mutex.unlock(s.io());
+            }
         }
         return &s.store.?;
     }
@@ -528,7 +555,18 @@ const SyncState = struct {
             .none => return,
             .forget => {
                 const host = s.client.host();
-                const r = forgetDesktop(s.io(), host);
+                var r: Forgotten = undefined;
+                if (s.forget_gone.load(.acquire)) {
+                    r = forgetDesktop(s.io(), host);
+                    r.remote = .gone_by_desktop;
+                } else {
+                    var session: ?client_mod.http_Cookie = null;
+                    s.shared.mutex.lockUncancelable(s.io());
+                    session = s.shared.session;
+                    s.shared.mutex.unlock(s.io());
+                    defer if (session) |*x| x.wipe();
+                    r = forgetBothWays(s.client, if (session) |*x| x else null);
+                }
                 s.store = null;
                 var w: std.Io.Writer = .fixed(&s.dropped_msg_buf);
                 r.describe(&w, host) catch {};
@@ -651,15 +689,75 @@ const SyncState = struct {
 pub const Forgotten = struct {
     first_error: ?anyerror = null,
     folders: sync.keypin.Dropped = .{},
+    /// What the desktop's side of the forget did.
+    remote: Remote = .not_asked,
+
+    pub const Remote = enum {
+        not_asked,
+        /// It removed this device (POST /device/forget).
+        forgotten,
+        /// It no longer had this device.
+        already_gone,
+        /// It could not be reached: it lists the device until it next
+        /// sees it or the owner unpairs it there.
+        unreachable_desktop,
+        /// The desktop itself said it no longer has this device (it was
+        /// unpaired at the desk, or forgotten): forgotten here in turn.
+        gone_by_desktop,
+    };
 
     pub fn describe(r: *const Forgotten, w: *std.Io.Writer, host: []const u8) !void {
+        if (r.remote == .gone_by_desktop)
+            try w.print("{s} no longer has this device paired (it was unpaired at the desk, or forgotten), so this device forgot it too. ", .{host});
         try w.print("Forgot {s}: its certificate pin, release-key pin, this device's credential and its sync folder", .{host});
         if (r.folders.kept > 0) try w.print(" (except {d} folder(s) still in use: close the programs running from them, then delete them)", .{r.folders.kept});
         try w.writeAll(".");
         if (r.first_error) |e| try w.print(" Some items could not be removed: {t}.", .{e});
-        try w.writeAll(" The desktop still lists this device until you unpair it there.");
+        switch (r.remote) {
+            .forgotten => try w.writeAll(" The desktop removed this device too."),
+            .already_gone, .gone_by_desktop => try w.writeAll(" The desktop no longer lists this device."),
+            .unreachable_desktop, .not_asked => try w.writeAll(" The desktop could not be told: it still lists this device until it next sees it (then it is told this device is gone) or you unpair it there."),
+        }
     }
 };
+
+/// Forget this desktop, both ways: first asks the desktop to remove this
+/// device (Client.forgetOnDesktop, with `session` or a fresh sign-in),
+/// then forgets it here whatever the answer (an unreachable desktop is
+/// reported, not waited for).
+pub fn forgetBothWays(c: *client_mod.Client, session: ?*const http.Cookie) Forgotten {
+    const told: Forgotten.Remote = switch (c.forgetOnDesktop(session)) {
+        .forgotten => .forgotten,
+        .already_gone => .already_gone,
+        .unreachable_desktop => .unreachable_desktop,
+    };
+    var r = forgetDesktop(c.io, c.host());
+    r.remote = told;
+    return r;
+}
+
+/// `connect --forget` / `sync-device --forget`: connects with `ca_der`
+/// (sync-device's --ca) or the pinned CA for `host` to tell the desktop,
+/// then forgets it here. Without either the desktop can't be reached
+/// securely: it is forgotten here only, and the result says so.
+pub fn forgetHost(gpa: std.mem.Allocator, io: std.Io, host: []const u8, ca_der: ?[]const u8) Forgotten {
+    var ca_buf: [x509check.max_cert_len]u8 = undefined;
+    const der: ?[]const u8 = ca_der orelse blk: {
+        const p = pin_mod.Pin.forHost(host) catch break :blk null;
+        break :blk p.load(io, &ca_buf) catch null;
+    };
+    if (der) |d| {
+        var shared: client_mod.Shared = .{};
+        if (client_mod.Client.init(gpa, io, &shared, host, .{ .tls = d })) |cl| {
+            var c = cl;
+            c.quiet = true;
+            return forgetBothWays(&c, null);
+        } else |_| {}
+    }
+    var r = forgetDesktop(io, host);
+    r.remote = .unreachable_desktop;
+    return r;
+}
 
 /// Forgets a paired desktop on this device: both credentials (TLS and
 /// plain), the pinned CA, the pinned release key, every sync folder of

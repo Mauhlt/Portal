@@ -41,6 +41,12 @@ fn showModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     });
 }
 
+/// The hand-declared Win32 surface (src/win32.zig) for the release tools,
+/// whose module roots are in src/tools.
+fn win32Module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("src/win32.zig"), .target = target, .optimize = optimize });
+}
+
 /// portal-launcher: the GUI build is installed as bin\portal.exe, the
 /// console build as bin\portalctl.exe and bin\portal-show.exe; each runs
 /// the same-named exe of the current release.
@@ -53,6 +59,7 @@ fn launcherModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     const opts = b.addOptions();
     opts.addOption(bool, "gui", gui);
     m.addOptions("build_options", opts);
+    m.addImport("win32", win32Module(b, target, optimize));
     return m;
 }
 
@@ -105,6 +112,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    release_mod.addImport("win32", win32Module(b, target, optimize));
     const release_exe = b.addExecutable(.{ .name = "portal-release", .root_module = release_mod });
     b.installArtifact(release_exe);
     const launcher_exe = b.addExecutable(.{ .name = "portal-launcher", .root_module = launcherModule(b, target, optimize, true) });

@@ -21,6 +21,18 @@
 //!  * Presenting any other secret for a known device revokes the device:
 //!    either the credential was copied and used elsewhere, or it is garbage.
 //!    Either way, re-pairing at the desk is required.
+//!  * Every device record has a random id, issued when it is paired.
+//!    Sessions are tagged with it (auth.Sessions), not with the name. A
+//!    re-pair under a name (or from an address) already in use removes the
+//!    old record outright and the server ends every session of it before
+//!    the new credential is issued; nothing of the old record is kept or
+//!    merged, so a misidentified device never inherits anything.
+//!  * A removed record (unpaired, forgotten by the device, replaced by a
+//!    re-pair, or revoked) leaves its secret hashes behind as tombstones
+//!    (`Gone`), not its name. A device presenting one of those is told,
+//!    unambiguously, that it is no longer paired (AuthResult.gone): it
+//!    then forgets this desktop. It does not revoke whatever record now
+//!    uses its old name, the way an unknown secret would.
 //!
 //! The store is a small text file shared by the running server and the
 //! `portal pair/devices/unpair` commands; every change is a locked
@@ -33,6 +45,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const auth = @import("auth.zig");
 const w = @import("win32.zig");
+const fsutil = @import("fsutil.zig");
 
 pub const max_devices = 16;
 pub const max_name = 32;
@@ -53,9 +66,13 @@ pub const max_requests = 8;
 pub const max_requests_per_ip = 2;
 /// Request code shown on the device and at the desk: 4 hex digits.
 pub const code_len = 4;
+/// Secret hashes of removed records remembered (oldest dropped first).
+pub const max_gone = 32;
 
 const header_v1 = "portal-devices-v1";
-const header = "portal-devices-v2";
+const header_v2 = "portal-devices-v2";
+/// v3: `dev` lines carry the record id.
+const header = "portal-devices-v3";
 
 pub fn validName(name: []const u8) bool {
     if (name.len == 0 or name.len > max_name) return false;
@@ -117,6 +134,13 @@ pub const Text = struct {
     }
 };
 
+/// A secret hash of a removed device record, kept until `until` (the
+/// record would have expired from disuse by then anyway).
+pub const Gone = struct {
+    hash: auth.Hash,
+    until: i64,
+};
+
 pub const Grace = struct {
     hash: auth.Hash,
     /// Valid while now <= until. Never extended.
@@ -126,12 +150,31 @@ pub const Grace = struct {
 pub const Device = struct {
     name: Text = .{},
     ip: Text = .{},
+    /// Random, issued at pairing; what sessions are tagged with.
+    id: auth.DeviceId,
     cur: auth.Hash,
     /// Recently superseded secrets, each valid until its own `until`.
     ring: [ring_len]?Grace = @splat(null),
     created: i64,
     last_seen: i64,
+
+    /// The record's identity, as sessions are tagged with it.
+    pub fn ref(d: *const Device) auth.Device {
+        return .init(d.id, d.name.get());
+    }
 };
+
+/// Id for a record from a file older than v3 (which had none): derived
+/// from its current secret hash, so it is stable until the file is
+/// rewritten as v3. Sessions are memory-only, so none predate it.
+fn legacyId(cur: auth.Hash) auth.DeviceId {
+    var h: auth.Hash = undefined;
+    var s = std.crypto.hash.sha2.Sha256.init(.{});
+    s.update("portal-device-id-v2:");
+    s.update(&cur);
+    s.final(&h);
+    return h[0..auth.device_id_len].*;
+}
 
 pub const ReqState = enum {
     pending,
@@ -206,8 +249,12 @@ pub const AuthResult = union(enum) {
     ok: usize,
     /// Known device, but presented from a different address. Not revoked.
     wrong_address,
-    /// Wrong or stale secret for a known device: the device was revoked.
-    revoked: []const u8,
+    /// Wrong or stale secret for a known device: that record was removed;
+    /// the caller ends its sessions.
+    revoked: auth.Device,
+    /// A secret of a record that was removed: the device is no longer
+    /// paired (and nothing else is touched).
+    gone,
     unknown,
 };
 
@@ -225,22 +272,81 @@ pub const RequestError = error{
 
 pub const AnswerResult = enum { approved, denied, not_pending, no_such_request, window_gone };
 
+/// Device records a pairing removed (same name or same address as the new
+/// one). The caller ends all their sessions before issuing the new
+/// credential.
+pub const Replaced = struct {
+    list: [max_devices]auth.Device = undefined,
+    n: usize = 0,
+
+    pub fn items(r: *const Replaced) []const auth.Device {
+        return r.list[0..r.n];
+    }
+};
+
+pub const Paired = struct {
+    /// The new record.
+    device: auth.Device,
+    replaced: Replaced = .{},
+};
+
 pub const ClaimResult = union(enum) {
     pending,
     denied,
     /// No such request (expired, window closed, wrong address).
     unknown,
-    /// Paired: the device's name.
-    paired: []const u8,
+    paired: Paired,
 };
 
 pub const Store = struct {
     devices: [max_devices]?Device = @splat(null),
     pairing: ?Pairing = null,
+    gone: [max_gone]?Gone = @splat(null),
+
+    /// Removes the record in slot `idx`, keeping its secret hashes as
+    /// tombstones. Returns its identity.
+    pub fn drop(s: *Store, idx: usize) ?auth.Device {
+        const d = s.devices[idx] orelse return null;
+        const until = d.last_seen +| unused_expiry_s;
+        s.bury(d.cur, until);
+        for (d.ring) |g| if (g) |e| s.bury(e.hash, until);
+        s.devices[idx] = null;
+        return d.ref();
+    }
+
+    fn bury(s: *Store, h: auth.Hash, until: i64) void {
+        var target: usize = 0;
+        var oldest: i64 = std.math.maxInt(i64);
+        for (s.gone, 0..) |slot, i| {
+            const t = if (slot) |g| g.until else std.math.minInt(i64);
+            if (t < oldest) {
+                oldest = t;
+                target = i;
+            }
+        }
+        s.gone[target] = .{ .hash = h, .until = until };
+    }
+
+    /// Whether `h` is a tombstone. Scans every slot.
+    fn isGone(s: *const Store, h: auth.Hash) bool {
+        var found = false;
+        for (s.gone) |slot| if (slot) |g| {
+            found = found or std.crypto.timing_safe.eql(auth.Hash, g.hash, h);
+        };
+        return found;
+    }
 
     pub fn find(s: *const Store, name: []const u8) ?usize {
         for (s.devices, 0..) |d, i| {
             if (d) |dev| if (std.mem.eql(u8, dev.name.get(), name)) return i;
+        }
+        return null;
+    }
+
+    /// The record with id `id` (a re-paired name has a different one).
+    pub fn findId(s: *const Store, id: auth.DeviceId) ?usize {
+        for (s.devices, 0..) |d, i| {
+            if (d) |dev| if (std.mem.eql(u8, &dev.id, &id)) return i;
         }
         return null;
     }
@@ -274,6 +380,10 @@ pub const Store = struct {
                 };
             }
         }
+        for (&s.gone) |*g| if (g.*) |e| if (now > e.until) {
+            g.* = null;
+            changed = true;
+        };
         return changed;
     }
 
@@ -284,18 +394,18 @@ pub const Store = struct {
         const name = cookie[0..dot];
         const secret = cookie[dot + 1 ..];
         if (!validName(name) or secret.len != auth.encoded_len) return .unknown;
+        const h = auth.hashSecret(secret);
+        if (s.isGone(h)) return .gone;
         const idx = s.find(name) orelse return .unknown;
         const dev = &s.devices[idx].?;
         if (!std.mem.eql(u8, dev.ip.get(), ip)) return .wrong_address;
-        const h = auth.hashSecret(secret);
         var valid = std.crypto.timing_safe.eql(auth.Hash, h, dev.cur);
         for (dev.ring) |slot| {
             const g = slot orelse continue;
             if (std.crypto.timing_safe.eql(auth.Hash, h, g.hash) and now <= g.until) valid = true;
         }
         if (valid) return .{ .ok = idx };
-        s.devices[idx] = null;
-        return .{ .revoked = name };
+        return .{ .revoked = s.drop(idx).? };
     }
 
     /// Issues `new_hash` as the device's current secret. The secret it
@@ -410,9 +520,11 @@ pub const Store = struct {
     }
 
     /// The device behind request `token` asks for its outcome from `ip`.
-    /// If approved, registers the device with secret hash `new_hash` (a
-    /// device already using that name, or that address, is replaced).
-    pub fn claim(s: *Store, token: auth.Hash, ip: []const u8, new_hash: auth.Hash, now: i64) !ClaimResult {
+    /// If approved, registers a new device record with id `new_id` and
+    /// secret hash `new_hash`. Any record already using that name, or that
+    /// address, is removed (never updated or merged) and reported in
+    /// `replaced`, so the caller can end its sessions.
+    pub fn claim(s: *Store, token: auth.Hash, ip: []const u8, new_id: auth.DeviceId, new_hash: auth.Hash, now: i64) !ClaimResult {
         const p = &(s.pairing orelse return .unknown);
         if (now > p.expires) return .unknown;
         const i = p.findToken(token) orelse return .unknown;
@@ -424,27 +536,39 @@ pub const Store = struct {
             .done => return .unknown, // single use
             .approved => {},
         }
-        var dev: Device = .{ .cur = new_hash, .created = now, .last_seen = now };
+        // An id collision (2^-128) would let sessions cross records.
+        if (s.findId(new_id) != null) return error.DuplicateDeviceId;
+        var dev: Device = .{ .id = new_id, .cur = new_hash, .created = now, .last_seen = now };
         dev.name = p.name;
         dev.ip.set(ip);
-        for (&s.devices) |*slot| {
-            if (slot.*) |d| if (std.mem.eql(u8, d.name.get(), dev.name.get()) or std.mem.eql(u8, d.ip.get(), ip)) {
-                slot.* = null;
+        var out: Paired = .{ .device = dev.ref() };
+        for (&s.devices, 0..) |slot, j| {
+            if (slot) |d| if (std.mem.eql(u8, d.name.get(), dev.name.get()) or std.mem.eql(u8, d.ip.get(), ip)) {
+                out.replaced.list[out.replaced.n] = s.drop(j).?;
+                out.replaced.n += 1;
             };
         }
         for (&s.devices) |*slot| {
             if (slot.* == null) {
                 slot.* = dev;
                 r.state = .done;
-                return .{ .paired = slot.*.?.name.get() };
+                return .{ .paired = out };
             }
         }
         return error.TooManyDevices;
     }
 
+    /// Unpairs device `name` (its secrets become tombstones).
     pub fn remove(s: *Store, name: []const u8) bool {
         const idx = s.find(name) orelse return false;
-        s.devices[idx] = null;
+        _ = s.drop(idx);
+        return true;
+    }
+
+    /// Removes record `id` only: a newer record under the same name stays.
+    pub fn removeId(s: *Store, id: auth.DeviceId) bool {
+        const idx = s.findId(id) orelse return false;
+        _ = s.drop(idx);
         return true;
     }
 
@@ -455,7 +579,8 @@ pub const Store = struct {
         var lines = std.mem.tokenizeAny(u8, text, "\r\n");
         const first = lines.next() orelse return error.BadDeviceFile;
         const v1 = std.mem.eql(u8, first, header_v1);
-        if (!v1 and !std.mem.eql(u8, first, header)) return error.BadDeviceFile;
+        const v2 = std.mem.eql(u8, first, header_v2);
+        if (!v1 and !v2 and !std.mem.eql(u8, first, header)) return error.BadDeviceFile;
         var n: usize = 0;
         var n_req: usize = 0;
         while (lines.next()) |line| {
@@ -495,12 +620,20 @@ pub const Store = struct {
                 r.state = std.meta.stringToEnum(ReqState, f.next() orelse return error.BadDeviceFile) orelse return error.BadDeviceFile;
                 p.requests[n_req] = r;
                 n_req += 1;
+            } else if (std.mem.eql(u8, kind, "gone") and !v1 and !v2) {
+                var k: usize = 0;
+                while (k < max_gone and s.gone[k] != null) k += 1;
+                if (k == max_gone) return error.BadDeviceFile;
+                s.gone[k] = .{ .hash = try parseHash(f.next()), .until = try parseInt(f.next()) };
             } else if (std.mem.eql(u8, kind, "dev")) {
                 if (n >= max_devices) return error.BadDeviceFile;
                 const name = f.next() orelse return error.BadDeviceFile;
                 const ip = f.next() orelse return error.BadDeviceFile;
                 if (!validName(name) or !validIp(ip)) return error.BadDeviceFile;
-                var d: Device = .{ .cur = try parseHash(f.next()), .created = 0, .last_seen = 0 };
+                const id: ?auth.DeviceId = if (v1 or v2) null else try parseId(f.next());
+                const cur = try parseHash(f.next());
+                var d: Device = .{ .id = id orelse legacyId(cur), .cur = cur, .created = 0, .last_seen = 0 };
+                for (s.devices[0..n]) |o| if (std.mem.eql(u8, &o.?.id, &d.id)) return error.BadDeviceFile;
                 if (v1) {
                     const prev = f.next() orelse return error.BadDeviceFile;
                     const prev_until = try parseInt(f.next());
@@ -542,10 +675,14 @@ pub const Store = struct {
                 }));
             }
         }
+        for (s.gone) |slot| {
+            const g = slot orelse continue;
+            try out.appendSlice(gpa, try std.fmt.bufPrint(&buf, "gone {x} {d}\n", .{ &g.hash, g.until }));
+        }
         for (s.devices) |slot| {
             const d = slot orelse continue;
-            try out.appendSlice(gpa, try std.fmt.bufPrint(&buf, "dev {s} {s} {x} {d} {d}", .{
-                d.name.get(), d.ip.get(), &d.cur, d.created, d.last_seen,
+            try out.appendSlice(gpa, try std.fmt.bufPrint(&buf, "dev {s} {s} {x} {x} {d} {d}", .{
+                d.name.get(), d.ip.get(), &d.id, &d.cur, d.created, d.last_seen,
             }));
             for (d.ring) |gs| {
                 const g = gs orelse continue;
@@ -558,6 +695,14 @@ pub const Store = struct {
 
 fn parseInt(s: ?[]const u8) !i64 {
     return std.fmt.parseInt(i64, s orelse return error.BadDeviceFile, 10) catch error.BadDeviceFile;
+}
+
+fn parseId(s: ?[]const u8) !auth.DeviceId {
+    const hex = s orelse return error.BadDeviceFile;
+    if (hex.len != 2 * auth.device_id_len) return error.BadDeviceFile;
+    var id: auth.DeviceId = undefined;
+    _ = std.fmt.hexToBytes(&id, hex) catch return error.BadDeviceFile;
+    return id;
 }
 
 fn parseHash(s: ?[]const u8) !auth.Hash {
@@ -574,7 +719,7 @@ pub fn describeError(err: anyerror) []const u8 {
         error.BadDeviceFile => "the device list (devices.txt in %LOCALAPPDATA%\\Portal) is damaged or from a newer Portal. " ++
             "To recover: close Portal, move devices.txt somewhere else (keep it if you want to report the problem), " ++
             "start Portal again, and re-pair every device (Pair a device in the Portal window)",
-        error.DeviceStoreBusy => "the device list is locked by another Portal process; try again",
+        error.DeviceStoreBusy => "the device list is held open by an older Portal process; close it and try again",
         error.DeviceStoreWriteFailed => "could not replace devices.txt (disk full, or the file is locked by another program)",
         else => "could not access the device list in %LOCALAPPDATA%\\Portal",
     };
@@ -582,97 +727,38 @@ pub fn describeError(err: anyerror) []const u8 {
 
 // ------------------------------------------------------------- file access
 
-pub const Paths = struct {
-    /// %LOCALAPPDATA%\Portal
-    dir: []const u8,
-
-    fn join(p: Paths, buf: []u8, name: []const u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "{s}\\{s}", .{ p.dir, name });
-    }
-};
-
-fn wide(gpa: Allocator, s: []const u8) ![:0]u16 {
-    return std.unicode.utf8ToUtf16LeAllocZ(gpa, s);
-}
-
-const CREATE_ALWAYS: w.DWORD = 2;
-extern "kernel32" fn FlushFileBuffers(h: w.HANDLE) callconv(.winapi) w.BOOL;
-
-/// Writes `data` to `path_w` and flushes it to disk before returning, so the
-/// atomic rename that follows can never publish an empty or partial file.
-fn writeFlushed(path_w: [:0]const u16, data: []const u8) !void {
-    const h = w.validHandle(w.CreateFileW(path_w.ptr, w.GENERIC_WRITE, 0, null, CREATE_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null)) orelse
-        return error.DeviceStoreWriteFailed;
-    defer _ = w.CloseHandle(h);
-    var off: usize = 0;
-    while (off < data.len) {
-        var n: w.DWORD = 0;
-        const chunk: w.DWORD = @intCast(@min(data.len - off, 1 << 20));
-        if (w.WriteFile(h, data[off..].ptr, chunk, &n, null) == 0 or n == 0) return error.DeviceStoreWriteFailed;
-        off += n;
-    }
-    if (FlushFileBuffers(h) == 0) return error.DeviceStoreWriteFailed;
-}
-
-/// The pause between attempts to open a busy lock file. A cancelation that
-/// lands here is re-armed before it is returned: callers in the web server
-/// turn store errors into HTTP responses, so without re-arming the request
-/// would be consumed and the connection's next read would block forever,
-/// with the supervisor stuck waiting in `worker.cancel` (a pre-auth DoS that
-/// leaks the connection slot).
-pub fn lockRetrySleep(io: Io) error{Canceled}!void {
-    io.sleep(.fromMilliseconds(10), .awake) catch |err| switch (err) {
-        error.Canceled => {
-            io.recancel();
-            return error.Canceled;
-        },
-    };
-}
+/// %LOCALAPPDATA%\Portal
+pub const Paths = fsutil.DataDir;
 
 /// Locked read-modify-write of the device store. `op(ctx, *Store)` returns
 /// whether it changed the store; if so the file is replaced atomically
-/// (written, flushed to disk, then renamed over the old one).
-/// The lock is an exclusively opened `devices.lock`, shared with any other
-/// Portal process (the running server and the `pair`/`unpair` commands).
+/// (written, flushed to disk, then renamed over the old one). The lock is
+/// `devices.lock`, shared with every other Portal process (the running
+/// server and the `pair`/`unpair` commands); waiting for it blocks without
+/// polling, and a cancel during the wait is returned and stays armed
+/// (fsutil.FileLock).
 pub fn withStore(gpa: Allocator, io: Io, paths: Paths, now: i64, ctx: anytype, comptime op: anytype) !void {
-    var pbuf: [1024]u8 = undefined;
-    const lock_w = try wide(gpa, try paths.join(&pbuf, "devices.lock"));
-    defer gpa.free(lock_w);
-    var lock: ?w.HANDLE = null;
-    var tries: usize = 0;
-    while (tries < 200) : (tries += 1) {
-        lock = w.validHandle(w.CreateFileW(lock_w.ptr, w.GENERIC_WRITE, 0, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null));
-        if (lock != null) break;
-        try lockRetrySleep(io);
-    }
-    const lock_h = lock orelse return error.DeviceStoreBusy;
-    defer _ = w.CloseHandle(lock_h);
-
-    const path = try paths.join(&pbuf, "devices.txt");
-    var store: Store = blk: {
-        const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch |err| switch (err) {
-            error.FileNotFound => break :blk .{},
-            else => return err,
-        };
-        defer gpa.free(text);
-        break :blk try Store.parse(text); // corrupt file: fail closed
+    var lb: [1024]u8 = undefined;
+    var pb: [1024]u8 = undefined;
+    const Ctx = struct { gpa: Allocator, now: i64, inner: @TypeOf(ctx) };
+    fsutil.update(gpa, io, try paths.join(&lb, &.{"devices.lock"}), try paths.join(&pb, &.{"devices.txt"}), 64 * 1024, Ctx{
+        .gpa = gpa,
+        .now = now,
+        .inner = ctx,
+    }, struct {
+        fn edit(c: Ctx, old: ?[]const u8, out: *std.ArrayList(u8)) !bool {
+            var store: Store = if (old) |text| try Store.parse(text) else .{}; // corrupt file: fail closed
+            var dirty = store.expire(c.now);
+            if (try op(c.inner, &store)) dirty = true;
+            if (!dirty) return false;
+            try store.format(c.gpa, out);
+            return true;
+        }
+    }.edit) catch |err| return switch (err) {
+        error.LockBusy => error.DeviceStoreBusy,
+        error.ReplaceFailed => error.DeviceStoreWriteFailed,
+        else => err,
     };
-    var dirty = store.expire(now);
-    if (try op(ctx, &store)) dirty = true;
-    if (!dirty) return;
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(gpa);
-    try store.format(gpa, &out);
-    var tbuf: [1024]u8 = undefined;
-    const tmp = try paths.join(&tbuf, "devices.txt.tmp");
-    const tmp_w = try wide(gpa, tmp);
-    defer gpa.free(tmp_w);
-    try writeFlushed(tmp_w, out.items);
-    const path_w = try wide(gpa, path);
-    defer gpa.free(path_w);
-    if (w.MoveFileExW(tmp_w.ptr, path_w.ptr, w.MOVEFILE_REPLACE_EXISTING | w.MOVEFILE_WRITE_THROUGH) == 0)
-        return error.DeviceStoreWriteFailed;
 }
 
 // ------------------------------------------------------ desk approval API
@@ -759,41 +845,13 @@ pub fn pairedRequest(p: *const Pairing) ?Request {
 
 // --------------------------------------------------- change notification
 
-pub const WAIT_OBJECT_0: w.DWORD = 0;
-pub const WAIT_TIMEOUT: w.DWORD = 258;
-const FILE_NOTIFY_CHANGE_FILE_NAME: w.DWORD = 0x1;
-extern "kernel32" fn FindFirstChangeNotificationW(path: [*:0]const u16, subtree: w.BOOL, filter: w.DWORD) callconv(.winapi) ?w.HANDLE;
-extern "kernel32" fn FindNextChangeNotification(h: w.HANDLE) callconv(.winapi) w.BOOL;
-extern "kernel32" fn FindCloseChangeNotification(h: w.HANDLE) callconv(.winapi) w.BOOL;
-pub extern "kernel32" fn WaitForMultipleObjects(n: w.DWORD, handles: [*]const w.HANDLE, all: w.BOOL, ms: w.DWORD) callconv(.winapi) w.DWORD;
-
 /// Signalled whenever a file in the data directory is created, renamed or
 /// deleted. Every store change ends in a rename (see `withStore`), so this
 /// wakes every Portal process sharing the directory, however many there
 /// are, without anyone polling. Log appends do not trigger it.
-pub const DirWatch = struct {
-    h: ?w.HANDLE = null,
-
-    pub fn open(gpa: Allocator, paths: Paths) DirWatch {
-        const dir_w = wide(gpa, paths.dir) catch return .{};
-        defer gpa.free(dir_w);
-        return .{ .h = w.validHandle(FindFirstChangeNotificationW(dir_w.ptr, 0, FILE_NOTIFY_CHANGE_FILE_NAME)) };
-    }
-
-    /// Re-arms after a wake. Call before re-reading the store, so a change
-    /// made while reading signals again.
-    pub fn rearm(d: *DirWatch) void {
-        if (d.h) |h| if (FindNextChangeNotification(h) == 0) {
-            _ = FindCloseChangeNotification(h);
-            d.h = null;
-        };
-    }
-
-    pub fn close(d: *DirWatch) void {
-        if (d.h) |h| _ = FindCloseChangeNotification(h);
-        d.h = null;
-    }
-};
+pub fn watchStore(gpa: Allocator, paths: Paths) !fsutil.DirWatch {
+    return fsutil.DirWatch.open(gpa, paths.dir, .{});
+}
 
 /// Milliseconds to wait (for WaitForMultipleObjects) until unix second
 /// `deadline_s`, plus a little slack; INFINITE for none.
@@ -824,15 +882,25 @@ fn hashOf(cookie: []const u8) auth.Hash {
     return auth.hashSecret(cookie[std.mem.indexOfScalar(u8, cookie, '.').? + 1 ..]);
 }
 
+/// A test record id (real ones are random).
+fn idOf(h: auth.Hash) auth.DeviceId {
+    return h[0..auth.device_id_len].*;
+}
+
 /// Pairs `name` at `ip` through the request/approve/claim flow.
 fn testPair(s: *Store, name: []const u8, ip: []const u8, secret_hash: auth.Hash, now: i64) !void {
+    _ = try testPairReplacing(s, name, ip, secret_hash, now);
+}
+
+fn testPairReplacing(s: *Store, name: []const u8, ip: []const u8, secret_hash: auth.Hash, now: i64) !Paired {
     try s.beginPair(name, now, 120, 0x1234, 1);
     const tok = auth.hashSecret("token");
     try s.addRequest(ip, tok, "ab12".*, now);
     try testing.expectEqual(AnswerResult.approved, s.answer(0x1234, "ab12", true));
-    const r = try s.claim(tok, ip, secret_hash, now);
-    try testing.expectEqualStrings(name, r.paired);
+    const r = try s.claim(tok, ip, idOf(secret_hash), secret_hash, now);
+    try testing.expectEqualStrings(name, r.paired.device.name());
     _ = s.endPair(0x1234);
+    return r.paired;
 }
 
 test "names and addresses" {
@@ -860,12 +928,12 @@ test "desk approval: only the approved request gets a credential" {
     try testing.expectError(error.DuplicateCode, s.addRequest("10.8.0.4", auth.hashSecret("C"), "aaaa".*, 2));
 
     // Nothing is issued before the owner answers.
-    try testing.expect((try s.claim(tok_b, "10.8.0.9", auth.hashSecret("x"), 3)) == .pending);
+    try testing.expect((try s.claim(tok_b, "10.8.0.9", idOf(auth.hashSecret("x")), auth.hashSecret("x"), 3)) == .pending);
     try testing.expectEqual(@as(usize, 0), s.count());
 
     // Deny the wrong-looking one: the window stays open.
     try testing.expectEqual(AnswerResult.denied, s.answer(7, "bbbb", false));
-    try testing.expect((try s.claim(tok_b, "10.8.0.9", auth.hashSecret("x"), 4)) == .denied);
+    try testing.expect((try s.claim(tok_b, "10.8.0.9", idOf(auth.hashSecret("x")), auth.hashSecret("x"), 4)) == .denied);
     try testing.expectError(error.AddressDenied, s.addRequest("10.8.0.9", auth.hashSecret("D"), "dddd".*, 4));
     try testing.expectEqual(AnswerResult.not_pending, s.answer(7, "bbbb", true));
     try testing.expectEqual(AnswerResult.window_gone, s.answer(8, "aaaa", true));
@@ -873,15 +941,16 @@ test "desk approval: only the approved request gets a credential" {
 
     // Approve the phone; the token is bound to its address.
     try testing.expectEqual(AnswerResult.approved, s.answer(7, "aaaa", true));
-    try testing.expect((try s.claim(tok_a, "10.8.0.9", auth.hashSecret("x"), 5)) == .unknown);
-    try testing.expect((try s.claim(auth.hashSecret("guess"), "10.8.0.3", auth.hashSecret("x"), 5)) == .unknown);
+    try testing.expect((try s.claim(tok_a, "10.8.0.9", idOf(auth.hashSecret("x")), auth.hashSecret("x"), 5)) == .unknown);
+    try testing.expect((try s.claim(auth.hashSecret("guess"), "10.8.0.3", idOf(auth.hashSecret("x")), auth.hashSecret("x"), 5)) == .unknown);
     try testing.expectError(error.WindowDecided, s.addRequest("10.8.0.5", auth.hashSecret("E"), "eeee".*, 5));
-    const r = try s.claim(tok_a, "10.8.0.3", auth.hashSecret("secret"), 6);
-    try testing.expectEqualStrings("iphone", r.paired);
+    const r = try s.claim(tok_a, "10.8.0.3", idOf(auth.hashSecret("secret")), auth.hashSecret("secret"), 6);
+    try testing.expectEqualStrings("iphone", r.paired.device.name());
+    try testing.expectEqual(@as(usize, 0), r.paired.replaced.n);
     try testing.expectEqual(@as(usize, 1), s.count());
     try testing.expectEqualStrings("10.8.0.3", s.devices[s.find("iphone").?].?.ip.get());
     // Single use.
-    try testing.expect((try s.claim(tok_a, "10.8.0.3", auth.hashSecret("again"), 7)) == .unknown);
+    try testing.expect((try s.claim(tok_a, "10.8.0.3", idOf(auth.hashSecret("again")), auth.hashSecret("again"), 7)) == .unknown);
 }
 
 test "approving one request denies the other pending ones" {
@@ -890,7 +959,7 @@ test "approving one request denies the other pending ones" {
     try s.addRequest("10.8.0.2", auth.hashSecret("1"), "0001".*, 1);
     try s.addRequest("10.8.0.3", auth.hashSecret("2"), "0002".*, 1);
     try testing.expectEqual(AnswerResult.approved, s.answer(1, "0002", true));
-    try testing.expect((try s.claim(auth.hashSecret("1"), "10.8.0.2", auth.hashSecret("x"), 2)) == .denied);
+    try testing.expect((try s.claim(auth.hashSecret("1"), "10.8.0.2", idOf(auth.hashSecret("x")), auth.hashSecret("x"), 2)) == .denied);
 }
 
 test "pairing request bounds" {
@@ -936,7 +1005,8 @@ test "authenticate, rotate, grace ring, theft detection" {
     const late = s.authenticate(c1, "10.8.0.2", 20 + grace_s + 1);
     try testing.expect(late == .revoked);
     try testing.expect(s.find("laptop") == null);
-    try testing.expect(s.authenticate(c2, "10.8.0.2", 20 + grace_s + 2) == .unknown);
+    // ...and the current one is then told it is no longer paired.
+    try testing.expect(s.authenticate(c2, "10.8.0.2", 20 + grace_s + 2) == .gone);
 }
 
 test "two tabs signing in with the same credential: no revocation" {
@@ -1038,10 +1108,105 @@ test "malformed cookies are unknown, not revocations" {
 test "re-pairing replaces same name or same address" {
     var s: Store = .{};
     try testPair(&s, "laptop", "10.8.0.2", auth.hashSecret("a"), 1);
-    try testPair(&s, "laptop2", "10.8.0.2", auth.hashSecret("b"), 3);
+    const p = try testPairReplacing(&s, "laptop2", "10.8.0.2", auth.hashSecret("b"), 3);
     try testing.expect(s.find("laptop") == null);
     try testing.expect(s.find("laptop2") != null);
     try testing.expectEqual(@as(usize, 1), s.count());
+    try testing.expectEqual(@as(usize, 1), p.replaced.n);
+    try testing.expectEqualStrings("laptop", p.replaced.items()[0].name());
+    try testing.expectEqual(idOf(auth.hashSecret("a")), p.replaced.items()[0].id);
+}
+
+test "re-pairing a name: the old record is removed outright, never updated" {
+    var s: Store = .{};
+    var b1: [80]u8 = undefined;
+    const old = cookieFor(&b1, "laptop", 1);
+    try testPair(&s, "laptop", "10.8.0.2", hashOf(old), 1);
+    s.rotate(s.find("laptop").?, auth.hashSecret("rotated"), 2); // grace ring has `old`
+    // The same name re-paired from another address (another machine).
+    var b2: [80]u8 = undefined;
+    const new = cookieFor(&b2, "laptop", 2);
+    const p = try testPairReplacing(&s, "laptop", "10.8.0.7", hashOf(new), 3);
+    try testing.expectEqual(@as(usize, 1), p.replaced.n);
+    try testing.expectEqual(idOf(hashOf(old)), p.replaced.items()[0].id);
+    try testing.expect(!std.mem.eql(u8, &p.device.id, &p.replaced.items()[0].id));
+    try testing.expectEqual(@as(usize, 1), s.count());
+    const d = s.devices[s.find("laptop").?].?;
+    // Nothing carried over: new id, address, secret, empty grace ring, new created.
+    try testing.expectEqual(p.device.id, d.id);
+    try testing.expectEqualStrings("10.8.0.7", d.ip.get());
+    try testing.expectEqual(@as(i64, 3), d.created);
+    for (d.ring) |g| try testing.expect(g == null);
+    try testing.expect(s.findId(idOf(hashOf(old))) == null);
+    // The old credential (current or in its grace ring) is told it is no
+    // longer paired, from anywhere, and never touches the new record.
+    try testing.expect(s.authenticate(old, "10.8.0.2", 4) == .gone);
+    try testing.expect(s.authenticate(old, "10.8.0.7", 4) == .gone);
+    try testing.expectEqual(@as(usize, 1), s.count());
+}
+
+test "a removed record's secrets are tombstones: told gone, nothing revoked" {
+    var s: Store = .{};
+    var b1: [80]u8 = undefined;
+    const old = cookieFor(&b1, "laptop", 1);
+    try testPair(&s, "laptop", "10.8.0.2", hashOf(old), 1);
+    var b2: [80]u8 = undefined;
+    const rotated = cookieFor(&b2, "laptop", 2);
+    s.rotate(s.find("laptop").?, hashOf(rotated), 2); // `old` in the grace ring
+    // Unpaired at the desk: both the current and the grace secret say gone.
+    try testing.expect(s.remove("laptop"));
+    try testing.expect(s.authenticate(rotated, "10.8.0.2", 3) == .gone);
+    try testing.expect(s.authenticate(old, "10.8.0.2", 3) == .gone);
+    // Another device paired under the name later: the old credential is
+    // still just gone, and does not revoke the new record.
+    var b3: [80]u8 = undefined;
+    const fresh = cookieFor(&b3, "laptop", 3);
+    try testPair(&s, "laptop", "10.8.0.2", hashOf(fresh), 4);
+    try testing.expect(s.authenticate(rotated, "10.8.0.2", 5) == .gone);
+    try testing.expect(s.authenticate(fresh, "10.8.0.2", 5) == .ok);
+    // A garbage secret still revokes (theft detection); its secret is
+    // then a tombstone too.
+    var b4: [80]u8 = undefined;
+    try testing.expect(s.authenticate(cookieFor(&b4, "laptop", 9), "10.8.0.2", 6) == .revoked);
+    try testing.expect(s.authenticate(fresh, "10.8.0.2", 7) == .gone);
+    // Round trip through the file.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try s.format(testing.allocator, &out);
+    var t = try Store.parse(out.items);
+    try testing.expect(t.authenticate(rotated, "10.8.0.2", 8) == .gone);
+    // Tombstones expire with the record's disuse horizon.
+    _ = t.expire(2 + unused_expiry_s + 1);
+    try testing.expect(t.authenticate(rotated, "10.8.0.2", 2 + unused_expiry_s + 1) == .unknown);
+}
+
+test "tombstones are bounded: the oldest go first" {
+    var s: Store = .{};
+    for (0..max_gone + 3) |i| s.bury(auth.hashSecret(&[_]u8{@intCast(i)}), @intCast(100 + i));
+    try testing.expect(!s.isGone(auth.hashSecret(&[_]u8{0})));
+    try testing.expect(s.isGone(auth.hashSecret(&[_]u8{max_gone + 2})));
+}
+
+test "removeId spares a newer record under the same name" {
+    var s: Store = .{};
+    try testPair(&s, "laptop", "10.8.0.2", auth.hashSecret("a"), 1);
+    const old_id = s.devices[s.find("laptop").?].?.id;
+    try testPair(&s, "laptop", "10.8.0.2", auth.hashSecret("b"), 2);
+    try testing.expect(!s.removeId(old_id));
+    try testing.expect(s.find("laptop") != null);
+    try testing.expect(s.removeId(idOf(auth.hashSecret("b"))));
+    try testing.expectEqual(@as(usize, 0), s.count());
+}
+
+test "authenticate reports which record it revoked" {
+    var s: Store = .{};
+    var b: [80]u8 = undefined;
+    const c = cookieFor(&b, "phone", 5);
+    try testPair(&s, "phone", "10.8.0.3", hashOf(c), 1);
+    var bad: [80]u8 = undefined;
+    const r = s.authenticate(cookieFor(&bad, "phone", 9), "10.8.0.3", 2);
+    try testing.expectEqualStrings("phone", r.revoked.name());
+    try testing.expectEqual(idOf(hashOf(c)), r.revoked.id);
 }
 
 test "pairing window expires and ends" {
@@ -1060,7 +1225,7 @@ test "pairing window expires and ends" {
     try s.beginPair("laptop", 0, 60, 9, 1);
     try s.addRequest("10.8.0.2", auth.hashSecret("t"), "0a0a".*, 1);
     _ = s.answer(9, "0a0a", true);
-    try testing.expect((try s.claim(auth.hashSecret("t"), "10.8.0.2", auth.hashSecret("x"), 61)) == .unknown);
+    try testing.expect((try s.claim(auth.hashSecret("t"), "10.8.0.2", idOf(auth.hashSecret("x")), auth.hashSecret("x"), 61)) == .unknown);
 }
 
 test "unused devices are forgotten" {
@@ -1112,13 +1277,31 @@ test "file round trip and strict parsing" {
     try testing.expectEqual(auth.hashSecret("new"), d.cur);
     try testing.expectEqual(hashOf(c), d.ring[0].?.hash);
     try testing.expectEqual(@as(i64, 8 + grace_s), d.ring[0].?.until);
+    try testing.expectEqual(idOf(hashOf(c)), d.id);
 
     try testing.expectError(error.BadDeviceFile, Store.parse(""));
-    try testing.expectError(error.BadDeviceFile, Store.parse("portal-devices-v3\n"));
+    try testing.expectError(error.BadDeviceFile, Store.parse("portal-devices-v4\n"));
     try testing.expectError(error.BadDeviceFile, Store.parse(header ++ "\ndev x\n"));
     try testing.expectError(error.BadDeviceFile, Store.parse(header ++ "\nhack\n"));
     try testing.expectError(error.BadDeviceFile, Store.parse(header ++ "\npair Bad 5\n"));
     try testing.expectError(error.BadDeviceFile, Store.parse(header ++ "\nreq 7f3a " ++ &zeros64 ++ " 10.8.0.3 1 pending\n"));
+    // Two records with one id would let sessions cross between them.
+    const dup = "dev a 10.8.0.2 " ++ zeros64[0..32] ++ " " ++ &zeros64 ++ " 1 1\n";
+    try testing.expectError(error.BadDeviceFile, Store.parse(header ++ "\n" ++ dup ++ "dev b 10.8.0.3 " ++ zeros64[0..32] ++ " " ++ &zeros64 ++ " 1 1\n"));
+    _ = try Store.parse(header ++ "\n" ++ dup);
+}
+
+test "v2 files still load (ids derived, stable)" {
+    const h1: [64]u8 = @splat('1');
+    const v2 = header_v2 ++ "\ndev laptop 10.8.0.2 " ++ &h1 ++ " 5 6\n";
+    const a = try Store.parse(v2);
+    const b = try Store.parse(v2);
+    try testing.expectEqual(a.devices[0].?.id, b.devices[0].?.id);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try a.format(testing.allocator, &out);
+    try testing.expect(std.mem.startsWith(u8, out.items, header ++ "\n"));
+    try testing.expectEqual(a.devices[0].?.id, (try Store.parse(out.items)).devices[0].?.id);
 }
 
 test "v1 files still load (prev secret becomes the ring; v1 windows are dropped)" {
@@ -1134,7 +1317,7 @@ test "v1 files still load (prev secret becomes the ring; v1 windows are dropped)
 
 test "Desk: begin, see a request, approve, collect, cancel (on a real store file)" {
     const io = testing.io;
-    var tmp = testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var pbuf: [256]u8 = undefined;
     const dir = try std.fmt.bufPrint(&pbuf, ".zig-cache\\tmp\\{s}", .{&tmp.sub_path});
@@ -1157,7 +1340,7 @@ test "Desk: begin, see a request, approve, collect, cancel (on a real store file
     try testing.expectEqual(AnswerResult.not_pending, try desk.answer(43, "7f3a", false));
     try withStore(testing.allocator, io, desk.paths, now, Ctx{ .now = now }, struct {
         fn op(c: Ctx, st: *Store) !bool {
-            _ = try st.claim(auth.hashSecret("tok"), "10.8.0.3", auth.hashSecret("secret"), c.now);
+            _ = try st.claim(auth.hashSecret("tok"), "10.8.0.3", idOf(auth.hashSecret("secret")), auth.hashSecret("secret"), c.now);
             return true;
         }
     }.op);
@@ -1165,10 +1348,11 @@ test "Desk: begin, see a request, approve, collect, cancel (on a real store file
     try desk.cancel(43);
     try testing.expect((try desk.get(43)) == null);
     // The tmp file was flushed and renamed; nothing is left behind.
-    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "devices.txt.tmp", .{}));
+    var it = tmp.dir.iterate();
+    while (try it.next(io)) |e| try testing.expect(!std.mem.endsWith(u8, e.name, ".tmp"));
 }
 
-test "withStore: a cancel during the busy-lock retry is returned and stays armed" {
+test "withStore: a cancel while waiting for the lock is returned and stays armed" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1176,12 +1360,10 @@ test "withStore: a cancel during the busy-lock retry is returned and stays armed
     const dir = try std.fmt.bufPrint(&pbuf, ".zig-cache\\tmp\\{s}", .{&tmp.sub_path});
     const paths: Paths = .{ .dir = dir };
 
-    // Hold the lock so withStore keeps retrying.
+    // Hold the lock (as another Portal process would) so withStore waits.
     var lbuf: [1024]u8 = undefined;
-    const lock_w = try wide(testing.allocator, try paths.join(&lbuf, "devices.lock"));
-    defer testing.allocator.free(lock_w);
-    const held = w.validHandle(w.CreateFileW(lock_w.ptr, w.GENERIC_WRITE, 0, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null)) orelse return error.SkipZigTest;
-    defer _ = w.CloseHandle(held);
+    const held = try fsutil.FileLock.acquire(io, try paths.join(&lbuf, &.{"devices.lock"}));
+    defer held.release(io);
 
     const Task = struct {
         /// Like the web handlers: the store error is turned into something
@@ -1201,7 +1383,7 @@ test "withStore: a cancel during the busy-lock retry is returned and stays armed
     var started: Io.Event = .unset;
     var fut = io.concurrent(Task.run, .{ io, paths, &started }) catch return error.SkipZigTest;
     try started.wait(io);
-    try io.sleep(.fromMilliseconds(30), .awake); // let it reach the retry loop
+    try io.sleep(.fromMilliseconds(30), .awake); // let it block on the lock
     const res = fut.cancel(io);
     try testing.expectError(error.Canceled, res.store);
     try testing.expectError(error.Canceled, res.next);

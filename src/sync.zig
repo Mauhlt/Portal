@@ -29,7 +29,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const manifest = @import("client").sync.manifest;
 const dpapi = @import("tls/dpapi.zig");
 const devices = @import("devices.zig");
-const w = @import("win32.zig");
+const fsutil = @import("fsutil.zig");
 
 pub const Ed25519 = manifest.Ed25519;
 
@@ -41,60 +41,8 @@ pub const max_subscriptions = 256;
 /// The Portal version devices need by default (manifest min-client).
 pub const default_min_client = "0.1.0";
 
-fn joinBuf(buf: []u8, parts: []const []const u8) ![]const u8 {
-    var wr: Io.Writer = .fixed(buf);
-    for (parts, 0..) |p, i| {
-        if (i > 0) wr.writeAll("\\") catch return error.NameTooLong;
-        wr.writeAll(p) catch return error.NameTooLong;
-    }
-    return wr.buffered();
-}
-
-fn wide(gpa: Allocator, s: []const u8) ![:0]u16 {
-    return std.unicode.wtf8ToWtf16LeAllocZ(gpa, s);
-}
-
-/// Atomic replace (temp file flushed, MoveFileEx REPLACE | WRITE_THROUGH).
-pub fn writeAtomic(gpa: Allocator, io: Io, final: []const u8, data: []const u8) !void {
-    var tb: [1100]u8 = undefined;
-    var rnd: [6]u8 = undefined;
-    io.random(&rnd);
-    const tmp = try std.fmt.bufPrint(&tb, "{s}.{x}.tmp", .{ final, &rnd });
-    {
-        const f = try Io.Dir.cwd().createFile(io, tmp, .{ .exclusive = true });
-        defer f.close(io);
-        try f.writeStreamingAll(io, data);
-        try f.sync(io);
-    }
-    const a = try wide(gpa, tmp);
-    defer gpa.free(a);
-    const b = try wide(gpa, final);
-    defer gpa.free(b);
-    if (w.MoveFileExW(a.ptr, b.ptr, w.MOVEFILE_REPLACE_EXISTING | w.MOVEFILE_WRITE_THROUGH) == 0) {
-        Io.Dir.cwd().deleteFile(io, tmp) catch {};
-        return error.SyncStoreWriteFailed;
-    }
-}
-
-/// An exclusively opened lock file, shared by every Portal process.
-const Lock = struct {
-    h: w.HANDLE,
-
-    fn take(gpa: Allocator, io: Io, path: []const u8) !Lock {
-        const lw = try wide(gpa, path);
-        defer gpa.free(lw);
-        var tries: usize = 0;
-        while (tries < 500) : (tries += 1) {
-            if (w.validHandle(w.CreateFileW(lw.ptr, w.GENERIC_WRITE, 0, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null))) |h| return .{ .h = h };
-            try devices.lockRetrySleep(io);
-        }
-        return error.SyncStoreBusy;
-    }
-
-    fn release(l: Lock) void {
-        _ = w.CloseHandle(l.h);
-    }
-};
+const joinBuf = fsutil.join;
+pub const writeAtomic = fsutil.writeAtomic;
 
 // ------------------------------------------------------------ release key
 
@@ -110,20 +58,8 @@ pub const ReleaseKey = struct {
     }
 };
 
-pub const Paths = struct {
-    /// %LOCALAPPDATA%\Portal
-    dir: []const u8,
-
-    fn join(p: Paths, buf: []u8, parts: []const []const u8) ![]const u8 {
-        var wr: Io.Writer = .fixed(buf);
-        wr.writeAll(p.dir) catch return error.NameTooLong;
-        for (parts) |s| {
-            wr.writeAll("\\") catch return error.NameTooLong;
-            wr.writeAll(s) catch return error.NameTooLong;
-        }
-        return wr.buffered();
-    }
-};
+/// %LOCALAPPDATA%\Portal
+pub const Paths = fsutil.DataDir;
 
 /// The release public key, if a release key exists (never decrypts).
 pub fn loadPublicKey(io: Io, paths: Paths) !?[32]u8 {
@@ -327,8 +263,8 @@ pub fn publish(gpa: Allocator, io: Io, paths: Paths, opts: PublishOptions, probl
     const pkg_dir = try paths.join(&pb, &.{ "publish", opts.package });
     try Io.Dir.cwd().createDirPath(io, pkg_dir);
     var lb: [1024]u8 = undefined;
-    const lock = try Lock.take(gpa, io, try paths.join(&lb, &.{ "publish", "publish.lock" }));
-    defer lock.release();
+    const lock = try takeLock(io, try paths.join(&lb, &.{ "publish", "publish.lock" }));
+    defer lock.release(io);
 
     var hb: [1024]u8 = undefined;
     const hist_path = try paths.join(&hb, &.{ "publish", opts.package, "history.txt" });
@@ -415,13 +351,13 @@ pub fn publish(gpa: Allocator, io: Io, paths: Paths, opts: PublishOptions, probl
 
 /// Removes a published version (devices keep what they installed; its
 /// sequence and name are never reused).
-pub fn unpublish(gpa: Allocator, io: Io, paths: Paths, package: []const u8, version: []const u8) !void {
+pub fn unpublish(io: Io, paths: Paths, package: []const u8, version: []const u8) !void {
     if (!manifest.validPackageId(package)) return error.BadPackageId;
     if (!manifest.validVersion(version)) return error.BadVersion;
     var pb: [1024]u8 = undefined;
     try Io.Dir.cwd().createDirPath(io, try paths.join(&pb, &.{"publish"}));
-    const lock = try Lock.take(gpa, io, try paths.join(&pb, &.{ "publish", "publish.lock" }));
-    defer lock.release();
+    const lock = try takeLock(io, try paths.join(&pb, &.{ "publish", "publish.lock" }));
+    defer lock.release(io);
     var vb: [1024]u8 = undefined;
     const vdir = try paths.join(&vb, &.{ "publish", package, version });
     var rnd: [8]u8 = undefined;
@@ -620,15 +556,32 @@ pub fn readSubs(gpa: Allocator, io: Io, paths: Paths) !Subs {
 /// Locked read-modify-write of the subscriptions, like devices.withStore.
 pub fn withSubs(gpa: Allocator, io: Io, paths: Paths, ctx: anytype, comptime op: anytype) !void {
     var lb: [1024]u8 = undefined;
-    const lock = try Lock.take(gpa, io, try paths.join(&lb, &.{"sync-subscriptions.lock"}));
-    defer lock.release();
-    var s = try readSubs(gpa, io, paths);
-    if (!try op(ctx, &s)) return;
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(gpa);
-    try s.format(gpa, &out);
     var pb: [1024]u8 = undefined;
-    try writeAtomic(gpa, io, try paths.join(&pb, &.{"sync-subscriptions.txt"}), out.items);
+    const Ctx = struct { gpa: Allocator, inner: @TypeOf(ctx) };
+    fsutil.update(gpa, io, try paths.join(&lb, &.{"sync-subscriptions.lock"}), try paths.join(&pb, &.{"sync-subscriptions.txt"}), 256 * 1024, Ctx{
+        .gpa = gpa,
+        .inner = ctx,
+    }, struct {
+        fn edit(c: Ctx, old: ?[]const u8, out: *std.ArrayList(u8)) !bool {
+            var s: Subs = if (old) |text| try Subs.parse(text) else .{};
+            if (!try op(c.inner, &s)) return false;
+            try s.format(c.gpa, out);
+            return true;
+        }
+    }.edit) catch |err| return switch (err) {
+        error.LockBusy => error.SyncStoreBusy,
+        error.ReplaceFailed => error.SyncStoreWriteFailed,
+        else => err,
+    };
+}
+
+/// The publish lock (publish\publish.lock): waits for the holder; a
+/// cancel is returned and stays armed (fsutil.FileLock).
+fn takeLock(io: Io, path: []const u8) !fsutil.FileLock {
+    return fsutil.FileLock.acquire(io, path) catch |err| switch (err) {
+        error.LockBusy => error.SyncStoreBusy,
+        else => err,
+    };
 }
 
 pub fn subscribe(gpa: Allocator, io: Io, paths: Paths, device: []const u8, package: []const u8, on: bool) !bool {
@@ -731,7 +684,7 @@ test "publish: hash, sign, store atomically; sequences and names never reused; i
     const p2 = try publish(gpa, io, paths, .{ .package = "stt-model", .folder = src, .kind = .data, .version = "2.0-rc", .now = 6 }, &problem);
     try testing.expectEqual(@as(u64, 2), p2.sequence);
     try testing.expectError(error.VersionUsed, publish(gpa, io, paths, .{ .package = "stt-model", .folder = src, .kind = .data, .version = "2.0-RC", .now = 7 }, &problem));
-    try unpublish(gpa, io, paths, "stt-model", "2.0-rc");
+    try unpublish(io, paths, "stt-model", "2.0-rc");
     try testing.expectError(error.VersionUsed, publish(gpa, io, paths, .{ .package = "stt-model", .folder = src, .kind = .data, .version = "2.0-rc", .now = 8 }, &problem));
     const p4 = try publish(gpa, io, paths, .{ .package = "stt-model", .folder = src, .kind = .data, .now = 9 }, &problem);
     try testing.expect(p4.sequence > p2.sequence);

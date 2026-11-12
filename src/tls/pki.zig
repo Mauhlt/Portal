@@ -41,7 +41,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const x509 = @import("x509.zig");
 const dpapi = @import("dpapi.zig");
-const w = @import("../win32.zig");
+const fsutil = @import("../fsutil.zig");
 
 pub const KeyPair = x509.KeyPair;
 
@@ -71,20 +71,14 @@ pub const Store = struct {
         return true;
     }
 
-    /// Write to a temporary file, then atomically replace.
+    /// Write to a temporary file, then atomically replace (fsutil).
     fn writeAtomic(s: Store, name: []const u8, data: []const u8) !void {
         try Io.Dir.cwd().createDirPath(s.io, s.dir);
         var pbuf: [1024]u8 = undefined;
-        var tbuf: [1024]u8 = undefined;
-        const final = try s.path(&pbuf, name);
-        const tmp = try std.fmt.bufPrint(&tbuf, "{s}.tmp", .{final});
-        try Io.Dir.cwd().writeFile(s.io, .{ .sub_path = tmp, .data = data });
-        const tmp_w = try std.unicode.utf8ToUtf16LeAllocZ(s.gpa, tmp);
-        defer s.gpa.free(tmp_w);
-        const final_w = try std.unicode.utf8ToUtf16LeAllocZ(s.gpa, final);
-        defer s.gpa.free(final_w);
-        if (w.MoveFileExW(tmp_w.ptr, final_w.ptr, w.MOVEFILE_REPLACE_EXISTING | w.MOVEFILE_WRITE_THROUGH) == 0)
-            return error.TlsStoreWriteFailed;
+        fsutil.writeAtomic(s.gpa, s.io, try s.path(&pbuf, name), data) catch |err| return switch (err) {
+            error.ReplaceFailed => error.TlsStoreWriteFailed,
+            else => err,
+        };
     }
 
     fn writeKey(s: Store, name: []const u8, kp: KeyPair, purpose: []const u8) !void {

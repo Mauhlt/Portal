@@ -41,6 +41,22 @@ fn logCount(inst: *proc.Instance, needle: []const u8) usize {
     return std.mem.count(u8, text, needle);
 }
 
+/// A GET /pair/wait loop on its own thread, to see that the server holds
+/// the request (long poll) until the desk answers.
+const HeldWait = struct {
+    inst: *proc.Instance,
+    cookie: []const u8,
+    done: std.atomic.Value(bool) = .init(false),
+    finished_at: u64 = 0,
+    result: anyerror!client.Collected = error.NotRun,
+
+    fn run(h: *HeldWait) void {
+        h.result = client.collect(h.inst, h.cookie, null, 10_000);
+        h.finished_at = net.now();
+        h.done.store(true, .release);
+    }
+};
+
 const SignInJob = struct {
     inst: *proc.Instance,
     cookie: []const u8,
@@ -144,11 +160,16 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
             const third = try client.requestPair(inst, null);
             _ = r.check("pending requests per address are bounded (busy)", std.mem.eql(u8, third.location(), "/pair?e=busy"), "{s}", .{third.location()});
         }
+        // The first /pair/wait is answered at once; later ones are held
+        // until the desk answers (long poll), so keep this page's code.
+        var page_code: [4]u8 = @splat('?');
         {
             var resp = try client.waitPage(inst, rq.cookie(), null);
             defer resp.deinit();
             _ = r.check("waiting page: 200, refreshes itself, issues nothing", resp.status == 200 and resp.bodyContains("http-equiv=\"refresh\"") and
                 resp.bodyContains("Request code") and resp.setCookieCount() == 0, "{d} cookies={d}", .{ resp.status, resp.setCookieCount() });
+            const hc = resp.header("x-portal-request-code") orelse "";
+            if (hc.len == 4 and resp.bodyContains(hc)) @memcpy(&page_code, hc);
             var resp2 = try client.waitPage(inst, rq.cookie(), other_ip);
             defer resp2.deinit();
             _ = r.check("a request token is bound to its address", !two_ips or (resp2.status == 303 and std.mem.eql(u8, resp2.location(), "/pair?e=expired")), "{d} {s}", .{ resp2.status, resp2.location() });
@@ -171,13 +192,18 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         const n_prompts: usize = if (racer != null) 2 else 1;
         _ = r.check("desk prompt for the device", pc.waitForCount("[y/N]", n_prompts, 10_000), "{s}", .{pc.output()});
         const code = pc.lastAfter("(request ", 4) orelse "????";
-        {
-            var resp = try client.waitPage(inst, rq.cookie(), null);
-            defer resp.deinit();
-            _ = r.check("device page shows the same request code as the desk", resp.bodyContains(code), "code={s}", .{code});
-        }
+        _ = r.check("device page shows the same request code as the desk", std.mem.eql(u8, &page_code, code), "page={s} desk={s}", .{ &page_code, code });
+        // The page above was the first answer for this request; asking
+        // again is held until the desk answers (no poll interval).
+        var held: HeldWait = .{ .inst = inst, .cookie = rq.cookie() };
+        const held_thread = try std.Thread.spawn(.{}, HeldWait.run, .{&held});
+        net.sleep(1500);
+        _ = r.check("a repeated /pair/wait is held while the desk has not answered (long poll)", !held.done.load(.acquire), "", .{});
+        const t_answer = net.now();
         pc.answer("y\r\n");
-        const got = try client.collect(inst, rq.cookie(), null, 10_000);
+        held_thread.join();
+        _ = r.check("...and answered as soon as the desk approves", held.finished_at -| t_answer < 5000, "after {d} ms", .{held.finished_at -| t_answer});
+        const got = try held.result;
         switch (got) {
             .creds => |c| c1 = c,
             else => {
@@ -381,7 +407,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("a credential that fell out of the grace ring revokes the device", std.mem.eql(u8, resp.location(), "/pair?e=revoked"), "{d} {s}", .{ resp.status, resp.location() });
         var resp2 = try get(inst, "/", cur.deviceCookie());
         defer resp2.deinit();
-        _ = r.check("revoked device's newest credential no longer works", std.mem.eql(u8, resp2.location(), "/pair"), "{s}", .{resp2.location()});
+        _ = r.check("revoked device's newest credential no longer works (told it is no longer paired)", std.mem.eql(u8, resp2.location(), "/pair?e=gone"), "{s}", .{resp2.location()});
         var resp3 = try post(inst, "/auth/refresh", cur.deviceCookie(), true);
         defer resp3.deinit();
         _ = r.check("revoked device's refresh is 401", resp3.status == 401, "{d}", .{resp3.status});
@@ -401,13 +427,52 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("forged credential revokes the device", std.mem.eql(u8, resp.location(), "/pair?e=revoked"), "{s}", .{resp.location()});
         var resp2 = try get(inst, "/", c6.deviceCookie());
         defer resp2.deinit();
-        _ = r.check("real credential no longer works after a forgery", std.mem.eql(u8, resp2.location(), "/pair"), "{s}", .{resp2.location()});
+        _ = r.check("real credential no longer works after a forgery", std.mem.eql(u8, resp2.location(), "/pair?e=gone"), "{s}", .{resp2.location()});
         var resp3 = try get(inst, "/", "portal_device=nosuchdevice." ++ &rep(43, 'B'));
         defer resp3.deinit();
         _ = r.check("unknown device name just goes to /pair", std.mem.eql(u8, resp3.location(), "/pair"), "{s}", .{resp3.location()});
         var resp4 = try get(inst, "/", "portal_session=" ++ &rep(43, 'A'));
         defer resp4.deinit();
         _ = r.check("forged session cookie is not accepted", resp4.status == 303 and std.mem.eql(u8, resp4.location(), "/pair"), "{d}", .{resp4.status});
+    }
+
+    // ------------- re-pairing a name removes the old record and its sessions
+    {
+        const old = try client.pair(inst, "laptop");
+        const v = try client.Viewer.open(inst, old.sessionCookie());
+        defer v.deinit();
+        const fresh = try client.pair(inst, "laptop");
+        // The old record's sessions end before the new credential is
+        // issued, so the logout is already on its way when pair() returns.
+        _ = r.check("re-pair: the old device's open viewer is told to log out at once", v.waitLogout(3000), "", .{});
+        _ = r.check("re-pair: ...with reason \"replaced\" (it signs in again to learn more)", v.logout_reason == .replaced, "{t}", .{v.logout_reason});
+        _ = r.check("re-pair: ...and its connection is closed", v.waitClose(12_000), "", .{});
+        var resp = try get(inst, "/", old.sessionCookie());
+        defer resp.deinit();
+        _ = r.check("re-pair: the old session no longer opens the viewer", resp.status == 303 and std.mem.eql(u8, resp.location(), "/pair"), "{d} {s}", .{ resp.status, resp.location() });
+        var resp2 = try get(inst, "/sync/index", old.sessionCookie());
+        defer resp2.deinit();
+        _ = r.check("re-pair: the old session gets no /sync", resp2.status == 401, "{d}", .{resp2.status});
+        var resp3 = try get(inst, "/", fresh.sessionCookie());
+        defer resp3.deinit();
+        _ = r.check("re-pair: the new device's session works", resp3.status == 200, "{d}", .{resp3.status});
+        _ = r.ok("re-pair logged with the old record's sessions ended", inst.logHas("re-pair: previous device record 'laptop' removed; 1 of its session(s) ended"));
+        {
+            // The old credential is told, unambiguously, that it is gone,
+            // and does not revoke the new record (tombstone, not theft).
+            var rr = try post(inst, "/auth/refresh", old.deviceCookie(), true);
+            defer rr.deinit();
+            _ = r.check("re-pair: the old credential's sign-in is 401 with X-Portal-Device: gone", rr.status == 401 and
+                std.mem.eql(u8, rr.header("x-portal-device") orelse "", "gone"), "{d} {s}", .{ rr.status, rr.header("x-portal-device") orelse "-" });
+            var still = try get(inst, "/", fresh.sessionCookie());
+            defer still.deinit();
+            _ = r.check("re-pair: ...and the new device is not revoked by it", still.status == 200, "{d}", .{still.status});
+            var wa = try http.request(gpa, inst.port, .{ .method = "POST", .path = "/auth/refresh", .host = inst.host, .origin = inst.origin, .cookie = fresh.deviceCookie(), .body = "", .source = other_ip });
+            defer wa.deinit();
+            _ = r.check("a known device from another address is refused without the gone header", !two_ips or (wa.status == 401 and wa.header("x-portal-device") == null), "{d}", .{wa.status});
+        }
+        const d = try inst.cli(&.{"devices"});
+        _ = r.check("re-pair: one 'laptop' record", std.mem.count(u8, d.out, "laptop ") == 1, "{s}", .{d.out});
     }
 
     // ----------------------------- unpair at the desk drops open viewers
@@ -422,12 +487,44 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         const got = v.waitLogout(15_000);
         const dt = net.now() - t0;
         _ = r.check("open viewer told to log out after unpair", got, "after {d} ms", .{dt});
+        _ = r.check("...with reason \"unpaired\" (the device forgets this desktop)", v.logout_reason == .unpaired, "{t}", .{v.logout_reason});
+        {
+            var rr = try post(inst, "/auth/refresh", c7.deviceCookie(), true);
+            defer rr.deinit();
+            _ = r.check("an unpaired device's sign-in is 401 with X-Portal-Device: gone", rr.status == 401 and
+                std.mem.eql(u8, rr.header("x-portal-device") orelse "", "gone"), "{d}", .{rr.status});
+        }
         _ = r.check("...promptly (event-driven, no polling interval)", dt < 3000, "{d} ms", .{dt});
         _ = r.check("viewer connection closed after logout", v.waitClose(12_000), "", .{});
         var resp = try get(inst, "/", c7.deviceCookie());
         defer resp.deinit();
-        _ = r.check("unpaired device can't sign in", std.mem.eql(u8, resp.location(), "/pair"), "{s}", .{resp.location()});
+        _ = r.check("unpaired device can't sign in (told it is no longer paired)", std.mem.eql(u8, resp.location(), "/pair?e=gone"), "{s}", .{resp.location()});
         _ = r.ok("desk unpair logged", inst.logHas("unpaired from the desktop"));
+    }
+
+    // ------------------- the device forgets this desktop: POST /device/forget
+    {
+        const cf = try client.pair(inst, "laptop");
+        const v = try client.Viewer.open(inst, cf.sessionCookie());
+        defer v.deinit();
+        {
+            var nos = try post(inst, "/device/forget", null, true);
+            defer nos.deinit();
+            _ = r.check("POST /device/forget needs a live session", nos.status == 401, "{d}", .{nos.status});
+            var bad = try http.request(gpa, port, .{ .method = "POST", .path = "/device/forget", .host = inst.host, .origin = "http://evil.example", .cookie = cf.sessionCookie(), .body = "" });
+            defer bad.deinit();
+            _ = r.check("...and an allowed Origin", bad.status == 403, "{d}", .{bad.status});
+        }
+        var resp = try post(inst, "/device/forget", cf.sessionCookie(), true);
+        defer resp.deinit();
+        _ = r.check("POST /device/forget with the device's session: 204", resp.status == 204, "{d}", .{resp.status});
+        _ = r.check("...its open viewer is told (logout, reason unpaired)", v.waitLogout(3000) and v.logout_reason == .unpaired, "{t}", .{v.logout_reason});
+        const d = try inst.cli(&.{"devices"});
+        _ = r.check("...the desktop no longer lists it", !d.has("laptop "), "{s}", .{d.out});
+        _ = r.ok("...and logged it", inst.logHas("device 'laptop' forgot this desktop from"));
+        var rr = try post(inst, "/auth/refresh", cf.deviceCookie(), true);
+        defer rr.deinit();
+        _ = r.check("...its credential then gets X-Portal-Device: gone", rr.status == 401 and std.mem.eql(u8, rr.header("x-portal-device") orelse "", "gone"), "{d}", .{rr.status});
     }
 
     // ------------------------------------------- self-unpair via /logout
@@ -441,7 +538,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("logout unpaired the device", d.has("No paired devices"), "{s}", .{d.out});
         var resp2 = try get(inst, "/", c8.deviceCookie());
         defer resp2.deinit();
-        _ = r.check("logged-out device can't sign in", std.mem.eql(u8, resp2.location(), "/pair"), "{s}", .{resp2.location()});
+        _ = r.check("logged-out device can't sign in (told it is no longer paired)", std.mem.eql(u8, resp2.location(), "/pair?e=gone"), "{s}", .{resp2.location()});
         var resp3 = try get(inst, "/", c8.sessionCookie());
         defer resp3.deinit();
         _ = r.check("logged-out session is gone", resp3.status == 303, "{d}", .{resp3.status});

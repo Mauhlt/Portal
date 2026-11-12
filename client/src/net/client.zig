@@ -12,8 +12,11 @@
 //!   stored credential -> POST /auth/refresh -> store the rotated value
 //!       immediately (before anything else), keep the session in memory
 //!   GET /ws with the session cookie -> 'G' frames into the shared grid
-//!   401 on refresh -> delete the credential, back to "Pair this device"
-//!   401 on /ws or a `logout` message -> refresh again
+//!   401 on refresh -> delete the credential, back to "Pair this device";
+//!       with `X-Portal-Device: gone` (the desktop unpaired or forgot this
+//!       device) also Shared.desktop_gone: the app forgets the desktop
+//!   401 on /ws or a `logout` message -> refresh again; `logout` with
+//!       reason "unpaired" -> desktop_gone at once
 //!   network errors -> retry with backoff 1 s doubling to 15 s
 //!
 //! Every connection is HTTPS/WSS with the server certificate pinned to the
@@ -119,6 +122,12 @@ pub const Shared = struct {
     sync_wake: Io.Event = .unset,
     /// Pairing just completed (the app offers voice packages then).
     just_paired: std.atomic.Value(bool) = .init(false),
+    /// The desktop said, unambiguously, that it no longer has this device
+    /// (`X-Portal-Device: gone`, or logout reason "unpaired"). The
+    /// credential is already deleted; the app then forgets the desktop
+    /// (connect.forgetDesktop) and says why. Never set by a transient
+    /// error.
+    desktop_gone: std.atomic.Value(bool) = .init(false),
 
     pub fn detail(s: *const Shared) []const u8 {
         return s.detail_buf[0..s.detail_len];
@@ -299,6 +308,12 @@ pub const Client = struct {
                     session = null; // refresh (or re-pair) next
                     c.publishSession(null);
                 },
+                .gone => {
+                    session.?.wipe();
+                    session = null;
+                    c.publishSession(null);
+                    c.desktopGone();
+                },
                 .exited => |code| {
                     c.shared.mutex.lockUncancelable(c.io);
                     c.shared.exit_code = code;
@@ -366,9 +381,56 @@ pub const Client = struct {
                 try credstore.save(c.target(), r.device.?.value());
                 return r.session.?;
             },
+            .gone => return error.DeviceGone,
             .revoked => return error.NotPaired,
             .unexpected => return error.SignInFailed,
         }
+    }
+
+    pub const ForgetRemote = enum {
+        /// The desktop removed this device.
+        forgotten,
+        /// It no longer had it.
+        already_gone,
+        /// It could not be reached (or refused): it still lists the device.
+        unreachable_desktop,
+    };
+
+    /// Asks the desktop to remove this device (POST /device/forget), with
+    /// `session` or, without one, a fresh sign-in. Never deletes anything
+    /// here: the caller then runs connect.forgetDesktop either way.
+    pub fn forgetOnDesktop(c: *Client, session: ?*const http.Cookie) ForgetRemote {
+        var own: ?http.Cookie = null;
+        defer if (own) |*o| o.wipe();
+        const sess: *const http.Cookie = session orelse blk: {
+            own = c.signIn() catch |err| return if (err == error.DeviceGone) .already_gone else .unreachable_desktop;
+            break :blk &own.?;
+        };
+        var resp_buf: [http.max_head_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &resp_buf);
+        var req_buf: [768]u8 = undefined;
+        defer std.crypto.secureZero(u8, &req_buf);
+        var w: Io.Writer = .fixed(&req_buf);
+        http.writeForgetRequest(&w, c.host(), c.secure(), sess) catch return .unreachable_desktop;
+        var r = c.roundTrip(w.buffered(), &resp_buf, request_timeout_ms) catch return .unreachable_desktop;
+        defer r.wipe();
+        return switch (http.forgetOutcome(&r)) {
+            .forgotten => .forgotten,
+            .already_gone => .already_gone,
+            // The given session ended meanwhile: sign in and ask again.
+            .need_session => if (session != null) c.forgetOnDesktop(null) else .unreachable_desktop,
+            .unexpected => .unreachable_desktop,
+        };
+    }
+
+    /// The desktop no longer has this device: drop the credential now (so
+    /// nothing signs in with it again) and let the app forget the rest.
+    fn desktopGone(c: *Client) void {
+        credstore.delete(c.target()) catch {};
+        c.setStatus(.need_pairing, "this desktop no longer has this device paired (unpaired at the desk, or forgotten)", .{});
+        c.shared.desktop_gone.store(true, .release);
+        c.signalSync();
+        c.notify();
     }
 
     /// Shows why and sleeps once until the retry (no countdown ticks).
@@ -558,6 +620,10 @@ pub const Client = struct {
                 c.last_logged = null;
                 return r.session.?;
             },
+            .gone => {
+                c.desktopGone();
+                return null;
+            },
             .revoked => {
                 credstore.delete(c.target()) catch {};
                 c.setStatus(.need_pairing, "this device is no longer paired", .{});
@@ -601,6 +667,8 @@ pub const Client = struct {
     const StreamResult = union(enum) {
         unauthorized,
         logout,
+        /// {"t":"logout","reason":"unpaired"}: the record is gone.
+        gone,
         exited: i64,
         failed: []const u8,
     };
@@ -822,6 +890,10 @@ pub const Client = struct {
                 } else if (std.mem.eql(u8, m.t, "exit")) {
                     return .{ .exited = m.code orelse 0 };
                 } else if (std.mem.eql(u8, m.t, "logout")) {
+                    // "unpaired": the desktop removed this device. Anything
+                    // else (expired, "replaced"): sign in again, whose
+                    // answer says whether this device is still paired.
+                    if (std.mem.eql(u8, m.reason orelse "", "unpaired")) return .gone;
                     return .logout;
                 }
             },

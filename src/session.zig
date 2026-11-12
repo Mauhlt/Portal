@@ -18,8 +18,14 @@ pub const Session = struct {
     /// Console in the GUI (web.zig sets its title on viewer changes).
     console: *Console,
     policy: Policy,
-    /// `--project NAME` (gui.validProject), sent to viewers in hello.
+    /// `--project NAME` (title.validProject), sent to viewers in hello and
+    /// shown in the window or console title.
     project: ?[]const u8 = null,
+    /// Writes the desktop's own input (window or console) into the PTY on
+    /// its own thread, so the GUI thread never blocks on the pipe (a big
+    /// paste, or a program not reading its input). Null in unit tests:
+    /// writeInput then writes directly.
+    local: ?*LocalInput = null,
     /// Optional change hook: the local GUI uses it to wake its message loop
     /// on output, resize, close or a viewer change. Set before any thread
     /// starts; called after `mutex` is released, on the changing thread.
@@ -37,6 +43,9 @@ pub const Session = struct {
     closed: bool = false,
     exit_code: u32 = 0,
     viewers: u32 = 0,
+    /// Set on every viewer count change (shutdown waits for the last
+    /// viewer to receive the exit notice and go).
+    viewers_changed: Io.Event = .unset,
     /// False once shutdown has begun closing the pseudo console. Distinct
     /// from `closed` (which tells viewers the session ended, and is only set
     /// after trailing output has drained): no ResizePseudoConsole may be
@@ -59,6 +68,10 @@ pub const Session = struct {
     /// Guarded by input_mutex. False once shutdown has begun; no write may
     /// touch the PTY input pipe after that, since it is about to be closed.
     input_open: bool = true,
+    /// Set (before taking input_mutex) when shutdown begins: a long local
+    /// write stops at its next chunk, so shutdown waits for at most one
+    /// chunk, never for a whole paste.
+    input_closing: std.atomic.Value(bool) = .init(false),
 
     pub fn appendOutput(s: *Session, data: []const u8) void {
         s.mutex.lockUncancelable(s.io);
@@ -139,13 +152,31 @@ pub const Session = struct {
         s.text_guard.at_line_start = true;
     }
 
-    /// Keystrokes from the desktop's own console or window: unfiltered.
+    /// Keystrokes and pastes from the desktop's own console or window:
+    /// unfiltered. Never blocks on the PTY: queued for the LocalInput
+    /// writer thread (when there is one).
     pub fn writeInput(s: *Session, data: []const u8) void {
         if (data.len == 0) return;
+        if (s.local) |l| return l.push(data);
+        s.writeLocal(data);
+    }
+
+    /// Largest piece of local input written at once.
+    pub const input_chunk = 4096;
+
+    /// Writes one local input item (a key's bytes, or a whole paste) in
+    /// `input_chunk` pieces under input_mutex, so web input never lands
+    /// inside it; stops early once shutdown has begun.
+    pub fn writeLocal(s: *Session, data: []const u8) void {
         s.input_mutex.lockUncancelable(s.io);
         defer s.input_mutex.unlock(s.io);
-        if (!s.input_open) return;
-        s.pty.write(data) catch {};
+        var rest = data;
+        while (rest.len > 0) {
+            if (!s.input_open or s.input_closing.load(.acquire)) return;
+            const n = @min(rest.len, input_chunk);
+            s.pty.write(rest[0..n]) catch return;
+            rest = rest[n..];
+        }
     }
 
     /// Called by the local console resize poller or the GUI window. The
@@ -181,11 +212,13 @@ pub const Session = struct {
         s.pty_live = false;
         s.mutex.unlock(s.io);
 
+        s.input_closing.store(true, .release);
         s.input_mutex.lockUncancelable(s.io);
         s.input_open = false;
         s.input_mutex.unlock(s.io);
+        if (s.local) |l| l.close();
 
-        s.pty.close();
+        s.pty.closeConsole();
     }
 
     pub fn markClosed(s: *Session, code: u32) void {
@@ -203,8 +236,96 @@ pub const Session = struct {
         if (delta > 0) s.viewers +|= @abs(delta) else s.viewers -|= @abs(delta);
         const n = s.viewers;
         s.mutex.unlock(s.io);
+        s.viewers_changed.set(s.io);
         s.notify();
         return n;
+    }
+
+    /// Waits until no viewer is connected or `deadline_ms` (awake clock)
+    /// passes. Woken by every viewer change; no polling.
+    pub fn waitViewersGone(s: *Session, deadline_ms: i64) void {
+        while (true) {
+            // Reset before checking, so a change right after is not lost.
+            s.viewers_changed.reset();
+            s.mutex.lockUncancelable(s.io);
+            const n = s.viewers;
+            s.mutex.unlock(s.io);
+            if (n == 0) return;
+            const left = deadline_ms - Io.Clock.awake.now(s.io).toMilliseconds();
+            if (left <= 0) return;
+            s.viewers_changed.waitTimeout(s.io, .{ .duration = .{ .raw = .fromMilliseconds(left), .clock = .awake } }) catch {};
+        }
+    }
+};
+
+/// The queue between the desktop's input (GUI thread, console input
+/// thread) and the PTY. `push` never blocks on the pipe; `run` (its own
+/// thread) writes each queued item with Session.writeLocal, in order.
+/// Event-driven: the writer sleeps on a condition until something is
+/// queued or the queue is closed.
+pub const LocalInput = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    session: *Session,
+    mutex: Io.Mutex = .init,
+    cond: Io.Condition = .init,
+    /// Queued bytes, item after item; `lens` gives each item's length.
+    bytes: std.ArrayList(u8) = .empty,
+    lens: std.ArrayList(usize) = .empty,
+    closed: bool = false,
+
+    /// More than this waiting (a stuck program, pastes piling up) and new
+    /// input is dropped rather than growing without bound.
+    pub const max_queued = 8 << 20;
+
+    pub fn push(l: *LocalInput, data: []const u8) void {
+        l.mutex.lockUncancelable(l.io);
+        defer l.mutex.unlock(l.io);
+        if (l.closed or l.bytes.items.len + data.len > max_queued) return;
+        l.lens.append(l.gpa, data.len) catch return;
+        l.bytes.appendSlice(l.gpa, data) catch {
+            l.lens.items.len -= 1;
+            return;
+        };
+        l.cond.signal(l.io);
+    }
+
+    pub fn deinit(l: *LocalInput) void {
+        l.bytes.deinit(l.gpa);
+        l.lens.deinit(l.gpa);
+    }
+
+    /// Ends `run` (shutdown); later pushes are dropped.
+    pub fn close(l: *LocalInput) void {
+        l.mutex.lockUncancelable(l.io);
+        l.closed = true;
+        l.mutex.unlock(l.io);
+        l.cond.broadcast(l.io);
+    }
+
+    /// The writer thread.
+    pub fn run(l: *LocalInput) void {
+        var item: std.ArrayList(u8) = .empty;
+        defer item.deinit(l.gpa);
+        while (true) {
+            l.mutex.lockUncancelable(l.io);
+            while (!l.closed and l.lens.items.len == 0) l.cond.waitUncancelable(l.io, &l.mutex);
+            if (l.closed) {
+                l.mutex.unlock(l.io);
+                return;
+            }
+            const n = l.lens.items[0];
+            item.clearRetainingCapacity();
+            const ok = if (item.appendSlice(l.gpa, l.bytes.items[0..n])) true else |_| false;
+            // Take the item off the queue (also when it could not be copied:
+            // dropped, like input that does not fit).
+            std.mem.copyForwards(u8, l.bytes.items, l.bytes.items[n..]);
+            l.bytes.items.len -= n;
+            std.mem.copyForwards(usize, l.lens.items, l.lens.items[1..]);
+            l.lens.items.len -= 1;
+            l.mutex.unlock(l.io);
+            if (ok) l.session.writeLocal(item.items);
+        }
     }
 };
 
@@ -262,4 +383,74 @@ test "viewerDelta saturates" {
     try std.testing.expectEqual(@as(u32, 0), s.viewerDelta(std.math.minInt(i32)));
     s.viewers = std.math.maxInt(u32);
     try std.testing.expectEqual(std.math.maxInt(u32), s.viewerDelta(std.math.maxInt(i32)));
+}
+
+test "LocalInput writes queued items whole and in order, on its own thread" {
+    const w = @import("win32.zig");
+    const gpa = std.testing.allocator;
+    var rd: w.HANDLE = undefined;
+    var wr: w.HANDLE = undefined;
+    if (w.CreatePipe(&rd, &wr, null, 1 << 16) == 0) return error.SkipZigTest;
+    defer _ = w.CloseHandle(rd);
+    defer _ = w.CloseHandle(wr);
+    var pty: Pty = .{ .hpc = undefined, .in_write = wr, .out_read = undefined, .process = undefined, .job = undefined };
+    var s: Session = .{
+        .io = std.testing.io,
+        .pty = &pty,
+        .console = undefined,
+        .policy = .keys,
+        .term = try vt.Terminal.init(gpa, 10, 5),
+        .size = .{ .cols = 10, .rows = 5 },
+    };
+    defer s.term.deinit();
+    var l: LocalInput = .{ .gpa = gpa, .io = std.testing.io, .session = &s };
+    defer l.deinit();
+    s.local = &l;
+    // Queued before the writer runs: the caller never touches the pipe.
+    const big: [3 * Session.input_chunk + 5]u8 = @splat('p');
+    s.writeInput("a");
+    s.writeInput(&big);
+    s.writeInput("z");
+    try std.testing.expectEqual(@as(usize, 3), l.lens.items.len);
+    const t = try std.Thread.spawn(.{}, LocalInput.run, .{&l});
+    var got: [big.len + 2]u8 = undefined;
+    var n: usize = 0;
+    while (n < got.len) {
+        var r: w.DWORD = 0;
+        if (w.ReadFile(rd, got[n..].ptr, @intCast(got.len - n), &r, null) == 0) return error.ReadFailed;
+        n += r;
+    }
+    l.close();
+    t.join();
+    try std.testing.expectEqual(@as(u8, 'a'), got[0]);
+    try std.testing.expectEqualSlices(u8, &big, got[1 .. 1 + big.len]);
+    try std.testing.expectEqual(@as(u8, 'z'), got[got.len - 1]);
+    // After close, input is dropped.
+    s.writeInput("x");
+    try std.testing.expectEqual(@as(usize, 0), l.lens.items.len);
+}
+
+test "writeLocal stops at the next chunk once shutdown begins" {
+    const w = @import("win32.zig");
+    var rd: w.HANDLE = undefined;
+    var wr: w.HANDLE = undefined;
+    if (w.CreatePipe(&rd, &wr, null, 1 << 16) == 0) return error.SkipZigTest;
+    defer _ = w.CloseHandle(rd);
+    defer _ = w.CloseHandle(wr);
+    var pty: Pty = .{ .hpc = undefined, .in_write = wr, .out_read = undefined, .process = undefined, .job = undefined };
+    var s: Session = .{
+        .io = std.testing.io,
+        .pty = &pty,
+        .console = undefined,
+        .policy = .keys,
+        .term = try vt.Terminal.init(std.testing.allocator, 10, 5),
+        .size = .{ .cols = 10, .rows = 5 },
+    };
+    defer s.term.deinit();
+    s.input_closing.store(true, .release);
+    const big: [2 * Session.input_chunk]u8 = @splat('p');
+    s.writeLocal(&big);
+    var avail: w.DWORD = 0;
+    try std.testing.expect(w.PeekNamedPipe(rd, null, 0, null, &avail, null) != 0);
+    try std.testing.expectEqual(@as(w.DWORD, 0), avail);
 }

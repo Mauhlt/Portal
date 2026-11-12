@@ -19,33 +19,22 @@
 
 const std = @import("std");
 
-const WINAPI: std.builtin.CallingConvention = .winapi;
-const HANDLE = *anyopaque;
-const BOOL = i32;
-const DWORD = u32;
-
-const SYSTEMTIME = extern struct {
-    wYear: u16,
-    wMonth: u16,
-    wDayOfWeek: u16,
-    wDay: u16,
-    wHour: u16,
-    wMinute: u16,
-    wSecond: u16,
-    wMilliseconds: u16,
-};
-
-extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buf: [*]u16, size: DWORD) callconv(WINAPI) DWORD;
-extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: DWORD, share: DWORD, sa: ?*anyopaque, disp: DWORD, flags: DWORD, template: ?HANDLE) callconv(WINAPI) HANDLE;
-extern "kernel32" fn WriteFile(h: HANDLE, buf: [*]const u8, len: DWORD, written: ?*DWORD, overlapped: ?*anyopaque) callconv(WINAPI) BOOL;
-extern "kernel32" fn CloseHandle(h: HANDLE) callconv(WINAPI) BOOL;
-extern "kernel32" fn GetStdHandle(which: DWORD) callconv(WINAPI) ?HANDLE;
-extern "kernel32" fn GetCurrentThreadId() callconv(WINAPI) DWORD;
-extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(WINAPI) ?*anyopaque;
-extern "kernel32" fn GetSystemTime(t: *SYSTEMTIME) callconv(WINAPI) void;
-extern "kernel32" fn Sleep(ms: DWORD) callconv(WINAPI) void;
-extern "kernel32" fn ExitProcess(code: u32) callconv(WINAPI) noreturn;
-extern "user32" fn MessageBoxW(hwnd: ?*anyopaque, text: [*:0]const u16, caption: [*:0]const u16, flags: u32) callconv(WINAPI) i32;
+// Plain externs only (src/win32.zig): nothing here can fail or allocate.
+const w = @import("win32.zig");
+const HANDLE = w.HANDLE;
+const DWORD = w.DWORD;
+const SYSTEMTIME = w.SYSTEMTIME;
+const GetEnvironmentVariableW = w.GetEnvironmentVariableW;
+const CreateFileW = w.CreateFileW;
+const WriteFile = w.WriteFile;
+const CloseHandle = w.CloseHandle;
+const GetStdHandle = w.GetStdHandle;
+const GetCurrentThreadId = w.GetCurrentThreadId;
+const GetModuleHandleW = w.GetModuleHandleW;
+const GetSystemTime = w.GetSystemTime;
+const Sleep = w.Sleep;
+const ExitProcess = w.ExitProcess;
+const MessageBoxW = w.MessageBoxW;
 
 const FILE_APPEND_DATA: DWORD = 0x0004;
 const FILE_SHARE_READ: DWORD = 0x1;
@@ -191,8 +180,7 @@ fn appendToLog(line: []const u8) void {
     if (n == 0 or n >= max_base) return;
     @memcpy(path[n..][0..suffix.len], suffix);
     path[n + suffix.len] = 0;
-    const h = CreateFileW(&path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, null, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, null);
-    if (@intFromPtr(h) == INVALID_HANDLE) return;
+    const h = w.validHandle(CreateFileW(&path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, null, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, null)) orelse return;
     _ = WriteFile(h, line.ptr, @intCast(line.len), null, null);
     _ = CloseHandle(h);
 }

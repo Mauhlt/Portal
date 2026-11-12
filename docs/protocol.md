@@ -35,7 +35,8 @@ Content-Length: 0
 * Too many pending requests (8 per window, 2 per address): `303` to `/pair?e=busy`.
 * This address was denied in this window: `303` to `/pair?e=denied`.
 
-Then poll, from the same source address and with the request cookie:
+Then wait for the answer, from the same source address and with the
+request cookie. `GET /pair/wait` is a long poll:
 
 ```
 GET /pair/wait HTTP/1.1
@@ -43,12 +44,20 @@ Cookie: __Host-portal_pairreq=<43 chars>
 ```
 
 * Waiting for the desk: `200`, an HTML page showing the 4-hex-digit
-  request code that the desk also shows (browsers re-load it every 2 s
-  with `<meta http-equiv="refresh">`). The same code is in the header
+  request code that the desk also shows. The same code is in the header
   `X-Portal-Request-Code: 7f3a`, for native clients, which read only the
-  response head. Show the code to the user. Native clients re-ask every
-  2 s (a real deadline, not a busy loop), back off on network errors, and
-  give up when the request's 10-minute lifetime is over.
+  response head. Show the code to the user.
+  The first `GET /pair/wait` for a request token is answered at once.
+  Every later one, while the request is still pending, is **held** by
+  the server until the pairing window changes (a request answered, the
+  window closed, replaced or expired, its `portalctl pair` gone) or 25 s
+  pass, and is then answered exactly as described here (the same waiting
+  page if still pending). Clients re-ask immediately after each answer:
+  there is no poll interval. Allow at least 30 s for the response; back
+  off only on network errors, and give up when the request's 10-minute
+  lifetime is over. Browsers do the same without script: the waiting
+  page has `<meta http-equiv="refresh" content="0">`, and the browser
+  keeps showing it while the held reload is pending.
 * Approved: `303`, `Location: /`, with three `Set-Cookie` headers:
   * `__Host-portal_device=<name>.<43 chars>; Path=/; HttpOnly; SameSite=Strict; Max-Age=7776000; Secure`
     is the device credential;
@@ -66,18 +75,45 @@ Cookie: __Host-portal_pairreq=<43 chars>
   rotated device cookie and a new session.
 * Native clients: `POST /auth/refresh` with the device cookie.
   Returns `204` with the same two `Set-Cookie` headers, or `401` if the
-  device is unknown or revoked.
+  device is unknown or revoked. A `401` that also carries
+  **`X-Portal-Device: gone`** means, unambiguously, that this desktop no
+  longer has the device: it was unpaired at the desk (`portalctl unpair`,
+  the Devices panel), forgot itself (`POST /device/forget`), was replaced
+  by a re-pair, was revoked by theft detection, or presented a credential
+  that matches no record. The device then **forgets this desktop** (its
+  credential, CA pin, release-key pin and sync folder) and says why. Any
+  other answer (a `401` without the header, a `5xx`, no answer) is never
+  a reason to forget anything.
 
 The device secret **rotates on every sign-in**, so clients must replace the
 stored value immediately. Each superseded value stays valid for 10 minutes
 from the sign-in that replaced it (the last 4 are remembered), which
 survives a lost response and several tabs signing in at once; that window
 is never extended. Presenting anything older or wrong revokes the device
-(theft detection), and re-pairing is then required. Credentials are bound
-to the device's source (WireGuard) address; a credential from another
-address, and an unknown one, both get the same answer (`303 /pair`, or
-`401`). Native clients store the device credential only in the OS
-credential store and keep the session in memory.
+(theft detection), and re-pairing is then required. A removed record's
+secrets are remembered (as hashes, up to 32, for 90 days after its last
+use): presenting one gets `X-Portal-Device: gone` and touches nothing, so
+an old device cannot revoke a newer pairing under its name. Credentials
+are bound to the device's source (WireGuard) address; a known credential
+presented from another address gets `303 /pair`, or a `401` *without*
+the gone header (it is not removed).
+Native clients store the device credential only in the OS credential
+store and keep the session in memory.
+
+**Re-pairing** a name (or an address) already in use removes the old
+record outright and ends every one of its sessions (WebSockets, input,
+`/sync`) before the new credential is issued; nothing of it is kept.
+
+`POST /device/forget` (Origin required, the session cookie; the device
+is taken from the session, never from the request): the device's "Forget
+this desktop". The desktop removes the record, ends all its sessions
+(open WebSockets get `logout` with reason `unpaired`), logs it and
+refreshes the desk's Devices panel. `204` (with `X-Portal-Device: gone`)
+when done; `401` without a live session (sign in first; that answer may
+already be `gone`); `500` if the device store is unavailable (nothing
+was removed). Clients call it first and then forget locally whatever the
+answer; if the desktop can't be reached they say that it still lists the
+device until it next sees it (and answers `gone`) or the owner unpairs it.
 
 `POST /logout` unpairs this device and ends its sessions. It uses the
 session cookie, or, if the session has expired, the device credential
@@ -109,7 +145,7 @@ frames must be masked; no fragmentation; no extensions.
 | `hello` | `input`: `"none"`, `"keys"`, `"instruct"` or `"text"`; `project` (only with `portal run --project`): the name, printable, at most 64 bytes, with `"` and `\` escaped as `\"` and `\\` | sent first; which input is accepted. `portal run` defaults to `instruct` (`keys` when the session program is a shell); clients must ignore fields they don't know |
 | `state` | `state`: `"working"`, `"waiting"` or `"done"` | **planned, not sent yet**: what the session program is doing, from its OSC 7501 status. Clients show it in the status line ("waiting for you" for `waiting`) and treat unknown values as unknown |
 | `exit` | `code` | the session's program exited; stream ends |
-| `logout` | | session revoked or expired; sign in again |
+| `logout` | `reason` (optional): `"unpaired"` or `"replaced"` | the session ended. `"unpaired"`: the desktop removed this device (unpaired at the desk, forgotten, revoked): forget this desktop now. `"replaced"`: a re-pair under its name or address replaced it: sign in again, whose answer (`X-Portal-Device: gone` or not) decides. No reason (expired, logged out): sign in again |
 | `updates` | | Portal sync: this device's package index changed (a publish, or a subscription changed at the desk). Fetch `GET /sync/index` (section 7). Devices also look on every connect |
 | `rejected` | `reason` | an `l:` instruction line was refused (e.g. `ShellEscape`, `SlashCommand`, `MemoryShortcut`, `ControlCharacter`, `TooLong`, `Empty`); nothing was typed |
 
@@ -245,7 +281,8 @@ except Ctrl+C in `text` mode; Shift+Tab is `shift-tab`.
 ## 5. Behaviour clients should implement
 
 * Reconnect with backoff (1 s doubling to 15 s). After `logout` or a `401`,
-  go back to sign-in.
+  go back to sign-in; after `logout` with reason `unpaired`, or a sign-in
+  answered `X-Portal-Device: gone`, forget the desktop instead.
 * Keep the window independent of the terminal size: scale the font, or scroll
   or pan, to fit `cols × rows`.
 * Show the input mode clearly ("view only", "answer keys", "instructions",

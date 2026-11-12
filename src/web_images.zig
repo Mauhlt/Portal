@@ -22,25 +22,29 @@ const Allocator = std.mem.Allocator;
 const vt = @import("vt.zig");
 const gfx = vt.gfx;
 
+const Bucket = @import("bucket.zig").Bucket;
+
 /// Token bucket: up to `burst` bytes at once (one maximum-size image),
 /// refilled at `rate_per_s`.
-pub const burst: u64 = 8 << 20;
-pub const rate_per_s: u64 = 4 << 20;
-/// While blobs wait for budget, the writer re-checks this often.
-pub const retry_ms: i64 = 100;
+pub const burst: i64 = 8 << 20;
+pub const rate_per_s: i64 = 4 << 20;
 
 pub const Sender = struct {
     /// Ids the viewer holds: those listed in the last 'P' frame.
     have: std.ArrayList(u32) = .empty,
     last_p: std.ArrayList(u8) = .empty,
     sent_gen: ?u64 = null,
-    tokens: u64 = burst,
-    last_ms: i64 = 0,
+    budget: Bucket = .init(rate_per_s, burst),
     /// Frames queued by `collect`, back to back; `ends` marks each one.
     out: std.ArrayList(u8) = .empty,
     ends: std.ArrayList(usize) = .empty,
     /// Some placed image still has to be sent (budget): call again soon.
     pending: bool = false,
+    /// While `pending`: milliseconds (from the last `collect`) until the
+    /// budget allows the smallest waiting blob. The writer sleeps exactly
+    /// that long instead of re-checking on a timer. Null when nothing
+    /// waits.
+    wait_ms: ?i64 = null,
     scratch: std.ArrayList(u32) = .empty,
 
     pub fn deinit(s: *Sender, gpa: Allocator) void {
@@ -76,14 +80,13 @@ pub const Sender = struct {
     pub fn collect(s: *Sender, gpa: Allocator, term: *const vt.Terminal, now_ms: i64) !void {
         s.out.clearRetainingCapacity();
         s.ends.clearRetainingCapacity();
-        const elapsed: u64 = @intCast(std.math.clamp(now_ms -| s.last_ms, 0, 60_000));
-        s.last_ms = now_ms;
-        s.tokens = @min(burst, s.tokens +| elapsed * rate_per_s / 1000);
+        s.budget.refill(now_ms);
 
         const gen = term.imagesGen();
         if (!s.pending and s.sent_gen != null and s.sent_gen.? == gen) return;
         s.sent_gen = gen;
         s.pending = false;
+        s.wait_ms = null;
 
         // Ids the next 'P' may reference: already held, or sent now.
         s.scratch.clearRetainingCapacity();
@@ -95,13 +98,17 @@ pub const Sender = struct {
                 continue;
             }
             const png = term.imagePng(p.image) orelse continue;
-            if (png.len > s.tokens) {
+            const size: i64 = @intCast(png.len);
+            if (!s.budget.has(size)) {
+                // Never sendable (larger than the whole budget): skip it.
+                const ms = s.budget.msUntil(size) orelse continue;
                 s.pending = true;
+                s.wait_ms = @min(s.wait_ms orelse ms, ms);
                 continue;
             }
             try gfx.appendBlobFrame(&s.out, gpa, p.image, png);
             try s.ends.append(gpa, s.out.items.len);
-            s.tokens -= png.len;
+            _ = s.budget.take(size);
             try s.scratch.append(gpa, p.image);
         }
 
@@ -190,17 +197,22 @@ test "byte budget defers blobs instead of starving the grid" {
     defer t.deinit();
     var s: Sender = .{};
     defer s.deinit(gpa);
-    s.tokens = 100; // almost nothing left
-    s.last_ms = 0;
+    s.budget.level_m = 100 * 1000; // almost nothing left
+    s.budget.last_ms = 0;
     try showImage(&t, 50, 50, "a=T,f=100,C=1");
     try s.collect(gpa, &t, 0);
     try testing.expectEqual(@as(usize, 0), countFrames(&s, 'I'));
     try testing.expect(s.pending);
+    // The writer's wake-up is the exact refill deadline for that blob.
+    const png_len: i64 = @intCast(t.imagePng(t.placements()[0].image).?.len);
+    try testing.expectEqual(s.budget.msUntil(png_len), s.wait_ms);
+    try testing.expect(s.wait_ms.? > 0 and s.wait_ms.? < 1000);
     // Its placement is not announced before its blob.
     var it = s.frames();
     while (it.next()) |f| if (f[0] == 'P') try testing.expectEqual(@as(u8, 0), f[1]);
     // A second later the budget allows it.
-    try s.collect(gpa, &t, 1000);
+    try s.collect(gpa, &t, s.wait_ms.?);
     try testing.expectEqual(@as(usize, 1), countFrames(&s, 'I'));
     try testing.expect(!s.pending);
+    try testing.expect(s.wait_ms == null);
 }
