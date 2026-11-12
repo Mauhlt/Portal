@@ -1,103 +1,88 @@
-# Speech-to-text sync: contract on file (not implemented)
+# Speech-to-text integration: contract on file (not implemented)
 
 **Status:** parked. The owner will say when to integrate their `stt` module
-(SpeechToText repo, formerly named TextToSpeech). Nothing in Portal implements this yet.
+(SpeechToText repo). Nothing in Portal implements this yet.
+
+## Owner decisions
+
+* **stt is GPU-only, on the home desktop**, for both transcription and
+  training. There is no CPU path.
+* **stt's own transport is gone.** Portal is the only way in: no stt TCP
+  server, no `stt.Client`, no stt mic capture or voice detection.
+* **Devices are thin clients** (iPhone, laptops). They record audio and
+  upload it through Portal; the desktop transcribes and learns.
+* **Unpairing never deletes samples** ("those will be used for training").
+  Pending bundles from an unpaired device are imported, not deleted.
+* **Portal must show training status.** While training runs, warn that
+  other GPU work, including transcription, may be slower.
+
+## stt API: `stt.Home` (src/home.zig in SpeechToText; thread-safe)
+
+```zig
+const home = try stt.Home.open(gpa, io, .{ .model_path = ..., .profile_dir = ... });
+defer home.close();
+const r = try home.transcribe(gpa, audio_bytes, device_name); // WAV, MP3 or QOA, any rate/channels -> { id, text }; caller frees text
+home.feedback(id, text, success);       // fix = (corrected, true); discard = (_, false); silence = no call (auto-confirmed after 60 s)
+home.setLearning(enabled);              // "nothing": learning off
+home.importBundle(gpa, bytes);          // device bundles (formats and caps unchanged)
+home.exportUpdate(gpa, device_version); // null = device current
+home.tick();                            // confirms silence, starts scheduled training, adopts a finished adapter
+home.trainingStatus();                  // stt.schedule.Status
+home.trainNow(); home.cancelTraining(); home.setSchedule(cfg); home.setListener(listener);
+```
+
+* **Build:** stt depends on `../Audio` (path dependency). The Audio repo must
+  be checked out next to SpeechToText.
+* **Event-driven:** stt suggests calling `tick()` about once a second.
+  Portal's rule is no polling, so Portal needs a next-deadline from stt (when
+  the next silence confirmation or schedule start is due). Requested from the
+  stt side.
+
+## Training schedule and status
+
+* **Schedule:** training starts automatically only inside a daily local-time
+  window (default 02:00–06:00), once 20 new samples have arrived since the
+  last adapter version. `trainNow()` ignores the window. A run takes seconds
+  to minutes.
+* **Status fields:**
+  * `state`: idle | waiting_for_window | running;
+  * `pending_samples` / `min_new_samples`;
+  * `next_start_unix` (when waiting);
+  * `started_unix`, `progress` (0–1), `eta_seconds`, `epoch`/`epochs` (while
+    running);
+  * `version` (the adapter in use);
+  * `last_finished_unix`, `last_loss`, `last_samples`, `last_error`.
+* **Events:** started, progress, finished, failed and canceled, each with a
+  Status.
+  * `started` and `progress` fire on the training thread. Keep the handler
+    quick and don't call back into Home from it.
+  * `finished`, `failed` and `canceled` fire inside `tick()`.
+* **Portal UI:**
+  * a top-bar banner on every viewer while running: "Training on GPU —
+    other GPU work may be slower (ETA …)";
+  * cleared on finished, failed or canceled;
+  * when waiting, the next start time.
+  * Train now / Cancel controls are **desk-only**.
 
 ## Proposed Portal endpoints
 
-All endpoints require a live session from a paired device. Payloads are
-opaque to Portal.
+All endpoints require a live session from a paired device. `device_name`
+comes from the session's device tag, never from the client. Payloads are
+opaque, with explicit body limits.
 
 | Endpoint | Body / reply |
 |---|---|
-| `POST /sync/bundle?device_version=N` | opaque bundle, Content-Length ≤ 8 MB (limit = max(cap, ~1.1 MB)); `200` only after a durable write (fsync) = ack; `400` on `error.BadBundle` / `error.Truncated` |
-| `GET /sync/update?version=N` | `200` + opaque update (≤ 16 MB), or `204` if the device is current |
+| `POST /stt/transcribe` | audio (WAV/MP3/QOA, ≤ ~4 MB, ≤ 120 s) → `{"id", "text"}`; 400 bad audio, 413 too long |
+| `POST /stt/feedback` | `{"id", "text", "success"}` |
+| `POST /sync/bundle?device_version=N` | opaque bundle ≤ 8 MB; 200 only after a durable write; 400 on bad bundle |
+| `GET /sync/update?version=N` | 200 + update ≤ 16 MB, or 204 if current |
 
-Pending bundles are stored per paired device name.
+Training status travels as a new text message on the existing WebSocket,
+`{"t":"training", ...}`, sent only on change (event-driven).
 
-**Unpairing never deletes samples (owner's decision: "those will be used for
-training").** On unpair, Portal *imports* that device's pending bundles with
-`stt.sync.importBundle` rather than deleting them. Samples already at home are
-never purged by Portal; stt manages its own storage cap (50 GB, see below).
+## Audio capture on the iPhone
 
-## Thin client: the iPhone, for now (owner's decision)
-
-Until the owner confirms the models can run on the iPhone, the iPhone only
-records audio. The desktop transcribes it and learns from feedback, with no
-bundle round trip: samples go straight into the home profile, tagged
-`source=<device_name>`.
-
-| Endpoint (suggested) | Body / reply |
-|---|---|
-| `POST /stt/transcribe` | body = WAV (≤ ~4 MB) → `{"id": <u64>, "text": "..."}`; `400` on `error.BadAudio`, `413` on `error.AudioTooLong` (> 120 s) |
-| `POST /stt/feedback` | `{"id", "text", "success"}` → outcome `learned` / `discarded` / `unknown_id` / `no_profile` / `failed` |
-
-Both need a live session from a paired device. `device_name` comes from the
-session's device tag, never from the client. They're served over the same
-hardened HTTP layer, with explicit body limits.
-
-```zig
-var svc = try stt.Service.init(gpa, io, &transcriber, &home_profile, .{}); // own stt.Transcriber; several can share one stt.Model
-const r = try svc.transcribeWav(gpa, wav_bytes, device_name);              // Result{ id: u64, text: []u8 }; caller frees text; id 0 = empty transcript
-_ = try svc.feedback(id, final_text, success);                              // fix = feedback(id, corrected, true)
-svc.tick();                                                                 // ~once a second
-svc.deinit();                                                               // confirms everything pending
-```
-
-* Thread-safe (requests are serialised), so it can be called from HTTP
-  handlers. Transcription is slow, so keep it off the accept and supervisor
-  paths and give it its own timeout budget.
-* Feedback semantics:
-  * **fix:** `feedback(id, corrected, true)`;
-  * **silence** (no feedback within 60 s, or the id falls out of the
-    64-entry window): auto-saved as correct;
-  * **"nothing":** learning is off.
-* **Audio format: WAV only.** RIFF; PCM 8/16/24/32-bit or float32; any sample
-  rate or channel count, resampled internally. stt does **not** decode
-  AAC/Opus/WebM (Safari's MediaRecorder output), so the wasm client must
-  capture raw PCM and wrap it in a 44-byte WAV header itself. 16 kHz mono
-  16-bit is ideal: 32 KB/s, so 120 s ≈ 3.8 MB.
-* **Mic in Safari needs HTTPS** (branch `feat/tls`). Raw PCM capture needs
-  browser audio APIs that only JS can reach (getUserMedia + AudioWorklet).
-  That's a small addition to the JS bridge, which only passes Float32
-  buffers to wasm; the WAV encoding is done in Zig.
-
-## Home storage
-
-stt caps home sample storage at 50 GB. Over the cap, `trainIfReady` folds
-everything into the weights and deletes the oldest trained audio down to 80%,
-keeping every 10th sample as a replay set. No Portal impact.
-
-## stt API (module `stt`)
-
-Device side, with `profile = try stt.Profile.load(gpa, io, dir)`:
-
-```zig
-stt.sync.exportBundle(gpa, &profile, device_name, max_bytes) !?stt.sync.Bundle // Bundle{ bytes, through, count }; null = nothing pending / learning off
-stt.sync.commitExport(&profile, bundle.through) !void                         // only after 200; deletes those samples
-profile.version: u32                                                            // sent as ?device_version=
-stt.sync.importUpdate(gpa, &profile, bytes) !u32                               // used on next model load
-```
-
-Home side (the desktop):
-
-```zig
-stt.sync.importBundle(gpa, &home, bytes) !ImportReport
-stt.sync.exportUpdate(gpa, &home, device_version) !?[]u8                         // null = 204
-stt.sync.trainIfReady(gpa, io, model_path, &home, .{ .threshold = 20 }, progress) !?u32 // after the response; slow; own model copy
-```
-
-The device loops: `exportBundle` → `POST` → `commitExport`, until `exportBundle`
-returns null. Then `GET /sync/update`, then `importUpdate`.
-
-## Sizes
-
-* **Sample:** at most ~1 MB (`stt.sync.max_sample_bytes`); typical 100–300 KB.
-* **Bundle:** at most `max_bytes`, and always at least one sample.
-  `stt.sync.default_bundle_bytes` is 8 MB.
-* **Update:** about 1.1 MB (tiny model), 2.2 MB (base) or 6.5 MB (small).
-
-## Open questions for the owner
-
-* **Models on the iPhone:** the owner is checking whether they can run there
-  at all. Until then the iPhone is a thin client (section above).
+Safari records only AAC/Opus/WebM through MediaRecorder, and stt accepts WAV,
+MP3 or QOA. So the wasm client captures raw PCM through the JS bridge's audio
+callback and encodes WAV (or QOA) in Zig. The mic needs HTTPS, which Portal
+now serves.
