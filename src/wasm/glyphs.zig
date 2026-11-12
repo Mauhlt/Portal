@@ -2,15 +2,16 @@
 //! cached per (code point, bold, italic, width) for the current cell size.
 //!
 //! Rasterising follows the native client's fontset.zig
-//! (Portal-wt-client/client/src/font/fontset.zig): same baseline and
+//! (the Renderer's Font module, fontset.zig): same baseline and
 //! centring rules, same procedural box-drawing / block characters (so lines
 //! join across cells whatever the font metrics), same replacement box for
 //! missing glyphs. Unlike the native client there are no system fallback
 //! fonts: a phone page cannot read them, so CJK and emoji become boxes.
 
 const std = @import("std");
-const ttf = @import("font/ttf.zig");
-const raster = @import("font/raster.zig");
+const Font = @import("Font"); // the Renderer's, never its Vulkan module
+const ttf = Font.ttf;
+const raster = Font.raster;
 const layout = @import("layout.zig");
 
 pub const Style = struct { bold: bool = false, italic: bool = false };

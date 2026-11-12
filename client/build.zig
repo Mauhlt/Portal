@@ -9,7 +9,8 @@
 //!
 //! Module layout (for merging into Portal's root build later):
 //!   "view"   src/view/root.zig   window, Vulkan drawing, fonts, input types.
-//!                                No networking; imports only "Renderer".
+//!                                No networking; imports the Renderer's
+//!                                "Renderer" and "Font" modules and imgdec.
 //!   client   src/main.zig        pairing, refresh, WebSocket, 'G' decoding.
 const std = @import("std");
 
@@ -64,6 +65,8 @@ pub fn viewModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
         .link_libc = target.result.os.tag != .windows,
         .imports = &.{
             .{ .name = "Renderer", .module = renderer.module("Renderer") },
+            // Fonts and cell widths: the Renderer's Font module.
+            .{ .name = "Font", .module = renderer.module("Font") },
             .{ .name = "imgdec", .module = imgdec },
         },
     });
