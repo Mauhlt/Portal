@@ -43,8 +43,13 @@ pub const Session = struct {
     closed: bool = false,
     exit_code: u32 = 0,
     viewers: u32 = 0,
-    /// Set on every viewer count change (shutdown waits for the last
-    /// viewer to receive the exit notice and go).
+    /// Viewer sockets not yet closed: a viewer counts here from its
+    /// upgrade until its socket is closed (after the exit notice and the
+    /// closing handshake), which is later than it leaves `viewers`.
+    /// Shutdown waits for this to reach 0, so the process never exits
+    /// (which resets open sockets) while an exit notice is in flight.
+    viewer_sockets: u32 = 0,
+    /// Set on every viewer (or viewer socket) count change.
     viewers_changed: Io.Event = .unset,
     /// False once shutdown has begun closing the pseudo console. Distinct
     /// from `closed` (which tells viewers the session ended, and is only set
@@ -241,14 +246,22 @@ pub const Session = struct {
         return n;
     }
 
-    /// Waits until no viewer is connected or `deadline_ms` (awake clock)
-    /// passes. Woken by every viewer change; no polling.
+    /// A viewer socket opened (+1) or was closed (-1); see viewer_sockets.
+    pub fn viewerSocketDelta(s: *Session, delta: i32) void {
+        s.mutex.lockUncancelable(s.io);
+        if (delta > 0) s.viewer_sockets +|= @abs(delta) else s.viewer_sockets -|= @abs(delta);
+        s.mutex.unlock(s.io);
+        s.viewers_changed.set(s.io);
+    }
+
+    /// Waits until every viewer socket is closed or `deadline_ms` (awake
+    /// clock) passes. Woken by every viewer change; no polling.
     pub fn waitViewersGone(s: *Session, deadline_ms: i64) void {
         while (true) {
             // Reset before checking, so a change right after is not lost.
             s.viewers_changed.reset();
             s.mutex.lockUncancelable(s.io);
-            const n = s.viewers;
+            const n = s.viewer_sockets;
             s.mutex.unlock(s.io);
             if (n == 0) return;
             const left = deadline_ms - Io.Clock.awake.now(s.io).toMilliseconds();
