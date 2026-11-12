@@ -107,6 +107,63 @@ repeat n_rows:
   frame is a full snapshot.
 * The server never sends terminal escape sequences; clients never interpret
   any.
+* Binary frames are told apart by their first byte. **Clients must ignore
+  binary frames whose first byte they don't know** (all current clients do),
+  so new frame types can be added without breaking them.
+
+### Inline images (`'I'` and `'P'` frames)
+
+Images appear only because a program running in the session emitted them
+(kitty graphics protocol, see `src/vt_gfx.zig`; `portal show <file.png>`
+does it from a shell or from the agent's Bash tool). There is no message or
+route a client can use to request an image, a file, or anything from disk.
+
+**Image blob**, sent at most once per image per viewer, always before the
+first `'P'` frame that lists it:
+
+```
+u8  'I'
+u32 image_id       server-assigned, never reused while the server runs
+u32 len            PNG byte count (at most 6 MiB)
+len bytes          a complete PNG file
+```
+
+**Placements** of the visible screen (main or alternate), sent whenever
+that list changes:
+
+```
+u8  'P'
+u16 n
+repeat n:
+    u32 image_id   always one this viewer has received in an 'I' frame
+    u16 col        left column
+    i16 row        top row; negative when the image has partly scrolled
+                   off the top
+    u16 cols       width in cells
+    u16 rows       height in cells
+    u16 reserved   0
+```
+
+* Draw each image scaled to `cols × rows` cells with its top-left cell at
+  (`col`, `row`), clipped to the grid. Images go above cell backgrounds and
+  below the cursor and selection. A placement replaces nothing in the grid:
+  the cells under it are still sent in `'G'` frames (usually blank).
+* The list is complete: placements missing from the latest `'P'` are gone
+  (erased, overwritten, scrolled off, cleared, or the screen switched).
+* **Cache rule.** After a `'P'` frame a client may discard every cached
+  blob that frame doesn't list; the server assumes it did and sends a blob
+  again if it is needed again later. A client therefore never needs more
+  than the blobs of one screen: the server holds at most 64 images and
+  64 MiB, and a screen at most 256 placements.
+* Clients must validate before decoding and must not trust the server
+  with their memory: drop blobs over 6 MiB, anything that is not a
+  well-formed PNG, and images over 8192 px per side or 32 Mpx; decode with
+  a bounded allocator; show a placeholder for images they can't decode.
+  Unknown ids in `'P'` are skipped.
+* Blobs are rate limited per viewer (8 MiB burst, 4 MiB/s) so images can't
+  starve grid updates; a placement appears once its blob has been sent.
+* Old clients that predate these frames ignore them and simply show no
+  images.
 
 ## 4. Client → server
 

@@ -22,6 +22,9 @@ pub const Atlas = struct {
     scratch: []u8 = &.{},
     /// Incremented when the atlas is wiped (all slots invalid).
     epoch: u32 = 0,
+    /// Height of the GPU texture the atlas lives in, for UVs. The texture
+    /// may be taller than the atlas (TermView keeps inline images below it).
+    tex_h: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, width: u32, height: u32) !Atlas {
         const pixels = try gpa.alloc(u8, @as(usize, width) * height * 4);
@@ -53,13 +56,17 @@ pub const Atlas = struct {
 
     pub fn whiteUv(a: *const Atlas) [4]f32 {
         const u = 1.0 / @as(f32, @floatFromInt(a.width));
-        const v = 1.0 / @as(f32, @floatFromInt(a.height));
+        const v = 1.0 / @as(f32, @floatFromInt(a.texHeight()));
         return .{ u * 0.5, v * 0.5, u * 1.5, v * 1.5 };
+    }
+
+    pub fn texHeight(a: *const Atlas) u32 {
+        return @max(a.tex_h, a.height);
     }
 
     pub fn uv(a: *const Atlas, s: Slot) [4]f32 {
         const fw: f32 = @floatFromInt(a.width);
-        const fh: f32 = @floatFromInt(a.height);
+        const fh: f32 = @floatFromInt(a.texHeight());
         return .{
             @as(f32, @floatFromInt(s.x)) / fw,
             @as(f32, @floatFromInt(s.y)) / fh,

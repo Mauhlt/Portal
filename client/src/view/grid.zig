@@ -35,6 +35,89 @@ pub const Cell = struct {
     bg: u32 = color_default,
 };
 
+/// An image placed on the grid, in cells (docs/protocol.md 'P' frames).
+/// `row` is negative when the image has partly scrolled off the top.
+pub const Placement = struct {
+    id: u32,
+    col: u16,
+    row: i16,
+    cols: u16,
+    rows: u16,
+};
+
+pub const max_blob_bytes: usize = 6 << 20;
+pub const max_blobs: usize = 64;
+pub const max_placements: usize = 256;
+
+/// The images of the visible screen: PNG bytes by id (untrusted; decoded
+/// by TermView through imgdec) and their placements. Bounded: at most
+/// `max_blobs` blobs of `max_blob_bytes`, `max_placements` placements.
+pub const Images = struct {
+    blobs: std.ArrayList(Blob) = .empty,
+    placements: std.ArrayList(Placement) = .empty,
+    /// Bumped on every change.
+    generation: u64 = 0,
+
+    pub const Blob = struct { id: u32, png: []u8 };
+
+    pub fn deinit(im: *Images, gpa: std.mem.Allocator) void {
+        for (im.blobs.items) |b| gpa.free(b.png);
+        im.blobs.deinit(gpa);
+        im.placements.deinit(gpa);
+        im.* = .{};
+    }
+
+    pub fn blob(im: *const Images, id: u32) ?[]const u8 {
+        for (im.blobs.items) |b| if (b.id == id) return b.png;
+        return null;
+    }
+
+    /// Stores a copy of `png` under `id` (replacing an older one). Oversized
+    /// blobs are refused; when full, the oldest blob goes.
+    pub fn putBlob(im: *Images, gpa: std.mem.Allocator, id: u32, png: []const u8) error{ OutOfMemory, TooLarge }!void {
+        if (png.len > max_blob_bytes) return error.TooLarge;
+        const copy = try gpa.dupe(u8, png);
+        errdefer gpa.free(copy);
+        im.drop(gpa, id);
+        if (im.blobs.items.len >= max_blobs) {
+            gpa.free(im.blobs.items[0].png);
+            _ = im.blobs.orderedRemove(0);
+        }
+        try im.blobs.append(gpa, .{ .id = id, .png = copy });
+        im.generation +%= 1;
+    }
+
+    fn drop(im: *Images, gpa: std.mem.Allocator, id: u32) void {
+        for (im.blobs.items, 0..) |b, k| if (b.id == id) {
+            gpa.free(b.png);
+            _ = im.blobs.orderedRemove(k);
+            return;
+        };
+    }
+
+    /// Replaces the placement list (capped) and, per the protocol's cache
+    /// rule, drops every blob it doesn't reference.
+    pub fn setPlacements(im: *Images, gpa: std.mem.Allocator, list: []const Placement) error{OutOfMemory}!void {
+        const n = @min(list.len, max_placements);
+        try im.placements.ensureTotalCapacity(gpa, n);
+        im.placements.clearRetainingCapacity();
+        im.placements.appendSliceAssumeCapacity(list[0..n]);
+        var k: usize = 0;
+        while (k < im.blobs.items.len) {
+            const id = im.blobs.items[k].id;
+            var used = false;
+            for (im.placements.items) |p| {
+                if (p.id == id) used = true;
+            }
+            if (used) k += 1 else {
+                gpa.free(im.blobs.items[k].png);
+                _ = im.blobs.orderedRemove(k);
+            }
+        }
+        im.generation +%= 1;
+    }
+};
+
 pub const Grid = struct {
     cols: u16 = 0,
     rows: u16 = 0,
@@ -46,9 +129,12 @@ pub const Grid = struct {
     generation: u64 = 0,
     /// True once every row has been filled for the current size.
     complete: bool = false,
+    /// Inline images of the visible screen.
+    images: Images = .{},
 
     pub fn deinit(g: *Grid, gpa: std.mem.Allocator) void {
         gpa.free(g.cells);
+        g.images.deinit(gpa);
         g.* = .{};
     }
 
@@ -111,6 +197,28 @@ pub const Theme = struct {
 
 
 const testing = std.testing;
+
+test "images: blobs bounded, dropped when no placement references them" {
+    const gpa = testing.allocator;
+    var im: Images = .{};
+    defer im.deinit(gpa);
+    try im.putBlob(gpa, 1, "one");
+    try im.putBlob(gpa, 2, "two");
+    try im.putBlob(gpa, 1, "uno");
+    try testing.expectEqualStrings("uno", im.blob(1).?);
+    const big = try gpa.alloc(u8, max_blob_bytes + 1);
+    defer gpa.free(big);
+    try testing.expectError(error.TooLarge, im.putBlob(gpa, 3, big));
+    for (0..max_blobs + 5) |i| try im.putBlob(gpa, @intCast(100 + i), "x");
+    try testing.expectEqual(max_blobs, im.blobs.items.len);
+    try im.setPlacements(gpa, &.{.{ .id = 110, .col = 0, .row = -1, .cols = 2, .rows = 2 }});
+    try testing.expectEqual(@as(usize, 1), im.blobs.items.len);
+    try testing.expect(im.blob(110) != null);
+    var many: [max_placements + 10]Placement = undefined;
+    for (&many) |*p| p.* = .{ .id = 110, .col = 0, .row = 0, .cols = 1, .rows = 1 };
+    try im.setPlacements(gpa, &many);
+    try testing.expectEqual(max_placements, im.placements.items.len);
+}
 
 test "theme resolves sentinels" {
     const t: Theme = .{};

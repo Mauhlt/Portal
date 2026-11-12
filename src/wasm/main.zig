@@ -220,6 +220,12 @@ export fn frame() void {
     if (!ready) return;
     app.frame_pending = false;
     if (!app.sized) return;
+    // Inline images decode lazily, one per frame so a big one can't stall
+    // several; the rows it covers redraw once it is ready.
+    if (app.grid.images.decodeOne(gpa)) |id| {
+        app.grid.markImage(id);
+        if (app.grid.images.nextToDecode() != null) schedule();
+    }
     const view: render.Renderer.View = .{ .l = app.l, .pan = app.pan, .show_cursor = app.policy != .none };
     if (app.full) app.r.clearTerm(app.l);
     var y: u16 = 0;
@@ -260,8 +266,9 @@ export fn on_ws_message(binary: u32, len: usize) void {
         return;
     }
     const old_y = app.grid.cursor_y;
-    const res = proto.applyFrame(&app.grid, gpa, data) catch |err| blk: {
-        logMsg("bad grid frame: {t}", .{err});
+    // 'G' grid, 'I' image, 'P' placements; unknown types are ignored.
+    const res = proto.applyBinary(&app.grid, gpa, data) catch |err| blk: {
+        logMsg("bad {c} frame: {t}", .{ if (data.len > 0 and data[0] >= 0x20 and data[0] < 0x7f) data[0] else '?', err });
         break :blk proto.FrameResult{};
     };
     if (res.resized) {

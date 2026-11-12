@@ -18,7 +18,8 @@
 
 const std = @import("std");
 const Image = @import("Image");
-const pngcheck = @import("pngcheck");
+/// The checks imgdec runs first, for callers that want header info.
+pub const pngcheck = @import("pngcheck");
 
 pub const Error = error{ Invalid, TooLarge, OutOfMemory };
 

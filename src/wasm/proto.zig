@@ -8,6 +8,8 @@
 
 const std = @import("std");
 const vt = @import("vt");
+const imgdec = @import("imgdec");
+const pngcheck = @import("pngcheck");
 
 pub const color_default = vt.color_default;
 pub const color_default_bg_as_fg = vt.color_default_bg_as_fg;
@@ -41,11 +43,27 @@ pub const Grid = struct {
     cursor_x: u16 = 0,
     cursor_y: u16 = 0,
     cursor_visible: bool = false,
+    /// Inline images ('I' / 'P' frames).
+    images: Images = .{},
 
     pub fn deinit(g: *Grid, gpa: std.mem.Allocator) void {
         gpa.free(g.cells);
         gpa.free(g.dirty);
+        g.images.deinit(gpa);
         g.* = .{};
+    }
+
+    /// Marks the grid rows a placement covers as dirty.
+    pub fn markPlacement(g: *Grid, p: Placement) void {
+        const r0: i64 = @max(0, @as(i64, p.row));
+        const r1: i64 = @min(@as(i64, g.rows), @as(i64, p.row) + p.rows);
+        var y = r0;
+        while (y < r1) : (y += 1) g.dirty[@intCast(y)] = true;
+    }
+
+    /// Marks the rows of every placement showing image `id`.
+    pub fn markImage(g: *Grid, id: u32) void {
+        for (g.images.places.items) |p| if (p.id == id) g.markPlacement(p);
     }
 
     pub fn row(g: *const Grid, y: u16) []Cell {
@@ -78,12 +96,179 @@ pub const Grid = struct {
     }
 };
 
-pub const FrameError = error{ NotGrid, Truncated, BadSize, OutOfMemory };
+pub const FrameError = error{ NotGrid, Truncated, BadSize, TooLarge, OutOfMemory };
 
 pub const FrameResult = struct {
     /// The grid was reallocated (cols/rows changed): relayout.
     resized: bool = false,
+    /// An 'I' or 'P' frame was applied.
+    images: bool = false,
 };
+
+// ------------------------------------------------------------ images
+
+/// Most blobs kept; the server never references more than one screen's
+/// worth (<= 64 images), so this is only a guard against a bad peer.
+pub const max_blobs = 64;
+/// Most placements accepted in one 'P' frame (the server sends <= 256).
+pub const max_placements = 1024;
+pub const placement_entry_len = 14;
+/// Decode limits for the browser: wasm memory only grows, so keep a single
+/// decode modest. Bigger images draw as a placeholder box.
+pub const decode_budget: usize = 96 << 20;
+pub const decode_max_side: u32 = 1024;
+/// The owner's pinned Image decoder (Image@c64d400) does not compile for
+/// 32-bit targets: src/inflate/inflate.zig indexes its tables with a u64
+/// bit buffer (`d.pre[b.buf & mask(pre_bits)]`, lines 184, 403, 473),
+/// which is a compile error where usize is 32 bits, i.e. wasm32. Until that
+/// is fixed upstream (docs/image-decoder-findings.md), the browser shows a
+/// placeholder box with the image's size instead of decoding; native
+/// builds (and this module's native tests) decode.
+pub const decoder_available = @import("builtin").target.ptrBitWidth() >= 64;
+
+pub const Placement = struct { id: u32, col: u16, row: i16, cols: u16, rows: u16 };
+
+pub const Blob = struct {
+    id: u32,
+    png: []u8,
+    /// IHDR size (0 if the header is unreadable), for the placeholder.
+    w: u32 = 0,
+    h: u32 = 0,
+    rgba: ?imgdec.Rgba = null,
+    /// Could not (or may not) be decoded: draw a placeholder.
+    failed: bool = false,
+
+    fn deinit(b: *Blob, gpa: std.mem.Allocator) void {
+        gpa.free(b.png);
+        if (b.rgba) |*r| r.deinit(gpa);
+    }
+};
+
+pub const Images = struct {
+    blobs: std.ArrayList(Blob) = .empty,
+    places: std.ArrayList(Placement) = .empty,
+
+    pub fn deinit(im: *Images, gpa: std.mem.Allocator) void {
+        for (im.blobs.items) |*b| b.deinit(gpa);
+        im.blobs.deinit(gpa);
+        im.places.deinit(gpa);
+        im.* = .{};
+    }
+
+    pub fn find(im: *const Images, id: u32) ?*Blob {
+        for (im.blobs.items) |*b| if (b.id == id) return b;
+        return null;
+    }
+
+    fn referenced(im: *const Images, id: u32) bool {
+        for (im.places.items) |p| if (p.id == id) return true;
+        return false;
+    }
+
+    fn remove(im: *Images, gpa: std.mem.Allocator, i: usize) void {
+        im.blobs.items[i].deinit(gpa);
+        _ = im.blobs.orderedRemove(i);
+    }
+
+    /// A placed blob that still needs decoding, if any.
+    pub fn nextToDecode(im: *const Images) ?*Blob {
+        for (im.places.items) |p| {
+            const b = im.find(p.id) orelse continue;
+            if (b.rgba == null and !b.failed) return b;
+        }
+        return null;
+    }
+
+    /// Decodes one pending blob. Returns its id, or null if none was left.
+    pub fn decodeOne(im: *Images, gpa: std.mem.Allocator) ?u32 {
+        const b = im.nextToDecode() orelse return null;
+        if (comptime !decoder_available) {
+            b.failed = true;
+            return b.id;
+        }
+        if (imgdec.decode(gpa, b.png, .{ .budget = decode_budget, .max_side = decode_max_side })) |r| {
+            b.rgba = r;
+        } else |_| b.failed = true;
+        return b.id;
+    }
+};
+
+fn applyBlob(g: *Grid, gpa: std.mem.Allocator, frame: []const u8) FrameError!void {
+    var r: Reader = .{ .buf = frame };
+    if ((try r.int(u8)) != 'I') return error.NotGrid;
+    const id = try r.int(u32);
+    const len = try r.int(u32);
+    if (len > pngcheck.max_file_bytes) return error.TooLarge;
+    const png = try r.bytes(len);
+    if (r.pos != frame.len) return error.BadSize;
+    const im = &g.images;
+    const owned = try gpa.dupe(u8, png);
+    errdefer gpa.free(owned);
+    var blob: Blob = .{ .id = id, .png = owned };
+    if (pngcheck.header(png)) |info| {
+        blob.w = info.width;
+        blob.h = info.height;
+    } else |_| blob.failed = true;
+    for (im.blobs.items, 0..) |b, i| if (b.id == id) {
+        im.remove(gpa, i);
+        break;
+    };
+    if (im.blobs.items.len >= max_blobs) im.remove(gpa, 0);
+    try im.blobs.append(gpa, blob);
+    g.markImage(id);
+}
+
+fn applyPlacements(g: *Grid, gpa: std.mem.Allocator, frame: []const u8) FrameError!void {
+    var r: Reader = .{ .buf = frame };
+    if ((try r.int(u8)) != 'P') return error.NotGrid;
+    const n = try r.int(u16);
+    if (n > max_placements) return error.TooLarge;
+    const body = try r.bytes(@as(usize, n) * placement_entry_len);
+    if (r.pos != frame.len) return error.BadSize;
+    const im = &g.images;
+    var fresh: std.ArrayList(Placement) = .empty;
+    errdefer fresh.deinit(gpa);
+    try fresh.ensureTotalCapacityPrecise(gpa, n);
+    for (0..n) |i| {
+        const e = body[i * placement_entry_len ..][0..placement_entry_len];
+        const p: Placement = .{
+            .id = std.mem.readInt(u32, e[0..4], .little),
+            .col = std.mem.readInt(u16, e[4..6], .little),
+            .row = std.mem.readInt(i16, e[6..8], .little),
+            .cols = std.mem.readInt(u16, e[8..10], .little),
+            .rows = std.mem.readInt(u16, e[10..12], .little),
+        };
+        if (p.cols == 0 or p.rows == 0) continue;
+        fresh.appendAssumeCapacity(p);
+    }
+    for (im.places.items) |p| g.markPlacement(p);
+    im.places.deinit(gpa);
+    im.places = fresh;
+    for (im.places.items) |p| g.markPlacement(p);
+    // Cache rule: blobs this frame doesn't list may go.
+    var i: usize = 0;
+    while (i < im.blobs.items.len) {
+        if (im.referenced(im.blobs.items[i].id)) i += 1 else im.remove(gpa, i);
+    }
+}
+
+/// Applies any binary frame: 'G' grid, 'I' image blob, 'P' placements.
+/// Frames of unknown types are ignored (protocol: new types may appear).
+pub fn applyBinary(g: *Grid, gpa: std.mem.Allocator, frame: []const u8) FrameError!FrameResult {
+    if (frame.len == 0) return .{};
+    switch (frame[0]) {
+        'G' => return applyFrame(g, gpa, frame),
+        'I' => {
+            try applyBlob(g, gpa, frame);
+            return .{ .images = true };
+        },
+        'P' => {
+            try applyPlacements(g, gpa, frame);
+            return .{ .images = true };
+        },
+        else => return .{},
+    }
+}
 
 const Reader = struct {
     buf: []const u8,
@@ -450,6 +635,127 @@ test "every truncation and random corruption of a frame is safe" {
         std.mem.writeInt(u16, buf[1..3], rand.uintAtMost(u16, 40), .little);
         std.mem.writeInt(u16, buf[3..5], rand.uintAtMost(u16, 40), .little);
         _ = applyFrame(&g, testing.allocator, buf[0..rand.uintAtMost(usize, buf.len)]) catch {};
+    }
+}
+
+fn blobFrame(id: u32, png: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try vt.gfx.appendBlobFrame(&out, testing.allocator, id, png);
+    return out.toOwnedSlice(testing.allocator);
+}
+
+fn placeFrame(list: []const vt.gfx.Placement) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    const All = struct {
+        fn f(_: void, _: u32) bool {
+            return true;
+        }
+    };
+    try vt.gfx.appendPlacementFrame(&out, testing.allocator, list, {}, All.f);
+    return out.toOwnedSlice(testing.allocator);
+}
+
+fn gp(id: u32, col: u16, row: i32, cols: u16, rows: u16) vt.gfx.Placement {
+    return .{ .image = id, .client_id = 0, .pid = 0, .col = col, .row = row, .cols = cols, .rows = rows };
+}
+
+test "image frames: blobs, placements, cache rule, unknown types" {
+    const gpa = testing.allocator;
+    var g: Grid = .{};
+    defer g.deinit(gpa);
+    // A grid first, so dirty marking has rows.
+    var b: Builder = .{};
+    defer b.deinit();
+    b.header(10, 5, 0, 0, 1, 0);
+    _ = try applyFrame(&g, gpa, b.list.items);
+
+    const png = try pngcheck.testImage(gpa, 8, 6);
+    defer gpa.free(png);
+    const f1 = try blobFrame(7, png);
+    defer gpa.free(f1);
+    const res = try applyBinary(&g, gpa, f1);
+    try testing.expect(res.images);
+    try testing.expectEqual(@as(usize, 1), g.images.blobs.items.len);
+    try testing.expectEqual(@as(u32, 8), g.images.find(7).?.w);
+
+    @memset(g.dirty, false);
+    const p1 = try placeFrame(&.{ gp(7, 1, 1, 3, 2), gp(99, 0, -1, 2, 2) });
+    defer gpa.free(p1);
+    _ = try applyBinary(&g, gpa, p1);
+    try testing.expectEqual(@as(usize, 2), g.images.places.items.len);
+    try testing.expect(g.dirty[0] and g.dirty[1] and g.dirty[2] and !g.dirty[3]);
+    try testing.expectEqual(@as(i16, -1), g.images.places.items[1].row);
+
+    // One decode per call; unknown id 99 is skipped.
+    try testing.expectEqual(@as(?u32, 7), g.images.decodeOne(gpa));
+    try testing.expect(g.images.find(7).?.rgba != null);
+    try testing.expectEqual(@as(?u32, null), g.images.decodeOne(gpa));
+
+    // A 'P' without id 7 drops its blob (and pixels).
+    const p2 = try placeFrame(&.{});
+    defer gpa.free(p2);
+    @memset(g.dirty, false);
+    _ = try applyBinary(&g, gpa, p2);
+    try testing.expectEqual(@as(usize, 0), g.images.blobs.items.len);
+    try testing.expect(g.dirty[1] and g.dirty[2]); // old placement area redraws
+
+    // Unknown frame types and empty frames are ignored, grid untouched.
+    const before = g.cols;
+    _ = try applyBinary(&g, gpa, "Zwhatever");
+    _ = try applyBinary(&g, gpa, "");
+    try testing.expectEqual(before, g.cols);
+
+    // An invalid PNG is kept but marked failed (placeholder).
+    const f3 = try blobFrame(3, "not a png");
+    defer gpa.free(f3);
+    _ = try applyBinary(&g, gpa, f3);
+    try testing.expect(g.images.find(3).?.failed);
+
+    // Oversized length, lying lengths, trailing bytes.
+    var big: [9]u8 = .{ 'I', 1, 0, 0, 0, 0, 0, 0x70, 0 };
+    try testing.expectError(error.TooLarge, applyBinary(&g, gpa, &big));
+    big[7] = 0;
+    big[6] = 1; // 256 bytes claimed, none present
+    try testing.expectError(error.Truncated, applyBinary(&g, gpa, &big));
+    try testing.expectError(error.BadSize, applyBinary(&g, gpa, "I\x01\x00\x00\x00\x00\x00\x00\x00X"));
+    try testing.expectError(error.Truncated, applyBinary(&g, gpa, "P\x05\x00"));
+    try testing.expectError(error.TooLarge, applyBinary(&g, gpa, "P\xff\xff"));
+    try testing.expectError(error.BadSize, applyBinary(&g, gpa, "P\x00\x00X"));
+
+    // The blob cache is capped.
+    for (0..max_blobs + 10) |k| {
+        const f = try blobFrame(@intCast(1000 + k), "x");
+        defer gpa.free(f);
+        _ = try applyBinary(&g, gpa, f);
+    }
+    try testing.expectEqual(@as(usize, max_blobs), g.images.blobs.items.len);
+}
+
+test "image frames: every truncation and random bytes are safe" {
+    const gpa = testing.allocator;
+    var g: Grid = .{};
+    defer g.deinit(gpa);
+    const png = try pngcheck.testImage(gpa, 4, 4);
+    defer gpa.free(png);
+    const f1 = try blobFrame(1, png);
+    defer gpa.free(f1);
+    const p1 = try placeFrame(&.{ gp(1, 0, 0, 2, 2), gp(1, 900, -30000, 65535, 65535) });
+    defer gpa.free(p1);
+    for ([_][]const u8{ f1, p1 }) |f| {
+        for (0..f.len) |n| _ = applyBinary(&g, gpa, f[0..n]) catch {};
+    }
+    var prng = std.Random.DefaultPrng.init(0x1AA6E);
+    const rand = prng.random();
+    var buf: [300]u8 = undefined;
+    for (0..20000) |_| {
+        rand.bytes(&buf);
+        buf[0] = "IPG"[rand.uintLessThan(usize, 3)];
+        if (buf[0] == 'I') std.mem.writeInt(u32, buf[5..9], rand.uintAtMost(u32, 400), .little);
+        if (buf[0] == 'P') std.mem.writeInt(u16, buf[1..3], rand.uintAtMost(u16, 25), .little);
+        _ = applyBinary(&g, gpa, buf[0..rand.uintAtMost(usize, buf.len)]) catch {};
+        _ = g.images.decodeOne(gpa);
+        try testing.expect(g.images.blobs.items.len <= max_blobs);
+        try testing.expect(g.images.places.items.len <= max_placements);
     }
 }
 

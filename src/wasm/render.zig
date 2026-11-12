@@ -24,6 +24,8 @@ pub const Theme = struct {
     pressed_label: u32 = 0x10131a,
     cursor: u32 = 0xd4d4d4,
     cursor_alpha: u8 = 140, // ≈ 0.55, as the old viewer
+    /// Outline and label of an image that can't be shown.
+    placeholder: u32 = 0x8a8a80,
 };
 
 /// 0x00RRGGBB → little-endian RGBA bytes as a u32 (what ImageData wants).
@@ -187,7 +189,21 @@ pub const Renderer = struct {
         // Cells beyond the visible area are skipped wholesale.
         const first: usize = @intCast(std.math.clamp(@divFloor(clip.x - left, cw) - 1, 0, @as(i32, g.cols)));
         const last: usize = @intCast(std.math.clamp(@divFloor(clip.right() - left, cw) + 1, 0, @as(i32, g.cols)));
+        // Pass 1: cell backgrounds.
         var x = first;
+        while (x < last) : (x += 1) {
+            const c = cells[x];
+            if (c.wide == .cont) continue;
+            const n: u2 = if (c.wide == .lead) 2 else 1;
+            const cell: Rect = .{ .x = left + @as(i32, @intCast(x)) * cw, .y = top, .w = cw * n, .h = ch };
+            const bg = bgColor(r.theme, c.bg);
+            if (bg != r.theme.bg) r.fb.fill(cell, clip, bg);
+        }
+        // Pass 2: images, above backgrounds and below text and cursor.
+        const grid_top = l.term.y + l.pad - v.pan[1];
+        for (g.images.places.items) |p| r.drawImageSlice(g, gl, p, left, grid_top, cw, ch, band, clip, y);
+        // Pass 3: glyphs and decorations.
+        x = first;
         while (x < last) : (x += 1) {
             const c = cells[x];
             if (c.wide == .cont) continue;
@@ -196,7 +212,6 @@ pub const Renderer = struct {
             const bg = bgColor(r.theme, c.bg);
             var fg = fgColor(r.theme, c.fg);
             if (c.attrs & proto.attr_dim != 0) fg = mixRgb(fg, bg, 102); // 60% opacity
-            if (bg != r.theme.bg) r.fb.fill(cell, clip, bg);
             const style: glyphs.Style = .{ .bold = c.attrs & proto.attr_bold != 0, .italic = c.attrs & proto.attr_italic != 0 };
             const cov = gl.get(c.cp, style, n);
             r.fb.glyph(cell.x, cell.y, cov, l.cw * n, l.ch, clip, fg);
@@ -212,6 +227,80 @@ pub const Renderer = struct {
             const wide = cells[cx].wide == .lead;
             const cur: Rect = .{ .x = left + @as(i32, cx) * cw, .y = top, .w = cw * @as(i32, if (wide) 2 else 1), .h = ch };
             r.fb.tint(cur, clip, r.theme.cursor, r.theme.cursor_alpha);
+        }
+    }
+
+    /// Draws the part of placement `p` inside grid row `y`'s pixel band:
+    /// the decoded image scaled (nearest) to its cells with alpha blending,
+    /// or, if it can't be shown, an outlined box labelled with its size.
+    /// Every coordinate comes from the peer: computed in i64 and clipped
+    /// to the band, the terminal clip and the framebuffer before indexing.
+    fn drawImageSlice(r: *Renderer, g: *const proto.Grid, gl: *glyphs.Glyphs, p: proto.Placement, left: i32, grid_top: i32, cw: i32, ch: i32, band: Rect, clip: Rect, y: u16) void {
+        if (@as(i64, p.row) > y or @as(i64, p.row) + p.rows <= y) return;
+        const blob = g.images.find(p.id) orelse return;
+        const x0: i64 = @as(i64, left) + @as(i64, p.col) * cw;
+        const y0: i64 = @as(i64, grid_top) + @as(i64, p.row) * ch;
+        const w: i64 = @as(i64, p.cols) * cw;
+        const h: i64 = @as(i64, p.rows) * ch;
+        if (w <= 0 or h <= 0) return;
+        const fb_w: i64 = r.fb.w;
+        const fb_h: i64 = r.fb.h;
+        const cx0 = @max(x0, clip.x, 0);
+        const cx1 = @min(x0 + w, @as(i64, clip.x) + clip.w, fb_w);
+        const cy0 = @max(y0, band.y, clip.y, 0);
+        const cy1 = @min(y0 + h, @as(i64, band.y) + band.h, @as(i64, clip.y) + clip.h, fb_h);
+        if (cx1 <= cx0 or cy1 <= cy0) return;
+        if (blob.rgba) |img| {
+            if (img.w == 0 or img.h == 0 or img.px.len < @as(usize, img.w) * img.h * 4) return;
+            var py = cy0;
+            while (py < cy1) : (py += 1) {
+                const sy: usize = @intCast(@min(@as(i64, img.h) - 1, @divFloor((py - y0) * img.h, h)));
+                const dst_row: usize = @intCast(py * fb_w);
+                var px = cx0;
+                while (px < cx1) : (px += 1) {
+                    const sx: usize = @intCast(@min(@as(i64, img.w) - 1, @divFloor((px - x0) * img.w, w)));
+                    const s = img.px[(sy * img.w + sx) * 4 ..][0..4];
+                    if (s[3] == 0) continue;
+                    const rgb = (@as(u32, s[0]) << 16) | (@as(u32, s[1]) << 8) | s[2];
+                    const i = dst_row + @as(usize, @intCast(px));
+                    r.fb.pixels[i] = if (s[3] == 255) pixel(rgb) else blendPixel(r.fb.pixels[i], rgb, s[3]);
+                }
+            }
+            return;
+        }
+        if (!blob.failed) return; // not decoded yet: drawn once it is
+        // Placeholder: a 1-device-pixel-ish outline.
+        const t: i64 = @max(1, @divFloor(@min(cw, ch), 8));
+        const col = pixel(r.theme.placeholder);
+        var py = cy0;
+        while (py < cy1) : (py += 1) {
+            const edge_row = py < y0 + t or py >= y0 + h - t;
+            const dst_row: usize = @intCast(py * fb_w);
+            var px = cx0;
+            while (px < cx1) : (px += 1) {
+                if (edge_row or px < x0 + t or px >= x0 + w - t) r.fb.pixels[dst_row + @as(usize, @intCast(px))] = col;
+            }
+        }
+        // Label "W×H" on the middle row, if it fits inside the box.
+        if (blob.w == 0 or blob.h == 0) return;
+        const mid: i64 = @as(i64, p.row) + @divFloor(@as(i64, p.rows), 2);
+        if (mid != y) return;
+        var buf: [32]u8 = undefined;
+        const label = std.fmt.bufPrint(&buf, "{d}\u{00D7}{d}", .{ blob.w, blob.h }) catch return;
+        var n_cells: i64 = 0;
+        var it: proto.Utf8Iter = .{ .s = label };
+        while (it.next()) |_| n_cells += 1;
+        if (n_cells + 2 > p.cols) return;
+        const lx0: i64 = x0 + @divFloor(@as(i64, p.cols) - n_cells, 2) * cw;
+        const ly: i64 = @as(i64, grid_top) + @as(i64, y) * ch;
+        if (lx0 < std.math.minInt(i32) / 2 or lx0 > std.math.maxInt(i32) / 2 or ly < std.math.minInt(i32) / 2 or ly > std.math.maxInt(i32) / 2) return;
+        it = .{ .s = label };
+        var k: i64 = 0;
+        while (it.next()) |cp| : (k += 1) {
+            const gx = lx0 + k * cw;
+            if (gx > std.math.maxInt(i32) / 2) break;
+            const cov = gl.get(cp, .{}, 1);
+            r.fb.glyph(@intCast(gx), @intCast(ly), cov, @intCast(cw), @intCast(ch), clip, r.theme.placeholder);
         }
     }
 
@@ -258,6 +347,106 @@ test "colour sentinels" {
     try testing.expectEqual(@as(u32, 0xffffff), mixRgb(0x000000, 0xffffff, 255));
     try testing.expectEqual(@as(u32, 0x204060), mixRgb(0x204060, 0xffffff, 0));
     try testing.expectEqual(@as(u32, 0x808080), mixRgb(0x000000, 0xffffff, 128));
+}
+
+fn imageGrid(gpa: std.mem.Allocator, g: *proto.Grid, png: []const u8, places: []const @import("vt").gfx.Placement) !void {
+    var t = try @import("vt").Terminal.init(gpa, 10, 4);
+    defer t.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try t.encodeRows(&.{ 0, 1, 2, 3 }, &out, gpa);
+    _ = try proto.applyFrame(g, gpa, out.items);
+    out.clearRetainingCapacity();
+    const gfx = @import("vt").gfx;
+    try gfx.appendBlobFrame(&out, gpa, 5, png);
+    _ = try proto.applyBinary(g, gpa, out.items);
+    out.clearRetainingCapacity();
+    const All = struct {
+        fn f(_: void, _: u32) bool {
+            return true;
+        }
+    };
+    try gfx.appendPlacementFrame(&out, gpa, places, {}, All.f);
+    _ = try proto.applyBinary(g, gpa, out.items);
+    while (g.images.decodeOne(gpa)) |_| {}
+}
+
+fn pl(col: u16, row: i32, cols: u16, rows: u16) @import("vt").gfx.Placement {
+    return .{ .image = 5, .client_id = 0, .pid = 0, .col = col, .row = row, .cols = cols, .rows = rows };
+}
+
+test "images land on their cells; placeholders for bad blobs; clipping" {
+    const gpa = testing.allocator;
+    var gl = try glyphs.Glyphs.init(gpa, @embedFile("font_regular"), @embedFile("font_bold"));
+    defer gl.deinit();
+    const in: layout.Input = .{ .css_w = 200, .css_h = 200, .dpr = 1, .touch = false, .show_bar = false, .cols = 10, .rows = 4, .zoom = .{}, .m = gl.metrics() };
+    const l = layout.compute(in);
+    gl.setSize(l.cw, l.ch, l.em);
+    var r: Renderer = .{};
+    defer r.fb.deinit(gpa);
+    try r.fb.resize(gpa, l.w, l.h);
+
+    // A solid red 4x4 PNG placed at cells (2,1)-(4,2).
+    var px: [4 * 4 * 4]u8 = undefined;
+    for (0..16) |i| px[i * 4 ..][0..4].* = .{ 255, 0, 0, 255 };
+    const png = try @import("pngcheck").encodeStored(gpa, 4, 4, &px);
+    defer gpa.free(png);
+    var g: proto.Grid = .{};
+    defer g.deinit(gpa);
+    try imageGrid(gpa, &g, png, &.{pl(2, 1, 3, 2)});
+    try testing.expect(g.images.find(5).?.rgba != null);
+    const v: Renderer.View = .{ .l = l, .pan = .{ 0, 0 }, .show_cursor = false };
+    r.clearTerm(l);
+    for (0..4) |y| r.drawRow(&g, &gl, v, @intCast(y));
+    const cw: usize = l.cw;
+    const ch: usize = l.ch;
+    const ox: usize = @intCast(l.term.x + l.pad);
+    const oy: usize = @intCast(l.term.y + l.pad);
+    const at = struct {
+        fn f(rr: *const Renderer, x: usize, y: usize) u32 {
+            return rr.fb.pixels[y * rr.fb.w + x];
+        }
+    }.f;
+    try testing.expectEqual(pixel(0xff0000), at(&r, ox + 2 * cw + 1, oy + ch + 1)); // top-left cell
+    try testing.expectEqual(pixel(0xff0000), at(&r, ox + 5 * cw - 1, oy + 3 * ch - 1)); // bottom-right
+    try testing.expectEqual(pixel(r.theme.bg), at(&r, ox + 5 * cw + 1, oy + ch + 1)); // right of it
+    try testing.expectEqual(pixel(r.theme.bg), at(&r, ox + 2 * cw + 1, oy + 3 * ch + 1)); // below it
+
+    // An undecodable blob draws an outlined placeholder.
+    var g2: proto.Grid = .{};
+    defer g2.deinit(gpa);
+    const bad = try gpa.dupe(u8, png);
+    defer gpa.free(bad);
+    bad[bad.len - 20] ^= 0xff; // IDAT CRC no longer matches
+    try imageGrid(gpa, &g2, bad, &.{pl(0, 0, 10, 3)});
+    try testing.expect(g2.images.find(5).?.failed);
+    r.clearTerm(l);
+    for (0..4) |y| r.drawRow(&g2, &gl, v, @intCast(y));
+    try testing.expectEqual(pixel(r.theme.placeholder), at(&r, ox, oy));
+    try testing.expectEqual(pixel(r.theme.bg), at(&r, ox + 5 * cw, oy + ch / 2));
+
+    // Partly off-grid placements (negative row, beyond the right edge),
+    // at extreme pans and zooms: clipped, never out of bounds.
+    var g3: proto.Grid = .{};
+    defer g3.deinit(gpa);
+    try imageGrid(gpa, &g3, png, &.{ pl(8, -1, 500, 3), pl(0, -30000, 65535, 65535), pl(65535, 3, 65535, 1) });
+    var g4: proto.Grid = .{};
+    defer g4.deinit(gpa);
+    try imageGrid(gpa, &g4, bad, &.{ pl(8, -1, 500, 3), pl(0, -30000, 65535, 65535), pl(3, 1, 7, 3) });
+    const zooms = [_]layout.Zoom{ .{}, .{ .fit = false, .font_px = 60 }, .{ .fit = false, .font_px = 6 } };
+    const pans = [_][2]i32{ .{ -5000, -5000 }, .{ 0, 0 }, .{ 37, 11 }, .{ 5000, 5000 } };
+    for (zooms) |z| {
+        var zin = in;
+        zin.zoom = z;
+        zin.dpr = 2;
+        const zl = layout.compute(zin);
+        try r.fb.resize(gpa, zl.w, zl.h);
+        gl.setSize(zl.cw, zl.ch, zl.em);
+        for (pans ++ [_][2]i32{zl.panMax()}) |p| for ([_]*proto.Grid{ &g3, &g4 }) |gg| {
+            r.clearTerm(zl);
+            for (0..4) |y| r.drawRow(gg, &gl, .{ .l = zl, .pan = p, .show_cursor = true }, @intCast(y));
+        };
+    }
 }
 
 test "draw a frame end to end and clip at every pan offset" {
