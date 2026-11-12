@@ -12,11 +12,20 @@
 //! parser and `verifyHostName` will visit exists and lies inside its parent,
 //! and only Portal's profile (ECDSA P-256, SHA-256) is accepted.
 //!
+//! The structure walk uses the shared bounds-checked DER reader
+//! (shared/pki/der.zig, also the server's); `verifyLeaf` additionally reads
+//! the leaf's extensions with the server's own certificate parser
+//! (shared/pki/cert.zig) to require a TLS server certificate.
+//!
 //! Also: PEM/DER loading of the CA file and SHA-256 fingerprints.
 
 const std = @import("std");
 const Certificate = std.crypto.Certificate;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const pki = @import("shared").pki;
+const der_mod = pki.der;
+const Tag = der_mod.Tag;
+const oids = der_mod.oids;
+const Element = der_mod.Element;
 
 /// Portal's certificates are well under 2 KiB.
 pub const max_cert_len = 8 * 1024;
@@ -24,192 +33,146 @@ const max_depth = 20;
 
 pub const Error = error{ BadCertificate, UnsupportedCertificate };
 
-const Tlv = struct {
-    tag: u8,
-    /// Content bounds.
-    start: usize,
-    end: usize,
-
-    fn constructed(t: Tlv) bool {
-        return t.tag & 0x20 != 0;
-    }
-};
-
-const tag_integer = 0x02;
-const tag_bit_string = 0x03;
-const tag_octet_string = 0x04;
-const tag_oid = 0x06;
-const tag_boolean = 0x01;
-const tag_utc_time = 0x17;
-const tag_generalized_time = 0x18;
-const tag_sequence = 0x30;
-const tag_set = 0x31;
-
-/// One DER header at `pos`, content inside `[pos, limit)`.
-fn header(buf: []const u8, pos: usize, limit: usize) Error!Tlv {
-    if (limit > buf.len or pos > limit or limit - pos < 2) return error.BadCertificate;
-    const tag = buf[pos];
-    if (tag & 0x1f == 0x1f) return error.BadCertificate; // multi-byte tags: std reads one byte
-    const l0 = buf[pos + 1];
-    var i = pos + 2;
-    var len: usize = 0;
-    if (l0 < 0x80) {
-        len = l0;
-    } else {
-        const n: usize = l0 & 0x7f;
-        if (n == 0 or n > 2) return error.BadCertificate; // indefinite, or >= 64 KiB
-        if (limit - i < n) return error.BadCertificate;
-        for (buf[i .. i + n]) |b| len = (len << 8) | b;
-        i += n;
-    }
-    if (len > limit - i) return error.BadCertificate;
-    return .{ .tag = tag, .start = i, .end = i + len };
+fn constructed(e: Element) bool {
+    return e.tag & 0x20 != 0;
 }
 
-/// Children of a constructed element, each checked recursively.
+/// The elements inside a constructed element, each checked recursively.
 const Children = struct {
-    buf: []const u8,
-    pos: usize,
-    end: usize,
+    r: der_mod.Reader,
     depth: u8,
 
-    fn of(buf: []const u8, t: Tlv, depth: u8) Error!Children {
-        if (!t.constructed()) return error.BadCertificate;
+    fn of(e: Element, depth: u8) Error!Children {
+        if (!constructed(e)) return error.BadCertificate;
         if (depth >= max_depth) return error.BadCertificate;
-        return .{ .buf = buf, .pos = t.start, .end = t.end, .depth = depth + 1 };
+        return .{ .r = .init(e.content), .depth = depth + 1 };
     }
 
-    fn next(c: *Children) Error!?Tlv {
-        if (c.pos == c.end) return null;
-        const t = try header(c.buf, c.pos, c.end);
-        c.pos = t.end;
-        try generic(c.buf, t, c.depth);
-        return t;
+    fn next(c: *Children) Error!?Element {
+        if (c.r.atEnd()) return null;
+        const e = c.r.next() catch return error.BadCertificate;
+        try generic(e, c.depth);
+        return e;
     }
 
-    fn need(c: *Children) Error!Tlv {
+    fn need(c: *Children) Error!Element {
         return (try c.next()) orelse error.BadCertificate;
     }
 
-    fn needTag(c: *Children, tag: u8) Error!Tlv {
-        const t = try c.need();
-        if (t.tag != tag) return error.BadCertificate;
-        return t;
+    fn needTag(c: *Children, tag: u8) Error!Element {
+        const e = try c.need();
+        if (e.tag != tag) return error.BadCertificate;
+        return e;
     }
 
     fn done(c: *Children) Error!void {
-        if (c.pos != c.end) return error.BadCertificate;
+        if (!c.r.atEnd()) return error.BadCertificate;
     }
 };
 
 /// Structure every element must have, whatever it is: constructed elements
 /// nest properly; BIT STRINGs have their unused-bits byte (std reads it).
-fn generic(buf: []const u8, t: Tlv, depth: u8) Error!void {
-    if (t.tag == tag_bit_string and t.end == t.start) return error.BadCertificate;
-    if (!t.constructed()) return;
-    var c = try Children.of(buf, t, depth);
+fn generic(e: Element, depth: u8) Error!void {
+    if (e.tag == Tag.bit_string and e.content.len == 0) return error.BadCertificate;
+    if (!constructed(e)) return;
+    var c = try Children.of(e, depth);
     while (try c.next()) |_| {}
 }
 
 /// A SEQUENCE starting with an OID (AlgorithmIdentifier), returning the OID.
-fn algorithm(buf: []const u8, t: Tlv, depth: u8, min_children: usize) Error![]const u8 {
-    if (t.tag != tag_sequence) return error.BadCertificate;
-    var c = try Children.of(buf, t, depth);
-    const oid = try c.needTag(tag_oid);
-    var n: usize = 1;
-    while (try c.next()) |_| n += 1;
-    if (n < min_children) return error.BadCertificate;
-    return buf[oid.start..oid.end];
+fn algorithm(e: Element, depth: u8) Error![]const u8 {
+    if (e.tag != Tag.sequence) return error.BadCertificate;
+    var c = try Children.of(e, depth);
+    const oid = try c.needTag(Tag.oid);
+    while (try c.next()) |_| {}
+    return oid.content;
 }
 
 /// Name ::= SEQUENCE OF SET OF SEQUENCE { OID, value }.
-fn name(buf: []const u8, t: Tlv, depth: u8) Error!void {
-    if (t.tag != tag_sequence) return error.BadCertificate;
-    var rdns = try Children.of(buf, t, depth);
+fn name(e: Element, depth: u8) Error!void {
+    if (e.tag != Tag.sequence) return error.BadCertificate;
+    var rdns = try Children.of(e, depth);
     while (try rdns.next()) |rdn| {
-        if (rdn.tag != tag_set) return error.BadCertificate;
-        var atavs = try Children.of(buf, rdn, rdns.depth);
+        if (rdn.tag != Tag.set) return error.BadCertificate;
+        var atavs = try Children.of(rdn, rdns.depth);
         while (try atavs.next()) |atav| {
-            if (atav.tag != tag_sequence) return error.BadCertificate;
-            var parts = try Children.of(buf, atav, atavs.depth);
-            _ = try parts.needTag(tag_oid);
+            if (atav.tag != Tag.sequence) return error.BadCertificate;
+            var parts = try Children.of(atav, atavs.depth);
+            _ = try parts.needTag(Tag.oid);
             _ = try parts.need();
             try parts.done();
         }
     }
 }
 
-const oid_ecdsa_with_sha256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 };
-const oid_ec_public_key = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
-const oid_prime256v1 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
-const oid_subject_alt_name = [_]u8{ 0x55, 0x1d, 0x11 };
-
 /// Checks that `der` is one X.509 certificate in Portal's profile whose
 /// structure std's parser can walk without leaving the buffer.
 pub fn validateCertificate(der: []const u8) Error!void {
     if (der.len < 2 or der.len > max_cert_len) return error.BadCertificate;
-    const cert = try header(der, 0, der.len);
-    if (cert.tag != tag_sequence or cert.end != der.len) return error.BadCertificate;
-    var top = try Children.of(der, cert, 0);
-    const tbs = try top.needTag(tag_sequence);
+    var r: der_mod.Reader = .init(der);
+    const cert = r.expect(Tag.sequence) catch return error.BadCertificate;
+    if (!r.atEnd()) return error.BadCertificate;
+    var top = try Children.of(cert, 0);
+    const tbs = try top.needTag(Tag.sequence);
     const sig_alg = try top.need();
-    if (!std.mem.eql(u8, try algorithm(der, sig_alg, top.depth, 1), &oid_ecdsa_with_sha256)) return error.UnsupportedCertificate;
-    _ = try top.needTag(tag_bit_string);
+    if (!std.mem.eql(u8, try algorithm(sig_alg, top.depth), &oids.ecdsa_with_sha256)) return error.UnsupportedCertificate;
+    _ = try top.needTag(Tag.bit_string);
     try top.done();
 
-    var f = try Children.of(der, tbs, top.depth);
+    var f = try Children.of(tbs, top.depth);
     var first = try f.need();
-    if (first.tag == 0xa0) {
-        if (first.end - first.start != 3) return error.BadCertificate;
+    if (first.tag == Tag.contextConstructed(0)) {
+        if (first.content.len != 3) return error.BadCertificate;
         first = try f.need(); // serial
     }
-    if (first.tag != tag_integer) return error.BadCertificate;
-    if (!std.mem.eql(u8, try algorithm(der, try f.need(), f.depth, 1), &oid_ecdsa_with_sha256)) return error.UnsupportedCertificate;
-    try name(der, try f.need(), f.depth); // issuer
+    if (first.tag != Tag.integer) return error.BadCertificate;
+    if (!std.mem.eql(u8, try algorithm(try f.need(), f.depth), &oids.ecdsa_with_sha256)) return error.UnsupportedCertificate;
+    try name(try f.need(), f.depth); // issuer
     {
-        const validity = try f.needTag(tag_sequence);
-        var v = try Children.of(der, validity, f.depth);
+        const validity = try f.needTag(Tag.sequence);
+        var v = try Children.of(validity, f.depth);
         for (0..2) |_| {
             const t = try v.need();
-            if (t.tag != tag_utc_time and t.tag != tag_generalized_time) return error.BadCertificate;
+            if (t.tag != Tag.utc_time and t.tag != Tag.generalized_time) return error.BadCertificate;
         }
         try v.done();
     }
-    try name(der, try f.need(), f.depth); // subject
+    try name(try f.need(), f.depth); // subject
     {
-        const spki = try f.needTag(tag_sequence);
-        var s = try Children.of(der, spki, f.depth);
-        const alg = try s.needTag(tag_sequence);
-        var a = try Children.of(der, alg, s.depth);
-        const alg_oid = try a.needTag(tag_oid);
-        if (!std.mem.eql(u8, der[alg_oid.start..alg_oid.end], &oid_ec_public_key)) return error.UnsupportedCertificate;
-        const curve = try a.needTag(tag_oid);
-        if (!std.mem.eql(u8, der[curve.start..curve.end], &oid_prime256v1)) return error.UnsupportedCertificate;
+        const spki = try f.needTag(Tag.sequence);
+        var s = try Children.of(spki, f.depth);
+        const alg = try s.needTag(Tag.sequence);
+        var a = try Children.of(alg, s.depth);
+        const alg_oid = try a.needTag(Tag.oid);
+        if (!std.mem.eql(u8, alg_oid.content, &oids.ec_public_key)) return error.UnsupportedCertificate;
+        const curve = try a.needTag(Tag.oid);
+        if (!std.mem.eql(u8, curve.content, &oids.prime256v1)) return error.UnsupportedCertificate;
         try a.done();
-        _ = try s.needTag(tag_bit_string);
+        _ = try s.needTag(Tag.bit_string);
         try s.done();
     }
     // Optional issuerUniqueID [1], subjectUniqueID [2], extensions [3].
     while (try f.next()) |t| {
-        if (t.tag != 0xa3) continue;
-        var outer = try Children.of(der, t, f.depth);
-        const exts = try outer.needTag(tag_sequence);
+        if (t.tag != Tag.contextConstructed(3)) continue;
+        var outer = try Children.of(t, f.depth);
+        const exts = try outer.needTag(Tag.sequence);
         try outer.done();
-        var e = try Children.of(der, exts, outer.depth);
+        var e = try Children.of(exts, outer.depth);
         while (try e.next()) |ext| {
-            if (ext.tag != tag_sequence) return error.BadCertificate;
-            var x = try Children.of(der, ext, e.depth);
-            const oid = try x.needTag(tag_oid);
+            if (ext.tag != Tag.sequence) return error.BadCertificate;
+            var x = try Children.of(ext, e.depth);
+            const oid = try x.needTag(Tag.oid);
             var value = try x.need();
-            if (value.tag == tag_boolean) value = try x.need();
-            if (value.tag != tag_octet_string) return error.BadCertificate;
+            if (value.tag == Tag.boolean) value = try x.need();
+            if (value.tag != Tag.octet_string) return error.BadCertificate;
             try x.done();
             // Every extension value is DER (RFC 5280 4.1); std parses the
             // subjectAltName value in verifyHostName.
-            const inner = try header(der, value.start, value.end);
-            if (inner.end != value.end) return error.BadCertificate;
-            try generic(der, inner, x.depth);
-            if (std.mem.eql(u8, der[oid.start..oid.end], &oid_subject_alt_name) and inner.tag != tag_sequence)
+            var vr: der_mod.Reader = .init(value.content);
+            const inner = vr.next() catch return error.BadCertificate;
+            if (!vr.atEnd()) return error.BadCertificate;
+            try generic(inner, x.depth);
+            if (std.mem.eql(u8, oid.content, &oids.subject_alt_name) and inner.tag != Tag.sequence)
                 return error.BadCertificate;
         }
     }
@@ -230,8 +193,10 @@ pub fn parse(der: []const u8) Error!Certificate.Parsed {
 pub const PinError = error{ NotIssuedByPinnedCa, CaExpired, CertificateExpired, CertificateNotYetValid, HostMismatch } || Error;
 
 /// The server certificate must be signed by exactly the pinned CA, be
-/// within its validity period, and name `ip` (the bare server IP) in its
-/// subjectAltName.
+/// within its validity period, be a TLS server certificate (extKeyUsage
+/// serverAuth, basicConstraints CA:FALSE: Portal's leaf profile, so a CA
+/// certificate or one for another purpose is refused even when the pinned
+/// CA signed it), and name `ip` (the bare server IP) in its subjectAltName.
 pub fn verifyLeaf(leaf_der: []const u8, ca_der: []const u8, ip: []const u8, now_sec: i64) PinError!void {
     const ca = try parse(ca_der);
     const leaf = try parse(leaf_der);
@@ -241,7 +206,18 @@ pub fn verifyLeaf(leaf_der: []const u8, ca_der: []const u8, ip: []const u8, now_
         error.CertificateNotYetValid => error.CertificateNotYetValid,
         else => error.NotIssuedByPinnedCa,
     };
+    try requireServerCert(leaf_der);
     leaf.verifyHostName(ip) catch return error.HostMismatch;
+}
+
+/// extKeyUsage lists serverAuth and basicConstraints is present with
+/// CA:FALSE (read with the same parser the server uses for its own
+/// certificates, which also refuses duplicate extensions and a signed
+/// algorithm that differs from the outer one).
+fn requireServerCert(leaf_der: []const u8) Error!void {
+    const info = pki.cert.parse(leaf_der) catch return error.BadCertificate;
+    if (!info.has_basic_constraints or info.is_ca) return error.UnsupportedCertificate;
+    if (!pki.cert.ekuAllows(info.eku, &oids.kp_server_auth)) return error.UnsupportedCertificate;
 }
 
 // ------------------------------------------------------------------ files
@@ -251,26 +227,9 @@ pub const LoadError = error{ NotACertificate, MoreThanOneCertificate } || Error;
 /// A CA certificate from a .pem (exactly one CERTIFICATE block) or a .cer
 /// (DER) file, decoded into `out`. Validated and parsed.
 pub fn loadCertificate(data: []const u8, out: *[max_cert_len]u8) LoadError![]const u8 {
-    const begin = "-----BEGIN CERTIFICATE-----";
-    const end_marker = "-----END CERTIFICATE-----";
-    const der: []const u8 = if (std.mem.indexOf(u8, data, begin)) |b| der: {
-        const body_start = b + begin.len;
-        const e = std.mem.indexOfPos(u8, data, body_start, end_marker) orelse return error.NotACertificate;
-        if (std.mem.indexOfPos(u8, data, e, begin) != null) return error.MoreThanOneCertificate;
-        // Base64 with line breaks: strip whitespace first.
-        var b64: [max_cert_len * 2]u8 = undefined;
-        var n: usize = 0;
-        for (data[body_start..e]) |ch| {
-            if (ch == '\r' or ch == '\n' or ch == ' ' or ch == '\t') continue;
-            if (n == b64.len) return error.NotACertificate;
-            b64[n] = ch;
-            n += 1;
-        }
-        const dec = std.base64.standard.Decoder;
-        const len = dec.calcSizeForSlice(b64[0..n]) catch return error.NotACertificate;
-        if (len > out.len) return error.NotACertificate;
-        dec.decode(out[0..len], b64[0..n]) catch return error.NotACertificate;
-        break :der out[0..len];
+    const der: []const u8 = if (pki.pem.isPem(data)) pki.pem.decode(data, out) catch |err| return switch (err) {
+        error.MoreThanOneCertificate => error.MoreThanOneCertificate,
+        else => error.NotACertificate,
     } else der: {
         if (data.len > out.len) return error.NotACertificate;
         @memcpy(out[0..data.len], data);
@@ -284,54 +243,13 @@ pub fn loadCertificate(data: []const u8, out: *[max_cert_len]u8) LoadError![]con
 }
 
 /// PEM encoding of one certificate (64-column lines).
-pub fn writePem(w: *std.Io.Writer, der: []const u8) std.Io.Writer.Error!void {
-    try w.writeAll("-----BEGIN CERTIFICATE-----\n");
-    var i: usize = 0;
-    while (i < der.len) {
-        const chunk = der[i..@min(der.len, i + 48)];
-        var line: [64]u8 = undefined;
-        try w.writeAll(std.base64.standard.Encoder.encode(&line, chunk));
-        try w.writeAll("\n");
-        i += chunk.len;
-    }
-    try w.writeAll("-----END CERTIFICATE-----\n");
-}
-
-pub fn fingerprint(der: []const u8) [32]u8 {
-    var out: [32]u8 = undefined;
-    Sha256.hash(der, &out, .{});
-    return out;
-}
-
+pub const writePem = pki.pem.write;
+/// SHA-256 of a DER certificate.
+pub const fingerprint = pki.fingerprint.sha256;
 /// "AB:CD:..." (the form `portal ca export` prints).
-pub fn formatFingerprint(fp: [32]u8, out: *[95]u8) []const u8 {
-    const hex = "0123456789ABCDEF";
-    for (fp, 0..) |b, i| {
-        out[i * 3] = hex[b >> 4];
-        out[i * 3 + 1] = hex[b & 15];
-        if (i < 31) out[i * 3 + 2] = ':';
-    }
-    return out[0..95];
-}
-
+pub const formatFingerprint = pki.fingerprint.format;
 /// Accepts 64 hex digits, optionally separated by ':' or spaces, any case.
-pub fn parseFingerprint(text: []const u8) error{BadFingerprint}![32]u8 {
-    var out: [32]u8 = undefined;
-    var n: usize = 0;
-    var hi: ?u4 = null;
-    for (text) |ch| {
-        if (ch == ':' or ch == ' ' or ch == '-') continue;
-        const v: u4 = @intCast(std.fmt.charToDigit(ch, 16) catch return error.BadFingerprint);
-        if (hi) |h| {
-            if (n == 32) return error.BadFingerprint;
-            out[n] = (@as(u8, h) << 4) | v;
-            n += 1;
-            hi = null;
-        } else hi = v;
-    }
-    if (n != 32 or hi != null) return error.BadFingerprint;
-    return out;
-}
+pub const parseFingerprint = pki.fingerprint.parse;
 
 // ------------------------------------------------------------------ tests
 
@@ -349,6 +267,9 @@ test "Portal CA and leaf: validate, parse, verify" {
     try testing.expectError(error.CertificateExpired, verifyLeaf(testdata.leaf_der, testdata.ca_der, testdata.leaf_ip, now + 3 * 365 * 86400));
     // A leaf is not a CA for itself.
     try testing.expectError(error.NotIssuedByPinnedCa, verifyLeaf(testdata.leaf_der, testdata.leaf_der, testdata.leaf_ip, now));
+    // The CA itself (CA:TRUE) is not a server certificate, even though it
+    // is signed by the pinned CA and lists serverAuth.
+    try testing.expectError(error.UnsupportedCertificate, verifyLeaf(testdata.ca_der, testdata.ca_der, testdata.leaf_ip, now));
 }
 
 test "every truncation and every single-byte change is rejected or parsed safely" {

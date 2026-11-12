@@ -416,21 +416,11 @@ pub fn parse(gpa: Allocator, bytes: []const u8) Error!Manifest {
 // -------------------------------------------------------------- signatures
 
 pub fn fingerprint(public_key: [public_key_len]u8) [32]u8 {
-    var d: [32]u8 = undefined;
-    Sha256.hash(&public_key, &d, .{});
-    return d;
+    return @import("shared").pki.fingerprint.sha256(&public_key);
 }
 
 /// "AB:CD:..." (95 characters), like the CA fingerprints the desk shows.
-pub fn formatFingerprint(fp: [32]u8, out: *[95]u8) []const u8 {
-    const hex = "0123456789ABCDEF";
-    for (fp, 0..) |b, i| {
-        out[i * 3] = hex[b >> 4];
-        out[i * 3 + 1] = hex[b & 0xf];
-        if (i < 31) out[i * 3 + 2] = ':';
-    }
-    return out[0..95];
-}
+pub const formatFingerprint = @import("shared").pki.fingerprint.format;
 
 pub fn sign(kp: Ed25519.KeyPair, bytes: []const u8) ![signature_len]u8 {
     const sig = try kp.sign(bytes, null);

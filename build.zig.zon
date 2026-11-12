@@ -16,5 +16,8 @@
         // Vulkan dependency is ../Vulkan. The de-facto Image: the owner's
         // checkout as it stands (no pin; a break is fixed once, in Image).
         .Image = .{ .path = "../Image" },
+        // Protocol and crypto code shared by the server, both clients and
+        // the e2e tests (shared/root.zig; client/ depends on it too).
+        .shared = .{ .path = "shared" },
     },
 }

@@ -1,15 +1,18 @@
-//! Client side of the Portal protocol (docs/protocol.md): the grid model,
-//! the 'G' binary frame decoder and the small JSON control messages.
+//! Client side of the Portal protocol (docs/protocol.md): the grid model
+//! the binary frames are written into, and the small JSON control messages.
 //!
-//! Everything here reads bytes from the network. A trap in wasm kills the
-//! page, so nothing may panic, assert, overflow or index out of bounds on
-//! peer data: every read is bounds-checked and malformed input is reported
-//! as an error (or ignored) after applying whatever decoded cleanly.
+//! The binary frames ('G', 'I', 'P') are decoded by shared/screen.zig, the
+//! same decoder the native client uses: a frame is validated whole before
+//! anything here changes, so a malformed one changes nothing and is
+//! reported as an error. Everything here reads bytes from the network; a
+//! trap in wasm kills the page, so nothing may panic, assert, overflow or
+//! index out of bounds on peer data.
 
 const std = @import("std");
 const vt = @import("vt");
 const imgdec = @import("imgdec");
 const imgcheck = @import("imgcheck");
+const screen = @import("shared").screen;
 
 pub const color_default = vt.color_default;
 pub const color_default_bg_as_fg = vt.color_default_bg_as_fg;
@@ -22,7 +25,7 @@ pub const attr_underline = vt.attr_underline;
 pub const attr_strike = vt.attr_strike;
 
 /// The server clamps its terminal to this, so anything bigger is bogus.
-pub const max_dim: u16 = vt.max_dim;
+pub const max_dim: u16 = screen.max_dim;
 
 pub const Wide = enum(u2) { narrow, lead, cont };
 
@@ -96,7 +99,7 @@ pub const Grid = struct {
     }
 };
 
-pub const FrameError = error{ NotGrid, Truncated, BadSize, TooLarge, OutOfMemory };
+pub const FrameError = screen.Error || error{OutOfMemory};
 
 pub const FrameResult = struct {
     /// The grid was reallocated (cols/rows changed): relayout.
@@ -107,12 +110,11 @@ pub const FrameResult = struct {
 
 // ------------------------------------------------------------ images
 
-/// Most blobs kept; the server never references more than one screen's
-/// worth (<= 64 images), so this is only a guard against a bad peer.
-pub const max_blobs = 64;
-/// Most placements accepted in one 'P' frame (the server sends <= 256).
-pub const max_placements = 1024;
-pub const placement_entry_len = 14;
+/// Most blobs (and bytes) kept, and most placements: the server's own
+/// limits (shared/screen.zig), only a guard against a bad peer.
+pub const max_blobs = screen.max_blobs;
+pub const max_blob_total_bytes = screen.max_blob_total_bytes;
+pub const max_placements = screen.max_placements;
 /// Decode limits for the browser: wasm memory only grows, so keep a single
 /// decode modest. Bigger images draw as a placeholder box.
 pub const decode_budget: usize = 96 << 20;
@@ -122,7 +124,7 @@ pub const decode_max_side: u32 = 1024;
 /// False would draw a placeholder box with the image's size instead.
 pub const decoder_available = true;
 
-pub const Placement = struct { id: u32, col: u16, row: i16, cols: u16, rows: u16 };
+pub const Placement = screen.Placement;
 
 pub const Blob = struct {
     id: u32,
@@ -143,6 +145,8 @@ pub const Blob = struct {
 pub const Images = struct {
     blobs: std.ArrayList(Blob) = .empty,
     places: std.ArrayList(Placement) = .empty,
+    /// Sum of the blobs' PNG sizes.
+    total_bytes: usize = 0,
 
     pub fn deinit(im: *Images, gpa: std.mem.Allocator) void {
         for (im.blobs.items) |*b| b.deinit(gpa);
@@ -156,12 +160,18 @@ pub const Images = struct {
         return null;
     }
 
+    /// Whether a blob is stored under `id` (for screen.parsePlacements).
+    pub fn has(im: *const Images, id: u32) bool {
+        return im.find(id) != null;
+    }
+
     fn referenced(im: *const Images, id: u32) bool {
         for (im.places.items) |p| if (p.id == id) return true;
         return false;
     }
 
     fn remove(im: *Images, gpa: std.mem.Allocator, i: usize) void {
+        im.total_bytes -= im.blobs.items[i].png.len;
         im.blobs.items[i].deinit(gpa);
         _ = im.blobs.orderedRemove(i);
     }
@@ -190,56 +200,33 @@ pub const Images = struct {
 };
 
 fn applyBlob(g: *Grid, gpa: std.mem.Allocator, frame: []const u8) FrameError!void {
-    var r: Reader = .{ .buf = frame };
-    if ((try r.int(u8)) != 'I') return error.NotGrid;
-    const id = try r.int(u32);
-    const len = try r.int(u32);
-    if (len > imgcheck.max_file_bytes) return error.TooLarge;
-    const png = try r.bytes(len);
-    if (r.pos != frame.len) return error.BadSize;
+    const b = try screen.parseBlob(frame);
     const im = &g.images;
-    const owned = try gpa.dupe(u8, png);
+    const owned = try gpa.dupe(u8, b.png);
     errdefer gpa.free(owned);
-    var blob: Blob = .{ .id = id, .png = owned };
-    if (imgcheck.header(png)) |info| {
+    var blob: Blob = .{ .id = b.id, .png = owned };
+    if (imgcheck.header(owned)) |info| {
         blob.w = info.width;
         blob.h = info.height;
     } else |_| blob.failed = true;
-    for (im.blobs.items, 0..) |b, i| if (b.id == id) {
+    for (im.blobs.items, 0..) |old, i| if (old.id == b.id) {
         im.remove(gpa, i);
         break;
     };
-    if (im.blobs.items.len >= max_blobs) im.remove(gpa, 0);
+    while (screen.mustEvict(im.blobs.items.len, im.total_bytes, owned.len)) im.remove(gpa, 0);
     try im.blobs.append(gpa, blob);
-    g.markImage(id);
+    im.total_bytes += owned.len;
+    g.markImage(b.id);
 }
 
 fn applyPlacements(g: *Grid, gpa: std.mem.Allocator, frame: []const u8) FrameError!void {
-    var r: Reader = .{ .buf = frame };
-    if ((try r.int(u8)) != 'P') return error.NotGrid;
-    const n = try r.int(u16);
-    if (n > max_placements) return error.TooLarge;
-    const body = try r.bytes(@as(usize, n) * placement_entry_len);
-    if (r.pos != frame.len) return error.BadSize;
     const im = &g.images;
-    var fresh: std.ArrayList(Placement) = .empty;
-    errdefer fresh.deinit(gpa);
-    try fresh.ensureTotalCapacityPrecise(gpa, n);
-    for (0..n) |i| {
-        const e = body[i * placement_entry_len ..][0..placement_entry_len];
-        const p: Placement = .{
-            .id = std.mem.readInt(u32, e[0..4], .little),
-            .col = std.mem.readInt(u16, e[4..6], .little),
-            .row = std.mem.readInt(i16, e[6..8], .little),
-            .cols = std.mem.readInt(u16, e[8..10], .little),
-            .rows = std.mem.readInt(u16, e[10..12], .little),
-        };
-        if (p.cols == 0 or p.rows == 0) continue;
-        fresh.appendAssumeCapacity(p);
-    }
+    var list: [max_placements]Placement = undefined;
+    const fresh = try screen.parsePlacements(frame, &list, im);
+    try im.places.ensureTotalCapacity(gpa, fresh.len);
     for (im.places.items) |p| g.markPlacement(p);
-    im.places.deinit(gpa);
-    im.places = fresh;
+    im.places.clearRetainingCapacity();
+    im.places.appendSliceAssumeCapacity(fresh);
     for (im.places.items) |p| g.markPlacement(p);
     // Cache rule: blobs this frame doesn't list may go.
     var i: usize = 0;
@@ -250,132 +237,54 @@ fn applyPlacements(g: *Grid, gpa: std.mem.Allocator, frame: []const u8) FrameErr
 
 /// Applies any binary frame: 'G' grid, 'I' image blob, 'P' placements.
 /// Frames of unknown types are ignored (protocol: new types may appear).
+/// On error nothing changed.
 pub fn applyBinary(g: *Grid, gpa: std.mem.Allocator, frame: []const u8) FrameError!FrameResult {
-    if (frame.len == 0) return .{};
-    switch (frame[0]) {
-        'G' => return applyFrame(g, gpa, frame),
-        'I' => {
+    switch (screen.kind(frame)) {
+        .grid => return applyFrame(g, gpa, frame),
+        .blob => {
             try applyBlob(g, gpa, frame);
             return .{ .images = true };
         },
-        'P' => {
+        .placements => {
             try applyPlacements(g, gpa, frame);
             return .{ .images = true };
         },
-        else => return .{},
+        .unknown => return .{},
     }
 }
 
-const Reader = struct {
-    buf: []const u8,
-    pos: usize = 0,
-
-    fn bytes(r: *Reader, n: usize) FrameError![]const u8 {
-        if (n > r.buf.len - r.pos) return error.Truncated;
-        const s = r.buf[r.pos..][0..n];
-        r.pos += n;
-        return s;
-    }
-    fn int(r: *Reader, comptime T: type) FrameError!T {
-        const s = try r.bytes(@sizeOf(T));
-        return std.mem.readInt(T, s[0..@sizeOf(T)], .little);
-    }
-};
-
-/// Applies one binary 'G' frame to `g`. On error the rows decoded before
-/// the problem stay applied (and dirty); the grid is always consistent.
+/// Applies one binary 'G' frame to `g`. A malformed frame is rejected
+/// whole: the grid is unchanged.
 pub fn applyFrame(g: *Grid, gpa: std.mem.Allocator, frame: []const u8) FrameError!FrameResult {
-    var r: Reader = .{ .buf = frame };
-    if ((try r.int(u8)) != 'G') return error.NotGrid;
-    const cols = try r.int(u16);
-    const rows = try r.int(u16);
-    const cx = try r.int(u16);
-    const cy = try r.int(u16);
-    const visible = (try r.int(u8)) == 1;
-    const n_rows = try r.int(u16);
-    if (cols == 0 or rows == 0 or cols > max_dim or rows > max_dim) return error.BadSize;
-
+    const f = try screen.GridFrame.parse(frame);
+    const h = f.header;
     var result: FrameResult = .{};
-    if (cols != g.cols or rows != g.rows) {
-        try g.resize(gpa, cols, rows);
+    if (h.cols != g.cols or h.rows != g.rows) {
+        try g.resize(gpa, h.cols, h.rows);
         result.resized = true;
     }
-    g.cursor_x = @min(cx, cols - 1);
-    g.cursor_y = @min(cy, rows - 1);
-    g.cursor_visible = visible;
-
-    var i: usize = 0;
-    while (i < n_rows) : (i += 1) {
-        const y = try r.int(u16);
-        const n_runs = try r.int(u16);
-        const target: ?[]Cell = if (y < rows) g.row(y) else null;
-        if (target) |cells| {
-            @memset(cells, .{});
-            g.dirty[y] = true;
-        }
-        var x: usize = 0;
-        var k: usize = 0;
-        while (k < n_runs) : (k += 1) {
-            const fg = try r.int(u32);
-            const bg = try r.int(u32);
-            const attrs = try r.int(u8);
-            const len = try r.int(u16);
-            const text = try r.bytes(len);
-            const cells = target orelse continue;
-            var it: Utf8Iter = .{ .s = text };
-            while (it.next()) |cp| {
-                if (x >= cells.len) break;
-                const w = vt.cellWidth(cp);
-                if (w == 0) continue; // combining marks: the server drops them too
-                const base: Cell = .{ .cp = cp, .attrs = attrs, .fg = fg, .bg = bg };
-                if (w == 2 and x + 1 < cells.len) {
-                    cells[x] = base;
-                    cells[x].wide = .lead;
-                    cells[x + 1] = .{ .cp = ' ', .wide = .cont, .attrs = attrs, .fg = fg, .bg = bg };
-                    x += 2;
-                } else {
-                    cells[x] = base;
-                    if (w == 2) cells[x].cp = ' '; // does not fit: never half a glyph
-                    x += 1;
-                }
+    g.cursor_x = h.cursor_x;
+    g.cursor_y = h.cursor_y;
+    g.cursor_visible = h.cursor_visible;
+    var rows = f.rows(vt.cellWidth);
+    while (rows.next()) |row| {
+        const cells = g.row(row.index);
+        @memset(cells, .{});
+        g.dirty[row.index] = true;
+        var it = row.cells();
+        while (it.next()) |c| {
+            cells[c.col] = .{ .cp = c.cp, .attrs = c.attrs, .fg = c.fg, .bg = c.bg };
+            if (c.width == 2) {
+                cells[c.col].wide = .lead;
+                cells[c.col + 1] = .{ .cp = ' ', .wide = .cont, .attrs = c.attrs, .fg = c.fg, .bg = c.bg };
             }
         }
     }
     return result;
 }
 
-/// Lenient UTF-8 decoding: every invalid or truncated sequence yields one
-/// U+FFFD and advances by one byte, so decoding always terminates.
-pub const Utf8Iter = struct {
-    s: []const u8,
-    i: usize = 0,
-
-    pub fn next(it: *Utf8Iter) ?u21 {
-        if (it.i >= it.s.len) return null;
-        const b0 = it.s[it.i];
-        const n: usize = if (b0 < 0x80) 1 else if (b0 & 0xE0 == 0xC0) 2 else if (b0 & 0xF0 == 0xE0) 3 else if (b0 & 0xF8 == 0xF0) 4 else 0;
-        if (n == 0 or n > it.s.len - it.i) {
-            it.i += 1;
-            return 0xFFFD;
-        }
-        const seq = it.s[it.i..][0..n];
-        const cp = std.unicode.utf8Decode(seq) catch {
-            it.i += 1;
-            return 0xFFFD;
-        };
-        it.i += n;
-        return cp;
-    }
-
-    /// Number of code points, or null if `s` is not exactly one.
-    pub fn single(s: []const u8) ?u21 {
-        var it: Utf8Iter = .{ .s = s };
-        const cp = it.next() orelse return null;
-        if (it.next() != null) return null;
-        if (cp == 0xFFFD and !std.mem.eql(u8, s, "\u{FFFD}")) return null;
-        return cp;
-    }
-};
+/// Lenient UTF-8 decoding (shared with the frame decoder).
+pub const Utf8Iter = screen.Utf8Iterator;
 
 // ------------------------------------------------------------ JSON control
 
@@ -579,21 +488,24 @@ test "decode a full frame, wide chars and colours" {
 test "wide char at the right edge and overlong rows never overflow" {
     var b: Builder = .{};
     defer b.deinit();
-    b.header(3, 1, 99, 99, 1, 3);
+    b.header(3, 1, 99, 99, 1, 2);
     b.u16_(0);
     b.u16_(1);
     b.run(color_default, color_default, 0, "ab中中中 and lots more text than fits");
-    b.u16_(500); // out-of-range row: consumed and skipped
+    b.u16_(500); // out-of-range row: the whole frame is rejected
     b.u16_(1);
     b.run(1, 2, 3, "ignored");
-    b.u16_(0);
-    b.u16_(0); // an empty repeat of row 0 blanks it
     var g: Grid = .{};
     defer g.deinit(testing.allocator);
+    try testing.expectError(error.Malformed, applyFrame(&g, testing.allocator, b.list.items));
+    try testing.expectEqual(@as(u16, 0), g.cols); // nothing applied
+    b.list.shrinkRetainingCapacity(b.list.items.len - (2 + 2 + 11 + "ignored".len));
+    b.list.items[10] = 1; // n_rows: without the bad row
     _ = try applyFrame(&g, testing.allocator, b.list.items);
     try testing.expectEqual(@as(u16, 2), g.cursor_x); // clamped
     try testing.expectEqual(@as(u16, 0), g.cursor_y);
-    try testing.expectEqual(@as(u21, ' '), g.at(0, 0).cp);
+    try testing.expectEqual(@as(u21, 'b'), g.at(1, 0).cp);
+    try testing.expectEqual(@as(u21, ' '), g.at(2, 0).cp); // wide did not fit
 
     var b2: Builder = .{};
     defer b2.deinit();
@@ -610,25 +522,38 @@ test "wide char at the right edge and overlong rows never overflow" {
 test "malformed frames are rejected without panicking" {
     var g: Grid = .{};
     defer g.deinit(testing.allocator);
-    try testing.expectError(error.Truncated, applyFrame(&g, testing.allocator, ""));
-    try testing.expectError(error.NotGrid, applyFrame(&g, testing.allocator, "X123456789012"));
-    try testing.expectError(error.Truncated, applyFrame(&g, testing.allocator, "G\x01"));
+    try testing.expectError(error.Malformed, applyFrame(&g, testing.allocator, ""));
+    try testing.expectError(error.Malformed, applyFrame(&g, testing.allocator, "X123456789012"));
+    try testing.expectError(error.Malformed, applyFrame(&g, testing.allocator, "G\x01"));
     var b: Builder = .{};
     defer b.deinit();
     b.header(0, 5, 0, 0, 0, 0);
-    try testing.expectError(error.BadSize, applyFrame(&g, testing.allocator, b.list.items));
+    try testing.expectError(error.Malformed, applyFrame(&g, testing.allocator, b.list.items));
     b.list.clearRetainingCapacity();
     b.header(5000, 5, 0, 0, 0, 0);
-    try testing.expectError(error.BadSize, applyFrame(&g, testing.allocator, b.list.items));
+    try testing.expectError(error.TooLarge, applyFrame(&g, testing.allocator, b.list.items));
     try testing.expectEqual(@as(u16, 0), g.cols); // grid untouched
-    // n_rows promises more than is present.
+    // n_rows promises more than is present: rejected whole, even the good row.
     b.list.clearRetainingCapacity();
-    b.header(4, 2, 0, 0, 0, 9);
+    b.header(4, 2, 0, 0, 0, 2);
     b.u16_(0);
     b.u16_(1);
     b.run(color_default, color_default, 0, "hi");
-    try testing.expectError(error.Truncated, applyFrame(&g, testing.allocator, b.list.items));
-    try testing.expectEqual(@as(u21, 'h'), g.at(0, 0).cp); // the good row applied
+    try testing.expectError(error.Malformed, applyFrame(&g, testing.allocator, b.list.items));
+    try testing.expectEqual(@as(u16, 0), g.cols);
+    b.list.items[10] = 1;
+    _ = try applyFrame(&g, testing.allocator, b.list.items);
+    try testing.expectEqual(@as(u21, 'h'), g.at(0, 0).cp);
+    // Control characters become U+FFFD too.
+    b.list.clearRetainingCapacity();
+    b.header(4, 2, 0, 0, 0, 1);
+    b.u16_(0);
+    b.u16_(1);
+    b.run(color_default, color_default, 0, "\x1b[\xc2\x9b");
+    _ = try applyFrame(&g, testing.allocator, b.list.items);
+    try testing.expectEqual(@as(u21, 0xFFFD), g.at(0, 0).cp);
+    try testing.expectEqual(@as(u21, '['), g.at(1, 0).cp);
+    try testing.expectEqual(@as(u21, 0xFFFD), g.at(2, 0).cp);
     // Invalid UTF-8 becomes U+FFFD.
     b.list.clearRetainingCapacity();
     b.header(4, 2, 0, 0, 0, 1);
@@ -729,14 +654,15 @@ test "image frames: blobs, placements, cache rule, unknown types" {
     try testing.expectEqual(@as(u32, 8), g.images.find(7).?.w);
 
     @memset(g.dirty, false);
-    const p1 = try placeFrame(&.{ gp(7, 1, 1, 3, 2), gp(99, 0, -1, 2, 2) });
+    const p1 = try placeFrame(&.{ gp(7, 1, -1, 3, 2), gp(99, 0, 0, 2, 2) });
     defer gpa.free(p1);
     _ = try applyBinary(&g, gpa, p1);
-    try testing.expectEqual(@as(usize, 2), g.images.places.items.len);
-    try testing.expect(g.dirty[0] and g.dirty[1] and g.dirty[2] and !g.dirty[3]);
-    try testing.expectEqual(@as(i16, -1), g.images.places.items[1].row);
+    // Unknown id 99 (no blob) is skipped.
+    try testing.expectEqual(@as(usize, 1), g.images.places.items.len);
+    try testing.expect(g.dirty[0] and !g.dirty[1]);
+    try testing.expectEqual(@as(i16, -1), g.images.places.items[0].row);
 
-    // One decode per call; unknown id 99 is skipped.
+    // One decode per call.
     try testing.expectEqual(@as(?u32, 7), g.images.decodeOne(gpa));
     try testing.expect(g.images.find(7).?.rgba != null);
     try testing.expectEqual(@as(?u32, null), g.images.decodeOne(gpa));
@@ -747,7 +673,7 @@ test "image frames: blobs, placements, cache rule, unknown types" {
     @memset(g.dirty, false);
     _ = try applyBinary(&g, gpa, p2);
     try testing.expectEqual(@as(usize, 0), g.images.blobs.items.len);
-    try testing.expect(g.dirty[1] and g.dirty[2]); // old placement area redraws
+    try testing.expect(g.dirty[0]); // old placement area redraws
 
     // Unknown frame types and empty frames are ignored, grid untouched.
     const before = g.cols;
@@ -762,15 +688,12 @@ test "image frames: blobs, placements, cache rule, unknown types" {
     try testing.expect(g.images.find(3).?.failed);
 
     // Oversized length, lying lengths, trailing bytes.
-    var big: [9]u8 = .{ 'I', 1, 0, 0, 0, 0, 0, 0x70, 0 };
-    try testing.expectError(error.TooLarge, applyBinary(&g, gpa, &big));
-    big[7] = 0;
-    big[6] = 1; // 256 bytes claimed, none present
-    try testing.expectError(error.Truncated, applyBinary(&g, gpa, &big));
-    try testing.expectError(error.BadSize, applyBinary(&g, gpa, "I\x01\x00\x00\x00\x00\x00\x00\x00X"));
-    try testing.expectError(error.Truncated, applyBinary(&g, gpa, "P\x05\x00"));
-    try testing.expectError(error.TooLarge, applyBinary(&g, gpa, "P\xff\xff"));
-    try testing.expectError(error.BadSize, applyBinary(&g, gpa, "P\x00\x00X"));
+    var big: [9]u8 = .{ 'I', 1, 0, 0, 0, 0, 1, 0, 0 }; // 256 bytes claimed, none present
+    try testing.expectError(error.Malformed, applyBinary(&g, gpa, &big));
+    try testing.expectError(error.Malformed, applyBinary(&g, gpa, "I\x01\x00\x00\x00\x00\x00\x00\x00X"));
+    try testing.expectError(error.Malformed, applyBinary(&g, gpa, "P\x05\x00"));
+    try testing.expectError(error.Malformed, applyBinary(&g, gpa, "P\xff\xff"));
+    try testing.expectError(error.Malformed, applyBinary(&g, gpa, "P\x00\x00X"));
 
     // The blob cache is capped.
     for (0..max_blobs + 10) |k| {
@@ -779,6 +702,15 @@ test "image frames: blobs, placements, cache rule, unknown types" {
         _ = try applyBinary(&g, gpa, f);
     }
     try testing.expectEqual(@as(usize, max_blobs), g.images.blobs.items.len);
+    try testing.expectEqual(@as(usize, max_blobs), g.images.total_bytes);
+}
+
+test "image limits are the server's" {
+    try testing.expectEqual(vt.max_dim, max_dim);
+    try testing.expectEqual(vt.gfx.max_images, max_blobs);
+    try testing.expectEqual(vt.gfx.max_total_bytes, max_blob_total_bytes);
+    try testing.expectEqual(vt.gfx.max_placements, max_placements);
+    try testing.expectEqual(imgcheck.max_file_bytes, screen.max_blob_bytes);
 }
 
 test "image frames: every truncation and random bytes are safe" {
@@ -805,6 +737,7 @@ test "image frames: every truncation and random bytes are safe" {
         _ = applyBinary(&g, gpa, buf[0..rand.uintAtMost(usize, buf.len)]) catch {};
         _ = g.images.decodeOne(gpa);
         try testing.expect(g.images.blobs.items.len <= max_blobs);
+        try testing.expect(g.images.total_bytes <= max_blob_total_bytes);
         try testing.expect(g.images.places.items.len <= max_placements);
     }
 }

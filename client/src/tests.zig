@@ -6,7 +6,6 @@ test {
     _ = @import("inputline.zig");
     _ = @import("dataview.zig");
     _ = @import("credstore.zig");
-    _ = @import("net/ws.zig");
     _ = @import("net/http.zig");
     _ = @import("net/x509check.zig");
     _ = @import("net/tlsconn.zig");

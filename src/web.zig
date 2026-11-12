@@ -52,6 +52,8 @@ const Allocator = std.mem.Allocator;
 const auth = @import("auth.zig");
 const guard = @import("guard.zig");
 const http1 = @import("http1.zig");
+const websocket = @import("shared").ws;
+const http_names = @import("shared").http;
 const Session = @import("session.zig").Session;
 const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
@@ -86,7 +88,7 @@ const max_input_message = 4096;
 /// 'i' prefix + up to max_input_message bytes of keystrokes.
 const max_ws_payload = max_input_message + 1;
 /// Largest client frame header: 2 + 8 (64-bit length) + 4 (mask).
-const max_ws_header = 14;
+const max_ws_header = websocket.max_header_len;
 
 /// Minimum gap between grid frames to one viewer (~30 per second).
 const frame_interval_ms = 33;
@@ -424,15 +426,15 @@ pub const Server = struct {
     stop: std.atomic.Value(bool) = .init(false),
 
     fn cookieName(srv: *const Server) []const u8 {
-        return if (srv.cfg.secure_cookie) "__Host-portal" else "portal_session";
+        return http_names.cookieName(.session, srv.cfg.secure_cookie);
     }
 
     fn deviceCookieName(srv: *const Server) []const u8 {
-        return if (srv.cfg.secure_cookie) "__Host-portal_device" else "portal_device";
+        return http_names.cookieName(.device, srv.cfg.secure_cookie);
     }
 
     fn pairReqCookieName(srv: *const Server) []const u8 {
-        return if (srv.cfg.secure_cookie) "__Host-portal_pairreq" else "portal_pairreq";
+        return http_names.cookieName(.pairreq, srv.cfg.secure_cookie);
     }
 
     fn nowUnix(srv: *const Server) i64 {
@@ -1752,13 +1754,13 @@ pub const Server = struct {
 
         /// Returns false if the connection should end. Cancelable: the
         /// supervisor can always tear down a sender stuck behind another.
-        fn send(c: *WsConn, srv: *Server, data: []const u8, op: http1.Opcode) bool {
+        fn send(c: *WsConn, srv: *Server, data: []const u8, op: websocket.Opcode) bool {
             c.write_mutex.lock(srv.io) catch return false;
             defer c.write_mutex.unlock(srv.io);
             if (c.close_sent) return false;
             if (op == .close) c.close_sent = true;
             c.conn.setDeadline(srv.nowMs() +| send_timeout_ms);
-            http1.writeFrame(c.w, op, data) catch return false;
+            websocket.writeServerFrame(c.w, op, data) catch return false;
             c.conn.setDeadline(no_deadline);
             return true;
         }
@@ -1787,15 +1789,14 @@ pub const Server = struct {
             _ = try srv.fail(conn, w, .bad_request, "unsupported websocket version\n");
             return;
         }
-        var accept_buf: [28]u8 = undefined;
-        const accept = http1.wsAccept(req.ws_key orelse "", &accept_buf) catch {
+        const accept = websocket.accept(req.ws_key orelse "") catch {
             _ = try srv.fail(conn, w, .bad_request, "bad websocket key\n");
             return;
         };
         if (leftover.len > max_ws_header + max_ws_payload) return;
 
         conn.setDeadline(srv.nowMs() +| send_timeout_ms);
-        try http1.writeUpgrade(w, accept);
+        try http1.writeUpgrade(w, &accept);
         conn.setDeadline(no_deadline);
 
         var ws: WsConn = .{ .conn = conn, .w = w, .cookie = undefined };
@@ -1978,15 +1979,15 @@ pub const Server = struct {
         var len: usize = leftover.len;
 
         while (!ws.dead.load(.acquire)) {
-            const parsed = http1.parseFrameHeader(buf[0..len], max_ws_payload) catch {
+            const parsed = websocket.parseHeader(buf[0..len], .client, max_ws_payload) catch {
                 _ = ws.send(srv, &.{ 0x03, 0xea }, .close); // 1002 protocol error
                 return;
             };
             if (parsed) |f| {
-                const total = f.header_len + f.payload_len;
+                const total = f.len + f.payload_len;
                 if (total <= len) {
-                    const payload = buf[f.header_len..total];
-                    http1.unmask(payload, f.mask);
+                    const payload = buf[f.len..total];
+                    if (f.mask) |m| websocket.applyMask(payload, m);
                     if (!srv.wsHandleFrame(ws, f.opcode, payload)) return;
                     std.mem.copyForwards(u8, buf[0 .. len - total], buf[total..len]);
                     len -= total;
@@ -2001,7 +2002,7 @@ pub const Server = struct {
     }
 
     /// Returns false to end the connection.
-    fn wsHandleFrame(srv: *Server, ws: *WsConn, opcode: http1.Opcode, payload: []const u8) bool {
+    fn wsHandleFrame(srv: *Server, ws: *WsConn, opcode: websocket.Opcode, payload: []const u8) bool {
         switch (opcode) {
             .ping, .text, .binary => if (!ws.limit.allow(srv.nowMs(), payload.len)) {
                 // A paired device flooding input (or pings): drop the excess

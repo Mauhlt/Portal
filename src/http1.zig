@@ -1,4 +1,5 @@
-//! Minimal, strict HTTP/1.1 + WebSocket (RFC 6455) protocol code.
+//! Minimal, strict HTTP/1.1 server protocol code (and the 101 response of
+//! the WebSocket handshake; framing is shared/ws.zig).
 //!
 //! Replaces std.http.Server, which had two remotely reachable panics
 //! (an assert on body-less POSTs during keep-alive, and a null unwrap in
@@ -7,6 +8,7 @@
 //! asserts on peer input, and rejects anything unusual instead of guessing.
 
 const std = @import("std");
+const syntax = @import("shared").http;
 
 pub const max_head_bytes = 8 * 1024;
 pub const max_headers = 64;
@@ -66,25 +68,9 @@ pub const CookieIterator = struct {
 
 /// Returns the length of the head including the terminating CRLFCRLF, or
 /// null if not yet complete.
-pub fn findHeadEnd(buf: []const u8) ?usize {
-    const i = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
-    return i + 4;
-}
-
-fn isTokenChar(c: u8) bool {
-    return switch (c) {
-        'a'...'z', 'A'...'Z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
-        else => false,
-    };
-}
-
-fn validValue(v: []const u8) bool {
-    for (v) |c| {
-        if (c == '\t') continue;
-        if (c < 0x20 or c == 0x7f) return false;
-    }
-    return true;
-}
+pub const findHeadEnd = syntax.findHeadEnd;
+const isToken = syntax.isToken;
+const validValue = syntax.validValue;
 
 fn listContainsToken(value: []const u8, token: []const u8) bool {
     var it = std.mem.splitScalar(u8, value, ',');
@@ -108,8 +94,7 @@ pub fn parseHead(head: []const u8) ParseError!Request {
     const target = parts.next() orelse return error.BadRequestLine;
     const version = parts.next() orelse return error.BadRequestLine;
     if (parts.next() != null) return error.BadRequestLine;
-    if (m.len == 0) return error.BadRequestLine;
-    for (m) |c| if (!isTokenChar(c)) return error.BadRequestLine;
+    if (!isToken(m)) return error.BadRequestLine;
     if (!std.mem.eql(u8, version, "HTTP/1.1")) return error.UnsupportedVersion;
     if (target.len == 0 or target.len > max_target_bytes or target[0] != '/') return error.BadTarget;
     for (target) |c| if (c <= 0x20 or c >= 0x7f) return error.BadTarget;
@@ -127,8 +112,7 @@ pub fn parseHead(head: []const u8) ParseError!Request {
         if (std.mem.indexOfAny(u8, hl, "\r\n") != null) return error.BadHeader; // bare CR / LF
         const colon = std.mem.indexOfScalar(u8, hl, ':') orelse return error.BadHeader;
         const name = hl[0..colon];
-        if (name.len == 0) return error.BadHeader;
-        for (name) |c| if (!isTokenChar(c)) return error.BadHeader;
+        if (!isToken(name)) return error.BadHeader;
         const value = std.mem.trim(u8, hl[colon + 1 ..], " \t");
         if (!validValue(value)) return error.BadHeader;
         if (req.header_count >= max_headers) return error.TooManyHeaders;
@@ -214,9 +198,7 @@ pub const Status = enum(u16) {
 /// Header values written by Portal are constants or base64url; this guards
 /// against a future caller accidentally passing CR/LF (response splitting).
 pub fn headerSafe(h: Header) bool {
-    if (h.name.len == 0) return false;
-    for (h.name) |c| if (!isTokenChar(c)) return false;
-    return validValue(h.value);
+    return isToken(h.name) and validValue(h.value);
 }
 
 pub fn writeResponse(
@@ -259,106 +241,6 @@ pub fn framingError(req: *const Request, max_body: u64) ?Reject {
 pub fn writeUpgrade(w: *std.Io.Writer, accept: []const u8) !void {
     if (!validValue(accept)) return error.UnsafeHeader;
     try w.print("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {s}\r\n\r\n", .{accept});
-    try w.flush();
-}
-
-// ------------------------------------------------------------- websocket
-
-pub const ws_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-/// Computes Sec-WebSocket-Accept. The key must be the base64 of 16 bytes.
-pub fn wsAccept(key: []const u8, out: *[28]u8) ![]const u8 {
-    var decoded: [16]u8 = undefined;
-    if (key.len != 24) return error.BadKey;
-    std.base64.standard.Decoder.decode(&decoded, key) catch return error.BadKey;
-    var sha = std.crypto.hash.Sha1.init(.{});
-    sha.update(key);
-    sha.update(ws_guid);
-    var digest: [20]u8 = undefined;
-    sha.final(&digest);
-    return std.base64.standard.Encoder.encode(out, &digest);
-}
-
-pub const Opcode = enum(u4) {
-    continuation = 0,
-    text = 1,
-    binary = 2,
-    close = 8,
-    ping = 9,
-    pong = 10,
-    _,
-};
-
-pub const FrameError = error{
-    ProtocolError,
-    Unmasked,
-    Fragmented,
-    TooLarge,
-};
-
-pub const FrameHeader = struct {
-    opcode: Opcode,
-    payload_len: usize,
-    mask: [4]u8,
-    header_len: usize,
-};
-
-/// Parses a client frame header from `buf`. Returns null if more bytes are
-/// needed. Clients must mask; fragmentation and RSV bits are rejected.
-pub fn parseFrameHeader(buf: []const u8, max_payload: usize) FrameError!?FrameHeader {
-    if (buf.len < 2) return null;
-    const b0 = buf[0];
-    const b1 = buf[1];
-    if (b0 & 0x70 != 0) return error.ProtocolError; // RSV bits (no extensions negotiated)
-    const fin = b0 & 0x80 != 0;
-    const opcode: Opcode = @enumFromInt(@as(u4, @truncate(b0)));
-    switch (opcode) {
-        .text, .binary, .close, .ping, .pong => {},
-        else => return error.ProtocolError,
-    }
-    if (!fin) return error.Fragmented;
-    if (b1 & 0x80 == 0) return error.Unmasked;
-    const len7: u8 = b1 & 0x7f;
-    var len: u64 = len7;
-    var off: usize = 2;
-    if (len7 == 126) {
-        if (buf.len < 4) return null;
-        len = std.mem.readInt(u16, buf[2..4], .big);
-        off = 4;
-    } else if (len7 == 127) {
-        if (buf.len < 10) return null;
-        len = std.mem.readInt(u64, buf[2..10], .big);
-        off = 10;
-    }
-    const is_control = @intFromEnum(opcode) >= 8;
-    if (is_control and len > 125) return error.ProtocolError;
-    if (len > max_payload) return error.TooLarge;
-    if (buf.len < off + 4) return null;
-    return .{
-        .opcode = opcode,
-        .payload_len = @intCast(len),
-        .mask = buf[off..][0..4].*,
-        .header_len = off + 4,
-    };
-}
-
-pub fn unmask(payload: []u8, mask: [4]u8) void {
-    for (payload, 0..) |*b, i| b.* ^= mask[i & 3];
-}
-
-/// Writes one unmasked server frame.
-pub fn writeFrame(w: *std.Io.Writer, opcode: Opcode, payload: []const u8) !void {
-    try w.writeByte(0x80 | @as(u8, @intFromEnum(opcode)));
-    if (payload.len < 126) {
-        try w.writeByte(@intCast(payload.len));
-    } else if (payload.len <= 0xffff) {
-        try w.writeByte(126);
-        try w.writeInt(u16, @intCast(payload.len), .big);
-    } else {
-        try w.writeByte(127);
-        try w.writeInt(u64, payload.len, .big);
-    }
-    try w.writeAll(payload);
     try w.flush();
 }
 
@@ -419,30 +301,8 @@ test "websocket upgrade fields" {
     const r = try parseHead("GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n" ++
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nTransfer-Encoding: chunked\r\n\r\n");
     try testing.expect(r.upgrade_websocket and r.connection_upgrade and r.has_transfer_encoding);
-    var out: [28]u8 = undefined;
     // RFC 6455 section 1.3 example.
-    try testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", try wsAccept(r.ws_key.?, &out));
-    try testing.expectError(error.BadKey, wsAccept("short", &out));
-}
-
-test "frame header parsing" {
-    // masked text frame "Hi"
-    const f = [_]u8{ 0x81, 0x82, 1, 2, 3, 4, 'H' ^ 1, 'i' ^ 2 };
-    const h = (try parseFrameHeader(&f, 4096)).?;
-    try testing.expectEqual(Opcode.text, h.opcode);
-    try testing.expectEqual(@as(usize, 2), h.payload_len);
-    var p = f[h.header_len..][0..2].*;
-    unmask(&p, h.mask);
-    try testing.expectEqualStrings("Hi", &p);
-
-    try testing.expectEqual(@as(?FrameHeader, null), try parseFrameHeader(&[_]u8{0x81}, 4096));
-    try testing.expectError(error.Unmasked, parseFrameHeader(&[_]u8{ 0x81, 0x02, 'H', 'i' }, 4096));
-    try testing.expectError(error.Fragmented, parseFrameHeader(&[_]u8{ 0x01, 0x80, 0, 0, 0, 0 }, 4096));
-    try testing.expectError(error.ProtocolError, parseFrameHeader(&[_]u8{ 0xC1, 0x80, 0, 0, 0, 0 }, 4096)); // RSV1
-    try testing.expectError(error.ProtocolError, parseFrameHeader(&[_]u8{ 0x83, 0x80, 0, 0, 0, 0 }, 4096)); // reserved opcode
-    try testing.expectError(error.ProtocolError, parseFrameHeader(&[_]u8{ 0x89, 0xFE, 0, 200, 0, 0, 0, 0 }, 4096)); // big ping
-    try testing.expectError(error.TooLarge, parseFrameHeader(&[_]u8{ 0x82, 0xFF, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0 }, 4096));
-    try testing.expectError(error.TooLarge, parseFrameHeader(&[_]u8{ 0x82, 0xFE, 0x20, 0x00, 0, 0, 0, 0 }, 4096));
+    try testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &try @import("shared").ws.accept(r.ws_key.?));
 }
 
 test "response refuses header injection" {
@@ -480,15 +340,4 @@ test "upgrade response" {
         "sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n", w.buffered());
     var w2: std.Io.Writer = .fixed(&buf);
     try testing.expectError(error.UnsafeHeader, writeUpgrade(&w2, "a\r\nb"));
-}
-
-test "frame writing" {
-    var buf: [300]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    try writeFrame(&w, .text, "hi");
-    try testing.expectEqualSlices(u8, &.{ 0x81, 2, 'h', 'i' }, w.buffered());
-    var w2: std.Io.Writer = .fixed(&buf);
-    const p: [200]u8 = @splat('x');
-    try writeFrame(&w2, .binary, &p);
-    try testing.expectEqualSlices(u8, &.{ 0x82, 126, 0, 200 }, w2.buffered()[0..4]);
 }
