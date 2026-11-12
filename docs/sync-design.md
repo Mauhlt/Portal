@@ -44,6 +44,12 @@ Packages carry only:
 The first package is `npu-probe`, which reports where the installed QNN
 runtime lives, its version and HTP arch, and runs one trivial graph.
 
+**Delivered at pairing (owner decision, 2026-11-12):** when a laptop is
+paired, the desktop offers it the voice packages it is subscribed to:
+`stt-local` (executable, approval required), `stt-model` and `stt-adapter`
+(data). The laptop app shows "Install voice model?" right after pairing;
+after that, new adapter versions arrive whenever training produces one.
+
 ## Directory layout on the device
 
 ```

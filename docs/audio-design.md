@@ -1,26 +1,31 @@
 # Voice input: microphones, headset detection, the 🎤 path
 
-**Owner decisions (2026-11-12):**
-* Voice fills the input box of the split layout.
-* The laptop mic feeds the owner's own speech model, not Win+H. It runs on
-  the desktop GPU over HTTPS now, and later on the laptop's NPU.
-* Headphones are detected and their mic used automatically, with Zoom/Teams
-  style device choice in the app.
+**Owner decisions (2026-11-12, revised):**
+* Voice fills the input box of the split layout, on every device.
+* **iPhone:** speech stays on the phone. Apple keyboard dictation types into
+  the input box, and only the resulting text goes up over HTTPS. Portal
+  sends no audio from the iPhone.
+* **Laptop (Snapdragon X):** the owner's own transformer runs locally on the
+  NPU (`stt.Local` via QNN bindings from the TranslateNPU repo). The model,
+  the adapter and the `stt-local` program are delivered by signed Portal
+  sync when the laptop is paired, and need approval on the laptop. No audio
+  leaves the laptop.
+* **Desktop window:** `stt.Home` on the desktop GPU, which is also where
+  training happens. Laptop corrections come home as bundles.
+* **Mic default:** a headset mic when one is connected, otherwise the
+  built-in mic, on the laptop and on the iPhone (iOS already routes
+  dictation to AirPods or a wired headset).
 
-## Flow
+## Flow (laptop and desktop)
 
-1. **Capture** on the device: Windows WASAPI from Zig, event-driven
-   (`AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, no polling). The iPhone uses
-   getUserMedia + AudioWorklet through the JS bridge, which passes raw
-   Float32 buffers only.
-2. **Encode in Zig:** 16 kHz mono, WAV (or QOA).
-3. **Transcribe:**
-   * **now:** `POST /stt/transcribe` to the desktop, where `stt.Home` runs on
-     the GPU;
-   * **later on the laptop:** `stt.Local` on the Snapdragon NPU (QNN), same
-     API.
-4. The text fills the input box. The user edits it and sends; edits become
-   `feedback(id, corrected, true)`, unchanged sends confirm.
+1. **Capture:** Windows WASAPI from Zig, event-driven
+   (`AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, no polling).
+2. **Encode in Zig:** 16 kHz mono PCM.
+3. **Transcribe locally:** `stt.Local.transcribe` on the laptop NPU, or
+   `stt.Home.transcribe` on the desktop GPU.
+4. The text fills the input box. The user edits and sends; edits become
+   `feedback(id, corrected, true)`. Laptop feedback is exported as bundles
+   and synced home for training.
 
 ## Microphone selection (Windows)
 
@@ -49,14 +54,16 @@
 
 ## iPhone
 
-iOS chooses the route itself (AirPods or a wired headset automatically when
-connected). The page shows the active input label. Apple keyboard dictation
-remains the default; 🎤 (own model) records over HTTPS.
+iOS chooses the route itself: AirPods or a wired headset automatically when
+connected, otherwise the phone mic. That matches the owner's default.
+Speech is Apple keyboard dictation into the input box, and the page shows
+the active input where the platform reports it.
 
 ## Privacy
 
 * Audio only flows while 🎤 is held or toggled on, with a visible recording
   indicator.
 * No background capture.
-* Samples are stored by stt on the desktop per its rules (unpairing doesn't
-  delete them; the owner's decision).
+* Laptop samples stay on the laptop until synced home as bundles. Home
+  storage follows stt's rules (unpairing never deletes samples; the
+  owner's decision).
