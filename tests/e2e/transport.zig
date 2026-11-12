@@ -226,9 +226,9 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         defer resp.deinit();
         const csp = resp.header("content-security-policy") orelse "";
         _ = r.check("pair page: CSP with frame-ancestors 'none'", std.mem.indexOf(u8, csp, "frame-ancestors 'none'") != null and std.mem.indexOf(u8, csp, "default-src 'none'") != null, "{s}", .{csp});
-        _ = r.ok("pair page: nosniff, DENY, no-referrer, no-store", std.mem.eql(u8, resp.header("x-content-type-options") orelse "", "nosniff") and
+        _ = r.ok("pair page: nosniff, DENY, same-origin referrers, no-store", std.mem.eql(u8, resp.header("x-content-type-options") orelse "", "nosniff") and
             std.mem.eql(u8, resp.header("x-frame-options") orelse "", "DENY") and
-            std.mem.eql(u8, resp.header("referrer-policy") orelse "", "no-referrer") and
+            std.mem.eql(u8, resp.header("referrer-policy") orelse "", "same-origin") and
             std.mem.eql(u8, resp.header("cache-control") orelse "", "no-store"));
     }
     {

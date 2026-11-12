@@ -81,10 +81,39 @@ pub const Status = enum {
     refreshing,
     connecting,
     connected,
+    /// A failure that is neither of the two below (TLS, HTTP, a dropped
+    /// stream); retried with backoff.
     retrying,
+    /// The program on the desktop exited ({"t":"exit"}; Shared.exit_code).
     session_ended,
+    /// The desktop does not answer (refused or timed out): Portal is not
+    /// running there, or the machine is off. Retried with backoff; Portal
+    /// starting again resumes the session (re-signing in as needed).
+    desktop_offline,
+    /// This side's network is down (no route to the desktop).
+    network_error,
     store_unavailable,
 };
+
+/// What a failed connection attempt says about the desktop.
+pub const Reach = enum { desktop_offline, network_error, other };
+
+pub fn classify(err: anyerror) Reach {
+    return switch (err) {
+        // Nobody listening, or nothing answering at all: the desktop (or
+        // Portal on it) is gone. A firewalled desktop without Portal
+        // running drops the SYN, so a timeout means the same.
+        error.ConnectionRefused, error.TimedOut, error.Timeout, error.Canceled => .desktop_offline,
+        error.NetworkUnreachable, error.HostUnreachable, error.NetworkDown, error.AddressUnavailable => .network_error,
+        else => .other,
+    };
+}
+
+/// The user-facing sentences for the session-ended and offline states.
+pub fn endedText(code: i64, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "Session ended on the desktop (exit code {d})", .{code}) catch "Session ended on the desktop";
+}
+pub const offline_text = "Desktop offline \u{2014} reconnects automatically";
 
 pub const Shared = struct {
     mutex: Io.Mutex = .init,
@@ -316,32 +345,44 @@ pub const Client = struct {
                 if (session == null) continue;
                 c.publishSession(&session.?);
             }
-            c.setStatus(.connecting, "opening stream", .{});
+            // After an ended session, or while the desktop is unreachable,
+            // keep saying so during the (possibly long) attempt instead of
+            // a bare "connecting".
+            if (!c.quietAttempt()) c.setStatus(.connecting, "opening stream", .{});
             const result = c.runStream(&session.?, &backoff);
-            switch (result) {
-                .unauthorized, .logout => {
-                    session.?.wipe();
-                    session = null; // refresh (or re-pair) next
-                    c.publishSession(null);
-                },
-                .gone => {
-                    session.?.wipe();
-                    session = null;
-                    c.publishSession(null);
-                    c.desktopGone();
-                },
-                .exited => |code| {
-                    c.shared.mutex.lockUncancelable(c.io);
-                    c.shared.exit_code = code;
-                    c.shared.mutex.unlock(c.io);
-                    c.setStatus(.session_ended, "program exited (code {d}); waiting for a new session", .{code});
-                    c.sleepMs(backoff);
-                    backoff = @min(backoff * 2, 15000);
-                },
-                .failed => |why| {
-                    c.retryWait(&backoff, why);
-                },
-            }
+            c.streamEnded(result, &session, &backoff);
+        }
+    }
+
+    /// What follows a stream's end: sign in again, forget the desktop,
+    /// show the ended session, or wait (a real deadline) before retrying.
+    pub fn streamEnded(c: *Client, result: StreamResult, session: *?http.Cookie, backoff: *i64) void {
+        switch (result) {
+            .unauthorized, .logout => {
+                session.*.?.wipe();
+                session.* = null; // refresh (or re-pair) next
+                c.publishSession(null);
+            },
+            .gone => {
+                session.*.?.wipe();
+                session.* = null;
+                c.publishSession(null);
+                c.desktopGone();
+            },
+            .exited => |code| {
+                c.shared.mutex.lockUncancelable(c.io);
+                c.shared.exit_code = code;
+                c.shared.mutex.unlock(c.io);
+                var b: [64]u8 = undefined;
+                c.setStatus(.session_ended, "{s}", .{endedText(code, &b)});
+                // The desktop closes the stream next (and, when this was
+                // its only session, exits): look again after the backoff;
+                // that attempt says whether it is still there.
+                c.sleepMs(backoff.*);
+                backoff.* = @min(backoff.* * 2, 15000);
+            },
+            .unreachable_err => |err| c.unreachableWait(backoff, err),
+            .failed => |why| c.retryWait(backoff, why),
         }
     }
 
@@ -447,6 +488,32 @@ pub const Client = struct {
         c.shared.desktop_gone.store(true, .release);
         c.signalSync();
         c.notify();
+    }
+
+    /// Whether the current status already explains the next attempt.
+    fn quietAttempt(c: *Client) bool {
+        c.shared.mutex.lockUncancelable(c.io);
+        defer c.shared.mutex.unlock(c.io);
+        return switch (c.shared.status) {
+            .session_ended, .desktop_offline, .network_error => true,
+            else => false,
+        };
+    }
+
+    /// A connection attempt failed with `err`: says whether the desktop
+    /// is offline or this side's network is down (anything else goes to
+    /// retryWait), then sleeps once until the retry: a real deadline.
+    fn unreachableWait(c: *Client, backoff: *i64, err: anyerror) void {
+        switch (classify(err)) {
+            .other => return c.retryWait(backoff, describe(err)),
+            .desktop_offline => c.setStatus(.desktop_offline, offline_text, .{}),
+            .network_error => c.setStatus(.network_error, "Network error: {s} \u{2014} reconnects automatically", .{describe(err)}),
+        }
+        c.shared.mutex.lockUncancelable(c.io);
+        c.shared.retry_in_ms = backoff.*;
+        c.shared.mutex.unlock(c.io);
+        c.sleepMs(backoff.*);
+        backoff.* = @min(backoff.* * 2, 15000);
     }
 
     /// Shows why and sleeps once until the retry (no countdown ticks).
@@ -621,7 +688,7 @@ pub const Client = struct {
         http.writeRefreshRequest(&w, c.host(), c.secure(), device) catch return null;
         var r = c.roundTrip(w.buffered(), &resp_buf, request_timeout_ms) catch |err| {
             c.logError(err);
-            c.retryWait(backoff, describe(err));
+            c.unreachableWait(backoff, err);
             return null;
         };
         defer r.wipe();
@@ -680,21 +747,23 @@ pub const Client = struct {
 
     // ------------------------------------------------------------ stream
 
-    const StreamResult = union(enum) {
+    pub const StreamResult = union(enum) {
         unauthorized,
         logout,
         /// {"t":"logout","reason":"unpaired"}: the record is gone.
         gone,
         exited: i64,
+        /// Could not connect at all (see classify).
+        unreachable_err: anyerror,
         failed: []const u8,
     };
 
-    fn runStream(c: *Client, session: *const http.Cookie, backoff: *i64) StreamResult {
+    pub fn runStream(c: *Client, session: *const http.Cookie, backoff: *i64) StreamResult {
         c.wd.extend(connect_timeout_ms);
         const r = c.wd.run(streamTask, .{ c, session, backoff }, .{ .ctx = c, .f = pingTick });
         if (c.wd.expired.load(.acquire)) {
             c.logError(error.TimedOut);
-            return .{ .failed = describe(error.TimedOut) };
+            return .{ .unreachable_err = error.TimedOut };
         }
         return r;
     }
@@ -717,7 +786,7 @@ pub const Client = struct {
     fn streamTask(c: *Client, session: *const http.Cookie, backoff: *i64) StreamResult {
         const conn = tlsconn.Conn.openWatched(c.gpa, c.io, c.addr, c.security(), &c.wd.stopped) catch |err| {
             c.logError(err);
-            return .{ .failed = describe(err) };
+            return .{ .unreachable_err = err };
         };
         defer conn.close(c.gpa);
         c.wd.extend(request_timeout_ms);
@@ -1436,10 +1505,111 @@ test "stream: the idle timeout fires while a write is blocked, and input never b
         if (watchdog.nowMs(io) - t0 > 20_000) break;
     }
     try std.testing.expect(done.isSet());
-    try std.testing.expect(result == .failed);
-    try std.testing.expectEqualStrings(describe(error.TimedOut), result.failed);
+    try std.testing.expect(result == .unreachable_err);
+    try std.testing.expectEqual(error.TimedOut, result.unreachable_err);
     try std.testing.expect(watchdog.nowMs(io) - t0 < 10_000);
     try std.testing.expect(slowest < 500);
     try std.testing.expect(refused > 0); // the writer was stuck: the queue filled
     try std.testing.expect(!c.sendInput("k:enter")); // not connected any more
+}
+
+/// A WebSocket server whose program exits at once: hello, {"t":"exit"},
+/// the closing handshake, then it waits for the client to close its end
+/// (as Portal's wsGoodbye does).
+const ExitServer = struct {
+    server: net.Server,
+    client_closed: Io.Event = .unset,
+
+    fn serve(s: *ExitServer, io: Io) void {
+        const conn = s.server.accept(io) catch return;
+        defer conn.close(io);
+        var buf: [2048]u8 = undefined;
+        var len: usize = 0;
+        while (std.mem.indexOf(u8, buf[0..len], "\r\n\r\n") == null) {
+            if (len == buf.len) return;
+            var vec = [_][]u8{buf[len..]};
+            const got = conn.readWithControl(io, &vec, &.{}) catch return;
+            if (got.data_len == 0) return;
+            len += got.data_len;
+        }
+        const head = buf[0..len];
+        const name = "Sec-WebSocket-Key: ";
+        const at = std.mem.indexOf(u8, head, name) orelse return;
+        const rest = head[at + name.len ..];
+        const key = rest[0 .. std.mem.indexOf(u8, rest, "\r\n") orelse return];
+        const accept = ws.accept(key) catch return;
+        var wb: [512]u8 = undefined;
+        var w = conn.writer(io, &wb);
+        w.interface.print("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{&accept}) catch return;
+        ws.writeServerFrame(&w.interface, .text, "{\"t\":\"hello\",\"v\":1,\"input\":\"keys\"}") catch return;
+        ws.writeServerFrame(&w.interface, .text, "{\"t\":\"exit\",\"code\":1}") catch return;
+        ws.writeServerFrame(&w.interface, .close, "\x03\xe8session ended") catch return;
+        w.interface.flush() catch return;
+        // Until the client closes (EOF or a reset).
+        while (true) {
+            var vec = [_][]u8{&buf};
+            const got = conn.readWithControl(io, &vec, &.{}) catch break;
+            if (got.data_len == 0) break;
+        }
+        s.client_closed.set(io);
+    }
+};
+
+test "stream: an exited program shows the ended session, then the desktop going away shows offline" {
+    const io = std.testing.io;
+    var addr: net.IpAddress = try .parseLiteral("127.0.0.1:0");
+    var srv: ExitServer = .{ .server = try addr.listen(io, .{}) };
+    addr = srv.server.socket.address;
+    var host_buf: [32]u8 = undefined;
+    const host_text = try std.fmt.bufPrint(&host_buf, "{f}", .{addr});
+    var fut = try io.concurrent(ExitServer.serve, .{ &srv, io });
+    var listening = true;
+    defer {
+        fut.cancel(io);
+        if (listening) srv.server.deinit(io);
+    }
+    var shared: Shared = .{};
+    const c = try std.testing.allocator.create(Client);
+    defer std.testing.allocator.destroy(c);
+    c.* = try Client.init(std.testing.allocator, io, &shared, host_text, .insecure_plain_http);
+    c.quiet = true;
+    var session: ?http.Cookie = http.Cookie.fromValue(.session, tok43, false).?;
+    defer if (session) |*x| x.wipe();
+    var backoff: i64 = 10;
+
+    const r = c.runStream(&session.?, &backoff);
+    try std.testing.expect(r == .exited);
+    try std.testing.expectEqual(@as(i64, 1), r.exited);
+    c.streamEnded(r, &session, &backoff);
+    try std.testing.expectEqual(Status.session_ended, shared.status);
+    try std.testing.expectEqualStrings("Session ended on the desktop (exit code 1)", shared.detail());
+    try std.testing.expectEqual(@as(?i64, 1), shared.exit_code);
+    try std.testing.expect(session != null); // kept: a restarted Portal answers 401, then sign-in
+    // The client closed its end, so the server could close without a reset.
+    try srv.client_closed.wait(io);
+    // The next attempt does not flip the status to "connecting".
+    try std.testing.expect(c.quietAttempt());
+
+    // Portal exits: nothing listens any more.
+    fut.await(io);
+    srv.server.deinit(io);
+    listening = false;
+    const r2 = c.runStream(&session.?, &backoff);
+    try std.testing.expect(r2 == .unreachable_err);
+    c.streamEnded(r2, &session, &backoff);
+    try std.testing.expectEqual(Status.desktop_offline, shared.status);
+    try std.testing.expectEqualStrings(offline_text, shared.detail());
+    try std.testing.expectEqual(@as(?i64, 1), shared.exit_code); // still says what ended
+    try std.testing.expect(c.quietAttempt());
+}
+
+test "classify: desktop offline vs network error vs anything else" {
+    try std.testing.expectEqual(Reach.desktop_offline, classify(error.ConnectionRefused));
+    try std.testing.expectEqual(Reach.desktop_offline, classify(error.TimedOut));
+    try std.testing.expectEqual(Reach.network_error, classify(error.NetworkUnreachable));
+    try std.testing.expectEqual(Reach.network_error, classify(error.HostUnreachable));
+    try std.testing.expectEqual(Reach.other, classify(error.NotIssuedByPinnedCa));
+    try std.testing.expectEqual(Reach.other, classify(error.ConnectionResetByPeer));
+    var b: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Session ended on the desktop (exit code -1)", endedText(-1, &b));
 }

@@ -371,9 +371,9 @@ timers). The CSP allows `'wasm-unsafe-eval'` for exactly this; see `web.zig`.
 The page is made of **slices**, the same on every platform:
 
 * **Terminal**: the live terminal (fit to width, A−/A+ zoom, drag or
-  scroll to pan) under a row of project tabs (the desktop's open
-  projects, in their colours, amber while one waits for an answer; tap one
-  to switch) and a status line: the project shown, viewer
+  scroll to pan) under the project tabs (the desktop's open projects, in
+  their colours, amber while one waits for an answer; tap one to switch,
+  left of the zoom buttons) and a status line: the project shown, viewer
   state, input mode, and the session state (working / waiting for you /
   done; a placeholder until the program reports it, see
   `docs/protocol.md`).

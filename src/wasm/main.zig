@@ -2,9 +2,9 @@
 //!
 //! The whole viewer lives here: protocol decoding (proto.zig), connection
 //! and reconnect policy (conn.zig), the page's slices (slices.zig: the
-//! terminal, the interaction slice with the input box and buttons, and the
-//! data slice, arranged as tabs on narrow screens or columns on wide ones,
-//! following the on-screen keyboard), the terminal canvas layout
+//! terminal, the Data slice under it, which grows when there is something
+//! to show, and the interaction slice with the input box and buttons at the
+//! bottom, following the on-screen keyboard), the terminal canvas layout
 //! (layout.zig), key mapping (keys.zig), what Send does with the input
 //! box's text (inputbox.zig), the data feed (data.zig), glyph rasterisation
 //! (glyphs.zig + font/) and drawing (render.zig). src/web/app.js is only
@@ -65,7 +65,7 @@ const host = struct {
 /// The page's two canvases.
 const Canvas = enum(u32) { terminal = 0, data = 1 };
 /// set_text targets, in the bridge's order.
-const TextSlot = enum(u32) { status = 0, mode = 1, note = 2, project = 3, state = 4 };
+const TextSlot = enum(u32) { status = 0, mode = 1, note = 2, project = 3, state = 4, dsum = 5 };
 
 pub const panic = std.debug.FullPanic(struct {
     fn f(msg: []const u8, _: ?usize) noreturn {
@@ -115,10 +115,14 @@ const App = struct {
     ui: glyphs.Glyphs,
     /// Slices: last viewport report, the user's choices, what the page has.
     vp: ?slices.Input = null,
-    tab: slices.Tab = .terminal,
-    data_frac: f64 = slices.default_data_frac,
-    splitting: bool = false,
+    /// The Data slice collapsed by the user (its Hide / Show button).
+    data_collapsed: bool = false,
     sl: ?slices.Slices = null,
+    /// The view follows the cursor's rows when they do not all fit (until
+    /// the user pans; Fit turns it back on).
+    follow: bool = true,
+    dsum_buf: [48]u8 = undefined,
+    dsum_len: usize = 0,
     class_buf: [160]u8 = undefined,
     class_len: usize = 0,
     /// Project tabs (protocol v2): the open ones, the one shown, and the
@@ -151,6 +155,17 @@ fn showStatus() void {
     var buf: [64]u8 = undefined;
     const st = app.conn.statusText(&buf);
     setText(.status, st.text, st.kind);
+    // The full sentence (session ended / desktop offline / network error)
+    // goes in the note under the box; put the preview back once it no
+    // longer applies.
+    var nbuf: [160]u8 = undefined;
+    if (app.conn.noteText(&nbuf)) |t| {
+        note(t, .bad);
+        conn_note = true;
+    } else if (conn_note) {
+        conn_note = false;
+        showPreview();
+    }
 }
 
 fn sameId(a: ?proto.tabs.Id, b: proto.tabs.Id) bool {
@@ -158,7 +173,8 @@ fn sameId(a: ?proto.tabs.Id, b: proto.tabs.Id) bool {
     return std.mem.eql(u8, &x, &b);
 }
 
-/// The project tab buttons and the project name in the status line.
+/// The project tab buttons (the header's control row, left of Fit / A− /
+/// A+) and the project name in the status line.
 fn showTabs() void {
     var shown_name: ?[]const u8 = null;
     for (0..proto.tabs.max_tabs) |i| {
@@ -193,6 +209,8 @@ fn repick(gone: ?proto.tabs.Id) void {
     if (app.current) |cur| if (!sameId(gone, cur) and app.tabs.find(cur) != null) return selectTab(cur);
     for (app.tabs.slice()) |e| if (!sameId(gone, e.id)) return selectTab(e.id);
 }
+/// The note under the box currently shows Conn.noteText.
+var conn_note = false;
 
 fn showState(s: proto.SessionState) void {
     switch (s) {
@@ -234,7 +252,28 @@ fn relayout() void {
     app.term.setSize(app.l.cw, app.l.ch, app.l.em);
     app.pan = app.l.clampPan(app.pan);
     app.full = true;
+    followCursor();
     schedule();
+}
+
+/// The last grid row with a visible character (0 if none).
+fn lastContentRow() u16 {
+    var y: u16 = app.grid.rows;
+    while (y > 0) {
+        y -= 1;
+        for (app.grid.row(y)) |c| if (c.cp != ' ' and c.cp != 0) return y;
+    }
+    return 0;
+}
+
+/// Rows that do not fit: show the ones with the cursor (layout.followPan).
+fn followCursor() void {
+    if (!app.follow or !app.term_size.known or app.l.panMax()[1] == 0) return;
+    const p = layout.followPan(app.l, app.grid.rows, app.grid.cursor_y, lastContentRow());
+    if (p != app.pan[1]) {
+        app.pan[1] = p;
+        app.full = true;
+    }
 }
 
 /// The data canvas was resized: new backing store, redraw the feed.
@@ -254,20 +293,38 @@ fn relayoutData() void {
     schedule();
 }
 
+/// The data canvas is on screen (the Data slice is open and has room).
 fn dataVisible() bool {
     const s = app.sl orelse return false;
-    return s.arrangement == .columns or s.tab == .data;
+    return s.dataOpen();
 }
 
-/// Re-derives the slices from the last viewport report, the input mode and
-/// the user's tab / splitter choices, and tells the page only what changed.
-/// The canvases' ResizeObservers then report their new sizes via `resize`.
+/// The Data slice's header text: "· nothing yet", "· 2 images", "· 1 new".
+fn showDataSummary() void {
+    const n = app.feed.items.items.len;
+    var buf: [48]u8 = undefined;
+    const t = if (n == 0)
+        "\u{00B7} nothing yet"
+    else if (app.data_collapsed and app.feed.unseen > 0)
+        std.fmt.bufPrint(&buf, "\u{00B7} {d} new", .{app.feed.unseen}) catch ""
+    else
+        std.fmt.bufPrint(&buf, "\u{00B7} {d} image{s}", .{ n, if (n == 1) "" else "s" }) catch "";
+    if (std.mem.eql(u8, t, app.dsum_buf[0..app.dsum_len])) return;
+    @memcpy(app.dsum_buf[0..t.len], t);
+    app.dsum_len = t.len;
+    setText(.dsum, t, if (app.data_collapsed and app.feed.unseen > 0) .bad else .neutral);
+}
+
+/// Re-derives the slices from the last viewport report, the input mode,
+/// the Data feed and the user's Hide / Show, and tells the page only what
+/// changed. The canvases' ResizeObservers then report their new sizes via
+/// `resize`.
 fn relayoutSlices() void {
     var in = app.vp orelse return;
     in.touch = app.touch;
     in.input = app.policy != .none;
-    in.tab = app.tab;
-    in.data_frac = app.data_frac;
+    in.data_content = data.wantedHeight(&app.feed, in.inner_w);
+    in.data_collapsed = app.data_collapsed;
     const s = slices.compute(in);
     if (app.sl == null or !app.sl.?.eql(s)) {
         app.sl = s;
@@ -276,15 +333,16 @@ fn relayoutSlices() void {
         host.set_layout(c.ptr, c.len);
     }
     if (dataVisible() and app.feed.unseen > 0) app.feed.seen();
+    showDataSummary();
     var buf: [160]u8 = undefined;
-    const cls = std.fmt.bufPrint(&buf, "viewer mode-{t} layout-{t} tab-{t}{s}{s}{s}{s}", .{
+    const cls = std.fmt.bufPrint(&buf, "viewer mode-{t}{s}{s}{s}{s}{s}{s}", .{
         app.policy,
-        s.arrangement,
-        s.tab,
         if (app.touch) " touch" else "",
         if (s.keyboard) " kb" else "",
         if (s.no_head) " nohead" else "",
-        if (app.feed.unseen > 0) " badge" else "",
+        if (s.no_data) " nodata" else "",
+        if (app.data_collapsed) " dcollapsed" else "",
+        if (app.feed.items.items.len == 0) " dempty" else "",
     }) catch return;
     if (!std.mem.eql(u8, cls, app.class_buf[0..app.class_len])) {
         @memcpy(app.class_buf[0..cls.len], cls);
@@ -308,7 +366,10 @@ fn writeBox(text: []const u8) void {
 
 /// Shows what Send would do with the box's current text.
 fn showPreview() void {
-    var buf: [128]u8 = undefined;
+    var buf: [160]u8 = undefined;
+    // While the session is ended or the desktop unreachable, that is
+    // what the note says (Send is refused anyway).
+    if (app.conn.noteText(&buf)) |t| return note(t, .bad);
     const n = inputbox.preview(app.policy, readBox(), app.touch, &buf);
     note(n.text, n.tone);
 }
@@ -336,7 +397,7 @@ fn sendBox() void {
     switch (d) {
         .nothing => return,
         .refuse => |r| return note(inputbox.refusalText(r), .bad),
-        else => if (app.conn.state != .live) return note(inputbox.refusalText(.offline), .bad),
+        else => if (!app.conn.canSend()) return note(inputbox.refusalText(.offline), .bad),
     }
     switch (d) {
         .nothing, .refuse => unreachable,
@@ -396,7 +457,7 @@ fn perform(e: conn_mod.Effect) void {
 }
 
 fn send(action: keys.Action) void {
-    if (app.policy == .none or app.conn.state != .live) return;
+    if (app.policy == .none or !app.conn.canSend()) return;
     var buf: [64]u8 = undefined;
     const f = keys.frame(&buf, action) orelse return;
     host.ws_send(f.ptr, f.len);
@@ -488,29 +549,6 @@ export fn on_viewport(inner_w: f64, inner_h: f64, vv_w: f64, vv_h: f64, vv_top: 
 export fn on_ptab(i: u32) void {
     if (!ready or i >= app.tabs.len) return;
     selectTab(app.tabs.items[i].id);
-}
-
-/// Segmented control: 0 Terminal, 1 Data (tabs arrangement).
-export fn on_tab(id: u32) void {
-    if (!ready) return;
-    app.tab = std.enums.fromInt(slices.Tab, id) orelse return;
-    relayoutSlices();
-    schedule();
-}
-
-/// The splitter between the left column and the data column. kind: 0 down,
-/// 1 move, 2 up/cancel; x in CSS pixels from the page's left edge.
-export fn on_split(kind: u32, x: f64) void {
-    if (!ready) return;
-    switch (kind) {
-        0 => app.splitting = true,
-        1 => if (app.splitting) {
-            const vp = app.vp orelse return;
-            app.data_frac = slices.dragFrac(x, vp.inner_w);
-            relayoutSlices();
-        },
-        else => app.splitting = false,
-    }
 }
 
 /// requestAnimationFrame callback: draw what changed and present it.
@@ -608,6 +646,7 @@ export fn on_ws_message(binary: u32, len: usize) void {
         // The cursor overlay is drawn with its row: redraw where it was.
         if (old_y < app.grid.rows) app.grid.dirty[old_y] = true;
         app.grid.dirty[app.grid.cursor_y] = true;
+        followCursor();
     }
     schedule();
 }
@@ -619,10 +658,10 @@ export fn on_timer() void {
 
 /// Result of check_session: final HTTP status (0 = network error) and the
 /// final URL's path (in the input buffer).
-export fn on_check(status: u32, len: usize) void {
+export fn on_check(status: u32, len: usize, device_offline: u32) void {
     if (!ready) return;
     const path = input(len) orelse "";
-    perform(app.conn.onCheck(.{ .status = status, .path = path }));
+    perform(app.conn.onCheck(.{ .status = status, .path = path, .device_offline = device_offline != 0 }));
 }
 
 /// keydown outside the input box: `KeyboardEvent.key` in the input
@@ -663,7 +702,7 @@ export fn on_button(id: u32) void {
         .send => sendBox(),
         else => {
             if (app.policy == .none) return;
-            if (app.conn.state != .live) return note(inputbox.refusalText(.offline), .bad);
+            if (!app.conn.canSend()) return note(inputbox.refusalText(.offline), .bad);
             const k = inputbox.buttonKey(b).?;
             sendFrame("k:", k);
             pressed(k);
@@ -686,6 +725,7 @@ export fn on_pointer(kind: u32, x_css: f64, y_css: f64) void {
             if (p[0] != app.pan[0] or p[1] != app.pan[1]) {
                 app.pan = p;
                 app.full = true;
+                app.follow = false; // the user looks elsewhere (Fit follows again)
             }
         },
         else => app.drag = null,
@@ -706,17 +746,33 @@ export fn on_wheel(dx: f64, dy: f64, mode: u32) u32 {
     if (p[0] == app.pan[0] and p[1] == app.pan[1]) return 0;
     app.pan = p;
     app.full = true;
+    app.follow = false;
     schedule();
     return 1;
 }
 
-/// Header buttons: 1 Fit, 2 A−, 3 A+.
+/// Header buttons: 1 Fit, 2 A−, 3 A+; the Data slice's 4 Hide / Show and
+/// 5 Clear.
 export fn on_cmd(id: u32) void {
     if (!ready) return;
     switch (id) {
-        1 => app.zoom = .{},
+        1 => {
+            app.zoom = .{};
+            app.follow = true;
+        },
         2 => app.zoom = layout.zoomStep(app.zoom, app.l, -1),
         3 => app.zoom = layout.zoomStep(app.zoom, app.l, 1),
+        4 => {
+            app.data_collapsed = !app.data_collapsed;
+            app.feed.dirty = true;
+            relayoutSlices();
+            return schedule();
+        },
+        5 => {
+            app.feed.clear(gpa);
+            relayoutSlices();
+            return schedule();
+        },
         else => return,
     }
     relayout();

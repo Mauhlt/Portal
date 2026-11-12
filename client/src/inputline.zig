@@ -13,7 +13,12 @@
 //!   * A line the server refuses ({"t":"rejected"}) comes back into the
 //!     field if nothing new was typed meanwhile.
 //!
-//! Pure state, no drawing: remote.zig builds the bottom pane from `snapshot()`.
+//! The desk's input box (src/gui.zig) is the same line with `policy` set to
+//! `text` (the person at the desk has full control): there Enter types the
+//! text and presses Enter (`t:` then `k:enter`), with no line checks.
+//!
+//! Pure state, no drawing: remote.zig and gui.zig build the bottom pane
+//! from `snapshot()`.
 
 const std = @import("std");
 const rules = @import("inputrules");
@@ -25,6 +30,9 @@ const input = view_mod.input;
 pub const cap = rules.max_line_bytes + 16;
 
 pub const Line = struct {
+    /// What Enter does with the text (rules.decide): `instruct` for remote
+    /// viewers, `text` on the desk.
+    policy: rules.Policy = .instruct,
     field: view_mod.form.TextField(cap) = .{},
     /// The last line sent, for a server refusal.
     last_buf: [rules.max_line_bytes]u8 = undefined,
@@ -53,7 +61,7 @@ pub const Line = struct {
     /// The note for what Enter would do now (or the help on an empty line).
     fn preview(l: *Line) void {
         var buf: [192]u8 = undefined;
-        const n = rules.preview(.instruct, l.field.text(), .native, &buf);
+        const n = rules.preview(l.policy, l.field.text(), .native, &buf);
         l.setNote(n.text, n.tone);
     }
 
@@ -111,7 +119,7 @@ pub const Line = struct {
             if (l.press("enter", sender)) l.field.clear();
             return;
         }
-        switch (rules.decide(.instruct, t, &l.scratch)) {
+        switch (rules.decide(l.policy, t, &l.scratch)) {
             .refuse => |r| l.setNote(rules.refusalText(r), .bad),
             .key => |k| if (l.press(k, sender)) l.field.clear(),
             .line => |line| {
@@ -121,8 +129,13 @@ pub const Line = struct {
                 l.field.clear();
                 l.setNote("Sent.", .ok);
             },
-            // Not produced in instruct mode.
-            .typed, .nothing => {},
+            .typed => |typed| {
+                if (!sender.send(l.frame("t:", typed))) return l.setNote(rules.refusalText(.offline), .bad);
+                _ = sender.send(l.frame("k:", "enter"));
+                l.field.clear();
+                l.setNote("Sent.", .ok);
+            },
+            .nothing => {},
         }
     }
 
@@ -261,4 +274,19 @@ test "a server refusal puts the line back" {
     l.rejected("Bogus");
     try testing.expectEqualStrings("new", l.text());
     try testing.expectEqualStrings("The desktop refused that line.", l.note());
+}
+
+test "text policy (the desk): typed and Enter, no line checks" {
+    var l: Line = .{ .policy = .text };
+    var r: Recorder = .{};
+    typeText(&l, "/help");
+    _ = l.onKey(.enter, .{}, &r);
+    try testing.expectEqual(@as(usize, 2), r.n);
+    try testing.expectEqualStrings("t:/help", r.frames[0][0..r.lens[0]]);
+    try testing.expectEqualStrings("k:enter", r.last());
+    try testing.expectEqualStrings("", l.text());
+    // Answer words still press their key.
+    typeText(&l, "yes");
+    _ = l.onKey(.enter, .{}, &r);
+    try testing.expectEqualStrings("k:y", r.last());
 }

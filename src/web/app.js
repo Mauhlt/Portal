@@ -11,7 +11,7 @@
 (async () => {
   const $ = (id) => document.getElementById(id);
   const cvs = [$('screen'), $('data')], ctxs = cvs.map((c) => c.getContext('2d')); // Canvas order in main.zig
-  const box = $('box'), safe = $('safe'), split = $('split');
+  const box = $('box'), safe = $('safe');
   const ptabs = document.querySelectorAll('[data-ptab]'); // project tabs, in order
   const enc = new TextEncoder(), dec = new TextDecoder();
   let X = null, ws = null; // wasm exports; the one WebSocket
@@ -39,10 +39,11 @@
     request_frame: () => requestAnimationFrame(() => X.frame()),
     set_timer: (ms) => setTimeout(() => X.on_timer(), ms),
     check_session: () => fetch('/', { credentials: 'same-origin', cache: 'no-store' }).then(
-      (r) => X.on_check(r.status, put(enc.encode(new URL(r.url).pathname))), () => X.on_check(0, 0)),
+      (r) => X.on_check(r.status, put(enc.encode(new URL(r.url).pathname)), 0),
+      () => X.on_check(0, 0, navigator.onLine === false ? 1 : 0)),
     navigate_pair: () => location.assign('/pair'),
     set_text: (slot, p, n, cls) => { // TextSlot order in main.zig
-      const el = $(['status', 'mode', 'note', 'project', 'state'][slot]);
+      const el = $(['status', 'mode', 'note', 'project', 'state', 'dsum'][slot]);
       el.textContent = str(p, n);
       el.className = el.id + ['', ' ok', ' bad'][cls];
     },
@@ -75,10 +76,10 @@
   // devicePixelRatio changes alone (another monitor) resize nothing: watch it.
   const dpr = () => matchMedia('(resolution: ' + devicePixelRatio + 'dppx)').addEventListener('change', () => { size(); dpr(); }, { once: true });
   dpr();
-  // Buttons carry a number for wasm: data-cmd (Fit / A− / A+), data-tab
-  // (slices.Tab), data-ptab (project tab position), data-btn (inputbox.Button).
+  // Buttons carry a number for wasm: data-cmd (Fit / A− / A+, the Data
+  // slice's Hide·Show / Clear), data-ptab (project tab position), data-btn
+  // (inputbox.Button).
   for (const b of document.querySelectorAll('[data-cmd]')) b.onclick = () => X.on_cmd(+b.dataset.cmd);
-  for (const b of document.querySelectorAll('[data-tab]')) b.onclick = () => X.on_tab(+b.dataset.tab);
   for (const b of ptabs) b.onclick = () => X.on_ptab(+b.dataset.ptab);
   for (const b of document.querySelectorAll('[data-btn]')) {
     b.onclick = () => X.on_button(+b.dataset.btn);
@@ -95,10 +96,6 @@
       if (!e.isPrimary) return;
       if (kind === 0) cvs[0].setPointerCapture(e.pointerId);
       X.on_pointer(kind, e.offsetX, e.offsetY);
-    });
-    split.addEventListener(type, (e) => {
-      if (kind === 0) split.setPointerCapture(e.pointerId);
-      X.on_split(kind, e.clientX);
     });
   });
   cvs[0].addEventListener('wheel', (e) => { if (X.on_wheel(e.deltaX, e.deltaY, e.deltaMode)) e.preventDefault(); },

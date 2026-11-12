@@ -255,8 +255,13 @@ pub const Hub = struct {
     finished_event: Io.Event = .unset,
 
     viewers: u32 = 0,
-    /// Set on every viewer count change (shutdown waits for the last
-    /// viewer to receive the exit notice and go).
+    /// Viewer sockets not yet closed: a viewer counts here from its
+    /// upgrade until its socket is closed (after the exit notice and the
+    /// closing handshake), which is later than it leaves `viewers`.
+    /// Shutdown waits for this to reach 0, so the process never exits
+    /// (which resets open sockets) while an exit notice is in flight.
+    viewer_sockets: u32 = 0,
+    /// Set on every viewer (or viewer socket) count change.
     viewers_changed: Io.Event = .unset,
 
     /// Optional change hook (the desk window): any tab's output, resize,
@@ -521,14 +526,22 @@ pub const Hub = struct {
         return n;
     }
 
-    /// Waits until no viewer is connected or `deadline_ms` (awake clock)
-    /// passes. Woken by every viewer change; no polling.
+    /// A viewer socket opened (+1) or was closed (-1); see viewer_sockets.
+    pub fn viewerSocketDelta(h: *Hub, delta: i32) void {
+        h.mutex.lockUncancelable(h.io);
+        if (delta > 0) h.viewer_sockets +|= @abs(delta) else h.viewer_sockets -|= @abs(delta);
+        h.mutex.unlock(h.io);
+        h.viewers_changed.set(h.io);
+    }
+
+    /// Waits until every viewer socket is closed or `deadline_ms` (awake
+    /// clock) passes. Woken by every viewer change; no polling.
     pub fn waitViewersGone(h: *Hub, deadline_ms: i64) void {
         while (true) {
             // Reset before checking, so a change right after is not lost.
             h.viewers_changed.reset();
             h.mutex.lockUncancelable(h.io);
-            const n = h.viewers;
+            const n = h.viewer_sockets;
             h.mutex.unlock(h.io);
             if (n == 0) return;
             const left = deadline_ms - Io.Clock.awake.now(h.io).toMilliseconds();

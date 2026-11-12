@@ -210,6 +210,9 @@ pub const Viewer = struct {
     /// The logout's `reason`, if it had one.
     logout_reason: enum { none, unpaired, replaced } = .none,
     got_exit: bool = false,
+    /// {"t":"exit"}'s code, and whether it came before the close frame.
+    exit_code: ?i64 = null,
+    exit_before_close: bool = false,
     closed: bool = false,
     close_payload: [2]u8 = .{ 0, 0 },
     /// Last {"t":"rejected",...} message (instruct-mode lines Portal refused).
@@ -314,6 +317,13 @@ pub const Viewer = struct {
                     if (std.mem.indexOf(u8, p, "\"reason\":\"replaced\"") != null) v.logout_reason = .replaced;
                 } else if (std.mem.indexOf(u8, p, "\"exit\"") != null) {
                     v.got_exit = true;
+                    v.exit_before_close = !v.closed;
+                    const key = "\"code\":";
+                    if (std.mem.indexOf(u8, p, key)) |at| {
+                        const rest = p[at + key.len ..];
+                        const end = std.mem.indexOfAny(u8, rest, ",}") orelse rest.len;
+                        v.exit_code = std.fmt.parseInt(i64, rest[0..end], 10) catch null;
+                    }
                 }
             },
             .binary => if (v.g.apply(f.payload)) |a| {
@@ -389,6 +399,14 @@ pub const Viewer = struct {
         return v.pumpUntil(ms, {}, struct {
             fn f(_: void, vv: *Viewer) bool {
                 return vv.got_logout;
+            }
+        }.f);
+    }
+
+    pub fn waitExit(v: *Viewer, ms: u32) bool {
+        return v.pumpUntil(ms, {}, struct {
+            fn f(_: void, vv: *Viewer) bool {
+                return vv.got_exit;
             }
         }.f);
     }

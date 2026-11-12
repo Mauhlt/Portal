@@ -5,11 +5,14 @@
 //! `Grid` snapshot plus an `Overlay` describing the chrome, and receive
 //! input through an `InputSink`.
 //!
-//! Layout (`Layout`, kept in `regions`), top to bottom: top bar (optional,
-//! `Overlay.top_bar`), the terminal (grid), the bottom region
-//! (`Overlay.bottom`: stacked panes such as the answer buttons, a button
-//! row or a text field, each with its own height), status line. A modal
-//! `Overlay.panel` is drawn as a layer over all of them.
+//! Layout (`Layout`, kept in `regions`), the same vertical slices on every
+//! device (docs/layout-design.md), top to bottom: top bar (optional,
+//! `Overlay.top_bar`), the terminal slice (grid), the Data slice
+//! (`Overlay.data`: a thin header strip that grows when there is something
+//! to show), the interaction slice (`Overlay.bottom`: stacked panes such as
+//! the answer buttons and the input box with Send, drawn large enough to
+//! read and hit), status line. A modal `Overlay.panel` is drawn as a layer
+//! over all of them.
 //!
 //!     var tv = try TermView.init(gpa, io, .{ .title = "Portal" });
 //!     defer tv.deinit();
@@ -169,8 +172,8 @@ pub const Rect = struct {
 };
 
 /// The window's regions for one frame, top to bottom: top bar, terminal
-/// (the grid), the bottom region (`Overlay.bottom`, its panes stacked in
-/// order), status line. A modal `Overlay.panel` is a layer over all of
+/// (the grid), the Data slice, the bottom region (`Overlay.bottom`, its
+/// panes stacked in order: the interaction slice), status line. A modal `Overlay.panel` is a layer over all of
 /// them, not a region. Kept after each build in `TermView.regions` so
 /// hosts can map clicks to regions.
 pub const Layout = struct {
@@ -178,8 +181,8 @@ pub const Layout = struct {
     terminal: Rect = .{},
     bottom: Rect = .{},
     status: Rect = .{},
-    /// The data column (Overlay.data), right of everything above the
-    /// status line; zero-sized when hidden.
+    /// The Data slice (Overlay.data), full width between the terminal and
+    /// the bottom region; zero-sized without one.
     data: Rect = .{},
     /// Each bottom pane's rectangle (same order as Overlay.bottom).
     panes: [max_panes]Rect = @splat(.{}),
@@ -195,6 +198,8 @@ pub const Pane = struct {
     /// Height in logical pixels (scaled with the window's DPI); 0 picks the
     /// content's natural height.
     height: f32 = 0,
+    /// A button at the right end of a `.field` pane (the input box's Send).
+    send: ?PanelButton = null,
     content: union(enum) {
         /// The answer buttons (input.answers): InputSink.answer.
         answers,
@@ -206,39 +211,64 @@ pub const Pane = struct {
     },
 };
 
-/// One entry of the data column, newest first.
+/// One entry of the Data slice, newest first.
 pub const DataItem = struct {
     caption: []const u8,
-    /// Image id in `DataColumn.images` (null: caption only).
+    /// Image id in `DataSlice.images` (null: caption only).
     image: ?u32 = null,
     /// The image's pixel size (0 if unknown), for fitting.
     w: u32 = 0,
     h: u32 = 0,
 };
 
-/// The data slice on the desktop (docs/layout-design.md ③): a column at
-/// the right, from the top down to the status line. The host owns the
-/// feed; images are looked up by id in `images` (a store separate from the
-/// grid's, so its ids never collide with the terminal's images).
-pub const DataColumn = struct {
+/// The Data slice (docs/layout-design.md): a strip under the terminal,
+/// full width. Its header line is always there ("Data · nothing yet", the
+/// Hide/Show and Clear buttons); below it the items, newest first, left to
+/// right. Its height follows `dataHeight` (the rule of module "datafeed",
+/// `sliceHeight`, shared with the browser): just the header while empty or
+/// collapsed, growing with the items up to `data_max_share`. The host owns
+/// the feed; images are looked up by id in `images` (a store separate from
+/// the grid's, so its ids never collide with the terminal's images).
+pub const DataSlice = struct {
     title: []const u8 = "Data",
-    /// Muted text right of the title (e.g. how to hide the column).
-    hint: []const u8 = "",
+    /// Text after the title ("nothing yet", "2 images", "1 new").
+    summary: []const u8 = "",
+    summary_tone: Tone = .muted,
     items: []const DataItem = &.{},
     images: ?*const grid_mod.Images = null,
-    empty_text: []const u8 = "No data yet",
-    /// Share of the window's width.
-    frac: f32 = 0.34,
+    /// Collapsed by the user: the header strip only.
+    collapsed: bool = false,
+    /// Header buttons (right-aligned): clicks reach InputSink.button(id).
+    /// A click elsewhere on the header reports `toggle`'s id too.
+    toggle: ?PanelButton = null,
+    clear: ?PanelButton = null,
 };
 
-/// Below this window width (logical px) the data column is not drawn.
-pub const data_min_window_w: f32 = 640;
+/// Most of the height shared by the terminal and the Data slice that the
+/// Data slice takes (datafeed.max_share; client/src/dataview.zig tests that
+/// the two rules agree, as the view module imports nothing of Portal's).
+pub const data_max_share: f32 = 0.38;
+
+/// The Data slice's height in a column `avail` high (datafeed.sliceHeight):
+/// the header strip while empty or collapsed, else header + `content`, at
+/// most `data_max_share` of `avail`.
+pub fn dataHeight(avail: f32, header: f32, content: f32, collapsed: bool) f32 {
+    const room = if (std.math.isFinite(avail)) @max(0, avail) else 0;
+    const head = @min(@round(if (std.math.isFinite(header)) @max(0, header) else 0), room);
+    if (collapsed or !(content > 0)) return head;
+    const cap = @max(head, @floor(room * data_max_share));
+    return @min(@round(head + @min(content, room)), cap);
+}
+
+/// Font size (logical px) of the interaction slice's buttons and input box:
+/// larger than the rest of the chrome, so they are easy to read and hit.
+pub const action_em: f32 = 16;
 
 pub const Overlay = struct {
     /// `.grid` draws the grid (if it has cells); `.message` a centred notice.
     screen: union(enum) { grid, message: Message } = .grid,
-    /// The data column (shown when the window is wide enough).
-    data: ?DataColumn = null,
+    /// The Data slice under the terminal.
+    data: ?DataSlice = null,
     top_bar: ?TopBar = null,
     selection: ?Selection = null,
     /// Shorthand for one `.answers` pane at the top of the bottom region.
@@ -251,7 +281,9 @@ pub const Overlay = struct {
 };
 
 pub const Sizing = union(enum) {
-    /// Scale the font so the host's cols x rows fit the window (remote view).
+    /// Scale the font to the host's grid (remote view): its columns fill the
+    /// terminal slice's width, with a readable minimum (see `fitEm`); rows
+    /// that do not fit then scroll to follow the cursor (`followTop`).
     fit_grid,
     /// Fixed font size in logical pixels; the window decides cols x rows
     /// (reported through InputSink.resized; local terminal hosts).
@@ -302,7 +334,7 @@ reported_capacity: [2]u16 = .{ 0, 0 },
 /// The regions of the last built frame (see Layout).
 regions: Layout = .{},
 /// Where the last built grid was drawn (pixels), for mouse -> cell.
-layout: struct { ox: f32 = 0, oy: f32 = 0, cw: f32 = 1, ch: f32 = 1, cols: u16 = 0, rows: u16 = 0 } = .{},
+layout: struct { ox: f32 = 0, oy: f32 = 0, cw: f32 = 1, ch: f32 = 1, cols: u16 = 0, rows: u16 = 0, first_row: u16 = 0 } = .{},
 live_ctx: ?*anyopaque = null,
 live_fn: ?Window.LiveFn = null,
 /// Inline images (decode, scale, pack into the texture's image region).
@@ -458,8 +490,10 @@ pub fn reportCapacity(tv: *TermView, sink: input.InputSink) void {
 fn mouseAt(tv: *const TermView, action: @FieldType(input.Mouse, "action"), button: input.MouseButton, x: f32, y: f32, mods: input.Mods) input.Mouse {
     const l = tv.layout;
     const fx = (x - l.ox) / l.cw;
-    const fy = (y - l.oy) / l.ch;
-    const inside = l.cols > 0 and l.rows > 0 and fx >= 0 and fy >= 0 and
+    // Rows above first_row are scrolled out of the slice.
+    const top: f32 = @floatFromInt(l.first_row);
+    const fy = (y - l.oy) / l.ch + top;
+    const inside = l.cols > 0 and l.rows > 0 and fx >= 0 and fy >= top and
         fx < @as(f32, @floatFromInt(l.cols)) and fy < @as(f32, @floatFromInt(l.rows));
     return .{
         .action = action,
@@ -626,20 +660,16 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
     tv.instances.clearRetainingCapacity();
     tv.n_buttons = 0;
     const size = tv.window.framebufferSize();
-    const full_w: f32 = @floatFromInt(size[0]);
+    const W: f32 = @floatFromInt(size[0]);
     const H: f32 = @floatFromInt(size[1]);
-    if (full_w < 1 or H < 1) return;
+    if (W < 1 or H < 1) return;
     const s = tv.window.scale();
     const ui = tv.fonts.metrics(@round(13 * s));
+    const act = tv.fonts.metrics(@round(action_em * s));
     const status_h: f32 = @round(@as(f32, @floatFromInt(ui.cell_h)) * 1.6);
     const top_h: f32 = if (overlay.top_bar != null) topBarHeight(ui) else 0;
-    // The data column takes the right part; the top bar, the terminal and
-    // the bottom region keep the rest (W); the status line and a modal
-    // panel span the window.
-    const data_w: f32 = if (overlay.data) |d| dataWidth(full_w, s, d.frac) else 0;
-    const W = full_w - data_w;
-    // The bottom region: its panes' heights, but never more than half the
-    // window (the terminal keeps the rest).
+    // The bottom region (interaction slice): its panes' heights, but never
+    // more than half the window (the terminal and data keep the rest).
     var panes: [max_panes]Pane = undefined;
     var n_panes: usize = 0;
     if (overlay.show_answers) {
@@ -653,7 +683,7 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
     var heights: [max_panes]f32 = undefined;
     var bar_h: f32 = 0;
     for (panes[0..n_panes], 0..) |p, i| {
-        heights[i] = paneHeight(ui, p, s);
+        heights[i] = paneHeight(act, p, s);
         bar_h += heights[i];
     }
     const room = @max(0, H - status_h - top_h);
@@ -665,16 +695,20 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
             bar_h += h.*;
         }
     }
-    const grid_h = @max(0, room - bar_h);
+    // The terminal and the Data slice share what is left: data takes its
+    // header strip, or more while it has something to show.
+    const middle = @max(0, room - bar_h);
+    const data_h: f32 = if (overlay.data) |d| dataHeight(middle, dataHeaderHeight(ui), dataContentHeight(ui, d, W, s), d.collapsed) else 0;
+    const grid_h = @max(0, middle - data_h);
     tv.regions = .{
         .top = .{ .w = W, .h = top_h },
         .terminal = .{ .y = top_h, .w = W, .h = grid_h },
-        .bottom = .{ .y = top_h + grid_h, .w = W, .h = bar_h },
-        .status = .{ .y = H - status_h, .w = full_w, .h = status_h },
-        .data = .{ .x = W, .y = 0, .w = data_w, .h = if (data_w > 0) H - status_h else 0 },
+        .data = .{ .y = top_h + grid_h, .w = W, .h = data_h },
+        .bottom = .{ .y = top_h + middle, .w = W, .h = bar_h },
+        .status = .{ .y = H - status_h, .w = W, .h = status_h },
         .n_panes = n_panes,
     };
-    var py = top_h + grid_h;
+    var py = top_h + middle;
     for (heights[0..n_panes], 0..) |h, i| {
         tv.regions.panes[i] = .{ .y = py, .w = W, .h = h };
         py += h;
@@ -682,7 +716,8 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
 
     tv.layout.cols = 0;
     tv.layout.rows = 0;
-    // Image entries live while the grid or the data column draws them.
+    tv.layout.first_row = 0;
+    // Image entries live while the grid or the Data slice draws them.
     tv.img.begin();
     defer tv.img.end();
     switch (overlay.screen) {
@@ -694,22 +729,42 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
         .message => |msg| tv.drawMessage(ui, msg, W, top_h, grid_h, s),
     }
     if (overlay.top_bar) |tb| tv.drawTopBar(ui, tb, W, top_h, s);
-    for (panes[0..n_panes], 0..) |p, i| tv.drawPane(ui, p, tv.regions.panes[i], s);
-    if (overlay.data) |d| if (data_w > 0) tv.drawData(ui, d, tv.regions.data, s);
-    tv.drawStatus(ui, overlay.status, H - status_h, full_w, status_h, s);
+    if (overlay.data) |d| if (data_h > 0) tv.drawData(ui, d, tv.regions.data, s);
+    for (panes[0..n_panes], 0..) |p, i| tv.drawPane(act, p, tv.regions.panes[i], s);
+    tv.drawStatus(ui, overlay.status, H - status_h, W, status_h, s);
     if (overlay.panel) |p| {
         // Modal: buttons under the panel stop reacting.
         tv.n_buttons = 0;
-        tv.drawPanel(ui, p, full_w, H, s);
+        tv.drawPanel(ui, p, W, H, s);
     }
 }
 
-/// The data column's width in pixels for a window `W` wide (0: too
-/// narrow, not shown).
-pub fn dataWidth(W: f32, s: f32, frac: f32) f32 {
-    if (W < data_min_window_w * s) return 0;
-    const f = std.math.clamp(frac, 0.2, 0.5);
-    return @round(std.math.clamp(W * f, 220 * s, W * 0.5));
+/// The Data slice's header strip.
+fn dataHeaderHeight(ui: fontset.Metrics) f32 {
+    return @round(@as(f32, @floatFromInt(ui.cell_h)) * 2.0);
+}
+
+/// What the Data slice's items would like under its header (0: nothing to
+/// show): a caption line and the tallest image at up to 1 image pixel per
+/// logical pixel, no wider than the slice; at least a few lines.
+fn dataContentHeight(ui: fontset.Metrics, d: DataSlice, W: f32, s: f32) f32 {
+    if (d.items.len == 0) return 0;
+    const lh: f32 = @floatFromInt(ui.cell_h);
+    const pad = @round(10 * s);
+    const inner = @max(1, W - 2 * pad);
+    var tallest: f32 = lh * 3;
+    for (d.items) |it| {
+        if (it.image == null) continue;
+        if (it.w == 0 or it.h == 0) {
+            tallest = @max(tallest, lh * 6);
+            continue;
+        }
+        const fw: f32 = @floatFromInt(it.w);
+        const fh: f32 = @floatFromInt(it.h);
+        const k = @min(s, inner / fw);
+        tallest = @max(tallest, @round(fh * k));
+    }
+    return pad + @round(lh * 1.3) + tallest + pad;
 }
 
 /// Fits a `w x h` image into `box_w x box_h` keeping its aspect ratio,
@@ -723,45 +778,62 @@ pub fn fitImage(w: u32, h: u32, box_w: f32, box_h: f32) [2]f32 {
     return .{ @max(1, @round(fw * k)), @max(1, @round(fh * k)) };
 }
 
-/// The data column: title, then each item's caption and image, newest
-/// first, clipped to the column.
-fn drawData(tv: *TermView, ui: fontset.Metrics, d: DataColumn, r: Rect, s: f32) void {
+/// The Data slice: the header strip (title, summary, buttons), then the
+/// items left to right, newest first, each a caption over its image,
+/// clipped to the slice.
+fn drawData(tv: *TermView, ui: fontset.Metrics, d: DataSlice, r: Rect, s: f32) void {
     tv.rect(r.x, r.y, r.w, r.h, ui_bg);
-    tv.rect(r.x, r.y, @max(1, @round(s)), r.h, panel_edge); // the edge to the terminal
+    tv.rect(r.x, r.y, r.w, @max(1, @round(s)), panel_edge); // the edge to the terminal
     const pad = @round(10 * s);
     const lh: f32 = @floatFromInt(ui.cell_h);
+    const head_h = @min(r.h, dataHeaderHeight(ui));
+    const ty = r.y + @round((head_h - lh) / 2);
     const x0 = r.x + pad;
-    const inner = @max(1, r.w - 2 * pad);
+    // Header buttons, right to left; the rest of the header toggles.
+    var bx = r.x + r.w - pad;
+    const bh = @round(head_h * 0.76);
+    const by = r.y + @round((head_h - bh) / 2);
+    for ([_]?PanelButton{ d.toggle, d.clear }) |ob| if (ob) |b| {
+        const bw = tv.panelButton(ui, 0, 0, bh, b, s, false);
+        if (bx - bw < x0 + lh * 8) break;
+        bx -= bw;
+        _ = tv.panelButton(ui, bx, by, bh, b, s, true);
+        bx -= @round(6 * s);
+    };
+    const tx = tv.text(ui, x0, ty, clipText(ui, d.title, @max(0, bx - x0), false), button_fg, true);
+    if (d.summary.len > 0) {
+        const room = bx - tx - lh;
+        if (room > 0) _ = tv.text(ui, tx + lh, ty, clipText(ui, d.summary, room, false), toneColor(d.summary_tone), false);
+    }
+    if (d.toggle) |t| tv.registerButton(r.x, r.y, @max(0, bx - r.x), head_h, t.id);
+    if (d.collapsed or d.items.len == 0) return;
+    // Items, left to right.
+    const top = r.y + head_h;
     const bottom = r.y + r.h;
-    var y = r.y + pad;
-    const tx = tv.text(ui, x0, y, clipText(ui, d.title, inner, false), button_fg, true);
-    if (d.hint.len > 0) {
-        const room = x0 + inner - tx - lh;
-        if (room > 0) _ = tv.text(ui, tx + lh, y, clipText(ui, d.hint, room, false), toneColor(.muted), false);
-    }
-    y += lh * 1.8;
-    if (d.items.len == 0) {
-        const w = textWidth(ui, d.empty_text);
-        _ = tv.text(ui, x0 + @max(0, @round((inner - w) / 2)), r.y + @round(r.h / 2), clipText(ui, d.empty_text, inner, false), toneColor(.muted), false);
-        return;
-    }
-    const tex = [2]u32{ tex_w, tex_h };
+    const right = r.x + r.w - pad;
+    const img_y = top + @round(lh * 1.3);
+    const img_h = bottom - pad - img_y;
+    if (img_h < lh) return;
+    var x = x0;
     for (d.items) |it| {
-        if (y + lh > bottom) break;
-        _ = tv.text(ui, x0, y, clipText(ui, it.caption, inner, false), toneColor(.muted), false);
-        y += lh * 1.3;
-        const id = it.image orelse continue;
-        const store = d.images orelse continue;
-        const fit = fitImage(it.w, it.h, inner, @max(lh * 3, r.h * 0.55));
-        if (fit[0] < 1 or fit[1] < 1) continue;
-        switch (tv.img.prepare(store, id, @intFromFloat(fit[0]), @intFromFloat(fit[1]), tex[0], tex[1])) {
-            .image => |uv| if (images.clip(x0, y, fit[0], fit[1], uv, r.x, r.y, r.x + r.w, bottom)) |c| {
-                tv.pushA(c.rect[0], c.rect[1], c.rect[2], c.rect[3], c.uv, .{ 255, 255, 255 }, 255);
-            },
-            .placeholder => |dims| tv.placeholder(ui, x0, y, fit[0], fit[1], dims, r.x, r.y, r.x + r.w, bottom),
-            .none => {},
+        const room = right - x;
+        if (room < lh * 4) break;
+        const fit: [2]f32 = if (it.image != null and d.images != null)
+            fitImage(it.w, it.h, @min(room, @max(lh * 4, r.w * 0.6)), img_h)
+        else
+            .{ 0, 0 };
+        const cap_w = @min(room, @max(fit[0], @min(textWidth(ui, it.caption), lh * 12)));
+        _ = tv.text(ui, x, top, clipText(ui, it.caption, cap_w, false), toneColor(.muted), false);
+        if (fit[0] >= 1 and fit[1] >= 1) {
+            switch (tv.img.prepare(d.images.?, it.image.?, @intFromFloat(fit[0]), @intFromFloat(fit[1]), tex_w, tex_h)) {
+                .image => |uv| if (images.clip(x, img_y, fit[0], fit[1], uv, r.x, top, right, bottom)) |c| {
+                    tv.pushA(c.rect[0], c.rect[1], c.rect[2], c.rect[3], c.uv, .{ 255, 255, 255 }, 255);
+                },
+                .placeholder => |dims| tv.placeholder(ui, x, img_y, fit[0], fit[1], dims, r.x, top, right, bottom),
+                .none => {},
+            }
         }
-        y += fit[1] + pad * 1.5;
+        x += @max(fit[0], cap_w) + pad * 2;
     }
 }
 
@@ -896,22 +968,21 @@ fn zoomed(tv: *const TermView, em: f32) f32 {
     return std.math.clamp(@round(em * z * 2) / 2, 5, 120);
 }
 
-/// Font metrics for the grid: fitted to cols x rows, or the fixed size.
+/// Font metrics for the grid: fitted to the remote grid (fitEm), or the
+/// fixed size.
 fn cellMetrics(tv: *TermView, grid: *const Grid, w: f32, h: f32, s: f32) fontset.Metrics {
     switch (tv.sizing) {
         .fixed_em => |em| return tv.fonts.metrics(tv.zoomed(@round(em * s * 2) / 2)),
         .fit_grid => {},
     }
     const cols = @max(grid.cols, 1);
-    const rows = @max(grid.rows, 1);
     const asp = tv.fonts.aspect();
     const pad = 4 * s;
     const aw = @max(1, w - 2 * pad);
-    const ah = @max(1, h - 2 * pad);
-    var em = @min(aw / (@as(f32, @floatFromInt(cols)) * asp.w_per_em), ah / (@as(f32, @floatFromInt(rows)) * asp.h_per_em));
-    em = std.math.clamp(@floor(em * 2) / 2, 5, 40 * s);
+    var em = fitEm(aw, @max(1, h - 2 * pad), cols, @max(grid.rows, 1), asp.w_per_em, asp.h_per_em, s);
     var m = tv.fonts.metrics(em);
-    while (em > 5 and (@as(f32, @floatFromInt(m.cell_w * cols)) > aw or @as(f32, @floatFromInt(m.cell_h * rows)) > ah)) {
+    // Rounding must never push the columns past the edge.
+    while (em > 5 and @as(f32, @floatFromInt(m.cell_w * cols)) > aw) {
         em -= 0.5;
         m = tv.fonts.metrics(em);
     }
@@ -919,20 +990,62 @@ fn cellMetrics(tv: *TermView, grid: *const Grid, w: f32, h: f32, s: f32) fontset
     return m;
 }
 
+/// Smallest font size (logical px) `fitEm` shrinks to for the rows' sake.
+pub const readable_em: f32 = 12;
+
+/// The remote grid's font size (em, device px) in a `w x h` px terminal
+/// slice: the size at which its columns fill the width, made smaller to
+/// show every row too, but not below `readable_em` (then the rows scroll,
+/// see `followTop`; the columns always fit). Between 5 px and 32 logical px.
+pub fn fitEm(w: f32, h: f32, cols: u16, rows: u16, w_per_em: f32, h_per_em: f32, s: f32) f32 {
+    const by_w = w / (@as(f32, @floatFromInt(@max(cols, 1))) * @max(w_per_em, 0.01));
+    const by_h = h / (@as(f32, @floatFromInt(@max(rows, 1))) * @max(h_per_em, 0.01));
+    // Unknown width (NaN, inf, <= 0): the smallest size.
+    if (!std.math.isFinite(by_w) or !(by_w > 0)) return 5;
+    const em = @min(by_w, @max(if (std.math.isFinite(by_h)) by_h else 0, readable_em * s));
+    return std.math.clamp(@floor(em * 2) / 2, 5, @max(5, 32 * s));
+}
+
+/// The first grid row to show when only `visible` of `rows` fit: the
+/// lowest rows with content (`last`: the last non-blank row), keeping the
+/// cursor in view; 0 when everything fits.
+pub fn followTop(rows: u16, visible: u16, cursor: u16, last: u16) u16 {
+    if (visible == 0 or visible >= rows) return 0;
+    const bottom = @max(cursor, last);
+    var first = (bottom + 1) -| visible;
+    first = @min(first, rows - visible);
+    return @min(first, cursor);
+}
+
+/// The last row of `g` with a visible character (0 if none).
+fn lastContentRow(g: *const Grid) u16 {
+    var y: usize = g.rows;
+    while (y > 0) {
+        y -= 1;
+        for (g.row(y)) |c| if (c.cp != ' ' and c.cp != 0) return @intCast(y);
+    }
+    return 0;
+}
+
 fn drawGrid(tv: *TermView, g: *const Grid, sel: ?Selection, m: fontset.Metrics, W: f32, y0: f32, area_h: f32, s: f32) void {
     const cw: f32 = @floatFromInt(m.cell_w);
     const ch: f32 = @floatFromInt(m.cell_h);
     const gw = cw * @as(f32, @floatFromInt(g.cols));
-    const gh = ch * @as(f32, @floatFromInt(g.rows));
-    // Centre when it fits; pin to the top-left when zoomed past the window.
-    const ox = @round(@max(4 * s, (W - gw) / 2));
-    const oy = y0 + @round(@max(4 * s, (area_h - gh) / 2));
+    const pad = @round(4 * s);
+    // Rows that fit; the rest scroll out at the top (followTop).
+    const fit_rows: u16 = @intFromFloat(std.math.clamp(@floor((area_h - 2 * pad) / ch), 1, @as(f32, @floatFromInt(g.rows))));
+    const first = followTop(g.rows, fit_rows, g.cursor_y, lastContentRow(g));
+    const gh = ch * @as(f32, @floatFromInt(g.rows - first));
+    // Centred across, top-aligned (no empty band above the terminal);
+    // pinned to the left when zoomed past the window.
+    const ox = @round(@max(pad, (W - gw) / 2));
+    const oy = y0 + pad;
     const H = y0 + area_h;
-    tv.layout = .{ .ox = ox, .oy = oy, .cw = cw, .ch = ch, .cols = g.cols, .rows = g.rows };
+    tv.layout = .{ .ox = ox, .oy = oy, .cw = cw, .ch = ch, .cols = g.cols, .rows = g.rows, .first_row = first };
     const t = tv.theme;
     // Pass 1: cell backgrounds (cursor and selection come later, over images).
-    for (0..g.rows) |y| {
-        const py = oy + ch * @as(f32, @floatFromInt(y));
+    for (first..g.rows) |y| {
+        const py = oy + ch * @as(f32, @floatFromInt(y - first));
         if (py >= H) break;
         for (g.row(y), 0..) |c, x| {
             if (c.kind == .continuation) continue;
@@ -946,11 +1059,11 @@ fn drawGrid(tv: *TermView, g: *const Grid, sel: ?Selection, m: fontset.Metrics, 
     }
     // Pass 2: inline images, clipped to the grid and the window.
     const n_inst = tv.instances.items.len;
-    tv.drawImages(g, m, ox, oy, @min(ox + gw, W), @min(oy + gh, H));
+    tv.drawImages(g, m, ox, oy - ch * @as(f32, @floatFromInt(first)), oy, @min(ox + gw, W), @min(oy + gh, H));
     const has_images = tv.instances.items.len > n_inst;
     // Pass 3: cursor, selection, glyphs and decorations.
-    for (0..g.rows) |y| {
-        const py = oy + ch * @as(f32, @floatFromInt(y));
+    for (first..g.rows) |y| {
+        const py = oy + ch * @as(f32, @floatFromInt(y - first));
         if (py >= H) break;
         for (g.row(y), 0..) |c, x| {
             if (c.kind == .continuation) continue;
@@ -983,7 +1096,9 @@ fn drawGrid(tv: *TermView, g: *const Grid, sel: ?Selection, m: fontset.Metrics, 
 }
 
 /// Pushes the grid's image placements (above backgrounds, below text).
-fn drawImages(tv: *TermView, g: *const Grid, m: fontset.Metrics, ox: f32, oy: f32, clip_x1: f32, clip_y1: f32) void {
+/// (ox, oy): row 0's corner (above the slice when rows scrolled out);
+/// clip_y0: the top of the first row drawn.
+fn drawImages(tv: *TermView, g: *const Grid, m: fontset.Metrics, ox: f32, oy: f32, clip_y0: f32, clip_x1: f32, clip_y1: f32) void {
     const cw: f32 = @floatFromInt(m.cell_w);
     const ch: f32 = @floatFromInt(m.cell_h);
     for (g.images.placements.items) |p| {
@@ -991,14 +1106,14 @@ fn drawImages(tv: *TermView, g: *const Grid, m: fontset.Metrics, ox: f32, oy: f3
         const y = oy + ch * @as(f32, @floatFromInt(p.row));
         const w = cw * @as(f32, @floatFromInt(p.cols));
         const h = ch * @as(f32, @floatFromInt(p.rows));
-        if (x >= clip_x1 or y >= clip_y1 or x + w <= ox or y + h <= oy) continue;
+        if (x >= clip_x1 or y >= clip_y1 or x + w <= ox or y + h <= clip_y0) continue;
         const dw: u32 = @intCast(@min(@as(u64, m.cell_w) * p.cols, 1 << 16));
         const dh: u32 = @intCast(@min(@as(u64, m.cell_h) * p.rows, 1 << 16));
         switch (tv.img.prepare(&g.images, p.id, dw, dh, tex_w, tex_h)) {
-            .image => |uv| if (images.clip(x, y, w, h, uv, ox, oy, clip_x1, clip_y1)) |c| {
+            .image => |uv| if (images.clip(x, y, w, h, uv, ox, clip_y0, clip_x1, clip_y1)) |c| {
                 tv.pushA(c.rect[0], c.rect[1], c.rect[2], c.rect[3], c.uv, .{ 255, 255, 255 }, 255);
             },
-            .placeholder => |dims| tv.placeholder(m, x, y, w, h, dims, ox, oy, clip_x1, clip_y1),
+            .placeholder => |dims| tv.placeholder(m, x, y, w, h, dims, ox, clip_y0, clip_x1, clip_y1),
             .none => {},
         }
     }
@@ -1057,16 +1172,29 @@ fn drawMessage(tv: *TermView, ui: fontset.Metrics, msg: Message, W: f32, y0: f32
     if (msg.detail.len > 0) _ = tv.text(ui, centreX(W, textWidth(ui, msg.detail)), y, msg.detail, toneColor(msg.detail_tone), false);
 }
 
-fn drawAnswerBar(tv: *TermView, ui: fontset.Metrics, y: f32, W: f32, h: f32, s: f32) void {
+/// The answer buttons: one row, centred, all the same width (at least
+/// five cells), sized from the pane so they are easy to hit.
+fn drawAnswerBar(tv: *TermView, m: fontset.Metrics, y: f32, W: f32, h: f32, s: f32) void {
     tv.rect(0, y, W, h, ui_bg);
-    const gap = @round(6 * s);
-    const bh = @round(h * 0.72);
+    const gap = @round(8 * s);
+    const bh = @round(h * 0.78);
     const by = y + @round((h - bh) / 2);
-    var total: f32 = 0;
-    for (input.answers) |a| total += textWidth(ui, a.label) + 2 * @as(f32, @floatFromInt(ui.cell_w)) + gap;
-    var x = @round(@max(gap, (W - total + gap) / 2));
+    const cw: f32 = @floatFromInt(m.cell_w);
+    var bw: f32 = cw * 5;
+    for (input.answers) |a| bw = @max(bw, textWidth(m, a.label) + 2 * cw);
+    const n: f32 = @floatFromInt(input.answers.len);
+    // Narrow window: shrink to fit.
+    bw = @max(cw * 2, @min(bw, @floor((W - gap * (n + 1)) / n)));
+    var x = @round(@max(gap, (W - (bw * n + gap * (n - 1))) / 2));
     for (input.answers) |a| {
-        x += tv.addButton(ui, x, by, bh, a.label, .{ .x = 0, .y = 0, .w = 0, .h = 0, .action = .{ .answer = a.key } }) + gap;
+        tv.rect(x, by, bw, bh, button_bg);
+        const lw = textWidth(m, a.label);
+        _ = tv.text(m, x + @round(@max(0, (bw - lw) / 2)), by + @round((bh - @as(f32, @floatFromInt(m.cell_h))) / 2), clipText(m, a.label, bw, false), button_fg, true);
+        if (tv.n_buttons < tv.buttons.len) {
+            tv.buttons[tv.n_buttons] = .{ .x = x, .y = by, .w = bw, .h = bh, .action = .{ .answer = a.key } };
+            tv.n_buttons += 1;
+        }
+        x += bw + gap;
     }
 }
 
@@ -1091,6 +1219,8 @@ const panel_bg: Rgb = .{ 0x26, 0x2A, 0x31 };
 const panel_edge: Rgb = .{ 0x4A, 0x52, 0x5E };
 const field_bg: Rgb = .{ 0x17, 0x19, 0x1D };
 const focus_edge: Rgb = .{ 0x6C, 0xA8, 0xE8 };
+/// Send: the interaction slice's main action.
+const send_bg: Rgb = .{ 0x2F, 0x5F, 0xD0 };
 
 /// Byte length of the next line of `s` that fits `max_w` pixels: breaks
 /// after the last space that fits, or mid-word if a word alone is too
@@ -1194,6 +1324,15 @@ fn panelButton(tv: *TermView, m: fontset.Metrics, x: f32, y: f32, h: f32, b: Pan
     return w;
 }
 
+/// The input box's Send: a `w` wide button, label centred.
+fn sendButton(tv: *TermView, m: fontset.Metrics, x: f32, y: f32, w: f32, h: f32, b: PanelButton, s: f32) void {
+    tv.rect(x, y, w, h, send_bg);
+    if (b.focused) tv.outline(x, y, w, h, @max(2, @round(2 * s)), focus_edge);
+    const lw = textWidth(m, b.label);
+    _ = tv.text(m, x + @round(@max(0, (w - lw) / 2)), y + @round((h - @as(f32, @floatFromInt(m.cell_h))) / 2), clipText(m, b.label, w, false), button_fg, true);
+    tv.registerButton(x, y, w, h, b.id);
+}
+
 /// One layout pass over the panel's contents, inside the box at (x, y0)
 /// with inner width `w`. Returns the height used. Measuring and drawing
 /// share this code so they always agree.
@@ -1288,12 +1427,12 @@ fn drawPanel(tv: *TermView, ui: fontset.Metrics, p: Panel, W: f32, H: f32, s: f3
 // ------------------------------------------------------------ bottom panes
 
 /// A pane's height in pixels: its own, or its content's natural height.
-fn paneHeight(ui: fontset.Metrics, p: Pane, s: f32) f32 {
+fn paneHeight(m: fontset.Metrics, p: Pane, s: f32) f32 {
     if (p.height > 0) return @round(p.height * s);
-    const ch: f32 = @floatFromInt(ui.cell_h);
+    const ch: f32 = @floatFromInt(m.cell_h);
     return switch (p.content) {
-        .answers, .buttons => @round(ch * 2.4),
-        .field => @round(ch * 2.6),
+        .answers, .buttons => @round(ch * 2.6),
+        .field => @round(ch * 2.8),
     };
 }
 
@@ -1313,14 +1452,22 @@ fn drawPane(tv: *TermView, ui: fontset.Metrics, p: Pane, r: Rect, s: f32) void {
         },
         .field => |f| {
             tv.rect(r.x, r.y, r.w, r.h, ui_bg);
-            const pad = @round(6 * s);
-            const box: Rect = .{ .x = r.x + pad, .y = r.y + pad, .w = @max(1, r.w - 2 * pad), .h = @max(1, r.h - 2 * pad) };
+            const pad = @round(8 * s);
+            // Send at the right end, as tall as the box.
+            var send_w: f32 = 0;
+            if (p.send) |b| {
+                const bh = @max(1, r.h - 2 * pad);
+                const bw = @max(textWidth(ui, b.label) + 4 * @as(f32, @floatFromInt(ui.cell_w)), @as(f32, @floatFromInt(ui.cell_w)) * 8);
+                tv.sendButton(ui, r.x + r.w - pad - bw, r.y + pad, bw, bh, b, s);
+                send_w = bw + pad;
+            }
+            const box: Rect = .{ .x = r.x + pad, .y = r.y + pad, .w = @max(1, r.w - 2 * pad - send_w), .h = @max(1, r.h - 2 * pad) };
             tv.rect(box.x, box.y, box.w, box.h, field_bg);
             tv.outline(box.x, box.y, box.w, box.h, if (f.focused) @max(2, @round(2 * s)) else @max(1, @round(s)), if (f.focused) focus_edge else panel_edge);
             const cw: f32 = @floatFromInt(ui.cell_w);
             const lh: f32 = @floatFromInt(ui.cell_h);
             const tx = box.x + cw;
-            const ty = box.y + @round(@min(cw, (box.h - lh) / 2));
+            const ty = box.y + @round((box.h - lh) / 2);
             const inner = box.w - 2 * cw;
             if (f.value.len == 0) {
                 // The hint stays visible in an empty focused box, after the cursor.
@@ -1336,11 +1483,12 @@ fn drawPane(tv: *TermView, ui: fontset.Metrics, p: Pane, r: Rect, s: f32) void {
     }
 }
 
-test "data column sizing and image fitting" {
-    try std.testing.expectEqual(@as(f32, 0), dataWidth(500, 1, 0.34)); // too narrow
-    try std.testing.expectEqual(@as(f32, 340), dataWidth(1000, 1, 0.34));
-    try std.testing.expectEqual(@as(f32, 440), dataWidth(1290, 2, 0.34)); // at least 220 logical px
-    try std.testing.expectEqual(@as(f32, 600), dataWidth(1200, 1, 0.9)); // at most half
+test "data slice sizing and image fitting" {
+    // A header strip while empty or collapsed; grows with content, capped.
+    try std.testing.expectEqual(@as(f32, 26), dataHeight(500, 26, 0, false));
+    try std.testing.expectEqual(@as(f32, 26), dataHeight(500, 26, 300, true));
+    try std.testing.expectEqual(@as(f32, 26 + 80), dataHeight(500, 26, 80, false));
+    try std.testing.expectEqual(@floor(500 * data_max_share), dataHeight(500, 26, 900, false));
     // Aspect kept, at most 2x, fits the box.
     try std.testing.expectEqual([2]f32{ 8, 4 }, fitImage(4, 2, 300, 300));
     try std.testing.expectEqual([2]f32{ 300, 150 }, fitImage(640, 320, 300, 300));
@@ -1355,4 +1503,28 @@ test "Rect contains" {
     try std.testing.expect(r.contains(10, 20));
     try std.testing.expect(!r.contains(15, 20));
     try std.testing.expect(!r.contains(9.9, 22));
+}
+
+test "remote grid font: fills the width, readable minimum, rows follow the cursor" {
+    // 120 x 40 cells (0.6 x 1.2 em) in 990 x 470 px at scale 1: the width
+    // allows 13.75, the height 9.79: the readable minimum (12) wins and the
+    // rows scroll.
+    try std.testing.expectEqual(@as(f32, 12), fitEm(990, 470, 120, 40, 0.6, 1.2, 1));
+    // Plenty of height: the width decides.
+    try std.testing.expectEqual(@as(f32, 13.5), fitEm(990, 2000, 120, 40, 0.6, 1.2, 1));
+    // Small grid: capped at 32 logical px.
+    try std.testing.expectEqual(@as(f32, 32), fitEm(2000, 2000, 20, 5, 0.6, 1.2, 1));
+    try std.testing.expectEqual(@as(f32, 64), fitEm(4000, 4000, 20, 5, 0.6, 1.2, 2));
+    // Very narrow: the columns still fit (below the readable size).
+    try std.testing.expectEqual(@as(f32, 5), fitEm(100, 500, 120, 40, 0.6, 1.2, 1));
+    try std.testing.expectEqual(@as(f32, 5), fitEm(std.math.nan(f32), 0, 0, 0, 0, 0, 1));
+    // Everything fits: from the top.
+    try std.testing.expectEqual(@as(u16, 0), followTop(30, 30, 29, 29));
+    try std.testing.expectEqual(@as(u16, 0), followTop(30, 40, 5, 5));
+    // A fresh screen, cursor near the top: the top.
+    try std.testing.expectEqual(@as(u16, 0), followTop(40, 25, 3, 3));
+    // Content to the bottom: the bottom rows.
+    try std.testing.expectEqual(@as(u16, 15), followTop(40, 25, 30, 39));
+    // Content below the cursor, but the cursor stays in view.
+    try std.testing.expectEqual(@as(u16, 10), followTop(40, 5, 10, 39));
 }

@@ -1487,8 +1487,11 @@ const text_warning =
     \\
 ;
 
-/// How long viewers get to receive the exit notice and disconnect.
-const viewer_goodbye_ms = 2_000;
+/// How long viewers get to receive the exit notice and close their end
+/// (web.goodbye_ms each, concurrently), plus the TLS close and socket
+/// close after it. Shutdown returns as soon as the last viewer socket is
+/// closed; this only bounds a viewer that never answers.
+const viewer_goodbye_ms = web.goodbye_ms + 1_500;
 
 const Threads = struct {
     /// Console mode: one thread blocks on the console input handle and wakes
@@ -1967,7 +1970,10 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     hub.mutex.lockUncancelable(io);
     const code: u32 = if (all_ended) hub.last_code else 1;
     hub.mutex.unlock(io);
-    log.print("stop: {s}, exit code {d}", .{ if (all_ended) "every tab ended" else "tabs did not end in time", code });
+    // The last tab's program's code (the same line as before tabs).
+    if (all_ended) {
+        log.print("stop: child exited with code {d} (every tab has ended)", .{code});
+    } else log.print("stop: tabs did not end in time, exit code {d}", .{code});
     // Viewers receive the exit notice, then disconnect: wait for that
     // (event-driven), at most viewer_goodbye_ms.
     hub.waitViewersGone(Io.Clock.awake.now(io).toMilliseconds() + viewer_goodbye_ms);

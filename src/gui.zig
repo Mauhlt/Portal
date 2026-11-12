@@ -23,6 +23,15 @@
 //!
 //! The person at the desk has full control (localinput.zig), unlike remote
 //! viewers, whose input is filtered by `--input` (keymap.zig).
+//!
+//! Layout (docs/layout-design.md), as on every device: top bar, terminal,
+//! the Data slice (dataview.zig: what the session pushed; a thin strip
+//! until there is something), the interaction slice (answer buttons, the
+//! input box with Send), status line. Typing goes to the terminal unless
+//! the input box has focus (a click on it; Esc on an empty box or a click
+//! on the terminal gives the keyboard back). Send types the box's text and
+//! presses Enter (an answer word presses its key), like a remote viewer in
+//! `text` mode; the answer buttons press their keys.
 
 const std = @import("std");
 const view = @import("view");
@@ -40,7 +49,11 @@ const guard = @import("guard.zig");
 const pki = @import("tls/pki.zig");
 const web = @import("web.zig");
 const sync = @import("sync.zig");
-const sync_manifest = @import("client").sync.manifest;
+const client = @import("client");
+const sync_manifest = client.sync.manifest;
+const inputline = client.inputline;
+const dataview = client.dataview;
+const rules = @import("inputrules");
 
 /// Font size of the local terminal, in logical pixels (zoom with Ctrl+= / -).
 pub const font_em: f32 = 15;
@@ -130,6 +143,14 @@ const Select = struct {
     }
 };
 
+/// Ids of the window's own controls (clear of deskui.id's ranges).
+const ctl = struct {
+    const line: u32 = 30;
+    const send: u32 = 31;
+    const data_toggle: u32 = 32;
+    const data_clear: u32 = 33;
+};
+
 /// The top bar's desk actions (keyboard: Ctrl+Shift+P / D / E / S).
 const top_buttons = [_]TermView.TopButton{
     .{ .label = "Pair a device\u{2026}", .id = deskui.id.tb_pair },
@@ -180,6 +201,13 @@ pub const LocalHost = struct {
     until_len: usize = 0,
     /// runSetup: the panel was submitted.
     setup_submitted: bool = false,
+    /// The interaction slice's input box (text mode: the desk has full
+    /// control) and whether it has the keyboard.
+    line: inputline.Line = .{ .policy = .text },
+    line_focus: bool = false,
+    /// The Data slice.
+    data: dataview.DataView = .{},
+    panes: [1]TermView.Pane = undefined,
 
     const title_max = title.max_title_bytes;
 
@@ -208,7 +236,10 @@ pub const LocalHost = struct {
 
     /// Cells that fit the window now: the PTY's initial size.
     pub fn initialSize(h: *LocalHost) [2]u16 {
-        h.tv.build(&h.grid, .{ .top_bar = .{} });
+        // The same slices as a running frame, so the PTY starts at its size.
+        var right_buf: [64]u8 = undefined;
+        var status_buf: [200]u8 = undefined;
+        h.tv.build(&h.grid, h.overlay(&right_buf, &status_buf));
         const c = h.tv.capacity;
         return .{ @max(c[0], 20), @max(c[1], 5) };
     }
@@ -377,6 +408,8 @@ pub const LocalHost = struct {
         h.viewers = hub.viewers;
         hub.mutex.unlock(h.io);
         if (old) |o| o.release();
+        // New images become Data items (h.grid is ours: no lock needed).
+        if (changed) _ = h.data.sync(h.gpa, &h.grid.images);
 
         if (changed) h.clampSelection();
         if (!force and !changed and !list_changed and old == null and !h.tv.needsRedraw() and h.viewers == h.drawn_viewers) return;
@@ -416,7 +449,19 @@ pub const LocalHost = struct {
                 .close_id = tab_close0 + @as(u32, @intCast(i)),
             };
         }
+        const lv = h.line.snapshot();
+        h.panes[0] = .{ .content = .{ .field = .{
+            .label = "",
+            .value = lv.text,
+            .hint = if (h.line_focus) "Type, then Enter or Send (Esc: back to the terminal)" else "Click here to type an instruction (keys go to the terminal)",
+            .id = ctl.line,
+            .focused = h.line_focus,
+        } }, .send = .{ .label = "Send", .id = ctl.send } };
+        const line_note = h.line_focus and lv.note.len > 0;
         return .{
+            .data = h.data.slice(ctl.data_toggle, ctl.data_clear),
+            .show_answers = true,
+            .bottom = h.panes[0..1],
             .top_bar = .{
                 .title = windowLabel(h.shownName(), &h.label_buf),
                 .tabs = h.top_tabs[0..h.list.len],
@@ -430,8 +475,12 @@ pub const LocalHost = struct {
             .status = .{
                 .tone = .good,
                 .label = "local session",
-                .extra = remote_input,
-                .extra_tone = if (h.opts.policy == .text) .bad else .muted,
+                .extra = if (line_note) lv.note else remote_input,
+                .extra_tone = if (line_note) switch (lv.note_tone) {
+                    .neutral => .normal,
+                    .ok => .good,
+                    .bad => .bad,
+                } else if (h.opts.policy == .text) .bad else .muted,
                 .right = std.fmt.bufPrint(status_buf, "sharing on {s}", .{h.opts.url}) catch h.opts.url,
             },
             .panel = h.ui.panel(&h.bufs, .{
@@ -720,18 +769,64 @@ pub const LocalHost = struct {
     }
 
     /// Who gets the keyboard (and the mouse): decided here only. A modal
-    /// panel wins over the terminal. A bottom-region input pane (see
-    /// TermView.Layout) would be one more target here.
-    pub const Focus = enum { terminal, panel };
+    /// panel wins; then the input box while it has focus; else the
+    /// terminal.
+    pub const Focus = enum { terminal, panel, line };
 
     fn focus(h: *const LocalHost) Focus {
-        return if (h.ui.open()) .panel else .terminal;
+        if (h.ui.open()) return .panel;
+        return if (h.line_focus) .line else .terminal;
+    }
+
+    /// The input box's frames ('k:' key names, 't:' text; see inputline)
+    /// typed into the local session.
+    const LineSender = struct {
+        h: *LocalHost,
+        pub fn send(ls: LineSender, f: []const u8) bool {
+            const s = ls.h.session() orelse return false;
+            if (f.len < 2) return false;
+            const body = f[2..];
+            switch (f[0]) {
+                'k' => s.writeInput(rules.keyBytes(.text, body) orelse return false),
+                't' => ls.h.typeText(body),
+                else => return false,
+            }
+            return true;
+        }
+    };
+
+    /// Types `text` into the session (as a paste when the program asked
+    /// for bracketed paste, so it is taken literally).
+    fn typeText(h: *LocalHost, text: []const u8) void {
+        const s = h.session() orelse return;
+        s.mutex.lockUncancelable(s.io);
+        const bracketed = s.term.bracketedPaste();
+        s.mutex.unlock(s.io);
+        if (bracketed) s.writeInput(localinput.paste_start);
+        s.writeInput(text);
+        if (bracketed) s.writeInput(localinput.paste_end);
     }
 
     fn onKey(ctx: *anyopaque, key: input.Key, mods: input.Mods) void {
         const h = self(ctx);
+        if (h.focus() != .panel and key == .f2 and !mods.ctrl and !mods.alt and !mods.super) {
+            // F2: collapse / open the Data slice.
+            return h.data.toggle();
+        }
+        // Ctrl+Tab / Ctrl+Shift+Tab: the next / previous tab, wherever the
+        // keyboard is (but not under a modal panel).
+        if (h.focus() != .panel and key == .tab and mods.ctrl and !mods.alt) return h.cycleTab(if (mods.shift) -1 else 1);
         switch (h.focus()) {
             .panel => return h.perform(h.ui.key(key, mods)),
+            .line => {
+                // Esc on an empty box: the keyboard goes back to the terminal.
+                if (key == .escape and h.line.text().len == 0) {
+                    h.line_focus = false;
+                    return;
+                }
+                _ = h.line.onKey(key, mods, LineSender{ .h = h });
+                return;
+            },
             .terminal => {},
         }
         // Ctrl+Tab / Ctrl+Shift+Tab: the next / previous tab (Ctrl+Tab
@@ -835,6 +930,10 @@ pub const LocalHost = struct {
         }
         switch (h.focus()) {
             .panel => return h.perform(h.ui.char(cp, mods)),
+            .line => {
+                _ = h.line.onChar(cp, mods);
+                return;
+            },
             .terminal => {},
         }
         const s = h.session() orelse return;
@@ -843,7 +942,14 @@ pub const LocalHost = struct {
         s.writeInput(localinput.encodeChar(cp, mods, &buf));
     }
 
-    fn onAnswer(_: *anyopaque, _: []const u8) void {} // no answer bar locally
+    /// An answer button: its key, typed into the session.
+    fn onAnswer(ctx: *anyopaque, key: []const u8) void {
+        const h = self(ctx);
+        if (h.focus() == .panel) return;
+        const s = h.session() orelse return;
+        h.select.active = false;
+        s.writeInput(rules.keyBytes(.text, key) orelse return);
+    }
 
     fn onButton(ctx: *anyopaque, b: u32) void {
         const h = self(ctx);
@@ -852,10 +958,20 @@ pub const LocalHost = struct {
             deskui.id.tb_devices => if (h.desk != null) h.perform(h.ui.openDevices()),
             deskui.id.tb_export => if (h.desk) |d| h.ui.openExport(d.export_default),
             deskui.id.tb_settings => h.openSettings(),
-            tab_add => if (h.focus() == .terminal) h.openTab(),
-            tab_id0...tab_id0 + tabs.max_tabs - 1 => if (h.focus() == .terminal) h.selectTab(b - tab_id0),
-            tab_close0...tab_close0 + tabs.max_tabs - 1 => if (h.focus() == .terminal) h.closeTab(b - tab_close0),
-            else => if (h.focus() == .panel) h.perform(h.ui.button(b)),
+            tab_add => if (h.focus() != .panel) h.openTab(),
+            tab_id0...tab_id0 + tabs.max_tabs - 1 => if (h.focus() != .panel) h.selectTab(b - tab_id0),
+            tab_close0...tab_close0 + tabs.max_tabs - 1 => if (h.focus() != .panel) h.closeTab(b - tab_close0),
+            else => if (h.focus() == .panel) {
+                h.perform(h.ui.button(b));
+            } else switch (b) {
+                ctl.line => h.line_focus = true,
+                ctl.send => {
+                    _ = h.line.onKey(.enter, .{}, LineSender{ .h = h });
+                },
+                ctl.data_toggle => h.data.toggle(),
+                ctl.data_clear => h.data.clear(h.gpa),
+                else => {},
+            },
         }
     }
 
@@ -868,7 +984,9 @@ pub const LocalHost = struct {
 
     fn onMouse(ctx: *anyopaque, m: input.Mouse) void {
         const h = self(ctx);
-        if (h.focus() != .terminal) return; // modal: only its buttons react
+        if (h.focus() == .panel) return; // modal: only its buttons react
+        // A click outside the controls gives the keyboard back to the terminal.
+        if (m.action == .down) h.line_focus = false;
         switch (m.button) {
             .left => switch (m.action) {
                 .down => {

@@ -10,8 +10,8 @@
 //!   instruct  (the default) answer bar plus the instruction line under it,
 //!             which has the keyboard (inputline.zig).
 //!   text      answer bar; typing and the editing keys go to the terminal.
-//! In every mode the Data column (dataview.zig) shows what the session
-//! pushed; F2 shows or hides it.
+//! In every mode the Data slice under the terminal (dataview.zig) shows
+//! what the session pushed; F2 or its Hide button collapses it.
 
 const std = @import("std");
 const view = @import("view");
@@ -30,6 +30,11 @@ pub const cancel_button_id = 2;
 pub const line_field_id = 3;
 /// The top bar's project tabs: tab_id0 + position switches to that tab.
 pub const tab_id0: u32 = 700;
+/// The instruction line's Send button.
+pub const send_button_id = 4;
+/// The Data slice's Hide/Show and Clear buttons.
+pub const data_toggle_id = 5;
+pub const data_clear_id = 6;
 
 /// InputSink that sends protocol key names / text per the server's
 /// `hello.input` mode.
@@ -43,7 +48,7 @@ pub const RemoteSink = struct {
     status: client_mod.Status = .starting,
     /// The instruction line (instruct mode). UI thread only.
     line: inputline.Line = .{},
-    /// The Data column. UI thread only (fed under the shared lock).
+    /// The Data slice. UI thread only (fed under the shared lock).
     data: dataview.DataView = .{},
     /// The tabs as last drawn (button position -> id) and the one shown.
     /// UI thread only, refreshed each frame by the main loop.
@@ -131,7 +136,7 @@ pub const RemoteSink = struct {
         if (r.modalActive()) |m| return m.key(m.ctx, key, mods);
         // Ctrl+Tab (never a protocol key: Ctrl combinations send nothing).
         if (key == .tab and mods.ctrl and !mods.alt and r.status == .connected) return r.cycleTab(if (mods.shift) -1 else 1);
-        // F2 (not a protocol key): show / hide the Data column.
+        // F2 (not a protocol key): collapse / open the Data slice.
         if (key == .f2 and !mods.ctrl and !mods.alt and !mods.super) {
             r.data.toggle();
             return r.redraw();
@@ -177,8 +182,23 @@ pub const RemoteSink = struct {
             return;
         }
         if (r.modal) |m| if (m.button(m.ctx, id)) return;
-        if (id == pair_button_id) r.client.requestPairing();
-        if (id == cancel_button_id) r.client.cancelPairing();
+        switch (id) {
+            pair_button_id => r.client.requestPairing(),
+            cancel_button_id => r.client.cancelPairing(),
+            // Send: what Enter in the line does.
+            send_button_id => if (r.focus() == .line) {
+                if (r.line.onKey(.enter, .{}, LineSender{ .client = r.client })) r.redraw();
+            },
+            data_toggle_id => {
+                r.data.toggle();
+                r.redraw();
+            },
+            data_clear_id => {
+                r.data.clear(r.client.gpa);
+                r.redraw();
+            },
+            else => {},
+        }
     }
 
     fn onResized(_: *anyopaque, _: u32, _: u32, _: u16, _: u16) void {
@@ -197,6 +217,8 @@ fn statusWord(st: client_mod.Status) []const u8 {
         .connected => "connected",
         .retrying => "reconnecting",
         .session_ended => "session ended",
+        .desktop_offline => "desktop offline",
+        .network_error => "network error",
         .store_unavailable => "credential store unavailable",
     };
 }
@@ -238,15 +260,16 @@ pub const View = struct {
     detail: []const u8,
     /// The instruction line (shown in instruct mode).
     line: inputline.View = .{},
-    /// The Data column (null: hidden) and the status note while hidden.
-    data: ?TermView.DataColumn = null,
-    data_badge: []const u8 = "",
+    /// The Data slice under the terminal.
+    data: ?TermView.DataSlice = null,
     host: []const u8,
     has_grid: bool,
     /// The request code while waiting for the desk.
     code: ?[4]u8 = null,
     /// The last connection error, if any.
     err: ?anyerror = null,
+    /// The ended session's exit code, kept while the desktop is offline.
+    exit_code: ?i64 = null,
     /// "AB:CD:..." of the pinned Portal CA ("" without TLS).
     pin_fp: []const u8 = "",
     /// The desktop's open tabs and the one shown (protocol v2).
@@ -332,6 +355,19 @@ pub fn overlay(v: View, b: *Bufs) TermView.Overlay {
             o.screen = .{ .message = .{ .title = "Cannot store the device credential", .title_tone = .bad, .detail = v.detail } };
             return o;
         },
+        // A clear end state instead of the last picture behind a status
+        // word: what ended, and whether the desktop is still there.
+        .session_ended, .desktop_offline => {
+            const t = if (v.exit_code) |code| client_mod.endedText(code, &b.txt[3]) else client_mod.offline_text;
+            b.lines[0] = if (st == .session_ended)
+                "Waiting for the desktop to start a new session."
+            else if (v.exit_code != null)
+                client_mod.offline_text ++ "."
+            else
+                "Portal is not answering on the desktop; this window resumes when it runs again.";
+            o.screen = .{ .message = .{ .title = t, .title_tone = .warn, .lines = b.lines[0..1] } };
+            return o;
+        },
         .connected => if (v.mode) |mode| {
             o.show_answers = mode.acceptsAnswers();
             o.status.extra = mode.label();
@@ -343,7 +379,7 @@ pub fn overlay(v: View, b: *Bufs) TermView.Overlay {
                     .hint = rules.placeholder(.instruct),
                     .id = line_field_id,
                     .focused = true,
-                } } };
+                } }, .send = .{ .label = "Send", .id = send_button_id } };
                 o.bottom = b.panes[0..1];
                 if (v.line.note.len > 0) {
                     o.status.extra = std.fmt.bufPrint(&b.extra, "{s}: {s}", .{ mode.label(), v.line.note }) catch mode.label();
@@ -385,7 +421,6 @@ pub fn overlay(v: View, b: *Bufs) TermView.Overlay {
         return o;
     }
     o.data = v.data;
-    if (v.data_badge.len > 0) o.status.right = std.fmt.bufPrint(&b.right, "{s}  \u{00B7}  {s}", .{ v.data_badge, v.host }) catch v.host;
     return o;
 }
 
@@ -431,23 +466,20 @@ test "overlay per input mode: the same features as the browser" {
     try std.testing.expectEqual(@as(usize, 1), o.bottom.len);
     try std.testing.expectEqualStrings("fix it", o.bottom[0].content.field.value);
     try std.testing.expect(o.bottom[0].content.field.focused);
+    try std.testing.expectEqual(@as(u32, send_button_id), o.bottom[0].send.?.id);
     try std.testing.expectEqualStrings("instructions: Sent.", o.status.extra);
     try std.testing.expectEqual(TermView.Tone.good, o.status.extra_tone);
 }
 
-test "overlay: the data column beside the terminal, its badge while hidden" {
+test "overlay: the Data slice under the terminal, not on pairing screens" {
     var b: Bufs = .{};
-    const col: TermView.DataColumn = .{};
-    var v: View = .{ .status = .connected, .mode = .instruct, .detail = "", .host = "h", .has_grid = true, .data = col };
-    try std.testing.expect(overlay(v, &b).data != null);
-    v.data = null;
-    v.data_badge = "2 new in Data (F2)";
+    const sl: TermView.DataSlice = .{ .collapsed = true };
+    var v: View = .{ .status = .connected, .mode = .instruct, .detail = "", .host = "h", .has_grid = true, .data = sl };
     const o = overlay(v, &b);
-    try std.testing.expect(o.data == null);
-    try std.testing.expectEqualStrings("2 new in Data (F2)  \u{00B7}  h", o.status.right);
-    // Pairing screens have no data column.
+    try std.testing.expect(o.data.?.collapsed);
+    try std.testing.expectEqualStrings("h", o.status.right);
+    // Pairing screens have no Data slice.
     v.status = .need_pairing;
-    v.data = col;
     try std.testing.expect(overlay(v, &b).data == null);
 }
 
@@ -472,6 +504,27 @@ test "top bar: the desktop's tabs, the one shown active, no open or close" {
     var tbuf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("Portal \u{2014} Beta \u{2014} connected", title(.connected, "Beta", &tbuf));
     try std.testing.expectEqualStrings("Portal \u{2014} reconnecting", title(.retrying, null, &tbuf));
+}
+
+test "overlay: session ended, then desktop offline, are explicit screens" {
+    var b: Bufs = .{};
+    const ended = overlay(.{ .status = .session_ended, .mode = .keys, .detail = "", .host = "h", .has_grid = true, .exit_code = 1 }, &b);
+    try std.testing.expectEqualStrings("session ended", ended.status.label);
+    try std.testing.expectEqualStrings("Session ended on the desktop (exit code 1)", ended.screen.message.title);
+    try std.testing.expectEqualStrings("Waiting for the desktop to start a new session.", ended.screen.message.lines[0]);
+    try std.testing.expect(!ended.show_answers);
+    const off = overlay(.{ .status = .desktop_offline, .mode = null, .detail = "", .host = "h", .has_grid = true, .exit_code = 1, .err = error.ConnectionRefused }, &b);
+    try std.testing.expectEqualStrings("desktop offline", off.status.label);
+    try std.testing.expectEqualStrings("Session ended on the desktop (exit code 1)", off.screen.message.title);
+    try std.testing.expectEqualStrings("Desktop offline \u{2014} reconnects automatically.", off.screen.message.lines[0]);
+    // Offline without an ended session (the desktop was off from the start).
+    const cold = overlay(.{ .status = .desktop_offline, .mode = null, .detail = "", .host = "h", .has_grid = false, .err = error.TimedOut }, &b);
+    try std.testing.expectEqualStrings("Desktop offline \u{2014} reconnects automatically", cold.screen.message.title);
+    // A network error keeps the picture and says so in the status line.
+    const net_err = overlay(.{ .status = .network_error, .mode = null, .detail = "Network error: network unreachable", .host = "h", .has_grid = true, .err = error.NetworkUnreachable }, &b);
+    try std.testing.expectEqualStrings("network error", net_err.status.label);
+    try std.testing.expect(net_err.screen == .grid);
+    try std.testing.expectEqualStrings("Network error: network unreachable", net_err.status.extra);
 }
 
 test "keyboard focus: the instruction line in instruct mode only" {
