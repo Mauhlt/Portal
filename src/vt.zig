@@ -327,6 +327,29 @@ fn fixWide(row: []Cell) void {
     }
 }
 
+/// OSC 7501 program status (docs/tabs-design.md): `ESC ] 7501 ; state=<s>
+/// [:kind=<k>][:app=<name>][:msg=<base64>] ST`, as described at
+/// https://mitchellh.com/writing/program-status-osc7501. Only the state is
+/// kept; kind, app and msg are program-controlled strings and are dropped.
+pub const ProgramState = enum { unknown, working, waiting, idle, done, failed };
+
+/// The state in an OSC 7501 payload (after "7501;"). Fields are separated
+/// by ':' or ';'; an unknown or missing state is `unknown`.
+pub fn parseProgramState(payload: []const u8) ProgramState {
+    var it = std.mem.tokenizeAny(u8, payload, ":;");
+    while (it.next()) |f| {
+        if (!std.mem.startsWith(u8, f, "state=")) continue;
+        const v = f["state=".len..];
+        const map = [_]struct { []const u8, ProgramState }{
+            .{ "working", .working }, .{ "blocked", .waiting }, .{ "idle", .idle },
+            .{ "done", .done },       .{ "error", .failed },
+        };
+        for (map) |m| if (std.mem.eql(u8, v, m[0])) return m[1];
+        return .unknown;
+    }
+    return .unknown;
+}
+
 pub const Terminal = struct {
     gpa: Allocator,
     cols: u16,
@@ -353,6 +376,10 @@ pub const Terminal = struct {
     parser: Parser = .{},
     title_buf: [max_title_bytes]u8 = @splat(0),
     title_len: u16 = 0,
+    /// The program's last OSC 7501 status, and a counter bumped whenever it
+    /// changes (see `setProgramState`).
+    program_state: ProgramState = .unknown,
+    program_state_gen: u64 = 0,
     /// Inline images and their placements (per screen).
     images: gfx.Graphics = .{},
 
@@ -1070,8 +1097,18 @@ pub const Terminal = struct {
         p.osc_len = 0;
         const semi = std.mem.indexOfScalar(u8, data, ';') orelse return;
         const cmd = data[0..semi];
+        if (std.mem.eql(u8, cmd, "7501")) return t.setProgramState(parseProgramState(data[semi + 1 ..]));
         if (!std.mem.eql(u8, cmd, "0") and !std.mem.eql(u8, cmd, "2")) return;
         t.setTitle(data[semi + 1 ..]);
+    }
+
+    /// OSC 7501 (program status): what the program says it is doing.
+    /// Untrusted (any output can contain it): it only changes a tab's
+    /// highlight. Not a visible change, so `gen` is not bumped.
+    fn setProgramState(t: *Terminal, s: ProgramState) void {
+        if (s == t.program_state) return;
+        t.program_state = s;
+        t.program_state_gen +%= 1;
     }
 
     /// Stores a sanitised copy: valid UTF-8, no controls or zero-width
@@ -2256,6 +2293,30 @@ test "generations" {
     const g2 = t.gen;
     t.feed("\x1b[3;3H\x1b[?2004h"); // no visible change
     try testing.expectEqual(g2, t.gen);
+}
+
+test "OSC 7501 program state" {
+    var t = try Terminal.init(testing.allocator, 20, 3);
+    defer t.deinit();
+    try testing.expectEqual(ProgramState.unknown, t.program_state);
+    const g0 = t.gen;
+    t.feed("\x1b]7501;state=blocked:kind=permission:app=claude\x07");
+    try testing.expectEqual(ProgramState.waiting, t.program_state);
+    try testing.expectEqual(@as(u64, 1), t.program_state_gen);
+    try testing.expectEqual(g0, t.gen); // not a visible change
+    try testing.expectEqualStrings("", t.title()); // nothing leaks into the title
+    t.feed("\x1b]7501;state=working\x1b\\");
+    try testing.expectEqual(ProgramState.working, t.program_state);
+    t.feed("\x1b]7501;state=working\x07"); // unchanged: no bump
+    try testing.expectEqual(@as(u64, 2), t.program_state_gen);
+    t.feed("\x1b]7501;app=x;state=error\x07");
+    try testing.expectEqual(ProgramState.failed, t.program_state);
+    t.feed("\x1b]7501;state=evil\x07");
+    try testing.expectEqual(ProgramState.unknown, t.program_state);
+    try testing.expectEqual(ProgramState.done, parseProgramState("state=done:msg=aGk="));
+    try testing.expectEqual(ProgramState.idle, parseProgramState("state=idle"));
+    try testing.expectEqual(ProgramState.unknown, parseProgramState("kind=permission"));
+    try testing.expectEqual(ProgramState.unknown, parseProgramState(""));
 }
 
 test "OSC title and truncation" {

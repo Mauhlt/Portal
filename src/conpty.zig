@@ -174,6 +174,14 @@ pub const Pty = struct {
     pub fn terminate(p: *Pty) void {
         _ = w.TerminateJobObject(p.job, 1);
     }
+
+    /// After the child has exited and the output has drained (a closed
+    /// tab): closes the output pipe and the job, which ends anything the
+    /// program left running (KILL_ON_JOB_CLOSE).
+    pub fn release(p: *Pty) void {
+        _ = w.CloseHandle(p.out_read);
+        _ = w.CloseHandle(p.job);
+    }
 };
 
 // ------------------------------------------------------------- elevation

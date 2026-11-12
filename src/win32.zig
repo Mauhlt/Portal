@@ -306,3 +306,44 @@ pub extern "kernel32" fn GetSystemTimeAsFileTime(ft: *FILETIME) callconv(.winapi
 pub extern "kernel32" fn FileTimeToLocalFileTime(ft: *const FILETIME, local: *FILETIME) callconv(.winapi) BOOL;
 pub extern "kernel32" fn FileTimeToSystemTime(ft: *const FILETIME, st: *SYSTEMTIME) callconv(.winapi) BOOL;
 pub extern "user32" fn MessageBoxW(hwnd: ?*anyopaque, text: [*:0]const u16, caption: [*:0]const u16, flags: u32) callconv(.winapi) i32;
+
+// ---- folder picker (the window's "open a project", Ctrl+Shift+T)
+
+pub const BROWSEINFOW = extern struct {
+    hwndOwner: ?*anyopaque = null,
+    pidlRoot: ?*anyopaque = null,
+    pszDisplayName: ?[*]u16 = null,
+    lpszTitle: ?[*:0]const u16 = null,
+    ulFlags: u32 = 0,
+    lpfn: ?*anyopaque = null,
+    lParam: isize = 0,
+    iImage: i32 = 0,
+};
+pub const BIF_RETURNONLYFSDIRS = 0x0001;
+pub const BIF_NEWDIALOGSTYLE = 0x0040;
+pub extern "shell32" fn SHBrowseForFolderW(bi: *BROWSEINFOW) callconv(.winapi) ?*anyopaque;
+pub extern "shell32" fn SHGetPathFromIDListEx(pidl: *anyopaque, path: [*]u16, cch: DWORD, flags: u32) callconv(.winapi) BOOL;
+pub extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: DWORD) callconv(.winapi) i32;
+pub extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.winapi) void;
+pub extern "user32" fn GetForegroundWindow() callconv(.winapi) ?*anyopaque;
+
+/// The system folder picker (modal, on the calling GUI thread). Returns
+/// the chosen folder (WTF-16, in `buf`), or null if cancelled.
+pub fn pickFolder(buf: []u16, prompt: [*:0]const u16) ?[]const u16 {
+    _ = CoInitializeEx(null, 0x2); // apartment threaded; S_FALSE/changed mode are fine
+    var name: [260]u16 = undefined;
+    var bi: BROWSEINFOW = .{
+        .hwndOwner = GetForegroundWindow(),
+        .pszDisplayName = &name,
+        .lpszTitle = prompt,
+        .ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
+    };
+    const pidl = SHBrowseForFolderW(&bi) orelse return null;
+    defer CoTaskMemFree(pidl);
+    if (SHGetPathFromIDListEx(pidl, buf.ptr, @intCast(buf.len), 0) == 0) return null;
+    var n: usize = 0;
+    while (n < buf.len and buf[n] != 0) n += 1;
+    if (n == buf.len) return null;
+    if (n == 0) return null;
+    return buf[0..n];
+}

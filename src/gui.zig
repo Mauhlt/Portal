@@ -5,11 +5,19 @@
 //! certificate export. There is no console: everything the desk sees and
 //! types goes through this window.
 //!
+//! Project tabs (tabs.zig): the top bar shows every open project as a
+//! coloured tab (amber while its program waits for an answer); the window
+//! shows one of them. Ctrl+Shift+T (or "+") opens a folder as a new tab,
+//! Ctrl+Shift+W (or a tab's ×) closes the tab shown, Ctrl+Tab /
+//! Ctrl+Shift+Tab or a click switches. Only the desk opens and closes
+//! tabs; paired devices can only switch between them.
+//!
 //! Threads: everything here runs on the main thread (window + message
-//! loop). The PTY output thread feeds `session.term`; this host copies the
-//! dirty rows into its own Grid under `session.mutex` (localgrid.zig), then
-//! builds and presents the frame without holding the lock. Keyboard, paste
-//! and resizes go to the PTY through Session.writeInput / Session.setSize.
+//! loop). Each tab's PTY output thread feeds its `session.term`; this host
+//! copies the shown tab's dirty rows into its own Grid under the hub's
+//! lock (localgrid.zig), then builds and presents the frame without
+//! holding it. Keyboard and paste go to the shown tab's PTY through
+//! Session.writeInput; resizes go to every tab (Hub.setSize).
 //! Pairing changes (a device asked, the store changed) arrive through
 //! web.Server.pairing_notify_fn, which only sets a flag and wakes the loop.
 //!
@@ -20,7 +28,8 @@ const std = @import("std");
 const view = @import("view");
 const TermView = view.TermView;
 const input = view.input;
-const Session = @import("session.zig").Session;
+const tabs = @import("tabs.zig");
+const tabs_wire = @import("shared").tabs;
 const keymap = @import("keymap.zig");
 const localgrid = @import("localgrid.zig");
 const localinput = @import("localinput.zig");
@@ -41,10 +50,6 @@ const max_paste_units = 256 * 1024;
 pub const Options = struct {
     /// The session program's name (e.g. the agent CLI). Not shown in the window.
     command_name: []const u8,
-    /// `--project NAME` (checked with validProject), shown as
-    /// "Portal — NAME". Null: "Portal — No project". (Tabs will supply
-    /// per-project names later.)
-    project: ?[]const u8 = null,
     /// e.g. "127.0.0.1:8420".
     listen_host: []const u8,
     /// e.g. "https://127.0.0.1:8420/", shown in the status line.
@@ -84,9 +89,19 @@ pub const Desk = struct {
     tls_dir: []const u8,
     /// settings.txt as of startup (the Settings panel edits it).
     saved: settings.Settings,
+    /// Opens a folder (absolute) as a new tab: main.openFolder. Returns
+    /// null, or why not.
+    open_ctx: *const anyopaque,
+    open_fn: *const fn (ctx: *const anyopaque, gpa: std.mem.Allocator, hub: *tabs.Hub, dir: []const u8) ?[]const u8,
 };
 
-pub const Ended = enum { window_closed, child_exited };
+pub const Ended = enum { window_closed, finished };
+
+/// Top bar ids for the tabs: tab_id0 + index selects, tab_close0 + index
+/// closes, tab_add opens a folder.
+const tab_id0: u32 = 300;
+const tab_close0: u32 = 320;
+const tab_add: u32 = 340;
 
 const title = @import("title.zig");
 const win32 = @import("win32.zig");
@@ -127,11 +142,17 @@ pub const LocalHost = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     tv: *TermView,
-    /// The session this window shows and types into (null until attach:
-    /// the first-run panel comes before the session). Everything goes
-    /// through this one pointer so a later tab strip (one session per
-    /// project) can switch it; nothing else names a session.
-    session: ?*Session = null,
+    /// The project tabs (null until attach: the first-run panel comes
+    /// before any session).
+    hub: ?*tabs.Hub = null,
+    /// The tab this window shows and types into, with a reference: it
+    /// follows hub.desk_active. Everything goes through this one pointer;
+    /// nothing else names a session.
+    shown: ?*tabs.Tab = null,
+    /// The tab list as of the last frame (for the top bar).
+    list: tabs_wire.List = .{},
+    list_gen: u64 = 0,
+    top_tabs: [tabs.max_tabs]TermView.TopTab = undefined,
     opts: Options = .{ .command_name = "", .listen_host = "", .policy = .keys },
     grid: view.grid.Grid = .{},
     sync: localgrid.Sync = .{},
@@ -150,8 +171,6 @@ pub const LocalHost = struct {
     /// loop is event-driven), and frames presented. Logged at shutdown.
     wakeups: u64 = 0,
     presents: u64 = 0,
-    /// Set by the child-exit waiter thread.
-    child_done: *const std.atomic.Value(bool),
 
     /// The desk panels and what they need.
     ui: deskui.Ui = .{},
@@ -164,7 +183,7 @@ pub const LocalHost = struct {
 
     const title_max = title.max_title_bytes;
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, child_done: *const std.atomic.Value(bool)) !*LocalHost {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io) !*LocalHost {
         const tv = try TermView.init(gpa, io, .{
             .title = "Portal",
             .width = 1100,
@@ -173,7 +192,7 @@ pub const LocalHost = struct {
         });
         errdefer tv.deinit();
         const h = try gpa.create(LocalHost);
-        h.* = .{ .gpa = gpa, .io = io, .tv = tv, .child_done = child_done };
+        h.* = .{ .gpa = gpa, .io = io, .tv = tv };
         return h;
     }
 
@@ -194,13 +213,13 @@ pub const LocalHost = struct {
         return .{ @max(c[0], 20), @max(c[1], 5) };
     }
 
-    /// Points the window at `s` and hooks its change notifications. Call
-    /// before any thread that touches the session starts.
-    pub fn attach(h: *LocalHost, s: *Session) void {
-        h.session = s;
-        s.notify_ctx = h;
-        s.notify_fn = notifyThunk;
-        h.tv.reported_capacity = .{ s.size.cols, s.size.rows };
+    /// Points the window at the tabs and hooks their change notifications.
+    /// Call before the first tab starts.
+    pub fn attach(h: *LocalHost, hub: *tabs.Hub) void {
+        h.hub = hub;
+        hub.notify_ctx = h;
+        hub.notify_fn = notifyThunk;
+        h.tv.reported_capacity = .{ hub.size.cols, hub.size.rows };
         h.tv.setLiveRedraw(h, liveRedraw);
     }
 
@@ -259,14 +278,15 @@ pub const LocalHost = struct {
     /// responding" and exiting the process under a live swapchain).
     ///
     /// Purely event-driven: it sleeps until window input or a wake()
-    /// (session output, viewer count changes, pairing changes and child
-    /// exit all call notifyThunk). The only timeout is a real deadline:
-    /// the expiry of a pairing window this desk opened.
+    /// (any tab's output, the tab list, viewer count changes, pairing
+    /// changes all call notifyThunk). The only timeout is a real deadline:
+    /// the expiry of a pairing window this desk opened. Returns
+    /// `.finished` once every tab has ended.
     pub fn run(h: *LocalHost) Ended {
         h.updateTitle();
         const ended: Ended = while (true) {
             if (!h.tv.pollEvents(h.sink())) break .window_closed;
-            if (h.child_done.load(.acquire)) break .child_exited;
+            if (h.allEnded()) break .finished;
             const changed = h.checkPairing();
             h.frame(changed);
             h.tv.waitEvents(h.waitMs());
@@ -308,10 +328,11 @@ pub const LocalHost = struct {
         return true;
     }
 
-    /// Any thread: the child exited (child_done is set); ends the wait in
-    /// run().
-    pub fn wakeChildExited(h: *LocalHost) void {
-        notifyThunk(h);
+    fn allEnded(h: *LocalHost) bool {
+        const hub = h.hub orelse return false;
+        hub.mutex.lockUncancelable(h.io);
+        defer hub.mutex.unlock(h.io);
+        return hub.finished;
     }
 
     /// Hides the window (shutdown can take a moment; the user already
@@ -330,14 +351,35 @@ pub const LocalHost = struct {
     /// builds and presents outside it.
     fn frame(h: *LocalHost, force: bool) void {
         h.wake_pending.store(false, .release);
-        const s = h.session orelse return;
-        s.mutex.lockUncancelable(s.io);
-        const changed = h.sync.sync(h.gpa, &h.grid, &s.term);
-        h.viewers = s.viewers;
-        s.mutex.unlock(s.io);
+        const hub = h.hub orelse return;
+        var old: ?*tabs.Tab = null;
+        hub.mutex.lockUncancelable(h.io);
+        // Follow the desk's tab (it moves when one is chosen, opened, or
+        // the shown one ends).
+        if (hub.desk_active) |a| if (a != h.shown) {
+            a.acquire();
+            old = h.shown;
+            h.shown = a;
+            // Another screen: copy everything again, drop its images.
+            h.sync.deinit(h.gpa);
+            h.sync = .{};
+            h.grid.deinit(h.gpa);
+            h.grid = .{};
+            h.select = .{};
+        };
+        var list_changed = false;
+        if (hub.gen != h.list_gen) {
+            hub.entriesLocked(&h.list);
+            h.list_gen = hub.gen;
+            list_changed = true;
+        }
+        const changed = if (h.shown) |t| h.sync.sync(h.gpa, &h.grid, &t.session.term) else false;
+        h.viewers = hub.viewers;
+        hub.mutex.unlock(h.io);
+        if (old) |o| o.release();
 
         if (changed) h.clampSelection();
-        if (!force and !changed and !h.tv.needsRedraw() and h.viewers == h.drawn_viewers) return;
+        if (!force and !changed and !list_changed and old == null and !h.tv.needsRedraw() and h.viewers == h.drawn_viewers) return;
         h.drawn_viewers = h.viewers;
         h.updateTitle();
 
@@ -362,9 +404,23 @@ pub const LocalHost = struct {
             .text => "remote: FULL CONTROL",
         };
         const d = h.desk;
+        const shown_id: ?tabs.Id = if (h.shown) |t| t.id else null;
+        for (h.list.slice(), 0..) |*e, i| {
+            const c = e.color;
+            h.top_tabs[i] = .{
+                .label = e.name(),
+                .color = .{ @truncate(c >> 16), @truncate(c >> 8), @truncate(c) },
+                .active = if (shown_id) |id| std.mem.eql(u8, &id, &e.id) else false,
+                .attention = e.state.attention(),
+                .id = tab_id0 + @as(u32, @intCast(i)),
+                .close_id = tab_close0 + @as(u32, @intCast(i)),
+            };
+        }
         return .{
             .top_bar = .{
-                .title = windowLabel(h.opts.project, &h.label_buf),
+                .title = windowLabel(h.shownName(), &h.label_buf),
+                .tabs = h.top_tabs[0..h.list.len],
+                .add_id = if (h.list.len < tabs.max_tabs) tab_add else null,
                 .right = viewerText(h.viewers, right_buf),
                 .right_tone = if (watching) .warn else .muted,
                 .right_badge = watching,
@@ -387,10 +443,16 @@ pub const LocalHost = struct {
         };
     }
 
+    /// The shown tab's name (desk-assigned, never a path).
+    fn shownName(h: *const LocalHost) ?[]const u8 {
+        const t = h.shown orelse return null;
+        return t.name();
+    }
+
     /// The one place the window title is set (see windowTitle).
     fn updateTitle(h: *LocalHost) void {
         var buf: [title_max]u8 = undefined;
-        const t = windowTitle(h.opts.project, h.viewers, &buf);
+        const t = windowTitle(h.shownName(), h.viewers, &buf);
         if (std.mem.eql(u8, t, h.title_buf[0..h.title_len])) return;
         @memcpy(h.title_buf[0..t.len], t);
         h.title_len = t.len;
@@ -426,7 +488,7 @@ pub const LocalHost = struct {
                 h.ui.paste(raw);
             },
             .setup_submit => {
-                if (h.session == null) {
+                if (h.hub == null) {
                     h.setup_submitted = true; // runSetup takes it from here
                 } else h.saveSettings();
             },
@@ -609,7 +671,7 @@ pub const LocalHost = struct {
     fn openSettings(h: *LocalHost) void {
         const d = h.desk orelse return;
         const s = &d.saved;
-        h.ui.openSetup(false, s.listen.get() orelse h.opts.listen_host, s.program.get() orelse "", s.project.get() orelse (h.opts.project orelse ""), s.input orelse h.opts.policy);
+        h.ui.openSetup(false, s.listen.get() orelse h.opts.listen_host, s.program.get() orelse "", s.project.get() orelse "", s.input orelse h.opts.policy);
     }
 
     /// The Settings panel (during a session): checked, then saved for the
@@ -672,7 +734,10 @@ pub const LocalHost = struct {
             .panel => return h.perform(h.ui.key(key, mods)),
             .terminal => {},
         }
-        const s = h.session orelse return;
+        // Ctrl+Tab / Ctrl+Shift+Tab: the next / previous tab (Ctrl+Tab
+        // sends nothing a terminal program would get anyway).
+        if (key == .tab and mods.ctrl and !mods.alt) return h.cycleTab(if (mods.shift) -1 else 1);
+        const s = h.session() orelse return;
         s.mutex.lockUncancelable(s.io);
         const app_cursor = s.term.appCursor();
         s.mutex.unlock(s.io);
@@ -681,11 +746,81 @@ pub const LocalHost = struct {
         s.writeInput(localinput.encodeKey(key, mods, app_cursor, &buf));
     }
 
+    /// The shown tab's session.
+    fn session(h: *LocalHost) ?*@import("session.zig").Session {
+        const t = h.shown orelse return null;
+        return &t.session;
+    }
+
+    // ------------------------------------------------------------ tabs
+
+    /// Shows the tab at bar position `i`.
+    fn selectTab(h: *LocalHost, i: usize) void {
+        const hub = h.hub orelse return;
+        if (i >= h.list.len) return;
+        hub.mutex.lockUncancelable(h.io);
+        if (hub.acquireLocked(h.list.items[i].id)) |t| {
+            hub.desk_active = t;
+            t.release();
+        }
+        hub.mutex.unlock(h.io);
+        h.frame(true);
+    }
+
+    fn cycleTab(h: *LocalHost, step: i32) void {
+        const n = h.list.len;
+        if (n < 2) return;
+        const id = (h.shown orelse return).id;
+        const at = h.list.find(id) orelse 0;
+        const next = @mod(@as(i64, @intCast(at)) + step, @as(i64, @intCast(n)));
+        h.selectTab(@intCast(next));
+    }
+
+    /// Closes the tab at bar position `i`: its program is asked to exit
+    /// (tabs.Tab.requestClose); the tab goes once it has.
+    fn closeTab(h: *LocalHost, i: usize) void {
+        const hub = h.hub orelse return;
+        if (i >= h.list.len) return;
+        hub.mutex.lockUncancelable(h.io);
+        const t = hub.acquireLocked(h.list.items[i].id);
+        hub.mutex.unlock(h.io);
+        const tab = t orelse return;
+        hub.log.print("desk closed tab '{s}'", .{tab.name()});
+        tab.requestClose();
+        tab.release();
+    }
+
+    fn closeShown(h: *LocalHost) void {
+        const id = (h.shown orelse return).id;
+        if (h.list.find(id)) |i| h.closeTab(i);
+    }
+
+    /// Ctrl+Shift+T / "+": the folder picker, then a new tab there.
+    fn openTab(h: *LocalHost) void {
+        const hub = h.hub orelse return;
+        const d = h.desk orelse return;
+        var buf: [32768]u16 = undefined;
+        const dir_w = win32.pickFolder(&buf, std.unicode.utf8ToUtf16LeStringLiteral("Open a project folder in a new Portal tab")) orelse return;
+        const dir = std.unicode.wtf16LeToWtf8Alloc(h.gpa, dir_w) catch return;
+        defer h.gpa.free(dir);
+        if (d.open_fn(d.open_ctx, h.gpa, hub, dir)) |why| {
+            var mb: [256]u8 = undefined;
+            const text = std.fmt.bufPrint(&mb, "Could not open the folder: {s}.", .{why}) catch "Could not open the folder.";
+            var wb: [257:0]u16 = undefined;
+            const n = std.unicode.utf8ToUtf16Le(wb[0..256], text) catch 0;
+            wb[n] = 0;
+            _ = win32.MessageBoxW(null, &wb, std.unicode.utf8ToUtf16LeStringLiteral("Portal"), 0x30);
+        }
+        h.frame(true);
+    }
+
     fn onChar(ctx: *anyopaque, cp: u21, mods: input.Mods) void {
         const h = self(ctx);
         if (mods.ctrl and mods.shift and !mods.alt) {
             // Desk shortcuts, also while a panel is open (they switch).
-            if (h.session != null and h.desk != null) switch (cp) {
+            if (h.hub != null and h.desk != null) switch (cp) {
+                't', 'T' => return h.openTab(),
+                'w', 'W' => if (h.focus() == .terminal) return h.closeShown(),
                 'p', 'P' => return h.ui.openPair(),
                 'd', 'D' => return h.perform(h.ui.openDevices()),
                 'e', 'E' => return h.ui.openExport(h.desk.?.export_default),
@@ -702,7 +837,7 @@ pub const LocalHost = struct {
             .panel => return h.perform(h.ui.char(cp, mods)),
             .terminal => {},
         }
-        const s = h.session orelse return;
+        const s = h.session() orelse return;
         var buf: [localinput.max_seq]u8 = undefined;
         h.select.active = false;
         s.writeInput(localinput.encodeChar(cp, mods, &buf));
@@ -717,15 +852,18 @@ pub const LocalHost = struct {
             deskui.id.tb_devices => if (h.desk != null) h.perform(h.ui.openDevices()),
             deskui.id.tb_export => if (h.desk) |d| h.ui.openExport(d.export_default),
             deskui.id.tb_settings => h.openSettings(),
+            tab_add => if (h.focus() == .terminal) h.openTab(),
+            tab_id0...tab_id0 + tabs.max_tabs - 1 => if (h.focus() == .terminal) h.selectTab(b - tab_id0),
+            tab_close0...tab_close0 + tabs.max_tabs - 1 => if (h.focus() == .terminal) h.closeTab(b - tab_close0),
             else => if (h.focus() == .panel) h.perform(h.ui.button(b)),
         }
     }
 
-    /// The window decides the PTY size; web viewers adapt.
+    /// The window decides the PTY size (of every tab); web viewers adapt.
     fn onResized(ctx: *anyopaque, _: u32, _: u32, cols: u16, rows: u16) void {
         const h = self(ctx);
-        const s = h.session orelse return;
-        s.setSize(.{ .cols = cols, .rows = rows });
+        const hub = h.hub orelse return;
+        hub.setSize(.{ .cols = cols, .rows = rows });
     }
 
     fn onMouse(ctx: *anyopaque, m: input.Mouse) void {
@@ -760,7 +898,7 @@ pub const LocalHost = struct {
     }
 
     fn paste(h: *LocalHost) void {
-        const s = h.session orelse return;
+        const s = h.session() orelse return;
         const raw = h.tv.window.clipboardText(h.gpa, max_paste_units) orelse return;
         defer h.gpa.free(raw);
         s.mutex.lockUncancelable(s.io);
