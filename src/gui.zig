@@ -317,7 +317,7 @@ pub const LocalHost = struct {
     /// Hides the window (shutdown can take a moment; the user already
     /// asked to close, or the program ended).
     pub fn hide(h: *LocalHost) void {
-        _ = win32.ShowWindow(@ptrCast(h.tv.window.hwnd), 0);
+        h.tv.window.hide();
     }
 
     fn liveRedraw(ctx: *anyopaque) void {
