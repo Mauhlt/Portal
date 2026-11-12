@@ -183,6 +183,7 @@ pub const Status = enum(u16) {
     length_required = 411,
     payload_too_large = 413,
     unsupported_media_type = 415,
+    expectation_failed = 417,
     misdirected_request = 421,
     header_fields_too_large = 431,
     internal_server_error = 500,
@@ -200,6 +201,7 @@ pub const Status = enum(u16) {
             .length_required => "Length Required",
             .payload_too_large => "Payload Too Large",
             .unsupported_media_type => "Unsupported Media Type",
+            .expectation_failed => "Expectation Failed",
             .misdirected_request => "Misdirected Request",
             .header_fields_too_large => "Request Header Fields Too Large",
             .internal_server_error => "Internal Server Error",
@@ -229,6 +231,32 @@ pub fn writeResponse(
     }
     try w.print("content-length: {d}\r\nconnection: {s}\r\n\r\n", .{ body.len, if (keep_alive) "keep-alive" else "close" });
     try w.writeAll(body);
+    try w.flush();
+}
+
+pub const Reject = struct { status: Status, msg: []const u8 };
+
+/// Framing checks applied to every parsed head before routing. Any non-null
+/// result must be answered with that status and the connection closed: after
+/// a framing problem the position of the next request is unknown.
+pub fn framingError(req: *const Request, max_body: u64) ?Reject {
+    if (req.has_transfer_encoding) return .{ .status = .bad_request, .msg = "transfer-encoding not supported\n" };
+    if (req.has_expect) return .{ .status = .expectation_failed, .msg = "expect not supported\n" };
+    switch (req.method) {
+        .other => return .{ .status = .method_not_allowed, .msg = "method not allowed\n" },
+        .GET => if ((req.content_length orelse 0) != 0) return .{ .status = .bad_request, .msg = "unexpected body\n" },
+        .POST => {
+            const len = req.content_length orelse return .{ .status = .length_required, .msg = "content-length required\n" };
+            if (len > max_body) return .{ .status = .payload_too_large, .msg = "too large\n" };
+        },
+    }
+    return null;
+}
+
+/// The 101 response completing a WebSocket handshake.
+pub fn writeUpgrade(w: *std.Io.Writer, accept: []const u8) !void {
+    if (!validValue(accept)) return error.UnsafeHeader;
+    try w.print("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {s}\r\n\r\n", .{accept});
     try w.flush();
 }
 
@@ -419,4 +447,46 @@ test "response refuses header injection" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try testing.expectError(error.UnsafeHeader, writeResponse(&w, .ok, &.{.{ .name = "x", .value = "a\r\nSet-Cookie: evil" }}, "", false));
+}
+
+test "framing checks" {
+    const ok_get = try parseHead("GET / HTTP/1.1\r\nHost: h\r\n\r\n");
+    try testing.expect(framingError(&ok_get, 512) == null);
+    const get_cl0 = try parseHead("GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    try testing.expect(framingError(&get_cl0, 512) == null);
+    const get_body = try parseHead("GET / HTTP/1.1\r\nContent-Length: 3\r\n\r\n");
+    try testing.expectEqual(Status.bad_request, framingError(&get_body, 512).?.status);
+    const put = try parseHead("PUT / HTTP/1.1\r\n\r\n");
+    try testing.expectEqual(Status.method_not_allowed, framingError(&put, 512).?.status);
+    const te = try parseHead("POST /login HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n");
+    try testing.expectEqual(Status.bad_request, framingError(&te, 512).?.status);
+    const ex = try parseHead("POST /login HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n");
+    try testing.expectEqual(Status.expectation_failed, framingError(&ex, 512).?.status);
+    const no_len = try parseHead("POST /login HTTP/1.1\r\n\r\n");
+    try testing.expectEqual(Status.length_required, framingError(&no_len, 512).?.status);
+    const big = try parseHead("POST /login HTTP/1.1\r\nContent-Length: 513\r\n\r\n");
+    try testing.expectEqual(Status.payload_too_large, framingError(&big, 512).?.status);
+    const post = try parseHead("POST /login HTTP/1.1\r\nContent-Length: 512\r\n\r\n");
+    try testing.expect(framingError(&post, 512) == null);
+}
+
+test "upgrade response" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeUpgrade(&w, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    try testing.expectEqualStrings("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n" ++
+        "sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n", w.buffered());
+    var w2: std.Io.Writer = .fixed(&buf);
+    try testing.expectError(error.UnsafeHeader, writeUpgrade(&w2, "a\r\nb"));
+}
+
+test "frame writing" {
+    var buf: [300]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeFrame(&w, .text, "hi");
+    try testing.expectEqualSlices(u8, &.{ 0x81, 2, 'h', 'i' }, w.buffered());
+    var w2: std.Io.Writer = .fixed(&buf);
+    const p: [200]u8 = @splat('x');
+    try writeFrame(&w2, .binary, &p);
+    try testing.expectEqualSlices(u8, &.{ 0x82, 126, 0, 200 }, w2.buffered()[0..4]);
 }

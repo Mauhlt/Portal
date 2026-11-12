@@ -16,8 +16,9 @@
     fontSize: fontSize,
     scrollback: 5000,
     allowProposedApi: false,
-    // Links in terminal output are not made clickable.
-    linkHandler: null,
+    // Links in terminal output (including OSC 8 hyperlinks, which xterm.js
+    // makes clickable by default) do nothing when activated.
+    linkHandler: { activate: function () {} },
   });
   term.open(document.getElementById('term'));
 
@@ -61,6 +62,11 @@
         modeEl.textContent = m.input === 'none' ? 'view only' : (m.input === 'keys' ? 'answer keys only' : 'typing allowed');
         keysEl.hidden = m.input === 'none';
         ws.send('r'); // ask for a repaint so the screen is complete
+      } else if (m.t === 'reset') {
+        // The server skipped output this viewer fell behind on; what follows
+        // starts mid-stream, so start clean and ask for a repaint.
+        term.reset();
+        ws.send('r');
       } else if (m.t === 'size') {
         term.resize(m.cols, m.rows);
       } else if (m.t === 'exit') {
@@ -87,6 +93,7 @@
   }
 
   term.onData(sendKeys);
+  // Deliberately no term.onBinary: nothing but onData reaches the session.
 
   keysEl.addEventListener('click', function (e) {
     const b = e.target.closest('button');
