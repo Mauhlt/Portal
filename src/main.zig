@@ -2026,6 +2026,7 @@ test {
     _ = @import("workdir.zig");
     _ = @import("settings.zig");
     _ = @import("deskui.zig");
+    _ = @import("qr.zig");
     _ = @import("keymap.zig");
     _ = @import("auth.zig");
     _ = @import("guard.zig");

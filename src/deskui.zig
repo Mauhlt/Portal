@@ -17,6 +17,8 @@ const form = view.form;
 const input = view.input;
 const devices = @import("devices.zig");
 const keymap = @import("keymap.zig");
+const qr = @import("qr.zig");
+const pairqr = @import("shared").pairqr;
 
 pub const Screen = enum { none, setup, pair_name, pairing, pair_result, devices, dev_packages, export_form, export_done };
 
@@ -663,6 +665,25 @@ pub const Ui = struct {
         txt: [14][200]u8 = undefined,
         row_txt: [@max(devices.max_devices, max_pkgs)][120]u8 = undefined,
         n_txt: usize = 0,
+        /// The pairing QR code (address + CA fingerprint) for the iPhone app.
+        qr_code: qr.Code = .{},
+        qr_modules: [qr.max_size * qr.max_size]u8 = undefined,
+        qr_text: [pairqr.max_len]u8 = undefined,
+
+        /// Encodes the pairing QR for `c` (TLS only: it carries the CA
+        /// fingerprint). Null if there is nothing to show.
+        fn pairQr(b: *Bufs, c: Ctx) ?TermView.PanelQr {
+            const fp_text = c.fingerprint orelse return null;
+            const fp = pairqr.parseFingerprint(fp_text) orelse return null;
+            const host = hostOfUrl(c.url) orelse return null;
+            const text = pairqr.format(&b.qr_text, host, fp) catch return null;
+            b.qr_code.encode(text) catch return null;
+            const n: usize = b.qr_code.size;
+            for (0..n) |y| for (0..n) |x| {
+                b.qr_modules[y * n + x] = @intFromBool(b.qr_code.get(x, y));
+            };
+            return .{ .size = b.qr_code.size, .modules = b.qr_modules[0 .. n * n] };
+        }
 
         fn fmt(b: *Bufs, comptime f: []const u8, args: anytype) []const u8 {
             if (b.n_txt == b.txt.len) return "";
@@ -756,6 +777,10 @@ pub const Ui = struct {
                         L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("Browser: open {s} and tap \"Pair this device\".", .{c.url}) });
                     }
                     L.add(&bufs.lines, &nl, .{ .text = "Portal on a laptop: enter this address, pick or check the certificate, and click Pair." });
+                    if (bufs.pairQr(c)) |code| {
+                        L.add(&bufs.lines, &nl, .{ .text = "Portal on an iPhone: tap Scan QR code and point the camera here (it carries this address and the certificate's SHA-256, nothing secret)." });
+                        p.qr = code;
+                    }
                     if (win) |w| switch (w.ca) {
                         .up => L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("First time only: the certificate download is at http://{s}/ (compare the SHA-256 below).", .{w.ca_where.get()}) }),
                         .failed => L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("WARNING: the certificate download on {s} could not be opened (another program may hold that port). Do not install a certificate from that address; use Export certificate instead.", .{w.ca_where.get()}), .tone = .bad }),
@@ -875,6 +900,23 @@ pub const Ui = struct {
         n.* += 1;
     }
 };
+
+/// "IP:PORT" of "https://IP:PORT/" (the desk's sharing URL); null for
+/// anything else (plain HTTP has no CA to put in the QR).
+pub fn hostOfUrl(url: []const u8) ?[]const u8 {
+    const prefix = "https://";
+    if (!std.mem.startsWith(u8, url, prefix)) return null;
+    const rest = url[prefix.len..];
+    const end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    if (end == 0) return null;
+    return rest[0..end];
+}
+
+test "hostOfUrl" {
+    try std.testing.expectEqualStrings("10.8.0.1:8420", hostOfUrl("https://10.8.0.1:8420/").?);
+    try std.testing.expectEqualStrings("[fd00::1]:8420", hostOfUrl("https://[fd00::1]:8420/").?);
+    try std.testing.expect(hostOfUrl("http://10.8.0.1:8420/") == null);
+}
 
 pub fn cyclePolicy(p: keymap.Policy, forward: bool) keymap.Policy {
     const all = [_]keymap.Policy{ .none, .keys, .instruct, .text };
