@@ -42,8 +42,6 @@ const index_html = @embedFile("web/index.html");
 const login_html = @embedFile("web/login.html");
 const app_js = @embedFile("web/app.js");
 const app_css = @embedFile("web/app.css");
-const xterm_js = @embedFile("web/vendor/xterm.js");
-const xterm_css = @embedFile("web/vendor/xterm.css");
 
 /// Hard cap on simultaneous connections (each costs a supervisor thread and
 /// a worker thread, a WebSocket one more).
@@ -61,6 +59,8 @@ const max_ws_payload = max_input_message + 1;
 /// Largest client frame header: 2 + 8 (64-bit length) + 4 (mask).
 const max_ws_header = 14;
 
+/// Minimum gap between grid frames to one viewer (~30 per second).
+const frame_interval_ms = 33;
 const auth_recheck_ms = 5000;
 /// A request head (and body) must arrive within this long of its first byte,
 /// or of the connection being accepted.
@@ -542,8 +542,6 @@ pub const Server = struct {
         const path = req.path;
         switch (req.method) {
             .GET => {
-                if (std.mem.eql(u8, path, "/static/xterm.js")) return srv.asset(conn, w, req, xterm_js, "text/javascript; charset=utf-8");
-                if (std.mem.eql(u8, path, "/static/xterm.css")) return srv.asset(conn, w, req, xterm_css, "text/css; charset=utf-8");
                 if (std.mem.eql(u8, path, "/static/app.js")) return srv.asset(conn, w, req, app_js, "text/javascript; charset=utf-8");
                 if (std.mem.eql(u8, path, "/static/app.css")) return srv.asset(conn, w, req, app_css, "text/css; charset=utf-8");
                 if (std.mem.eql(u8, path, "/login")) return srv.loginPage(conn, w, req);
@@ -806,21 +804,25 @@ pub const Server = struct {
 
     fn wsWriteLoop(srv: *Server, ws: *WsConn) void {
         const s = srv.session;
-        var out: [32 * 1024]u8 = undefined;
         var msg: [128]u8 = undefined;
-
-        s.mutex.lockUncancelable(srv.io);
-        var pos = s.ring.oldest(); // replay scrollback on connect
-        var sent_gen = s.size_gen -% 1; // force an initial size message
-        s.mutex.unlock(srv.io);
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(srv.gpa);
+        var rows: std.ArrayList(u16) = .empty;
+        defer rows.deinit(srv.gpa);
 
         const hello = std.fmt.bufPrint(&msg, "{{\"t\":\"hello\",\"input\":\"{t}\"}}", .{s.policy}) catch return;
         if (!ws.send(srv, hello, .text)) return;
 
+        // Generation of the emulator state last sent; 0 plus `full` forces a
+        // complete snapshot first (docs/protocol.md section 3).
+        var sent_gen: u64 = 0;
+        var full = true;
+        var sent_cols: u16 = 0;
+        var sent_rows: u16 = 0;
         var last_auth = srv.nowMs();
         while (true) {
             s.mutex.lockUncancelable(srv.io);
-            if (!s.closed and pos >= s.ring.total and sent_gen == s.size_gen and !ws.dead.load(.acquire)) {
+            if (!s.closed and !full and s.term.gen == sent_gen and !ws.dead.load(.acquire)) {
                 s.cond.waitTimeout(srv.io, &s.mutex, .{ .duration = .{
                     .raw = .fromMilliseconds(auth_recheck_ms),
                     .clock = .awake,
@@ -833,29 +835,42 @@ pub const Server = struct {
                     },
                 };
             }
-            const res = s.ring.readFrom(pos, &out);
-            pos = res.next;
-            const gen = s.size_gen;
-            const size = s.size;
+            // Encode under the lock so the frame is a consistent snapshot.
+            const t = &s.term;
+            if (t.cols != sent_cols or t.rows != sent_rows) full = true;
+            var encode_ok = true;
+            const changed = full or t.gen != sent_gen;
+            if (changed) {
+                rows.clearRetainingCapacity();
+                frame.clearRetainingCapacity();
+                var r: u16 = 0;
+                while (r < t.rows) : (r += 1) {
+                    if (full or t.rowGen(r) > sent_gen) {
+                        rows.append(srv.gpa, r) catch {
+                            encode_ok = false;
+                            break;
+                        };
+                    }
+                }
+                if (encode_ok) t.encodeRows(rows.items, &frame, srv.gpa) catch {
+                    encode_ok = false;
+                };
+                if (encode_ok) {
+                    sent_gen = t.gen;
+                    sent_cols = t.cols;
+                    sent_rows = t.rows;
+                    full = false;
+                }
+            }
             const closed = s.closed;
             const exit_code = s.exit_code;
             s.mutex.unlock(srv.io);
 
             if (ws.dead.load(.acquire)) return;
+            if (!encode_ok) return; // out of memory: drop this viewer, keep the session
 
-            if (gen != sent_gen) {
-                sent_gen = gen;
-                const m = std.fmt.bufPrint(&msg, "{{\"t\":\"size\",\"cols\":{d},\"rows\":{d}}}", .{ size.cols, size.rows }) catch return;
-                if (!ws.send(srv, m, .text)) return;
-            }
-            if (res.skipped) {
-                // This viewer fell behind the scrollback; what follows starts
-                // mid-stream, so the client resets its terminal and asks for
-                // a repaint.
-                if (!ws.send(srv, "{\"t\":\"reset\"}", .text)) return;
-            }
-            if (res.n > 0) {
-                if (!ws.send(srv, out[0..res.n], .binary)) return;
+            if (changed) {
+                if (!ws.send(srv, frame.items, .binary)) return;
             } else if (closed) {
                 const m = std.fmt.bufPrint(&msg, "{{\"t\":\"exit\",\"code\":{d}}}", .{exit_code}) catch return;
                 _ = ws.send(srv, m, .text);
@@ -871,6 +886,8 @@ pub const Server = struct {
                     return;
                 }
             }
+            // Coalesce bursts of output into at most ~30 frames per second.
+            if (changed) srv.io.sleep(.fromMilliseconds(frame_interval_ms), .awake) catch return;
         }
     }
 
@@ -922,17 +939,14 @@ pub const Server = struct {
             },
             .text, .binary => {
                 if (payload.len == 0) return true;
+                // "k:<name>" key press, "t:<text>" typing (docs/protocol.md section 4).
+                if (payload.len < 2 or payload[1] != ':') return true;
+                if (srv.session.policy == .none) return true;
+                // Re-check on every input message, not just periodically.
+                if (!srv.sessionLive(&ws.cookie, false)) return false;
                 switch (payload[0]) {
-                    'i' => {
-                        if (srv.session.policy == .none) return true;
-                        // Re-check on every keystroke batch, not just periodically.
-                        if (!srv.sessionLive(&ws.cookie, false)) return false;
-                        srv.session.writeWebInput(payload[1..], srv.nowMs());
-                    },
-                    'r' => {
-                        if (!srv.sessionLive(&ws.cookie, false)) return false;
-                        srv.session.requestRedraw(srv.nowMs());
-                    },
+                    'k' => srv.session.writeWebKey(payload[2..], srv.nowMs()),
+                    't' => srv.session.writeWebText(payload[2..]),
                     else => {},
                 }
                 return true;

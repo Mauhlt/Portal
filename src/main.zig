@@ -13,19 +13,18 @@ const Allocator = std.mem.Allocator;
 const auth = @import("auth.zig");
 const guard = @import("guard.zig");
 const cmdline = @import("cmdline.zig");
-const input_filter = @import("input_filter.zig");
+const keymap = @import("keymap.zig");
+const vt = @import("vt.zig");
 const conpty = @import("conpty.zig");
 const console_mod = @import("console.zig");
 const Console = console_mod.Console;
 const Session = @import("session.zig").Session;
 const Log = @import("log.zig").Log;
-const Ring = @import("ring.zig").Ring;
 const w = @import("win32.zig");
 const web = @import("web.zig");
 
 pub const portal_version = "0.1.0";
 const default_listen = "127.0.0.1:8420";
-const scrollback_bytes = 2 * 1024 * 1024;
 
 const usage =
     \\Portal {s} - remote viewer for a desktop terminal session
@@ -198,7 +197,7 @@ const RunOptions = struct {
     hosts: std.ArrayList([]const u8) = .empty,
     /// `keys` by default: a remote viewer can answer prompts but cannot
     /// start new work. `text` (full remote control) must be chosen explicitly.
-    policy: input_filter.Policy = .keys,
+    policy: keymap.Policy = .keys,
     https: bool = false,
     command: []const []const u8 = &.{"claude"},
 };
@@ -223,7 +222,7 @@ fn parseRunArgs(gpa: Allocator, args: []const []const u8) !RunOptions {
             try o.hosts.append(gpa, args[i]);
         } else if (std.mem.eql(u8, a, "--input")) {
             i += 1;
-            o.policy = input_filter.Policy.parse(args[i]) orelse fatal("--input must be none, keys or text", .{});
+            o.policy = keymap.Policy.parse(args[i]) orelse fatal("--input must be none, keys or text", .{});
         } else if (std.mem.eql(u8, a, "--https")) {
             o.https = true;
         } else {
@@ -244,7 +243,7 @@ fn parseListen(text: []const u8) !std.Io.net.IpAddress {
 }
 
 /// Suffix for the log line and banner when the remote side has full control.
-fn policyNote(policy: input_filter.Policy) []const u8 {
+fn policyNote(policy: keymap.Policy) []const u8 {
     return if (policy == .text) " (FULL REMOTE CONTROL)" else "";
 }
 
@@ -350,8 +349,6 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         fatal("cannot find program '{s}': {t}", .{ opts.command[0], err });
     defer resolved.deinit(gpa);
 
-    const ring_buf = gpa.alloc(u8, scrollback_bytes) catch fatal("out of memory", .{});
-    defer gpa.free(ring_buf);
 
     var attr_buf: [256]u8 align(@alignOf(usize)) = undefined;
     var pty = conpty.Pty.spawn(resolved.app, resolved.cmdline, null, initial, &attr_buf) catch |err|
@@ -364,7 +361,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .pty = &pty,
         .console = &console,
         .policy = opts.policy,
-        .ring = Ring.init(ring_buf),
+        // Owned by the session for the life of the process (exit is via
+        // ExitProcess, so it is never freed explicitly).
+        .term = vt.Terminal.init(gpa, initial.cols, initial.rows) catch fatal("out of memory", .{}),
         .size = initial,
     };
 
@@ -445,8 +444,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
 }
 
 test {
-    _ = @import("ring.zig");
-    _ = @import("input_filter.zig");
+    _ = @import("keymap.zig");
     _ = @import("auth.zig");
     _ = @import("guard.zig");
     _ = @import("cmdline.zig");
@@ -469,10 +467,10 @@ test "parseListen" {
 test "run defaults to keys input" {
     var o = try parseRunArgs(std.testing.allocator, &.{});
     defer o.hosts.deinit(std.testing.allocator);
-    try std.testing.expectEqual(input_filter.Policy.keys, o.policy);
+    try std.testing.expectEqual(keymap.Policy.keys, o.policy);
     var t = try parseRunArgs(std.testing.allocator, &.{ "--input", "text" });
     defer t.hosts.deinit(std.testing.allocator);
-    try std.testing.expectEqual(input_filter.Policy.text, t.policy);
+    try std.testing.expectEqual(keymap.Policy.text, t.policy);
     try std.testing.expectEqualStrings("", policyNote(.keys));
     try std.testing.expect(std.mem.indexOf(u8, policyNote(.text), "FULL REMOTE CONTROL") != null);
 }

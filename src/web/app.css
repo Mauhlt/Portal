@@ -56,9 +56,23 @@ header form button[type=submit] { width: auto; padding: 4px 10px; background: va
 .status.bad { color: var(--bad); }
 .mode { color: var(--muted); font-size: 13px; }
 #keys { display: flex; gap: 4px; }
+#keys[hidden] { display: none; }
 .spacer { flex: 1; }
-#wrap { flex: 1; overflow: auto; background: #000; padding: 4px; }
-#term { display: inline-block; }
+#wrap { flex: 1; overflow: auto; background: #0c0c0c; padding: 4px; }
+
+/* terminal grid drawn from Portal's frames (no terminal emulation here) */
+#screen { position: relative; color: #d4d4d4; white-space: pre; line-height: 1.2;
+  font-family: "Cascadia Mono", Consolas, Menlo, "DejaVu Sans Mono", monospace;
+  font-variant-ligatures: none; -webkit-text-size-adjust: none; text-size-adjust: none; }
+#screen .row { height: 1.2em; overflow: hidden; }
+#screen .probe { position: absolute; visibility: hidden; white-space: pre; }
+#screen .b { font-weight: 700; }
+#screen .d { opacity: 0.6; }
+#screen .i { font-style: italic; }
+#screen .u { text-decoration: underline; }
+#screen .s { text-decoration: line-through; }
+#screen .u.s { text-decoration: underline line-through; }
+#cursor { position: absolute; background: rgba(212, 212, 212, 0.55); pointer-events: none; }
 
 /* phone / touch: big answer bar, no on-screen keyboard */
 #answers { display: none; }

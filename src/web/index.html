@@ -7,14 +7,13 @@
 <meta name="apple-mobile-web-app-title" content="Portal">
 <meta name="referrer" content="no-referrer">
 <title>Portal</title>
-<link rel="stylesheet" href="/static/xterm.css">
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body class="viewer">
 <header>
   <span id="status" class="status">connecting…</span>
   <span id="mode" class="mode"></span>
-  <nav id="keys" aria-label="Quick answers">
+  <nav id="keys" class="answer-keys" aria-label="Quick answers">
     <button data-key="1">1</button>
     <button data-key="2">2</button>
     <button data-key="3">3</button>
@@ -25,13 +24,13 @@
     <button data-key="esc">Esc</button>
   </nav>
   <span class="spacer"></span>
+  <button id="fit" title="Fit terminal to window">Fit</button>
   <button id="smaller" title="Smaller text">A−</button>
   <button id="bigger" title="Larger text">A+</button>
-  <button id="redraw" title="Ask the program to repaint">Redraw</button>
   <form method="post" action="/logout"><button type="submit">Sign out</button></form>
 </header>
-<div id="wrap"><div id="term"></div></div>
-<nav id="answers" aria-label="Answer the agent" hidden>
+<div id="wrap"><div id="screen" aria-live="off"><div id="cursor"></div></div></div>
+<nav id="answers" class="answer-keys" aria-label="Answer the agent" hidden>
   <button data-key="1">1</button>
   <button data-key="2">2</button>
   <button data-key="3">3</button>
@@ -41,7 +40,6 @@
   <button data-key="enter">Enter</button>
   <button data-key="esc">Esc</button>
 </nav>
-<script src="/static/xterm.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
