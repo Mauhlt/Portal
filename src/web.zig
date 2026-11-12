@@ -61,6 +61,7 @@ const sync = @import("sync.zig");
 const sync_manifest = @import("client").sync.manifest;
 const sync_keypin = @import("client").sync.keypin;
 const keymap = @import("keymap.zig");
+const title = @import("title.zig");
 
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 
@@ -1886,13 +1887,11 @@ pub const Server = struct {
         reader.cancel(srv.io);
     }
 
+    /// The console's title in `portalctl run --console` (a no-op in the
+    /// window, which titles itself the same way): title.zig.
     fn updateTitle(srv: *Server, viewers: u32) void {
-        var buf: [96]u8 = undefined;
-        const title = if (viewers == 0)
-            "Portal - no remote viewers"
-        else
-            std.fmt.bufPrint(&buf, "Portal - {d} REMOTE VIEWER{s} CONNECTED", .{ viewers, if (viewers == 1) "" else "S" }) catch "Portal";
-        srv.session.console.setTitle(title);
+        var buf: [title.max_title_bytes]u8 = undefined;
+        srv.session.console.setTitle(title.windowTitle(srv.session.project, viewers, &buf));
     }
 
     fn wsWriteLoop(srv: *Server, ws: *WsConn) void {
@@ -2100,7 +2099,7 @@ pub const Server = struct {
 
 /// `{"t":"hello","input":...}`, plus `"project"` when `portal run
 /// --project` was given (docs/protocol.md section 3). The name is printable
-/// (gui.validProject); `"` and `\` are escaped.
+/// (title.validProject); `"` and `\` are escaped.
 fn helloMessage(buf: []u8, policy: keymap.Policy, project: ?[]const u8) ![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
     try w.print("{{\"t\":\"hello\",\"input\":\"{t}\"", .{policy});

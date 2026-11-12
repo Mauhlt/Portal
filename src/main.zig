@@ -47,6 +47,7 @@ const fsutil = @import("fsutil.zig");
 const w = @import("win32.zig");
 const web = @import("web.zig");
 const gui = @import("gui.zig");
+const title = @import("title.zig");
 const workdir = @import("workdir.zig");
 const tls_server = @import("tls/server.zig");
 const x509 = @import("tls/x509.zig");
@@ -1258,7 +1259,7 @@ const RunOptions = struct {
     no_tls: bool = false,
     /// Allow instruct/text input when the session program is a shell.
     allow_remote_shell: bool = false,
-    /// `--project`: shown in the window title (gui.validProject).
+    /// `--project`: shown in the window title (title.validProject).
     project: ?[]const u8 = null,
     /// `--allow-elevated`: run even with an administrator token.
     allow_elevated: bool = false,
@@ -1294,7 +1295,7 @@ fn parseRunArgs(gpa: Allocator, args: []const []const u8) !RunOptions {
             o.allow_elevated = true;
         } else if (std.mem.eql(u8, a, "--project")) {
             i += 1;
-            if (!gui.validProject(args[i])) fatal("--project must be 1-{d} bytes of printable text on one line", .{gui.max_project_bytes});
+            if (!title.validProject(args[i])) fatal("--project must be 1-{d} bytes of printable text on one line", .{title.max_project_bytes});
             o.project = args[i];
         } else if (std.mem.eql(u8, a, "--no-tls")) {
             o.no_tls = true;
@@ -1391,8 +1392,8 @@ fn prepare(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, cfg: *co
         "Enter the program to run in this window."
     else
         "no program: pass -- <program> [args...] (or save one in the Portal window's first-run screen, settings.txt `program = ...`)" };
-    if (cfg.project) |p| if (!gui.validProject(p))
-        return fail_(err_buf, "The project name must be 1-{d} bytes of printable text on one line.", .{gui.max_project_bytes});
+    if (cfg.project) |p| if (!title.validProject(p))
+        return fail_(err_buf, "The project name must be 1-{d} bytes of printable text on one line.", .{title.max_project_bytes});
     // Remote typing into a shell is a remote shell: refuse unless explicit.
     if ((cfg.policy == .instruct or cfg.policy == .text) and isShellProgram(command[0]) and !allow_remote_shell)
         return fail_(err_buf, "Refusing {t} input for a shell ({s}): remote typing would be a remote shell. Choose keys input, or pass --allow-remote-shell if you really mean it.", .{ cfg.policy, command[0] });
@@ -1534,7 +1535,7 @@ const Threads = struct {
             };
             failures = 0;
             if (n == 0) return;
-            console.write(buf[0..n]);
+            console.mirror(buf[0..n]);
             session.appendOutput(buf[0..n]);
         }
     }
@@ -1546,7 +1547,7 @@ const Threads = struct {
     /// change before the window has finished growing, and growing the
     /// window alone sends no event. With nothing happening it waits forever.
     fn consoleInput(session: *Session, console: *Console) void {
-        var buf: [4 * 1024]u8 = undefined;
+        var buf: [Console.events_buf_len]u8 = undefined;
         session.setSize(console.size());
         var settle_pending = false;
         while (true) {
@@ -1904,7 +1905,10 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     if (opts.console) {
         console.enableRaw() catch fatal("could not switch console to raw mode", .{});
         raw_console = &console;
-        console.setTitle("Portal - no remote viewers");
+        // Project name only, never the program's title or a path; web.zig
+        // keeps it current with the viewer count (title.zig).
+        var tb: [title.max_title_bytes]u8 = undefined;
+        console.setTitle(title.windowTitle(cfg.project, 0, &tb));
     }
 
     // ------------------------------------------------------------------
@@ -2021,6 +2025,7 @@ test {
     _ = @import("sync_cli.zig");
     _ = @import("fsutil.zig");
     _ = @import("bucket.zig");
+    _ = @import("title.zig");
 }
 
 test "isYes" {
