@@ -15,6 +15,8 @@
 //!                                and input line, shared with Portal's server
 //!                                and browser client (Portal's own source
 //!                                tree: this build lives inside it).
+//!   "datafeed"    ../src/datafeed/root.zig     the Data slice's model,
+//!                                shared with the browser client.
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -38,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "view", .module = view },
             .{ .name = "inputrules", .module = inputrulesModule(b, target, optimize) },
+            .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
         },
     }) });
     const test_step = b.step("test", "Run unit tests and compile-check the executables");
@@ -84,6 +87,12 @@ pub fn inputrulesModule(b: *std.Build, target: std.Build.ResolvedTarget, optimiz
     return b.createModule(.{ .root_source_file = b.path("../src/inputrules/root.zig"), .target = target, .optimize = optimize });
 }
 
+/// The Data slice's model, shared with Portal's browser client:
+/// Portal's src/datafeed (one directory up, as inputrules).
+pub fn datafeedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("../src/datafeed/root.zig"), .target = target, .optimize = optimize });
+}
+
 fn addClient(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
     return b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -93,6 +102,7 @@ fn addClient(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, 
         .imports = &.{
             .{ .name = "view", .module = viewModule(b, target, optimize) },
             .{ .name = "inputrules", .module = inputrulesModule(b, target, optimize) },
+            .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
         },
     }) });
 }

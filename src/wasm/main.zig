@@ -362,7 +362,7 @@ fn noteImage(msg: []const u8) void {
     if (msg.len < 5 or msg[0] != 'I') return;
     const id = std.mem.readInt(u32, msg[1..5], .little);
     const blob = app.grid.images.find(id) orelse return;
-    app.feed.addImage(gpa, id, blob.w, blob.h, dataVisible()) catch return;
+    data.addImage(&app.feed, gpa, id, blob.w, blob.h, dataVisible()) catch return;
     relayoutSlices(); // badge
 }
 
@@ -465,7 +465,7 @@ export fn frame() void {
     // several; the rows it covers redraw once it is ready.
     if (app.grid.images.decodeOne(gpa)) |id| {
         app.grid.markImage(id);
-        if (app.grid.images.find(id)) |b| if (b.rgba) |rgba| app.feed.imageDecoded(gpa, id, rgba);
+        if (app.grid.images.find(id)) |b| if (b.rgba) |rgba| data.imageDecoded(&app.feed, gpa, id, rgba);
         if (app.grid.images.nextToDecode() != null) schedule();
     }
     if (app.term_size.known) {
@@ -480,7 +480,7 @@ export fn frame() void {
     }
     // The data slice redraws only when it changed and can be seen.
     if (app.data_size.known and app.feed.dirty and dataVisible() and app.dfb.w > 0) {
-        app.feed.draw(&app.dfb, &app.ui, app.r.theme, @floatCast(app.data_size.dpr));
+        data.draw(&app.feed, &app.dfb, &app.ui, app.r.theme, @floatCast(app.data_size.dpr));
         host.present(@intFromEnum(Canvas.data), app.dfb.pixels.ptr, app.dfb.w, app.dfb.h, 0, app.dfb.h);
     }
 }

@@ -130,11 +130,17 @@ const Host = struct {
             h.seen_rejected = s.rejected_gen;
             h.sink.rejected(s.rejected_buf[0..s.rejected_len]);
         }
+        // The Data column: new blobs from the terminal; whether it fits.
+        _ = h.sink.data.sync(h.client.gpa, &s.grid.images);
+        const fb = h.tv.window.framebufferSize();
+        h.sink.data.setFits(TermView.dataWidth(@floatFromInt(fb[0]), h.tv.window.scale(), (TermView.DataColumn{}).frac) > 0);
         const o = remote.overlay(.{
             .status = st,
             .mode = mode,
             .detail = detail,
             .line = h.sink.line.snapshot(),
+            .data = h.sink.data.column(),
+            .data_badge = h.sink.data.badge(),
             .host = h.client.host(),
             .has_grid = s.grid.cols > 0,
             .code = s.pair_code,

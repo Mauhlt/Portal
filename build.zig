@@ -153,8 +153,10 @@ pub fn build(b: *std.Build) void {
     // The shared GUI modules' own unit tests (client/src/view, client/src).
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.view })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.client })).step);
-    // The input policy and input line shared by server and both clients.
+    // The input policy and input line shared by server and both clients,
+    // and the Data slice's model shared by both clients.
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.inputrules })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = datafeedModule(b, target, optimize) })).step);
     // Inline images: PNG checks and the bounded decoder (fuzzed).
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.pngcheck })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.imgdec })).step);
@@ -175,6 +177,13 @@ pub fn build(b: *std.Build) void {
 /// browser client (src/wasm). std only.
 fn inputrulesModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     return b.createModule(.{ .root_source_file = b.path("src/inputrules/root.zig"), .target = target, .optimize = optimize });
+}
+
+/// "datafeed" (src/datafeed): the Data slice's model (bounded history of
+/// what the session pushed, the "new" badge), shared by the browser client
+/// (src/wasm/data.zig) and the native one (client/src/dataview.zig).
+fn datafeedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("src/datafeed/root.zig"), .target = target, .optimize = optimize });
 }
 
 /// `zig build e2e [-- group...]`: end-to-end tests (tests/e2e) that launch
@@ -235,6 +244,7 @@ fn clientModule(b: *std.Build, root_src: []const u8, target: std.Build.ResolvedT
     m.addImport("vt", vt_mod);
     // Keys and the input box follow the server's own rules.
     m.addImport("inputrules", inputrulesModule(b, target, optimize));
+    m.addImport("datafeed", datafeedModule(b, target, optimize));
     m.addImport("imgdec", img.imgdec);
     m.addImport("pngcheck", img.pngcheck);
     m.addAnonymousImport("font_regular", .{ .root_source_file = b.path("src/web/fonts/DejaVuSansMono.ttf") });
@@ -318,6 +328,7 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
         .imports = &.{
             .{ .name = "view", .module = view },
             .{ .name = "inputrules", .module = inputrules },
+            .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
         },
     });
     mod.addImport("view", view);

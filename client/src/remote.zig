@@ -10,6 +10,8 @@
 //!   instruct  (the default) answer bar plus the instruction line under it,
 //!             which has the keyboard (inputline.zig).
 //!   text      answer bar; typing and the editing keys go to the terminal.
+//! In every mode the Data column (dataview.zig) shows what the session
+//! pushed; F2 shows or hides it.
 
 const std = @import("std");
 const view = @import("view");
@@ -17,6 +19,7 @@ const TermView = view.TermView;
 const input = view.input;
 const keys = @import("keys.zig");
 const inputline = @import("inputline.zig");
+const dataview = @import("dataview.zig");
 const rules = @import("inputrules");
 const client_mod = @import("net/client.zig");
 
@@ -37,6 +40,8 @@ pub const RemoteSink = struct {
     status: client_mod.Status = .starting,
     /// The instruction line (instruct mode). UI thread only.
     line: inputline.Line = .{},
+    /// The Data column. UI thread only (fed under the shared lock).
+    data: dataview.DataView = .{},
 
     pub fn sink(r: *RemoteSink) input.InputSink {
         return .{ .ctx = r, .vtable = &vtable };
@@ -108,6 +113,11 @@ pub const RemoteSink = struct {
     fn onKey(ctx: *anyopaque, key: input.Key, mods: input.Mods) void {
         const r: *RemoteSink = @ptrCast(@alignCast(ctx));
         if (r.modalActive()) |m| return m.key(m.ctx, key, mods);
+        // F2 (not a protocol key): show / hide the Data column.
+        if (key == .f2 and !mods.ctrl and !mods.alt and !mods.super) {
+            r.data.toggle();
+            return r.redraw();
+        }
         switch (r.focus()) {
             .pair_screen => if (key == .enter) r.client.requestPairing(),
             .wait_screen => if (key == .escape) r.client.cancelPairing(),
@@ -200,6 +210,9 @@ pub const View = struct {
     detail: []const u8,
     /// The instruction line (shown in instruct mode).
     line: inputline.View = .{},
+    /// The Data column (null: hidden) and the status note while hidden.
+    data: ?TermView.DataColumn = null,
+    data_badge: []const u8 = "",
     host: []const u8,
     has_grid: bool,
     /// The request code while waiting for the desk.
@@ -216,6 +229,7 @@ pub const Bufs = struct {
     lines: [4][]const u8 = undefined,
     title: [48]u8 = undefined,
     extra: [256]u8 = undefined,
+    right: [128]u8 = undefined,
     panes: [1]TermView.Pane = undefined,
 };
 
@@ -314,7 +328,12 @@ pub fn overlay(v: View, b: *Bufs) TermView.Overlay {
         o.status.tone = .bad;
         return o;
     };
-    if (!v.has_grid) o.screen = .{ .message = .{ .title = statusWord(st), .title_tone = .muted, .detail = v.detail } };
+    if (!v.has_grid) {
+        o.screen = .{ .message = .{ .title = statusWord(st), .title_tone = .muted, .detail = v.detail } };
+        return o;
+    }
+    o.data = v.data;
+    if (v.data_badge.len > 0) o.status.right = std.fmt.bufPrint(&b.right, "{s}  \u{00B7}  {s}", .{ v.data_badge, v.host }) catch v.host;
     return o;
 }
 
@@ -362,6 +381,22 @@ test "overlay per input mode: the same features as the browser" {
     try std.testing.expect(o.bottom[0].content.field.focused);
     try std.testing.expectEqualStrings("instructions: Sent.", o.status.extra);
     try std.testing.expectEqual(TermView.Tone.good, o.status.extra_tone);
+}
+
+test "overlay: the data column beside the terminal, its badge while hidden" {
+    var b: Bufs = .{};
+    const col: TermView.DataColumn = .{};
+    var v: View = .{ .status = .connected, .mode = .instruct, .detail = "", .host = "h", .has_grid = true, .data = col };
+    try std.testing.expect(overlay(v, &b).data != null);
+    v.data = null;
+    v.data_badge = "2 new in Data (F2)";
+    const o = overlay(v, &b);
+    try std.testing.expect(o.data == null);
+    try std.testing.expectEqualStrings("2 new in Data (F2)  \u{00B7}  h", o.status.right);
+    // Pairing screens have no data column.
+    v.status = .need_pairing;
+    v.data = col;
+    try std.testing.expect(overlay(v, &b).data == null);
 }
 
 test "keyboard focus: the instruction line in instruct mode only" {
