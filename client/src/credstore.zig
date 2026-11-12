@@ -20,9 +20,13 @@ pub const Error = error{ Unavailable, Failed, TooLong };
 pub const max_secret = 256;
 pub const max_target = 128;
 
-/// "Portal/<server host>"
-pub fn targetName(host: []const u8, buf: *[max_target]u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Portal/{s}", .{host}) catch buf[0..0];
+/// "Portal/<server host>" for credentials used over HTTPS (also where
+/// clients before TLS support stored theirs: those are only ever sent over
+/// HTTPS now). "Portal-plain/<server host>" for `--insecure-plain-http`, so
+/// a credential obtained over TLS is never sent in cleartext and a
+/// cleartext one never mixes with it.
+pub fn targetName(host: []const u8, plain: bool, buf: *[max_target]u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ if (plain) "Portal-plain" else "Portal", host }) catch buf[0..0];
 }
 
 const impl = switch (builtin.os.tag) {

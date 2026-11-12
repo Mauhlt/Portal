@@ -6,4 +6,9 @@ test {
     _ = @import("credstore.zig");
     _ = @import("net/ws.zig");
     _ = @import("net/http.zig");
+    _ = @import("net/x509check.zig");
+    _ = @import("net/tlsconn.zig");
+    _ = @import("net/watchdog.zig");
+    _ = @import("net/pin.zig");
+    _ = @import("net/client.zig");
 }

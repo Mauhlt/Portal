@@ -2,13 +2,23 @@
 //! reconnects (docs/protocol.md).
 //!
 //!   no stored device credential -> wait for the user to press "Pair"
-//!       -> POST /pair -> store portal_device in the OS credential store
+//!       -> POST /pair -> store the device cookie in the OS credential store
 //!   stored credential -> POST /auth/refresh -> store the rotated value
-//!       immediately (before anything else), keep portal_session in memory
+//!       immediately (before anything else), keep the session in memory
 //!   GET /ws with the session cookie -> 'G' frames into the shared grid
 //!   401 on refresh -> delete the credential, back to "Pair this device"
 //!   401 on /ws or a `logout` message -> refresh again
 //!   network errors -> retry with backoff 1 s doubling to 15 s
+//!
+//! Every connection is HTTPS/WSS with the server certificate pinned to the
+//! Portal CA imported for this server (tlsconn.zig), unless the user chose
+//! `--insecure-plain-http`; nothing is sent before the TLS handshake has
+//! authenticated the server.
+//!
+//! Liveness: each step runs under a watchdog (watchdog.zig): 15 s for
+//! connect + TLS handshake, 15 s for each request/response, and on the
+//! stream 60 s without any data from the server. A ping goes out after
+//! 20 s of silence, so a live server always answers in time.
 //!
 //! Everything read from the network is bounded and parsed defensively.
 
@@ -17,12 +27,20 @@ const Io = std.Io;
 const net = Io.net;
 const http = @import("http.zig");
 const ws = @import("ws.zig");
+const tlsconn = @import("tlsconn.zig");
+const x509check = @import("x509check.zig");
+const watchdog = @import("watchdog.zig");
 const Grid = @import("view").grid.Grid;
 const gframe = @import("../gframe.zig");
 const keys = @import("../keys.zig");
 const credstore = @import("../credstore.zig");
 
 pub const max_frame_payload = 8 << 20;
+
+pub const connect_timeout_ms = 15_000;
+pub const request_timeout_ms = 15_000;
+pub const idle_timeout_ms = 60_000;
+pub const ping_interval_ms = 20_000;
 
 pub const Status = enum {
     starting,
@@ -57,6 +75,37 @@ pub const Shared = struct {
     }
 };
 
+/// How to reach the server.
+pub const Transport = union(enum) {
+    /// HTTPS/WSS, server certificate signed by this CA (DER).
+    tls: []const u8,
+    /// `--insecure-plain-http` (servers run with --no-tls).
+    insecure_plain_http,
+};
+
+/// Short user-facing reason for a connection error (no secrets).
+pub fn describe(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NotIssuedByPinnedCa => "server certificate is not from the pinned Portal CA",
+        error.HostMismatch => "server certificate is not for this IP",
+        error.CertificateExpired => "server certificate expired",
+        error.CertificateNotYetValid => "server certificate not yet valid (check the clock)",
+        error.CaExpired => "the pinned Portal CA expired",
+        error.BadCertificate, error.UnsupportedCertificate => "server sent an unusable certificate",
+        error.NotTls13, error.UnsupportedCipherSuite, error.HelloRetryRequest => "server TLS is not Portal's (TLS 1.3)",
+        error.TlsHandshakeMalformed, error.TlsUnexpectedMessage, error.TlsDecodeError => "not a TLS server (a --no-tls server needs --insecure-plain-http)",
+        error.TlsAlert => "server refused the TLS handshake",
+        error.TlsConnectionTruncated => "connection closed during the TLS handshake (a --no-tls server needs --insecure-plain-http)",
+        error.NoServerCertificate, error.NoHandshakeSecret, error.TlsHandshakeTooLarge => "TLS handshake failed",
+        error.TimedOut, error.Canceled => "server not responding (timed out)",
+        error.ConnectionRefused => "connection refused (is Portal running?)",
+        error.ConnectionResetByPeer, error.ConnectionClosed => "connection closed by the server",
+        error.NetworkUnreachable, error.HostUnreachable => "network unreachable (is the tunnel up?)",
+        error.ResponseTooLarge => "response too large",
+        else => @errorName(err),
+    };
+}
+
 pub const Client = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -64,18 +113,47 @@ pub const Client = struct {
     addr: net.IpAddress,
     host_buf: [64]u8 = undefined,
     host_len: usize = 0,
+    ip_buf: [64]u8 = undefined,
+    ip_len: usize = 0,
     target_buf: [credstore.max_target]u8 = undefined,
     target_len: usize = 0,
+    plain: bool,
+    ca_buf: [x509check.max_cert_len]u8 = undefined,
+    ca_len: usize = 0,
 
+    wd: watchdog.Watchdog,
+    /// The open WebSocket connection; guarded by write_mutex.
     write_mutex: Io.Mutex = .init,
-    stream: ?net.Stream = null,
+    conn: ?*tlsconn.Conn = null,
+    last_rx_ms: std.atomic.Value(i64) = .init(0),
+    last_ping_ms: std.atomic.Value(i64) = .init(0),
+    /// Last connection error printed to stderr (printed once per change).
+    last_logged: ?anyerror = null,
 
-    pub fn init(gpa: std.mem.Allocator, io: Io, shared: *Shared, server: []const u8) !Client {
-        var c: Client = .{ .gpa = gpa, .io = io, .shared = shared, .addr = undefined };
+    pub fn init(gpa: std.mem.Allocator, io: Io, shared: *Shared, server: []const u8, transport: Transport) !Client {
+        var c: Client = .{
+            .gpa = gpa,
+            .io = io,
+            .shared = shared,
+            .addr = undefined,
+            .plain = transport == .insecure_plain_http,
+            .wd = .{ .io = io },
+        };
         const h = try http.canonicalHost(server, &c.host_buf);
         c.host_len = h.len;
         c.addr = net.IpAddress.parseLiteral(h) catch return error.BadServerAddress;
-        c.target_len = credstore.targetName(h, &c.target_buf).len;
+        const ip = bareIp(h);
+        @memcpy(c.ip_buf[0..ip.len], ip);
+        c.ip_len = ip.len;
+        c.target_len = credstore.targetName(h, c.plain, &c.target_buf).len;
+        switch (transport) {
+            .tls => |ca| {
+                if (ca.len > c.ca_buf.len) return error.BadCertificate;
+                @memcpy(c.ca_buf[0..ca.len], ca);
+                c.ca_len = ca.len;
+            },
+            .insecure_plain_http => {},
+        }
         return c;
     }
 
@@ -85,6 +163,15 @@ pub const Client = struct {
 
     pub fn target(c: *const Client) []const u8 {
         return c.target_buf[0..c.target_len];
+    }
+
+    fn secure(c: *const Client) bool {
+        return !c.plain;
+    }
+
+    fn security(c: *const Client) tlsconn.Security {
+        if (c.plain) return .plain;
+        return .{ .tls = .{ .ca_der = c.ca_buf[0..c.ca_len], .ip = c.ip_buf[0..c.ip_len] } };
     }
 
     // ------------------------------------------------------------ status
@@ -107,6 +194,13 @@ pub const Client = struct {
 
     fn sleepMs(c: *Client, ms: i64) void {
         c.io.sleep(.fromMilliseconds(ms), .awake) catch {};
+    }
+
+    /// Prints connection errors to stderr once per distinct error.
+    fn logError(c: *Client, err: anyerror) void {
+        if (c.last_logged) |l| if (l == err) return;
+        c.last_logged = err;
+        std.debug.print("portal connect: {s}: {s} ({t})\n", .{ c.host(), describe(err), err });
     }
 
     // ------------------------------------------------------------ main loop
@@ -164,7 +258,7 @@ pub const Client = struct {
             return null;
         };
         if (stored) |value| {
-            var device = http.Cookie.fromValue(.device, value) orelse {
+            var device = http.Cookie.fromValue(.device, value, c.secure()) orelse {
                 credstore.delete(c.target()) catch {};
                 return null;
             };
@@ -184,15 +278,15 @@ pub const Client = struct {
 
     fn pair(c: *Client) ?http.Cookie {
         var resp_buf: [http.max_head_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &resp_buf);
         var req_buf: [512]u8 = undefined;
         var w: Io.Writer = .fixed(&req_buf);
-        http.writePairRequest(&w, c.host()) catch return null;
-        const resp = c.roundTrip(w.buffered(), &resp_buf) catch |err| {
-            c.setStatus(.pair_closed, "could not reach the server ({t})", .{err});
+        http.writePairRequest(&w, c.host(), c.secure()) catch return null;
+        var r = c.roundTrip(w.buffered(), &resp_buf) catch |err| {
+            c.logError(err);
+            c.setStatus(.pair_closed, "could not reach the server: {s}", .{describe(err)});
             return null;
         };
-        defer std.crypto.secureZero(u8, &resp_buf);
-        var r = resp;
         defer if (r.device) |*d| d.wipe();
         switch (http.pairOutcome(&r)) {
             .ok => {
@@ -214,9 +308,10 @@ pub const Client = struct {
         var req_buf: [768]u8 = undefined;
         defer std.crypto.secureZero(u8, &req_buf);
         var w: Io.Writer = .fixed(&req_buf);
-        http.writeRefreshRequest(&w, c.host(), device) catch return null;
+        http.writeRefreshRequest(&w, c.host(), c.secure(), device) catch return null;
         var r = c.roundTrip(w.buffered(), &resp_buf) catch |err| {
-            c.retryWait(backoff, @errorName(err));
+            c.logError(err);
+            c.retryWait(backoff, describe(err));
             return null;
         };
         defer if (r.device) |*d| d.wipe();
@@ -228,6 +323,7 @@ pub const Client = struct {
                     c.sleepMs(5000);
                     return null;
                 };
+                c.last_logged = null;
                 return r.session.?;
             },
             .revoked => {
@@ -243,27 +339,24 @@ pub const Client = struct {
         }
     }
 
-    fn connect(c: *Client) !net.Stream {
-        // No connect timeout: std.Io.Threaded panics ("TODO") when one is
-        // given, on both Windows and POSIX in this Zig version. The OS default
-        // applies (about 21 s on Windows) when the tunnel is down.
-        return c.addr.connect(c.io, .{ .mode = .stream });
-    }
-
     /// Sends a request on a fresh connection and parses the response head.
     /// Returned slices point into `buf`.
-    fn roundTrip(c: *Client, request: []const u8, buf: *[http.max_head_bytes]u8) !http.Response {
-        const stream = try c.connect();
-        defer stream.close(c.io);
-        var wbuf: [256]u8 = undefined;
-        var sw = stream.writer(c.io, &wbuf);
-        try sw.interface.writeAll(request);
-        try sw.interface.flush();
+    fn roundTrip(c: *Client, request: []const u8, buf: *[http.max_head_bytes]u8) anyerror!http.Response {
+        c.wd.extend(connect_timeout_ms);
+        const r = c.wd.run(roundTripTask, .{ c, request, buf }, null);
+        if (c.wd.expired.load(.acquire)) return error.TimedOut;
+        return r;
+    }
+
+    fn roundTripTask(c: *Client, request: []const u8, buf: *[http.max_head_bytes]u8) anyerror!http.Response {
+        const conn = try tlsconn.Conn.open(c.gpa, c.io, c.addr, c.security());
+        defer conn.close(c.gpa);
+        c.wd.extend(request_timeout_ms);
+        try conn.writeAll(request);
         var len: usize = 0;
         while (true) {
             if (len == buf.len) return error.ResponseTooLarge;
-            var vec = [_][]u8{buf[len..]};
-            const n = sockRead(stream, c.io, &vec) catch return error.ReadFailed;
+            const n = try conn.read(buf[len..]);
             if (n == 0) return error.ConnectionClosed;
             len += n;
             if (http.findHeadEnd(buf[0..len])) |end| return http.parseResponseHead(buf[0..end]);
@@ -280,8 +373,33 @@ pub const Client = struct {
     };
 
     fn runStream(c: *Client, session: *const http.Cookie, backoff: *i64) StreamResult {
-        const stream = c.connect() catch |err| return .{ .failed = @errorName(err) };
-        defer stream.close(c.io);
+        c.wd.extend(connect_timeout_ms);
+        const r = c.wd.run(streamTask, .{ c, session, backoff }, .{ .ctx = c, .f = pingTick });
+        if (c.wd.expired.load(.acquire)) {
+            c.logError(error.TimedOut);
+            return .{ .failed = describe(error.TimedOut) };
+        }
+        return r;
+    }
+
+    /// Runs on the network thread while the stream task runs: keeps an idle
+    /// stream alive (the server answers pings with pongs).
+    fn pingTick(ctx: *anyopaque) void {
+        const c: *Client = @ptrCast(@alignCast(ctx));
+        const now = watchdog.nowMs(c.io);
+        if (now - c.last_rx_ms.load(.acquire) < ping_interval_ms) return;
+        if (now - c.last_ping_ms.load(.acquire) < ping_interval_ms) return;
+        c.last_ping_ms.store(now, .release);
+        c.sendFrame(.ping, "") catch {};
+    }
+
+    fn streamTask(c: *Client, session: *const http.Cookie, backoff: *i64) StreamResult {
+        const conn = tlsconn.Conn.open(c.gpa, c.io, c.addr, c.security()) catch |err| {
+            c.logError(err);
+            return .{ .failed = describe(err) };
+        };
+        defer conn.close(c.gpa);
+        c.wd.extend(request_timeout_ms);
 
         var rnd: [16]u8 = undefined;
         c.io.randomSecure(&rnd) catch return .{ .failed = "no secure randomness" };
@@ -290,11 +408,8 @@ pub const Client = struct {
             var req_buf: [768]u8 = undefined;
             defer std.crypto.secureZero(u8, &req_buf);
             var w: Io.Writer = .fixed(&req_buf);
-            http.writeUpgradeRequest(&w, c.host(), session, &key) catch return .{ .failed = "request too long" };
-            var wbuf: [256]u8 = undefined;
-            var sw = stream.writer(c.io, &wbuf);
-            sw.interface.writeAll(w.buffered()) catch return .{ .failed = "write failed" };
-            sw.interface.flush() catch return .{ .failed = "write failed" };
+            http.writeUpgradeRequest(&w, c.host(), c.secure(), session, &key) catch return .{ .failed = "request too long" };
+            conn.writeAll(w.buffered()) catch return .{ .failed = "write failed" };
         }
 
         // Buffer for the response head and then for frames; grows on demand.
@@ -306,7 +421,7 @@ pub const Client = struct {
         var head_end: usize = 0;
         while (true) {
             if (buf.items.len >= http.max_head_bytes) return .{ .failed = "response head too large" };
-            if (!c.readMore(stream, &buf)) return .{ .failed = "connection closed during upgrade" };
+            if (!c.readMore(conn, &buf)) return .{ .failed = "connection closed during upgrade" };
             if (http.findHeadEnd(buf.items)) |e| {
                 if (e > http.max_head_bytes) return .{ .failed = "response head too large" };
                 head_end = e;
@@ -323,14 +438,18 @@ pub const Client = struct {
         std.mem.copyForwards(u8, buf.items[0 .. buf.items.len - head_end], buf.items[head_end..]);
         buf.shrinkRetainingCapacity(buf.items.len - head_end);
 
+        c.last_rx_ms.store(watchdog.nowMs(c.io), .release);
+        c.last_ping_ms.store(0, .release);
+        c.wd.extend(idle_timeout_ms);
         c.write_mutex.lockUncancelable(c.io);
-        c.stream = stream;
+        c.conn = conn;
         c.write_mutex.unlock(c.io);
         defer {
             c.write_mutex.lockUncancelable(c.io);
-            c.stream = null;
+            c.conn = null;
             c.write_mutex.unlock(c.io);
         }
+        c.last_logged = null;
         c.setStatus(.connected, "", .{});
         c.shared.mutex.lockUncancelable(c.io);
         c.shared.exit_code = null;
@@ -348,17 +467,19 @@ pub const Client = struct {
                 buf.shrinkRetainingCapacity(buf.items.len - used);
             }
             if (buf.items.len > max_frame_payload + 16) return .{ .failed = "frame too large" };
-            if (!c.readMore(stream, &buf)) return .{ .failed = "connection lost" };
+            if (!c.readMore(conn, &buf)) return .{ .failed = "connection lost" };
         }
     }
 
-    fn readMore(c: *Client, stream: net.Stream, buf: *std.ArrayList(u8)) bool {
+    /// Reads into `buf`; any data from the server moves the idle deadline.
+    fn readMore(c: *Client, conn: *tlsconn.Conn, buf: *std.ArrayList(u8)) bool {
         buf.ensureUnusedCapacity(c.gpa, 32 * 1024) catch return false;
         const spare = buf.unusedCapacitySlice();
-        var vec = [_][]u8{spare};
-        const n = sockRead(stream, c.io, &vec) catch return false;
+        const n = conn.read(spare) catch return false;
         if (n == 0) return false;
         buf.items.len += n;
+        c.last_rx_ms.store(watchdog.nowMs(c.io), .release);
+        c.wd.extend(idle_timeout_ms);
         return true;
     }
 
@@ -420,19 +541,24 @@ pub const Client = struct {
         return null;
     }
 
+    /// Callable from any thread. Inside the watchdog's task, a cancelation
+    /// that lands here is re-armed so that the next read sees it.
     fn sendFrame(c: *Client, opcode: ws.Opcode, payload: []const u8) !void {
         if (payload.len > ws.max_client_payload) return error.TooLarge;
         var mask: [4]u8 = undefined;
-        try c.io.randomSecure(&mask);
+        c.io.randomSecure(&mask) catch |err| {
+            if (err == error.Canceled) c.io.recancel();
+            return err;
+        };
         var out: [ws.max_client_payload + 16]u8 = undefined;
         const frame = try ws.encodeClientFrame(&out, opcode, payload, mask);
         c.write_mutex.lockUncancelable(c.io);
         defer c.write_mutex.unlock(c.io);
-        const stream = c.stream orelse return error.NotConnected;
-        var wbuf: [64]u8 = undefined;
-        var sw = stream.writer(c.io, &wbuf);
-        try sw.interface.writeAll(frame);
-        try sw.interface.flush();
+        const conn = c.conn orelse return error.NotConnected;
+        conn.writeAll(frame) catch |err| {
+            if (err == error.Canceled) c.io.recancel();
+            return err;
+        };
     }
 
     /// Sends an input frame ("k:..." or "t:..."); callable from the UI thread.
@@ -446,9 +572,67 @@ pub const Client = struct {
     }
 };
 
-/// std.Io.net.Stream.read does not compile in this Zig version (it
-/// destructures a struct); the control-data variant is equivalent.
-fn sockRead(stream: net.Stream, io: Io, vec: [][]u8) !usize {
-    const r = try stream.readWithControl(io, vec, &.{});
-    return r.data_len;
+/// "10.8.0.1:8420" -> "10.8.0.1", "[fd00::1]:8420" -> "fd00::1".
+pub fn bareIp(canonical_host: []const u8) []const u8 {
+    if (canonical_host.len > 0 and canonical_host[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, canonical_host, ']') orelse return canonical_host;
+        return canonical_host[1..close];
+    }
+    const colon = std.mem.lastIndexOfScalar(u8, canonical_host, ':') orelse return canonical_host;
+    return canonical_host[0..colon];
+}
+
+/// Downloads the CA certificate from the pairing-time download listener
+/// (plain HTTP on the server port + 1, `/ca.cer`) into `out`. This channel
+/// is not authenticated: the caller must compare the certificate's
+/// fingerprint with one the user read on the desktop before trusting it.
+pub fn fetchCaCertificate(gpa: std.mem.Allocator, io: Io, server: []const u8, out: *[x509check.max_cert_len]u8) anyerror![]const u8 {
+    var host_buf: [64]u8 = undefined;
+    const h = try http.canonicalHost(server, &host_buf);
+    var addr = net.IpAddress.parseLiteral(h) catch return error.BadServerAddress;
+    if (addr.getPort() == 65535) return error.BadServerAddress;
+    addr.setPort(addr.getPort() + 1);
+    var dl_host_buf: [64]u8 = undefined;
+    const dl_host = std.fmt.bufPrint(&dl_host_buf, "{f}", .{addr}) catch return error.BadServerAddress;
+    var wd: watchdog.Watchdog = .{ .io = io };
+    wd.extend(connect_timeout_ms);
+    const r = wd.run(fetchTask, .{ gpa, io, addr, dl_host, &wd, out }, null);
+    if (wd.expired.load(.acquire)) return error.TimedOut;
+    return r;
+}
+
+fn fetchTask(gpa: std.mem.Allocator, io: Io, addr: net.IpAddress, host_: []const u8, wd: *watchdog.Watchdog, out: *[x509check.max_cert_len]u8) anyerror![]const u8 {
+    const conn = try tlsconn.Conn.open(gpa, io, addr, .plain);
+    defer conn.close(gpa);
+    wd.extend(request_timeout_ms);
+    var req_buf: [256]u8 = undefined;
+    var rw: Io.Writer = .fixed(&req_buf);
+    try http.writeCaRequest(&rw, host_);
+    try conn.writeAll(rw.buffered());
+    var buf: [http.max_head_bytes + x509check.max_cert_len]u8 = undefined;
+    var len: usize = 0;
+    var head_end: ?usize = null;
+    var want: usize = 0;
+    while (true) {
+        if (head_end) |e| if (len - e >= want) {
+            @memcpy(out[0..want], buf[e..][0..want]);
+            return out[0..want];
+        };
+        if (len == buf.len) return error.ResponseTooLarge;
+        const n = try conn.read(buf[len..]);
+        if (n == 0) return error.ConnectionClosed;
+        len += n;
+        if (head_end == null) if (http.findHeadEnd(buf[0..len])) |e| {
+            const resp = try http.parseResponseHead(buf[0..e]);
+            if (resp.status != 200) return error.CaDownloadRefused;
+            want = resp.content_length orelse return error.CaDownloadRefused;
+            if (want == 0 or want > out.len) return error.ResponseTooLarge;
+            head_end = e;
+        };
+    }
+}
+
+test "bare IP" {
+    try std.testing.expectEqualStrings("10.8.0.1", bareIp("10.8.0.1:8420"));
+    try std.testing.expectEqualStrings("fd00::1", bareIp("[fd00::1]:8420"));
 }
