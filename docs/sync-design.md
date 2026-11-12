@@ -84,6 +84,32 @@ after that, new adapter versions arrive whenever training produces one.
   fetch `GET /sync/pkg/<package>/<version>/manifest` and files over HTTPS
   with the session, with explicit size limits. Nothing polls.
 
+## Running delivered programs: `stt-local`
+
+* `stt-local` runs as a **child process of the Portal app**, not linked in.
+  This gives crash and hang isolation from the NPU driver, keeps the vendor
+  DLLs out of the process holding device credentials, and allows
+  independent updates.
+* **Protocol:** JSON lines on stdin/stdout, treated by Portal as
+  **untrusted input**:
+  * the first line is a `ready` event with the protocol version;
+  * stdout carries protocol lines only (≤ 8 MiB each); logs go to stderr;
+  * requests carry `rid` and replies echo it; fixed error codes;
+  * 16 kHz mono s16 PCM in, text out;
+  * `wakeup` events keep it event-driven;
+  * stdin EOF means exit.
+* **Restrictions** stt-local must honour: no sockets, no spawning, writes
+  only under its profile dir (`sync\data\stt-local\`). It runs from its
+  read-only package folder, with the model and adapter from their own
+  package folders.
+
+## Diagnostics back to the desktop (proposed)
+
+A device-to-desktop report upload for programs such as `npu-probe`: the
+laptop app offers "Send report to desktop" (with approval) and
+`POST /sync/report/<pkg>` stores it under the desktop's Portal data folder,
+with size caps.
+
 ## The other direction
 
 Device → desktop data (speech samples and corrections) uses the bundle
