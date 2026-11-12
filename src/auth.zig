@@ -175,8 +175,9 @@ pub const Sessions = struct {
     /// Ends the sessions of device records for which `paired(ctx, id)` is
     /// false. Sessions created at or after `since_ms` are kept: the
     /// caller's view of the device list may predate them. Untagged
-    /// sessions are kept. Returns how many were ended.
-    pub fn revokeUnpaired(s: *Sessions, since_ms: i64, ctx: anytype, comptime paired: fn (@TypeOf(ctx), DeviceId) bool) usize {
+    /// sessions are kept. Returns how many were ended; `ended[0..n]` are
+    /// their device ids.
+    pub fn revokeUnpaired(s: *Sessions, since_ms: i64, ctx: anytype, comptime paired: fn (@TypeOf(ctx), DeviceId) bool, ended: *[max_sessions]DeviceId) usize {
         var n: usize = 0;
         for (&s.slots) |*slot| {
             const v = slot.* orelse continue;
@@ -184,6 +185,7 @@ pub const Sessions = struct {
             if (v.created_ms >= since_ms) continue;
             if (!paired(ctx, d.id)) {
                 slot.* = null;
+                ended[n] = d.id;
                 n += 1;
             }
         }
@@ -368,12 +370,14 @@ test "sessions: revokeUnpaired keeps new and untagged sessions" {
     s.createFor(&b, 0, .init(testId(2), "laptop")); // same name, the record that is kept
     s.create(&d, 0);
     s.createFor(&c, 50, .init(testId(1), "laptop")); // created after the device list was read
+    var ended: [Sessions.max_sessions]DeviceId = undefined;
     const n = s.revokeUnpaired(40, {}, struct {
         fn f(_: void, id: DeviceId) bool {
             return std.mem.eql(u8, &id, &testId(2));
         }
-    }.f);
+    }.f, &ended);
     try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(testId(1), ended[0]);
     try testing.expect(!s.isLive(&a, 60));
     try testing.expect(s.isLive(&b, 60) and s.isLive(&c, 60) and s.isLive(&d, 60));
 }

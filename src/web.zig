@@ -363,6 +363,11 @@ pub const Server = struct {
 
     auth_mutex: Io.Mutex = .init,
     sessions: auth.Sessions = .{},
+    /// Guarded by auth_mutex. Device records whose sessions were ended
+    /// because the record itself went away, and why: what a WebSocket's
+    /// {"t":"logout"} then says (`reason`). Memory only, oldest dropped.
+    ended: [ended_slots]?Ended = @splat(null),
+    ended_next: usize = 0,
 
     conn_mutex: Io.Mutex = .init,
     conns: ConnTable = .{},
@@ -417,6 +422,29 @@ pub const Server = struct {
     /// Makes `run` return (the pairing-time download listener is stopped
     /// this way, together with cancelling its accept).
     stop: std.atomic.Value(bool) = .init(false),
+
+    /// Why a device record's sessions ended (docs/protocol.md section 3,
+    /// `logout`). `unpaired`: the record was removed (unpaired at the desk,
+    /// forgotten by the device, revoked): the device should forget this
+    /// desktop. `replaced`: another pairing under its name or address
+    /// replaced it: the device signs in again and learns from that
+    /// answer whether it is still paired.
+    pub const EndReason = enum { unpaired, replaced };
+    const Ended = struct { id: auth.DeviceId, reason: EndReason };
+    const ended_slots = 32;
+
+    /// Caller holds auth_mutex. The first reason recorded for `id` stays.
+    fn noteEnded(srv: *Server, id: auth.DeviceId, reason: EndReason) void {
+        if (srv.endedReason(id) != null) return;
+        srv.ended[srv.ended_next] = .{ .id = id, .reason = reason };
+        srv.ended_next = (srv.ended_next + 1) % ended_slots;
+    }
+
+    /// Caller holds auth_mutex.
+    fn endedReason(srv: *const Server, id: auth.DeviceId) ?EndReason {
+        for (srv.ended) |slot| if (slot) |e| if (std.mem.eql(u8, &e.id, &id)) return e.reason;
+        return null;
+    }
 
     fn cookieName(srv: *const Server) []const u8 {
         return http_names.cookieName(.session, srv.cfg.secure_cookie);
@@ -638,11 +666,13 @@ pub const Server = struct {
     pub fn applyStore(srv: *Server, st: *const devices.Store, read_start_ms: i64) void {
         srv.setPairing(st.pairing);
         srv.auth_mutex.lockUncancelable(srv.io);
+        var ended: [auth.Sessions.max_sessions]auth.DeviceId = undefined;
         const n = srv.sessions.revokeUnpaired(read_start_ms, st, struct {
             fn paired(s: *const devices.Store, id: auth.DeviceId) bool {
                 return s.findId(id) != null;
             }
-        }.paired);
+        }.paired, &ended);
+        for (ended[0..n]) |id| srv.noteEnded(id, .unpaired);
         srv.auth_mutex.unlock(srv.io);
         if (n > 0) {
             srv.log.print("ended {d} session(s) of devices that are no longer paired", .{n});
@@ -992,7 +1022,6 @@ pub const Server = struct {
             error.EndOfStream, error.ReadFailed, error.WriteFailed => return,
             else => {},
         }
-        srv.note_mutex.lockUncancelable(srv.io);
         const suppressed = srv.limited(&srv.tls_fail_log, 10_000) orelse return;
         var abuf: [64]u8 = undefined;
         // Never `{t}` a peer-supplied alert: it may have no name.
@@ -1196,6 +1225,7 @@ pub const Server = struct {
                     return srv.deviceSignIn(conn, w, req, d, .api);
                 }
                 if (std.mem.eql(u8, path, "/logout")) return srv.logout(conn, w, req, h);
+                if (std.mem.eql(u8, path, "/device/forget")) return srv.deviceForget(conn, w, h);
             },
             .other => return srv.fail(conn, w, .method_not_allowed, "method not allowed\n"),
         }
@@ -1299,6 +1329,8 @@ pub const Server = struct {
         const view = srv.pairingSnapshot(srv.nowUnix());
         const msg: []const u8 = if (std.mem.eql(u8, q, "e=closed"))
             "<p class=\"error\">No pairing window is open. Open one at the desktop first (see below).</p>"
+        else if (std.mem.eql(u8, q, "e=gone"))
+            "<p class=\"error\">This device is no longer paired with this desktop (it was unpaired at the desk, or forgot this desktop). Pair it again at the desktop.</p>"
         else if (std.mem.eql(u8, q, "e=revoked"))
             "<p class=\"error\">This device's credential was used from somewhere else, so it was revoked. Pair it again at the desktop.</p>"
         else if (std.mem.eql(u8, q, "e=denied"))
@@ -1458,21 +1490,34 @@ pub const Server = struct {
         return srv.sessions.live(cookie, srv.realMs(), refresh);
     }
 
-    /// Ends every session of device record `id` and wakes every viewer
-    /// and supervisor so open WebSockets of it close. Returns how many
-    /// sessions ended.
-    fn endDeviceSessions(srv: *Server, id: auth.DeviceId) usize {
+    /// Ends every session of device record `id` (which the store no longer
+    /// has, for `reason`) and wakes every viewer and supervisor so open
+    /// WebSockets of it are told (`logout` with the reason) and close.
+    /// Returns how many sessions ended.
+    fn endDeviceSessions(srv: *Server, id: auth.DeviceId, reason: EndReason) usize {
         srv.auth_mutex.lockUncancelable(srv.io);
         const n = srv.sessions.revokeDevice(id);
+        srv.noteEnded(id, reason);
         srv.auth_mutex.unlock(srv.io);
         srv.wakeViewers();
         return n;
     }
 
+    /// The {"t":"logout"} message for a session that is no longer live.
+    fn logoutMessage(srv: *Server, device: ?auth.Device) []const u8 {
+        const d = device orelse return "{\"t\":\"logout\"}";
+        srv.auth_mutex.lockUncancelable(srv.io);
+        defer srv.auth_mutex.unlock(srv.io);
+        return switch (srv.endedReason(d.id) orelse return "{\"t\":\"logout\"}") {
+            .unpaired => "{\"t\":\"logout\",\"reason\":\"unpaired\"}",
+            .replaced => "{\"t\":\"logout\",\"reason\":\"replaced\"}",
+        };
+    }
+
     /// A stale or wrong credential was presented: the store already
     /// removed the record; end its sessions and say so.
     fn deviceRevoked(srv: *Server, gone: auth.Device, peer: []const u8) void {
-        const n = srv.endDeviceSessions(gone.id);
+        const n = srv.endDeviceSessions(gone.id, .unpaired);
         srv.log.print("DEVICE REVOKED '{s}': stale or wrong credential presented from {s} (copied credential?); {d} session(s) ended. Re-pair required.", .{ gone.name(), peer, n });
     }
 
@@ -1517,6 +1562,10 @@ pub const Server = struct {
                     },
                     .wrong_address => {
                         c.res.outcome = .wrong_address;
+                        return false;
+                    },
+                    .gone => {
+                        c.res.outcome = .gone;
                         return false;
                     },
                     .unknown => return false,
@@ -1683,7 +1732,7 @@ pub const Server = struct {
         // end every one of their sessions (and so their WebSockets, input
         // and /sync access) before the new credential exists.
         for (paired.replaced.items()) |old| {
-            const n = srv.endDeviceSessions(old.id);
+            const n = srv.endDeviceSessions(old.id, .replaced);
             srv.log.print("re-pair: previous device record '{s}' removed; {d} of its session(s) ended", .{ old.name(), n });
         }
         srv.log.print("PAIRED device '{s}' at {s} (request {s}, approved at the desk)", .{ paired.device.name(), ip, &r.code });
@@ -1693,7 +1742,15 @@ pub const Server = struct {
     }
 
     const SignInMode = enum { page, api };
-    const SignInOutcome = enum { ok, wrong_address, revoked, unknown };
+    const SignInOutcome = enum { ok, wrong_address, revoked, gone, unknown };
+
+    /// On a refused native sign-in (`POST /auth/refresh`) and
+    /// `POST /device/forget`: says, unambiguously, that this desktop no
+    /// longer has the device (its record was removed, or its credential
+    /// matches no record). A device that gets it forgets this desktop.
+    /// Never sent for a store error (500) or a known device presented from
+    /// another address.
+    const device_gone_header: http1.Header = .{ .name = "x-portal-device", .value = "gone" };
 
     /// A paired device presents its credential: verify it against the
     /// device's bound address, rotate it, and start a session. A stale or
@@ -1729,14 +1786,68 @@ pub const Server = struct {
             // Logged here only: the response is the same for both, so a
             // peer can't use it to learn which device names exist.
             .wrong_address => srv.notePreAuth(&srv.signin_log, "device credential presented from unexpected address {s}; rejected", .{peer}),
+            .gone => srv.notePreAuth(&srv.signin_log, "credential of a removed device presented from {s}; told it is no longer paired", .{peer}),
             .unknown => srv.notePreAuth(&srv.signin_log, "device credential from {s} matches no paired device; rejected", .{peer}),
         }
         var clear_buf: [2][128]u8 = undefined;
         const clear = try srv.clearCookies(&clear_buf);
         switch (mode) {
-            .page => return srv.redirect(conn, w, req, if (outcome == .revoked) "/pair?e=revoked" else "/pair", &clear),
-            .api => return srv.fail(conn, w, .unauthorized, "not paired\n"),
+            .page => return srv.redirect(conn, w, req, switch (outcome) {
+                .revoked => "/pair?e=revoked",
+                .gone => "/pair?e=gone",
+                else => "/pair",
+            }, &clear),
+            .api => {
+                const gone = [_]http1.Header{device_gone_header};
+                try srv.respond(conn, w, .unauthorized, "not paired\n", "text/plain; charset=utf-8", if (outcome == .wrong_address) &.{} else &gone, false);
+                return false;
+            },
         }
+    }
+
+    /// POST /device/forget: the device forgets this desktop ("Forget this
+    /// desktop" in portal connect, `connect --forget`, `sync-device
+    /// --forget`) and asks it to forget the device too. The device is the
+    /// one its live session belongs to (never anything in the request):
+    /// its record is removed (secrets kept as tombstones), all its
+    /// sessions end (WebSockets get logout/unpaired), and the desk's
+    /// Devices panel refreshes. 204 when done; 401 with
+    /// `X-Portal-Device: gone` without a live device session.
+    fn deviceForget(srv: *Server, conn: *Conn, w: *Io.Writer, h: Headers) !bool {
+        const peer = conn.peer();
+        const gone = [_]http1.Header{device_gone_header};
+        const cookie = h.cookie orelse {
+            try srv.respond(conn, w, .unauthorized, "login required\n", "text/plain; charset=utf-8", &.{}, false);
+            return false;
+        };
+        const d = switch (srv.sessionOwner(cookie, false)) {
+            .device => |d| d,
+            .anonymous => return srv.fail(conn, w, .forbidden, "not a paired device\n"),
+            .none => {
+                // No live session: it may have ended because the device
+                // is gone; the device signs in to find out.
+                try srv.respond(conn, w, .unauthorized, "login required\n", "text/plain; charset=utf-8", &.{}, false);
+                return false;
+            },
+        };
+        var removed = false;
+        const Ctx = struct { id: auth.DeviceId, removed: *bool };
+        devices.withStore(srv.gpa, srv.io, srv.cfg.devices, srv.nowUnix(), Ctx{ .id = d.id, .removed = &removed }, struct {
+            fn op(c: Ctx, st: *devices.Store) !bool {
+                c.removed.* = st.removeId(c.id);
+                return c.removed.*;
+            }
+        }.op) catch |err| {
+            srv.noteStoreFailure("forget", peer, err);
+            return srv.fail(conn, w, .internal_server_error, "device store unavailable: the device was NOT forgotten\n");
+        };
+        const n = srv.endDeviceSessions(d.id, .unpaired);
+        srv.log.print("device '{s}' forgot this desktop from {s}: its record was removed{s}; {d} session(s) ended", .{
+            d.name(), peer, if (removed) "" else " (already gone)", n,
+        });
+        srv.notifyPairing(); // the desk's Devices panel re-reads the list
+        try srv.respond(conn, w, .no_content, "", "text/plain; charset=utf-8", &gone, false);
+        return false;
     }
 
     /// POST /logout ("Unpair this device"): removes the device and its
@@ -1777,7 +1888,7 @@ pub const Server = struct {
         switch (res.outcome) {
             .ok => {
                 const d = res.device.?;
-                _ = srv.endDeviceSessions(d.id);
+                _ = srv.endDeviceSessions(d.id, .unpaired);
                 srv.log.print("device '{s}' unpaired itself from {s}", .{ d.name(), peer });
                 return srv.redirect(conn, w, req, "/pair?bye", &clear);
             },
@@ -1785,7 +1896,7 @@ pub const Server = struct {
                 srv.deviceRevoked(res.device.?, peer);
                 return srv.redirect(conn, w, req, "/pair?e=revoked", &clear);
             },
-            .wrong_address, .unknown => return srv.redirect(conn, w, req, "/pair", &clear),
+            .wrong_address, .gone, .unknown => return srv.redirect(conn, w, req, "/pair", &clear),
         }
     }
 
@@ -2008,7 +2119,7 @@ pub const Server = struct {
             // ends its sessions and wakes this loop) ends the stream.
             // Checked on every wake; memory only.
             if (!srv.sessionLive(&ws.cookie, false)) {
-                _ = ws.send(srv, "{\"t\":\"logout\"}", .text);
+                _ = ws.send(srv, srv.logoutMessage(ws.device), .text);
                 return;
             }
             // Coalesce bursts of output into at most ~30 frames per second.

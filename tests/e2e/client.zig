@@ -204,6 +204,8 @@ pub const Viewer = struct {
     /// The first grid frame was a full snapshot.
     first_full: bool = false,
     got_logout: bool = false,
+    /// The logout's `reason`, if it had one.
+    logout_reason: enum { none, unpaired, replaced } = .none,
     got_exit: bool = false,
     closed: bool = false,
     close_payload: [2]u8 = .{ 0, 0 },
@@ -271,6 +273,8 @@ pub const Viewer = struct {
                     v.rejected_count += 1;
                 } else if (std.mem.indexOf(u8, p, "\"logout\"") != null) {
                     v.got_logout = true;
+                    if (std.mem.indexOf(u8, p, "\"reason\":\"unpaired\"") != null) v.logout_reason = .unpaired;
+                    if (std.mem.indexOf(u8, p, "\"reason\":\"replaced\"") != null) v.logout_reason = .replaced;
                 } else if (std.mem.indexOf(u8, p, "\"exit\"") != null) {
                     v.got_exit = true;
                 }

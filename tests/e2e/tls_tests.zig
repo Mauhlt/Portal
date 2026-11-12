@@ -478,7 +478,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.ok("...and closes the WSS connection", v.waitClose(12_000));
         var page = try client.get(inst, "/", creds.deviceCookie());
         defer page.deinit();
-        _ = r.check("logged-out device can't sign in", std.mem.eql(u8, page.location(), "/pair"), "{s}", .{page.location()});
+        _ = r.check("logged-out device can't sign in (told it is no longer paired)", std.mem.eql(u8, page.location(), "/pair?e=gone"), "{s}", .{page.location()});
     }
     {
         const c = try client.pair(inst, "phone");

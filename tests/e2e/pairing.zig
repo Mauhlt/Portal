@@ -407,7 +407,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("a credential that fell out of the grace ring revokes the device", std.mem.eql(u8, resp.location(), "/pair?e=revoked"), "{d} {s}", .{ resp.status, resp.location() });
         var resp2 = try get(inst, "/", cur.deviceCookie());
         defer resp2.deinit();
-        _ = r.check("revoked device's newest credential no longer works", std.mem.eql(u8, resp2.location(), "/pair"), "{s}", .{resp2.location()});
+        _ = r.check("revoked device's newest credential no longer works (told it is no longer paired)", std.mem.eql(u8, resp2.location(), "/pair?e=gone"), "{s}", .{resp2.location()});
         var resp3 = try post(inst, "/auth/refresh", cur.deviceCookie(), true);
         defer resp3.deinit();
         _ = r.check("revoked device's refresh is 401", resp3.status == 401, "{d}", .{resp3.status});
@@ -427,7 +427,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("forged credential revokes the device", std.mem.eql(u8, resp.location(), "/pair?e=revoked"), "{s}", .{resp.location()});
         var resp2 = try get(inst, "/", c6.deviceCookie());
         defer resp2.deinit();
-        _ = r.check("real credential no longer works after a forgery", std.mem.eql(u8, resp2.location(), "/pair"), "{s}", .{resp2.location()});
+        _ = r.check("real credential no longer works after a forgery", std.mem.eql(u8, resp2.location(), "/pair?e=gone"), "{s}", .{resp2.location()});
         var resp3 = try get(inst, "/", "portal_device=nosuchdevice." ++ &rep(43, 'B'));
         defer resp3.deinit();
         _ = r.check("unknown device name just goes to /pair", std.mem.eql(u8, resp3.location(), "/pair"), "{s}", .{resp3.location()});
@@ -445,6 +445,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         // The old record's sessions end before the new credential is
         // issued, so the logout is already on its way when pair() returns.
         _ = r.check("re-pair: the old device's open viewer is told to log out at once", v.waitLogout(3000), "", .{});
+        _ = r.check("re-pair: ...with reason \"replaced\" (it signs in again to learn more)", v.logout_reason == .replaced, "{t}", .{v.logout_reason});
         _ = r.check("re-pair: ...and its connection is closed", v.waitClose(12_000), "", .{});
         var resp = try get(inst, "/", old.sessionCookie());
         defer resp.deinit();
@@ -456,6 +457,20 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         defer resp3.deinit();
         _ = r.check("re-pair: the new device's session works", resp3.status == 200, "{d}", .{resp3.status});
         _ = r.ok("re-pair logged with the old record's sessions ended", inst.logHas("re-pair: previous device record 'laptop' removed; 1 of its session(s) ended"));
+        {
+            // The old credential is told, unambiguously, that it is gone,
+            // and does not revoke the new record (tombstone, not theft).
+            var rr = try post(inst, "/auth/refresh", old.deviceCookie(), true);
+            defer rr.deinit();
+            _ = r.check("re-pair: the old credential's sign-in is 401 with X-Portal-Device: gone", rr.status == 401 and
+                std.mem.eql(u8, rr.header("x-portal-device") orelse "", "gone"), "{d} {s}", .{ rr.status, rr.header("x-portal-device") orelse "-" });
+            var still = try get(inst, "/", fresh.sessionCookie());
+            defer still.deinit();
+            _ = r.check("re-pair: ...and the new device is not revoked by it", still.status == 200, "{d}", .{still.status});
+            var wa = try http.request(gpa, inst.port, .{ .method = "POST", .path = "/auth/refresh", .host = inst.host, .origin = inst.origin, .cookie = fresh.deviceCookie(), .body = "", .source = other_ip });
+            defer wa.deinit();
+            _ = r.check("a known device from another address is refused without the gone header", !two_ips or (wa.status == 401 and wa.header("x-portal-device") == null), "{d}", .{wa.status});
+        }
         const d = try inst.cli(&.{"devices"});
         _ = r.check("re-pair: one 'laptop' record", std.mem.count(u8, d.out, "laptop ") == 1, "{s}", .{d.out});
     }
@@ -472,12 +487,44 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         const got = v.waitLogout(15_000);
         const dt = net.now() - t0;
         _ = r.check("open viewer told to log out after unpair", got, "after {d} ms", .{dt});
+        _ = r.check("...with reason \"unpaired\" (the device forgets this desktop)", v.logout_reason == .unpaired, "{t}", .{v.logout_reason});
+        {
+            var rr = try post(inst, "/auth/refresh", c7.deviceCookie(), true);
+            defer rr.deinit();
+            _ = r.check("an unpaired device's sign-in is 401 with X-Portal-Device: gone", rr.status == 401 and
+                std.mem.eql(u8, rr.header("x-portal-device") orelse "", "gone"), "{d}", .{rr.status});
+        }
         _ = r.check("...promptly (event-driven, no polling interval)", dt < 3000, "{d} ms", .{dt});
         _ = r.check("viewer connection closed after logout", v.waitClose(12_000), "", .{});
         var resp = try get(inst, "/", c7.deviceCookie());
         defer resp.deinit();
-        _ = r.check("unpaired device can't sign in", std.mem.eql(u8, resp.location(), "/pair"), "{s}", .{resp.location()});
+        _ = r.check("unpaired device can't sign in (told it is no longer paired)", std.mem.eql(u8, resp.location(), "/pair?e=gone"), "{s}", .{resp.location()});
         _ = r.ok("desk unpair logged", inst.logHas("unpaired from the desktop"));
+    }
+
+    // ------------------- the device forgets this desktop: POST /device/forget
+    {
+        const cf = try client.pair(inst, "laptop");
+        const v = try client.Viewer.open(inst, cf.sessionCookie());
+        defer v.deinit();
+        {
+            var nos = try post(inst, "/device/forget", null, true);
+            defer nos.deinit();
+            _ = r.check("POST /device/forget needs a live session", nos.status == 401, "{d}", .{nos.status});
+            var bad = try http.request(gpa, port, .{ .method = "POST", .path = "/device/forget", .host = inst.host, .origin = "http://evil.example", .cookie = cf.sessionCookie(), .body = "" });
+            defer bad.deinit();
+            _ = r.check("...and an allowed Origin", bad.status == 403, "{d}", .{bad.status});
+        }
+        var resp = try post(inst, "/device/forget", cf.sessionCookie(), true);
+        defer resp.deinit();
+        _ = r.check("POST /device/forget with the device's session: 204", resp.status == 204, "{d}", .{resp.status});
+        _ = r.check("...its open viewer is told (logout, reason unpaired)", v.waitLogout(3000) and v.logout_reason == .unpaired, "{t}", .{v.logout_reason});
+        const d = try inst.cli(&.{"devices"});
+        _ = r.check("...the desktop no longer lists it", !d.has("laptop "), "{s}", .{d.out});
+        _ = r.ok("...and logged it", inst.logHas("device 'laptop' forgot this desktop from"));
+        var rr = try post(inst, "/auth/refresh", cf.deviceCookie(), true);
+        defer rr.deinit();
+        _ = r.check("...its credential then gets X-Portal-Device: gone", rr.status == 401 and std.mem.eql(u8, rr.header("x-portal-device") orelse "", "gone"), "{d}", .{rr.status});
     }
 
     // ------------------------------------------- self-unpair via /logout
@@ -491,7 +538,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("logout unpaired the device", d.has("No paired devices"), "{s}", .{d.out});
         var resp2 = try get(inst, "/", c8.deviceCookie());
         defer resp2.deinit();
-        _ = r.check("logged-out device can't sign in", std.mem.eql(u8, resp2.location(), "/pair"), "{s}", .{resp2.location()});
+        _ = r.check("logged-out device can't sign in (told it is no longer paired)", std.mem.eql(u8, resp2.location(), "/pair?e=gone"), "{s}", .{resp2.location()});
         var resp3 = try get(inst, "/", c8.sessionCookie());
         defer resp3.deinit();
         _ = r.check("logged-out session is gone", resp3.status == 303, "{d}", .{resp3.status});

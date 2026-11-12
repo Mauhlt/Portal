@@ -27,6 +27,12 @@
 //!    old record outright and the server ends every session of it before
 //!    the new credential is issued; nothing of the old record is kept or
 //!    merged, so a misidentified device never inherits anything.
+//!  * A removed record (unpaired, forgotten by the device, replaced by a
+//!    re-pair, or revoked) leaves its secret hashes behind as tombstones
+//!    (`Gone`), not its name. A device presenting one of those is told,
+//!    unambiguously, that it is no longer paired (AuthResult.gone): it
+//!    then forgets this desktop. It does not revoke whatever record now
+//!    uses its old name, the way an unknown secret would.
 //!
 //! The store is a small text file shared by the running server and the
 //! `portal pair/devices/unpair` commands; every change is a locked
@@ -60,6 +66,8 @@ pub const max_requests = 8;
 pub const max_requests_per_ip = 2;
 /// Request code shown on the device and at the desk: 4 hex digits.
 pub const code_len = 4;
+/// Secret hashes of removed records remembered (oldest dropped first).
+pub const max_gone = 32;
 
 const header_v1 = "portal-devices-v1";
 const header_v2 = "portal-devices-v2";
@@ -124,6 +132,13 @@ pub const Text = struct {
     pub fn get(t: *const Text) []const u8 {
         return t.buf[0..t.len];
     }
+};
+
+/// A secret hash of a removed device record, kept until `until` (the
+/// record would have expired from disuse by then anyway).
+pub const Gone = struct {
+    hash: auth.Hash,
+    until: i64,
 };
 
 pub const Grace = struct {
@@ -237,6 +252,9 @@ pub const AuthResult = union(enum) {
     /// Wrong or stale secret for a known device: that record was removed;
     /// the caller ends its sessions.
     revoked: auth.Device,
+    /// A secret of a record that was removed: the device is no longer
+    /// paired (and nothing else is touched).
+    gone,
     unknown,
 };
 
@@ -283,6 +301,40 @@ pub const ClaimResult = union(enum) {
 pub const Store = struct {
     devices: [max_devices]?Device = @splat(null),
     pairing: ?Pairing = null,
+    gone: [max_gone]?Gone = @splat(null),
+
+    /// Removes the record in slot `idx`, keeping its secret hashes as
+    /// tombstones. Returns its identity.
+    pub fn drop(s: *Store, idx: usize) ?auth.Device {
+        const d = s.devices[idx] orelse return null;
+        const until = d.last_seen +| unused_expiry_s;
+        s.bury(d.cur, until);
+        for (d.ring) |g| if (g) |e| s.bury(e.hash, until);
+        s.devices[idx] = null;
+        return d.ref();
+    }
+
+    fn bury(s: *Store, h: auth.Hash, until: i64) void {
+        var target: usize = 0;
+        var oldest: i64 = std.math.maxInt(i64);
+        for (s.gone, 0..) |slot, i| {
+            const t = if (slot) |g| g.until else std.math.minInt(i64);
+            if (t < oldest) {
+                oldest = t;
+                target = i;
+            }
+        }
+        s.gone[target] = .{ .hash = h, .until = until };
+    }
+
+    /// Whether `h` is a tombstone. Scans every slot.
+    fn isGone(s: *const Store, h: auth.Hash) bool {
+        var found = false;
+        for (s.gone) |slot| if (slot) |g| {
+            found = found or std.crypto.timing_safe.eql(auth.Hash, g.hash, h);
+        };
+        return found;
+    }
 
     pub fn find(s: *const Store, name: []const u8) ?usize {
         for (s.devices, 0..) |d, i| {
@@ -328,6 +380,10 @@ pub const Store = struct {
                 };
             }
         }
+        for (&s.gone) |*g| if (g.*) |e| if (now > e.until) {
+            g.* = null;
+            changed = true;
+        };
         return changed;
     }
 
@@ -338,19 +394,18 @@ pub const Store = struct {
         const name = cookie[0..dot];
         const secret = cookie[dot + 1 ..];
         if (!validName(name) or secret.len != auth.encoded_len) return .unknown;
+        const h = auth.hashSecret(secret);
+        if (s.isGone(h)) return .gone;
         const idx = s.find(name) orelse return .unknown;
         const dev = &s.devices[idx].?;
         if (!std.mem.eql(u8, dev.ip.get(), ip)) return .wrong_address;
-        const h = auth.hashSecret(secret);
         var valid = std.crypto.timing_safe.eql(auth.Hash, h, dev.cur);
         for (dev.ring) |slot| {
             const g = slot orelse continue;
             if (std.crypto.timing_safe.eql(auth.Hash, h, g.hash) and now <= g.until) valid = true;
         }
         if (valid) return .{ .ok = idx };
-        const gone = dev.ref();
-        s.devices[idx] = null;
-        return .{ .revoked = gone };
+        return .{ .revoked = s.drop(idx).? };
     }
 
     /// Issues `new_hash` as the device's current secret. The secret it
@@ -487,11 +542,10 @@ pub const Store = struct {
         dev.name = p.name;
         dev.ip.set(ip);
         var out: Paired = .{ .device = dev.ref() };
-        for (&s.devices) |*slot| {
-            if (slot.*) |*d| if (std.mem.eql(u8, d.name.get(), dev.name.get()) or std.mem.eql(u8, d.ip.get(), ip)) {
-                out.replaced.list[out.replaced.n] = d.ref();
+        for (&s.devices, 0..) |slot, j| {
+            if (slot) |d| if (std.mem.eql(u8, d.name.get(), dev.name.get()) or std.mem.eql(u8, d.ip.get(), ip)) {
+                out.replaced.list[out.replaced.n] = s.drop(j).?;
                 out.replaced.n += 1;
-                slot.* = null;
             };
         }
         for (&s.devices) |*slot| {
@@ -504,16 +558,17 @@ pub const Store = struct {
         return error.TooManyDevices;
     }
 
+    /// Unpairs device `name` (its secrets become tombstones).
     pub fn remove(s: *Store, name: []const u8) bool {
         const idx = s.find(name) orelse return false;
-        s.devices[idx] = null;
+        _ = s.drop(idx);
         return true;
     }
 
     /// Removes record `id` only: a newer record under the same name stays.
     pub fn removeId(s: *Store, id: auth.DeviceId) bool {
         const idx = s.findId(id) orelse return false;
-        s.devices[idx] = null;
+        _ = s.drop(idx);
         return true;
     }
 
@@ -565,6 +620,11 @@ pub const Store = struct {
                 r.state = std.meta.stringToEnum(ReqState, f.next() orelse return error.BadDeviceFile) orelse return error.BadDeviceFile;
                 p.requests[n_req] = r;
                 n_req += 1;
+            } else if (std.mem.eql(u8, kind, "gone") and !v1 and !v2) {
+                var k: usize = 0;
+                while (k < max_gone and s.gone[k] != null) k += 1;
+                if (k == max_gone) return error.BadDeviceFile;
+                s.gone[k] = .{ .hash = try parseHash(f.next()), .until = try parseInt(f.next()) };
             } else if (std.mem.eql(u8, kind, "dev")) {
                 if (n >= max_devices) return error.BadDeviceFile;
                 const name = f.next() orelse return error.BadDeviceFile;
@@ -614,6 +674,10 @@ pub const Store = struct {
                     &r.code, &r.token, r.ip.get(), r.created, r.state,
                 }));
             }
+        }
+        for (s.gone) |slot| {
+            const g = slot orelse continue;
+            try out.appendSlice(gpa, try std.fmt.bufPrint(&buf, "gone {x} {d}\n", .{ &g.hash, g.until }));
         }
         for (s.devices) |slot| {
             const d = slot orelse continue;
@@ -941,7 +1005,8 @@ test "authenticate, rotate, grace ring, theft detection" {
     const late = s.authenticate(c1, "10.8.0.2", 20 + grace_s + 1);
     try testing.expect(late == .revoked);
     try testing.expect(s.find("laptop") == null);
-    try testing.expect(s.authenticate(c2, "10.8.0.2", 20 + grace_s + 2) == .unknown);
+    // ...and the current one is then told it is no longer paired.
+    try testing.expect(s.authenticate(c2, "10.8.0.2", 20 + grace_s + 2) == .gone);
 }
 
 test "two tabs signing in with the same credential: no revocation" {
@@ -1073,10 +1138,53 @@ test "re-pairing a name: the old record is removed outright, never updated" {
     try testing.expectEqual(@as(i64, 3), d.created);
     for (d.ring) |g| try testing.expect(g == null);
     try testing.expect(s.findId(idOf(hashOf(old))) == null);
-    // The old credential (current or in its grace ring) is just unknown
-    // now from the old address, and never works for the new record.
-    try testing.expect(s.authenticate(old, "10.8.0.2", 4) == .wrong_address);
-    try testing.expect(s.authenticate(old, "10.8.0.7", 4) == .revoked);
+    // The old credential (current or in its grace ring) is told it is no
+    // longer paired, from anywhere, and never touches the new record.
+    try testing.expect(s.authenticate(old, "10.8.0.2", 4) == .gone);
+    try testing.expect(s.authenticate(old, "10.8.0.7", 4) == .gone);
+    try testing.expectEqual(@as(usize, 1), s.count());
+}
+
+test "a removed record's secrets are tombstones: told gone, nothing revoked" {
+    var s: Store = .{};
+    var b1: [80]u8 = undefined;
+    const old = cookieFor(&b1, "laptop", 1);
+    try testPair(&s, "laptop", "10.8.0.2", hashOf(old), 1);
+    var b2: [80]u8 = undefined;
+    const rotated = cookieFor(&b2, "laptop", 2);
+    s.rotate(s.find("laptop").?, hashOf(rotated), 2); // `old` in the grace ring
+    // Unpaired at the desk: both the current and the grace secret say gone.
+    try testing.expect(s.remove("laptop"));
+    try testing.expect(s.authenticate(rotated, "10.8.0.2", 3) == .gone);
+    try testing.expect(s.authenticate(old, "10.8.0.2", 3) == .gone);
+    // Another device paired under the name later: the old credential is
+    // still just gone, and does not revoke the new record.
+    var b3: [80]u8 = undefined;
+    const fresh = cookieFor(&b3, "laptop", 3);
+    try testPair(&s, "laptop", "10.8.0.2", hashOf(fresh), 4);
+    try testing.expect(s.authenticate(rotated, "10.8.0.2", 5) == .gone);
+    try testing.expect(s.authenticate(fresh, "10.8.0.2", 5) == .ok);
+    // A garbage secret still revokes (theft detection); its secret is
+    // then a tombstone too.
+    var b4: [80]u8 = undefined;
+    try testing.expect(s.authenticate(cookieFor(&b4, "laptop", 9), "10.8.0.2", 6) == .revoked);
+    try testing.expect(s.authenticate(fresh, "10.8.0.2", 7) == .gone);
+    // Round trip through the file.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try s.format(testing.allocator, &out);
+    var t = try Store.parse(out.items);
+    try testing.expect(t.authenticate(rotated, "10.8.0.2", 8) == .gone);
+    // Tombstones expire with the record's disuse horizon.
+    _ = t.expire(2 + unused_expiry_s + 1);
+    try testing.expect(t.authenticate(rotated, "10.8.0.2", 2 + unused_expiry_s + 1) == .unknown);
+}
+
+test "tombstones are bounded: the oldest go first" {
+    var s: Store = .{};
+    for (0..max_gone + 3) |i| s.bury(auth.hashSecret(&[_]u8{@intCast(i)}), @intCast(100 + i));
+    try testing.expect(!s.isGone(auth.hashSecret(&[_]u8{0})));
+    try testing.expect(s.isGone(auth.hashSecret(&[_]u8{max_gone + 2})));
 }
 
 test "removeId spares a newer record under the same name" {
