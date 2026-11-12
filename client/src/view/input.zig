@@ -1,0 +1,95 @@
+//! Input types shared by the platform backends, TermView and hosts.
+//!
+//! Platform code produces `Event`s; TermView handles view-local ones (zoom,
+//! close, resize, button clicks) and forwards keyboard input to an
+//! `InputSink`. The sink decides what a key means: the remote client turns
+//! it into protocol key names ("k:enter", "t:x"); a local terminal host
+//! would encode VT bytes for its PTY.
+
+const std = @import("std");
+
+pub const Key = enum {
+    enter,
+    escape,
+    backspace,
+    tab,
+    up,
+    down,
+    left,
+    right,
+    home,
+    end,
+    page_up,
+    page_down,
+    delete,
+};
+
+pub const Mods = packed struct(u8) {
+    ctrl: bool = false,
+    shift: bool = false,
+    alt: bool = false,
+    super: bool = false,
+    _: u4 = 0,
+};
+
+pub const Event = union(enum) {
+    close,
+    resize: struct { width: u32, height: u32 },
+    /// Device scale changed (moved to another monitor).
+    scale: f32,
+    expose,
+    key: struct { key: Key, mods: Mods },
+    /// Typed text. Control characters are never delivered here; Ctrl+letter
+    /// arrives as the lowercase letter with `mods.ctrl`.
+    char: struct { cp: u21, mods: Mods = .{} },
+    mouse_down: struct { x: f32, y: f32 },
+    zoom: enum { in, out, reset },
+};
+
+/// On-screen answer buttons. `key` uses the protocol key names
+/// (docs/protocol.md section 4): digits, "y", "n", "enter", "esc".
+pub const Answer = struct { label: []const u8, key: []const u8 };
+pub const answers = [_]Answer{
+    .{ .label = "1", .key = "1" },
+    .{ .label = "2", .key = "2" },
+    .{ .label = "3", .key = "3" },
+    .{ .label = "4", .key = "4" },
+    .{ .label = "Yes", .key = "y" },
+    .{ .label = "No", .key = "n" },
+    .{ .label = "Enter", .key = "enter" },
+    .{ .label = "Esc", .key = "esc" },
+};
+
+/// Where TermView sends input. All callbacks run on the UI thread.
+pub const InputSink = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        key: *const fn (ctx: *anyopaque, key: Key, mods: Mods) void,
+        char: *const fn (ctx: *anyopaque, cp: u21, mods: Mods) void,
+        /// An answer-bar button (`Answer.key`).
+        answer: *const fn (ctx: *anyopaque, key: []const u8) void,
+        /// A message-screen button (`Overlay.button_id`).
+        button: *const fn (ctx: *anyopaque, id: u32) void,
+        /// The drawable area changed. `cols`/`rows` is how many cells fit at
+        /// the current font size, for hosts that size a PTY to the window.
+        resized: *const fn (ctx: *anyopaque, width_px: u32, height_px: u32, cols: u16, rows: u16) void,
+    };
+
+    pub fn key(s: InputSink, k: Key, m: Mods) void {
+        s.vtable.key(s.ctx, k, m);
+    }
+    pub fn char(s: InputSink, cp: u21, m: Mods) void {
+        s.vtable.char(s.ctx, cp, m);
+    }
+    pub fn answer(s: InputSink, k: []const u8) void {
+        s.vtable.answer(s.ctx, k);
+    }
+    pub fn button(s: InputSink, id: u32) void {
+        s.vtable.button(s.ctx, id);
+    }
+    pub fn resized(s: InputSink, w: u32, h: u32, cols: u16, rows: u16) void {
+        s.vtable.resized(s.ctx, w, h, cols, rows);
+    }
+};
