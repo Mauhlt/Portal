@@ -104,7 +104,10 @@ pub fn filterStateful(policy: Policy, st: *State, in_full: []const u8, out: []u8
         else => {},
     };
     if (policy == .keys and in.len == 1 and in[0] == 0x1b) {
-        if (now_ms -| st.last_esc_ms < 1000) return out[0..0]; // no Esc Esc
+        // No Esc Esc. Saturating; a clock that went backwards (dt < 0) does
+        // not count as "recent", so it cannot disable Esc indefinitely.
+        const dt = now_ms -| st.last_esc_ms;
+        if (dt >= 0 and dt < 1000) return out[0..0];
         st.last_esc_ms = now_ms;
     }
     const r = filter(policy, in, out);
@@ -239,6 +242,32 @@ test "stateful: keys Esc is rate limited, first use does not overflow" {
     try testing.expectEqualStrings("\x1b", filterStateful(.keys, &st, "\x1b", &buf, 0));
     try testing.expectEqualStrings("", filterStateful(.keys, &st, "\x1b", &buf, 500));
     try testing.expectEqualStrings("\x1b", filterStateful(.keys, &st, "\x1b", &buf, 1500));
+}
+
+test "stateful: extreme and backwards timestamps never overflow" {
+    var st: State = .{};
+    var buf: [8]u8 = undefined;
+    const max = std.math.maxInt(i64);
+    const min = std.math.minInt(i64);
+    try testing.expectEqualStrings("\x1b", filterStateful(.keys, &st, "\x1b", &buf, max));
+    try testing.expectEqualStrings("", filterStateful(.keys, &st, "\x1b", &buf, max));
+    try testing.expectEqualStrings("\x1b", filterStateful(.keys, &st, "\x1b", &buf, min));
+    try testing.expectEqualStrings("\x1b", filterStateful(.keys, &st, "\x1b", &buf, 0));
+}
+
+test "stateful: ESC carried across messages only strips one introducer" {
+    var st: State = .{};
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("\x1b", filterStateful(.keys, &st, "\x1b", &buf, 0));
+    try testing.expectEqualStrings("", filterStateful(.keys, &st, "[A", &buf, 1));
+    try testing.expectEqualStrings("1", filterStateful(.keys, &st, "1", &buf, 2));
+    try testing.expectEqualStrings("", filterStateful(.keys, &st, "[\x1b", &buf, 3)); // ESC within 1s
+    try testing.expectEqualStrings("", filterStateful(.none, &st, "\x1b", &buf, 5000));
+}
+
+test "keys default policy parse" {
+    try testing.expectEqual(Policy.keys, Policy.parse("keys").?);
+    try testing.expectEqual(@as(?Policy, null), Policy.parse("TEXT"));
 }
 
 test "text drops C1 controls" {
