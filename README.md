@@ -51,17 +51,25 @@ watching, and every login attempt and viewer connection is written to
      paired again;
    * revocable any time with `portal unpair <name>`, which also disconnects
      its open viewers within seconds.
-3. **Sessions**: random, HttpOnly, SameSite=Strict, in memory only. A paired
+3. **HTTPS (TLS 1.3) inside the tunnel**: Portal serves HTTPS itself (a
+   small TLS 1.3 server built on Zig std's crypto: x25519, AES-128-GCM /
+   ChaCha20-Poly1305, ECDSA P-256). Its certificate comes from a private
+   CA created on this desktop. The CA can only vouch for the WireGuard
+   subnet and loopback (X.509 name constraints), and its key is
+   DPAPI-protected (see [HTTPS certificates](#https-certificates)). Cookies
+   are `Secure` and `__Host-` prefixed. `--no-tls` (plain HTTP) exists for
+   tests only.
+4. **Sessions**: random, HttpOnly, SameSite=Strict, in memory only. A paired
    device silently starts a new one after a Portal restart.
-4. **Browser hardening**: Host allowlist (blocks DNS rebinding), Origin checks
+5. **Browser hardening**: Host allowlist (blocks DNS rebinding), Origin checks
    on every POST and on the WebSocket upgrade (blocks CSRF and cross-site
    WebSocket hijacking), strict Content-Security-Policy, no framing.
-5. **Robustness**: Portal parses HTTP and WebSocket itself, strictly, instead
+6. **Robustness**: Portal parses HTTP and WebSocket itself, strictly, instead
    of using `std.http` (which had remotely reachable crashes). Every
    connection has read/idle/send timeouts, and unauthenticated connections
    are capped per address, so idle or slow connections can't lock out a
    real viewer.
-6. **Process hygiene**: the child runs in a Windows job object, so if Portal
+7. **Process hygiene**: the child runs in a Windows job object, so if Portal
    dies, the agent and anything it spawned die too, leaving no unobserved
    session. Programs are resolved to absolute paths from PATH only, never
    the current directory.
@@ -104,16 +112,53 @@ portal run --listen 10.8.0.1:8420 -- claude          # --input keys is the defau
 portal pair laptop          # or: portal pair iphone
 ```
 
-Within 2 minutes, on that device: turn the WireGuard tunnel **on** and open
-`http://10.8.0.1:8420/`, then tap **Pair this device**. Pair through the
+Within 2 minutes, on that device: turn the WireGuard tunnel **on**. If this
+device does not trust the Portal CA yet, first open `http://10.8.0.1:8421/`
+(listen port + 1; served only while a pairing window is open) and install
+the certificate (see below). Then open `https://10.8.0.1:8420/` and tap
+**Pair this device**. Pair through the
 WireGuard address even at home, because that's the address the device will
 use when away (browsers keep credentials per address). If your router can't
 reach its own public IP from inside the house, put the phone on cellular for
 those 30 seconds.
 
-From then on, opening `http://10.8.0.1:8420/` from anywhere with the tunnel on
+From then on, opening `https://10.8.0.1:8420/` from anywhere with the tunnel on
 just works. `portal devices` lists paired devices; `portal unpair <name>`
 revokes one.
+
+### HTTPS certificates
+
+The first `portal run` creates a private CA, "Portal Local CA (xxxxxxxx)",
+in `%LOCALAPPDATA%\Portal\tls\`. Its X.509 name constraints only allow
+`10.8.0.0/24` and `127.0.0.1`, and no real DNS names, so even a stolen CA
+key cannot impersonate other web sites to a device that trusts it. To
+choose the subnets yourself, do this before the first run:
+`portal ca init --permit 10.8.0.0/24 --permit 127.0.0.1/32 [--permit-dns name]`.
+The private keys (`ca.key`, `leaf.key`) are encrypted with Windows DPAPI for
+your account. The server certificate (397 days, IP SAN of the listen
+address) is renewed automatically at startup.
+
+Trust the CA once on each device:
+
+```powershell
+portal ca export            # writes portal-ca.cer / .pem / .mobileconfig, prints the SHA-256
+```
+
+* **iPhone / iPad**: during `portal pair`, open `http://10.8.0.1:8421/` and
+  tap *install profile*, or AirDrop `portal-ca.mobileconfig`. Then
+  Settings > General > VPN & Device Management > the Portal profile >
+  **Install**. Then Settings > General > About > Certificate Trust Settings
+  > **enable full trust** for "Portal Local CA". Check the fingerprint
+  against `portal ca export`.
+* **Windows**: double-click `portal-ca.cer` > Install Certificate > Current
+  User > Trusted Root Certification Authorities.
+* **macOS**: open `portal-ca.mobileconfig` (or add the `.cer` in Keychain
+  Access and set it to Always Trust).
+* **Linux / Android**: import `portal-ca.pem` / `portal-ca.cer` as a CA.
+
+`portal ca` shows the CA, its constraints and the server certificate.
+`portal ca init --force` replaces the CA, and every device must then trust
+the new one.
 
 ## Upgrading Zig safely
 

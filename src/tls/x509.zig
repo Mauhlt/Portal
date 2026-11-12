@@ -1,0 +1,728 @@
+//! Portal's private certificate authority: X.509 profiles for the CA and
+//! the server (leaf) certificate, built with the DER writer in der.zig and
+//! signed with ECDSA P-256 / SHA-256 (std.crypto).
+//!
+//! CA profile (RFC 5280):
+//!   * subject = issuer = CN "Portal Local CA (<8 hex>)", O "Portal"
+//!   * basicConstraints  critical  CA:TRUE, pathLenConstraint 0
+//!   * keyUsage          critical  keyCertSign | cRLSign
+//!   * subjectKeyIdentifier
+//!   * nameConstraints   critical  permitted iPAddress subtrees (the
+//!     WireGuard subnet and loopback by default) plus permitted dNSName
+//!     subtrees. With no DNS names configured the single permitted dNSName
+//!     is "invalid" (RFC 6761: never resolves), so the dNSName form is
+//!     constrained too: a constraint on iPAddress alone would leave every
+//!     DNS name unconstrained (RFC 5280 4.2.1.10 only restricts name forms
+//!     that have a constraint), and a leaked CA key could then mint a
+//!     certificate for any web site.
+//!   * validity ~10 years
+//!
+//! Leaf profile (also Apple's TLS server requirements, support.apple.com
+//! HT210176 / HT211025):
+//!   * subject O=Portal only (no CN: see leafSubject)
+//!   * subjectAltName iPAddress (+ dNSName when configured and permitted)
+//!   * extKeyUsage serverAuth, keyUsage critical digitalSignature
+//!   * basicConstraints CA:FALSE, authority/subject key identifiers
+//!   * ECDSA P-256, SHA-256, validity 397 days (Apple: <= 398)
+//!   * serial: 16 random bytes, positive
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const der = @import("der.zig");
+const oids = der.oids;
+const Tag = der.Tag;
+
+pub const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+pub const KeyPair = Ecdsa.KeyPair;
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+pub const ca_validity_s: i64 = 3650 * 86400;
+pub const leaf_validity_s: i64 = 397 * 86400;
+/// Certificates start this long in the past to tolerate device clock skew.
+pub const backdate_s: i64 = 3600;
+/// Renew the leaf when it has less than this left.
+pub const renew_before_s: i64 = 30 * 86400;
+
+pub const max_subnets = 8;
+pub const max_dns = 8;
+pub const max_dns_len = 253;
+
+/// An IP subnet (address + mask), v4 or v6.
+pub const Subnet = struct {
+    v6: bool,
+    addr: [16]u8 = @splat(0),
+    mask: [16]u8 = @splat(0),
+
+    pub fn len(s: Subnet) usize {
+        return if (s.v6) 16 else 4;
+    }
+
+    /// "10.8.0.0/24", "127.0.0.1/32", "fd00::/64". A bare address is /32 (/128).
+    pub fn parse(text: []const u8) !Subnet {
+        const slash = std.mem.indexOfScalar(u8, text, '/');
+        const host = if (slash) |i| text[0..i] else text;
+        var s: Subnet = undefined;
+        var max_prefix: u8 = 32;
+        if (std.Io.net.Ip4Address.parse(host, 0)) |a| {
+            s = .{ .v6 = false };
+            @memcpy(s.addr[0..4], &a.bytes);
+        } else |_| {
+            const a6 = std.Io.net.Ip6Address.parse(host, 0) catch return error.BadSubnet;
+            s = .{ .v6 = true };
+            s.addr = a6.bytes;
+            max_prefix = 128;
+        }
+        const prefix: u8 = if (slash) |i|
+            std.fmt.parseInt(u8, text[i + 1 ..], 10) catch return error.BadSubnet
+        else
+            max_prefix;
+        if (prefix > max_prefix) return error.BadSubnet;
+        var i: usize = 0;
+        while (i < s.len()) : (i += 1) {
+            const bits_here: u8 = if (prefix >= (i + 1) * 8) 8 else if (prefix > i * 8) @intCast(prefix - i * 8) else 0;
+            s.mask[i] = if (bits_here == 0) 0 else @as(u8, 0xff) << @intCast(8 - bits_here);
+            s.addr[i] &= s.mask[i];
+        }
+        return s;
+    }
+
+    pub fn contains(s: Subnet, ip: []const u8) bool {
+        if (ip.len != s.len()) return false;
+        for (ip, 0..) |b, i| if (b & s.mask[i] != s.addr[i]) return false;
+        return true;
+    }
+
+    pub fn prefixLen(s: Subnet) u8 {
+        var n: u8 = 0;
+        for (s.mask[0..s.len()]) |m| n += @popCount(m);
+        return n;
+    }
+
+    pub fn format(s: Subnet, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (s.v6) {
+            const a: std.Io.net.Ip6Address = .{ .bytes = s.addr, .port = 0 };
+            // Ip6Address formats as [addr]:port; print the bare address.
+            var buf: [64]u8 = undefined;
+            const full = std.fmt.bufPrint(&buf, "{f}", .{a}) catch "?";
+            const end = std.mem.lastIndexOfScalar(u8, full, ']') orelse full.len;
+            const start: usize = if (full.len > 0 and full[0] == '[') 1 else 0;
+            try w.print("{s}/{d}", .{ full[start..end], s.prefixLen() });
+        } else {
+            try w.print("{d}.{d}.{d}.{d}/{d}", .{ s.addr[0], s.addr[1], s.addr[2], s.addr[3], s.prefixLen() });
+        }
+    }
+};
+
+pub const default_permits = [_][]const u8{ "10.8.0.0/24", "127.0.0.1/32" };
+
+pub const Constraints = struct {
+    subnets: [max_subnets]Subnet = undefined,
+    n_subnets: usize = 0,
+    dns: [max_dns][]const u8 = undefined,
+    n_dns: usize = 0,
+
+    pub fn ipPermitted(c: *const Constraints, ip: []const u8) bool {
+        for (c.subnets[0..c.n_subnets]) |s| if (s.contains(ip)) return true;
+        return false;
+    }
+
+    /// RFC 5280 dNSName constraint semantics: the name equals the
+    /// constraint or ends with "." + constraint (case-insensitive).
+    pub fn dnsPermitted(c: *const Constraints, name: []const u8) bool {
+        for (c.dns[0..c.n_dns]) |base| {
+            if (std.ascii.eqlIgnoreCase(name, base)) return true;
+            if (name.len > base.len + 1 and name[name.len - base.len - 1] == '.' and
+                std.ascii.eqlIgnoreCase(name[name.len - base.len ..], base)) return true;
+        }
+        return false;
+    }
+};
+
+/// A DNS name we are willing to put in a certificate: LDH labels only.
+pub fn validDnsName(name: []const u8) bool {
+    if (name.len == 0 or name.len > max_dns_len) return false;
+    var it = std.mem.splitScalar(u8, name, '.');
+    while (it.next()) |label| {
+        if (label.len == 0 or label.len > 63) return false;
+        if (label[0] == '-' or label[label.len - 1] == '-') return false;
+        for (label) |ch| switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-' => {},
+            else => return false,
+        };
+    }
+    return true;
+}
+
+pub const SanEntry = union(enum) {
+    ip: struct { bytes: [16]u8, len: u8 },
+    dns: []const u8,
+};
+
+// ---------------------------------------------------------------- builders
+
+/// Subject of the server certificate: O=Portal only. Names live in the
+/// subjectAltName. No CN on purpose: Windows CryptoAPI checks a CN that
+/// looks like a host name against the CA's dNSName constraints (and would
+/// reject "CN=10.8.0.1" under the "invalid"-only DNS constraint), and
+/// modern clients ignore the CN for name matching anyway.
+pub fn leafSubject(d: der.Writer) ![]u8 {
+    return d.seq(&.{
+        try d.set(&.{try d.seq(&.{ try d.oid(&oids.organization), try d.utf8("Portal") })}),
+    });
+}
+
+fn dnName(d: der.Writer, cn: []const u8) ![]u8 {
+    return d.seq(&.{
+        try d.set(&.{try d.seq(&.{ try d.oid(&oids.organization), try d.utf8("Portal") })}),
+        try d.set(&.{try d.seq(&.{ try d.oid(&oids.common_name), try d.utf8(cn) })}),
+    });
+}
+
+fn spki(d: der.Writer, pk: Ecdsa.PublicKey) ![]u8 {
+    const point = pk.toUncompressedSec1();
+    return d.seq(&.{
+        try d.seq(&.{ try d.oid(&oids.ec_public_key), try d.oid(&oids.prime256v1) }),
+        try d.bitString(&point),
+    });
+}
+
+/// Key identifier: first 20 bytes of SHA-256 over the public key bits
+/// (RFC 7093 section 2, method 1).
+pub fn keyId(pk: Ecdsa.PublicKey) [20]u8 {
+    var h: [32]u8 = undefined;
+    Sha256.hash(&pk.toUncompressedSec1(), &h, .{});
+    return h[0..20].*;
+}
+
+fn extension(d: der.Writer, oid: []const u8, critical: bool, value: []const u8) ![]u8 {
+    if (critical) return d.seq(&.{ try d.oid(oid), try d.boolean(true), try d.octets(value) });
+    return d.seq(&.{ try d.oid(oid), try d.octets(value) });
+}
+
+fn sigAlg(d: der.Writer) ![]u8 {
+    return d.seq(&.{try d.oid(&oids.ecdsa_with_sha256)});
+}
+
+/// Signs `tbs` and wraps it into a Certificate.
+fn finish(d: der.Writer, tbs: []const u8, signer: KeyPair, noise: ?[Ecdsa.noise_length]u8) ![]u8 {
+    const sig = try signer.sign(tbs, noise);
+    var sig_buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
+    const sig_der = sig.toDer(&sig_buf);
+    return d.seq(&.{ tbs, try sigAlg(d), try d.bitString(sig_der) });
+}
+
+/// The nameConstraints extension value.
+pub fn nameConstraintsValue(d: der.Writer, c: *const Constraints) ![]u8 {
+    var subtrees: std.ArrayList([]const u8) = .empty;
+    for (c.subnets[0..c.n_subnets]) |s| {
+        var both: [32]u8 = undefined;
+        @memcpy(both[0..s.len()], s.addr[0..s.len()]);
+        @memcpy(both[s.len() .. 2 * s.len()], s.mask[0..s.len()]);
+        try subtrees.append(d.arena, try d.seq(&.{try d.tlv(Tag.contextPrimitive(7), both[0 .. 2 * s.len()])}));
+    }
+    if (c.n_dns == 0) {
+        try subtrees.append(d.arena, try d.seq(&.{try d.tlv(Tag.contextPrimitive(2), "invalid")}));
+    } else for (c.dns[0..c.n_dns]) |n| {
+        try subtrees.append(d.arena, try d.seq(&.{try d.tlv(Tag.contextPrimitive(2), n)}));
+    }
+    return d.seq(&.{try d.constructed(Tag.contextConstructed(0), subtrees.items)});
+}
+
+pub const CaParams = struct {
+    key: KeyPair,
+    /// 8 lowercase hex characters, shown in the CA's name.
+    tag: [8]u8,
+    serial: [16]u8,
+    now: i64,
+    constraints: *const Constraints,
+    noise: ?[Ecdsa.noise_length]u8 = null,
+};
+
+pub fn buildCa(gpa: Allocator, p: CaParams) ![]u8 {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const d: der.Writer = .{ .arena = arena.allocator() };
+
+    var cn_buf: [64]u8 = undefined;
+    const cn = try std.fmt.bufPrint(&cn_buf, "Portal Local CA ({s})", .{&p.tag});
+    const subject = try dnName(d, cn);
+    const kid = keyId(p.key.public_key);
+    const exts = try d.seq(&.{
+        try extension(d, &oids.basic_constraints, true, try d.seq(&.{ try d.boolean(true), try d.uint(0) })),
+        try extension(d, &oids.key_usage, true, try d.namedBits(0x0600)), // keyCertSign | cRLSign
+        try extension(d, &oids.subject_key_identifier, false, try d.octets(&kid)),
+        try extension(d, &oids.name_constraints, true, try nameConstraintsValue(d, p.constraints)),
+    });
+    const tbs = try d.seq(&.{
+        try d.tlv(Tag.contextConstructed(0), try d.uint(2)), // v3
+        try d.uintBytes(&positiveSerial(p.serial)),
+        try sigAlg(d),
+        subject,
+        try d.seq(&.{ try d.time(p.now - backdate_s), try d.time(p.now - backdate_s + ca_validity_s) }),
+        subject,
+        try spki(d, p.key.public_key),
+        try d.tlv(Tag.contextConstructed(3), exts),
+    });
+    return gpa.dupe(u8, try finish(d, tbs, p.key, p.noise));
+}
+
+/// Top bit cleared (positive INTEGER), second-highest set (keeps 16 bytes).
+fn positiveSerial(s: [16]u8) [16]u8 {
+    var out = s;
+    out[0] = (out[0] & 0x7f) | 0x40;
+    return out;
+}
+
+/// The subjectAltName extension value for `sans` (in order).
+pub fn sanValue(d: der.Writer, sans: []const SanEntry) ![]u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    for (sans) |s| switch (s) {
+        .ip => |ip| try names.append(d.arena, try d.tlv(Tag.contextPrimitive(7), ip.bytes[0..ip.len])),
+        .dns => |n| try names.append(d.arena, try d.tlv(Tag.contextPrimitive(2), n)),
+    };
+    return d.seq(names.items);
+}
+
+pub const LeafParams = struct {
+    key: Ecdsa.PublicKey,
+    ca_key: KeyPair,
+    /// The CA certificate (its subject becomes the issuer).
+    ca_der: []const u8,
+    sans: []const SanEntry,
+    serial: [16]u8,
+    now: i64,
+    noise: ?[Ecdsa.noise_length]u8 = null,
+};
+
+pub fn buildLeaf(gpa: Allocator, p: LeafParams) ![]u8 {
+    if (p.sans.len == 0) return error.NoSubjectAltNames;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const d: der.Writer = .{ .arena = arena.allocator() };
+
+    const ca = try parse(p.ca_der);
+    const aki = keyId(p.ca_key.public_key);
+    const ski = keyId(p.key);
+    const exts = try d.seq(&.{
+        try extension(d, &oids.basic_constraints, true, try d.seq(&.{})), // CA:FALSE
+        try extension(d, &oids.key_usage, true, try d.namedBits(0x8000)), // digitalSignature
+        try extension(d, &oids.ext_key_usage, false, try d.seq(&.{try d.oid(&oids.kp_server_auth)})),
+        try extension(d, &oids.subject_alt_name, false, try sanValue(d, p.sans)),
+        try extension(d, &oids.authority_key_identifier, false, try d.seq(&.{try d.tlv(Tag.contextPrimitive(0), &aki)})),
+        try extension(d, &oids.subject_key_identifier, false, try d.octets(&ski)),
+    });
+    const tbs = try d.seq(&.{
+        try d.tlv(Tag.contextConstructed(0), try d.uint(2)),
+        try d.uintBytes(&positiveSerial(p.serial)),
+        try sigAlg(d),
+        ca.subject_raw,
+        try d.seq(&.{ try d.time(p.now - backdate_s), try d.time(p.now - backdate_s + leaf_validity_s) }),
+        try leafSubject(d),
+        try spki(d, p.key),
+        try d.tlv(Tag.contextConstructed(3), exts),
+    });
+    return gpa.dupe(u8, try finish(d, tbs, p.ca_key, p.noise));
+}
+
+pub fn formatIp(buf: []u8, ip: []const u8) []const u8 {
+    if (ip.len == 4) return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch "?";
+    if (ip.len == 16) {
+        const a: std.Io.net.Ip6Address = .{ .bytes = ip[0..16].*, .port = 0 };
+        const full = std.fmt.bufPrint(buf, "{f}", .{a}) catch return "?";
+        const end = std.mem.lastIndexOfScalar(u8, full, ']') orelse full.len;
+        const start: usize = if (full.len > 0 and full[0] == '[') 1 else 0;
+        return full[start..end];
+    }
+    return "?";
+}
+
+// ----------------------------------------------------------------- parsing
+
+/// What Portal needs to know about a certificate it wrote earlier. Every
+/// field is located with the bounds-checked reader.
+pub const Info = struct {
+    tbs_raw: []const u8,
+    serial: []const u8,
+    issuer_raw: []const u8,
+    subject_raw: []const u8,
+    not_before: i64,
+    not_after: i64,
+    /// Uncompressed SEC1 point (65 bytes for P-256).
+    public_key: []const u8,
+    /// The whole SubjectPublicKeyInfo (for SPKI pins).
+    spki_raw: []const u8,
+    signature_der: []const u8,
+    /// subjectAltName extension value (GeneralNames DER), or empty.
+    san: []const u8 = "",
+    /// nameConstraints extension value, or empty.
+    name_constraints: []const u8 = "",
+    name_constraints_critical: bool = false,
+    is_ca: bool = false,
+    path_len: ?u64 = null,
+    basic_constraints_critical: bool = false,
+    key_usage: []const u8 = "",
+    key_usage_critical: bool = false,
+    eku: []const u8 = "",
+    ski: []const u8 = "",
+    aki: []const u8 = "",
+};
+
+pub fn parse(cert: []const u8) !Info {
+    var top: der.Reader = .init(cert);
+    const certificate = try top.expect(Tag.sequence);
+    if (!top.atEnd()) return error.DerMalformed;
+    var c: der.Reader = .init(certificate.content);
+    const tbs = try c.expect(Tag.sequence);
+    const alg = try c.expect(Tag.sequence);
+    const sig = try c.expect(Tag.bit_string);
+    if (!c.atEnd()) return error.DerMalformed;
+    if (!std.mem.eql(u8, alg.content, &([_]u8{ Tag.oid, oids.ecdsa_with_sha256.len } ++ oids.ecdsa_with_sha256)))
+        return error.UnsupportedAlgorithm;
+    if (sig.content.len < 2 or sig.content[0] != 0) return error.DerMalformed;
+
+    var t: der.Reader = .init(tbs.content);
+    const version = try t.expect(Tag.contextConstructed(0));
+    var vr: der.Reader = .init(version.content);
+    const v = try vr.expect(Tag.integer);
+    if (!std.mem.eql(u8, v.content, &.{2})) return error.UnsupportedVersion;
+    const serial = try t.expect(Tag.integer);
+    _ = try t.expect(Tag.sequence); // signature algorithm (checked above via outer)
+    const issuer = try t.expect(Tag.sequence);
+    const validity = try t.expect(Tag.sequence);
+    const subject = try t.expect(Tag.sequence);
+    const spki_e = try t.expect(Tag.sequence);
+
+    var vv: der.Reader = .init(validity.content);
+    const nb = try der.parseTime(try vv.next());
+    const na = try der.parseTime(try vv.next());
+
+    var sp: der.Reader = .init(spki_e.content);
+    const algid = try sp.expect(Tag.sequence);
+    const expect_alg = [_]u8{ Tag.oid, oids.ec_public_key.len } ++ oids.ec_public_key ++
+        [_]u8{ Tag.oid, oids.prime256v1.len } ++ oids.prime256v1;
+    if (!std.mem.eql(u8, algid.content, &expect_alg)) return error.UnsupportedAlgorithm;
+    const pk_bits = try sp.expect(Tag.bit_string);
+    if (pk_bits.content.len != 66 or pk_bits.content[0] != 0) return error.DerMalformed;
+
+    var info: Info = .{
+        .tbs_raw = tbs.raw,
+        .serial = serial.content,
+        .issuer_raw = issuer.raw,
+        .subject_raw = subject.raw,
+        .not_before = nb,
+        .not_after = na,
+        .public_key = pk_bits.content[1..],
+        .spki_raw = spki_e.raw,
+        .signature_der = sig.content[1..],
+    };
+
+    while (!t.atEnd()) {
+        const e = try t.next();
+        if (e.tag != Tag.contextConstructed(3)) continue;
+        var outer: der.Reader = .init(e.content);
+        const list = try outer.expect(Tag.sequence);
+        var exts: der.Reader = .init(list.content);
+        while (!exts.atEnd()) {
+            const ext = try exts.expect(Tag.sequence);
+            var er: der.Reader = .init(ext.content);
+            const oid = try er.expect(Tag.oid);
+            var critical = false;
+            if (er.peekTag() == Tag.boolean) {
+                const b = try er.next();
+                critical = b.content.len == 1 and b.content[0] == 0xff;
+            }
+            const val = (try er.expect(Tag.octet_string)).content;
+            if (std.mem.eql(u8, oid.content, &oids.subject_alt_name)) {
+                info.san = val;
+            } else if (std.mem.eql(u8, oid.content, &oids.name_constraints)) {
+                info.name_constraints = val;
+                info.name_constraints_critical = critical;
+            } else if (std.mem.eql(u8, oid.content, &oids.basic_constraints)) {
+                info.basic_constraints_critical = critical;
+                var br: der.Reader = .init(val);
+                const bs = try br.expect(Tag.sequence);
+                var bi: der.Reader = .init(bs.content);
+                if (bi.peekTag() == Tag.boolean) {
+                    const b = try bi.next();
+                    info.is_ca = b.content.len == 1 and b.content[0] == 0xff;
+                }
+                if (bi.peekTag() == Tag.integer) {
+                    const n = try bi.next();
+                    if (n.content.len >= 1 and n.content.len <= 8) {
+                        var x: u64 = 0;
+                        for (n.content) |byte| x = (x << 8) | byte;
+                        info.path_len = x;
+                    }
+                }
+            } else if (std.mem.eql(u8, oid.content, &oids.key_usage)) {
+                info.key_usage = val;
+                info.key_usage_critical = critical;
+            } else if (std.mem.eql(u8, oid.content, &oids.ext_key_usage)) {
+                info.eku = val;
+            } else if (std.mem.eql(u8, oid.content, &oids.subject_key_identifier)) {
+                info.ski = val;
+            } else if (std.mem.eql(u8, oid.content, &oids.authority_key_identifier)) {
+                info.aki = val;
+            }
+        }
+    }
+    return info;
+}
+
+/// Verifies that `subject` was signed by the key in `issuer` (and the names
+/// chain). Does not check validity times.
+pub fn verifySignedBy(subject: Info, issuer: Info) !void {
+    if (!std.mem.eql(u8, subject.issuer_raw, issuer.subject_raw)) return error.IssuerMismatch;
+    const pk = try Ecdsa.PublicKey.fromSec1(issuer.public_key);
+    const sig = try Ecdsa.Signature.fromDer(subject.signature_der);
+    try sig.verify(subject.tbs_raw, pk);
+}
+
+/// SHA-256 over the DER certificate, the fingerprint users compare.
+pub fn fingerprint(cert: []const u8) [32]u8 {
+    var h: [32]u8 = undefined;
+    Sha256.hash(cert, &h, .{});
+    return h;
+}
+
+/// "AB:CD:..." form of a fingerprint.
+pub fn formatFingerprint(fp: [32]u8, out: *[95]u8) []const u8 {
+    const hex = "0123456789ABCDEF";
+    for (fp, 0..) |b, i| {
+        out[i * 3] = hex[b >> 4];
+        out[i * 3 + 1] = hex[b & 0xf];
+        if (i < 31) out[i * 3 + 2] = ':';
+    }
+    return out[0..95];
+}
+
+// -------------------------------------------------------------------- tests
+
+const testing = std.testing;
+const Certificate = std.crypto.Certificate;
+
+fn testConstraints() Constraints {
+    var c: Constraints = .{};
+    for (default_permits) |p| {
+        c.subnets[c.n_subnets] = Subnet.parse(p) catch unreachable;
+        c.n_subnets += 1;
+    }
+    return c;
+}
+
+pub const TestPki = struct {
+    ca_key: KeyPair,
+    leaf_key: KeyPair,
+    ca_der: []u8,
+    leaf_der: []u8,
+
+    pub fn init(gpa: Allocator, now: i64, sans: []const SanEntry) !TestPki {
+        const ca_key = try KeyPair.generateDeterministic(@splat(7));
+        const leaf_key = try KeyPair.generateDeterministic(@splat(9));
+        const c = testConstraints();
+        const ca_der = try buildCa(gpa, .{ .key = ca_key, .tag = "0123abcd".*, .serial = @splat(0x11), .now = now, .constraints = &c });
+        errdefer gpa.free(ca_der);
+        const leaf_der = try buildLeaf(gpa, .{
+            .key = leaf_key.public_key,
+            .ca_key = ca_key,
+            .ca_der = ca_der,
+            .sans = sans,
+            .serial = @splat(0x22),
+            .now = now,
+        });
+        return .{ .ca_key = ca_key, .leaf_key = leaf_key, .ca_der = ca_der, .leaf_der = leaf_der };
+    }
+
+    pub fn deinit(p: *TestPki, gpa: Allocator) void {
+        gpa.free(p.ca_der);
+        gpa.free(p.leaf_der);
+    }
+};
+
+pub fn ip4(a: u8, b: u8, c: u8, d: u8) SanEntry {
+    var bytes: [16]u8 = @splat(0);
+    bytes[0..4].* = .{ a, b, c, d };
+    return .{ .ip = .{ .bytes = bytes, .len = 4 } };
+}
+
+test "subnet parsing" {
+    const s = try Subnet.parse("10.8.0.77/24");
+    try testing.expectEqualSlices(u8, &.{ 10, 8, 0, 0 }, s.addr[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 0 }, s.mask[0..4]);
+    try testing.expect(s.contains(&.{ 10, 8, 0, 2 }));
+    try testing.expect(!s.contains(&.{ 10, 8, 1, 2 }));
+    try testing.expectEqual(@as(u8, 24), s.prefixLen());
+    const l = try Subnet.parse("127.0.0.1");
+    try testing.expectEqual(@as(u8, 32), l.prefixLen());
+    const v6 = try Subnet.parse("fd00::/8");
+    try testing.expect(v6.v6 and v6.mask[0] == 0xff and v6.mask[1] == 0);
+    try testing.expectError(error.BadSubnet, Subnet.parse("10.8.0.0/33"));
+    try testing.expectError(error.BadSubnet, Subnet.parse("nonsense/8"));
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("10.8.0.0/24", try std.fmt.bufPrint(&buf, "{f}", .{s}));
+}
+
+test "dns constraint matching" {
+    var c: Constraints = .{};
+    c.dns[0] = "portal.home";
+    c.n_dns = 1;
+    try testing.expect(c.dnsPermitted("portal.home"));
+    try testing.expect(c.dnsPermitted("desk.Portal.HOME"));
+    try testing.expect(!c.dnsPermitted("evilportal.home"));
+    try testing.expect(!c.dnsPermitted("home"));
+    try testing.expect(validDnsName("desk.portal.home"));
+    try testing.expect(!validDnsName("bad_name.home"));
+    try testing.expect(!validDnsName("a..b"));
+}
+
+test "CA and leaf round-trip through std.crypto.Certificate" {
+    const gpa = testing.allocator;
+    const now: i64 = 1_790_000_000;
+    var pki = try TestPki.init(gpa, now, &.{ ip4(10, 8, 0, 1), .{ .dns = "desk.invalid" } });
+    defer pki.deinit(gpa);
+
+    const ca: Certificate = .{ .buffer = pki.ca_der, .index = 0 };
+    const leaf: Certificate = .{ .buffer = pki.leaf_der, .index = 0 };
+    const ca_p = try ca.parse();
+    const leaf_p = try leaf.parse();
+    try testing.expectEqualStrings("Portal Local CA (0123abcd)", ca_p.commonName());
+    try testing.expectEqualStrings("", leaf_p.commonName()); // no CN: names are in the SAN
+    try testing.expectEqual(Certificate.Version.v3, leaf_p.version);
+    try testing.expectEqual(Certificate.Algorithm.ecdsa_with_SHA256, leaf_p.signature_algorithm);
+    try testing.expectEqual(Certificate.NamedCurve.X9_62_prime256v1, leaf_p.pub_key_algo.X9_62_id_ecPublicKey);
+    try ca_p.verify(ca_p, now); // self-signed
+    try leaf_p.verify(ca_p, now);
+    try testing.expectError(error.CertificateExpired, leaf_p.verify(ca_p, now + leaf_validity_s));
+    try leaf_p.verifyHostName("10.8.0.1");
+    try leaf_p.verifyHostName("desk.invalid");
+    try testing.expectError(error.CertificateHostMismatch, leaf_p.verifyHostName("10.8.0.2"));
+    try testing.expectEqual(@as(u64, @intCast(now - backdate_s + leaf_validity_s)), leaf_p.validity.not_after);
+    try testing.expectEqual(@as(u64, @intCast(now - backdate_s + ca_validity_s)), ca_p.validity.not_after);
+    // Apple: leaf validity <= 398 days.
+    try testing.expect(leaf_p.validity.not_after - leaf_p.validity.not_before <= 398 * 86400);
+}
+
+test "certificate profile fields" {
+    const gpa = testing.allocator;
+    const now: i64 = 1_790_000_000;
+    var pki = try TestPki.init(gpa, now, &.{ip4(10, 8, 0, 1)});
+    defer pki.deinit(gpa);
+
+    const ca = try parse(pki.ca_der);
+    try testing.expect(ca.is_ca and ca.basic_constraints_critical);
+    try testing.expectEqual(@as(?u64, 0), ca.path_len);
+    try testing.expect(ca.key_usage_critical);
+    try testing.expectEqualSlices(u8, &.{ 0x03, 0x02, 0x01, 0x06 }, ca.key_usage);
+    try testing.expect(ca.name_constraints_critical);
+    // permittedSubtrees [0] { iPAddress 10.8.0.0/255.255.255.0, iPAddress 127.0.0.1/32, dNSName "invalid" }
+    const expected_nc = [_]u8{
+        0x30, 0x25, 0xa0, 0x23,
+        0x30, 0x0a, 0x87, 0x08, 10,   8,    0,    0,    255,  255,  255,  0,
+        0x30, 0x0a, 0x87, 0x08, 127,  0,    0,    1,    255,  255,  255,  255,
+        0x30, 0x09, 0x82, 0x07, 'i',  'n',  'v',  'a',  'l',  'i',  'd',
+    };
+    try testing.expectEqualSlices(u8, &expected_nc, ca.name_constraints);
+    try testing.expectEqual(@as(usize, 22), ca.ski.len); // 04 14 <20>
+    try testing.expectEqualSlices(u8, ca.subject_raw, ca.issuer_raw);
+    try testing.expectEqual(@as(u8, 0x40), ca.serial[0] & 0xc0); // positive, 16 bytes
+    try testing.expectEqual(@as(usize, 16), ca.serial.len);
+
+    const leaf = try parse(pki.leaf_der);
+    try testing.expect(!leaf.is_ca and leaf.basic_constraints_critical);
+    try testing.expect(leaf.key_usage_critical);
+    try testing.expectEqualSlices(u8, &.{ 0x03, 0x02, 0x07, 0x80 }, leaf.key_usage);
+    try testing.expectEqualSlices(u8, &([_]u8{ 0x30, 0x0a, 0x06, 0x08 } ++ oids.kp_server_auth), leaf.eku);
+    try testing.expectEqualSlices(u8, &.{ 0x30, 0x06, 0x87, 0x04, 10, 8, 0, 1 }, leaf.san);
+    try testing.expectEqualSlices(u8, ca.subject_raw, leaf.issuer_raw);
+    // AKI keyIdentifier == CA SKI
+    try testing.expectEqualSlices(u8, ca.ski[2..], leaf.aki[4..]);
+    try verifySignedBy(leaf, ca);
+    try verifySignedBy(ca, ca);
+    try testing.expectEqual(@as(usize, 16), leaf.serial.len);
+    try testing.expectEqualSlices(u8, &pki.leaf_key.public_key.toUncompressedSec1(), leaf.public_key);
+
+    // A leaf signed by some other key does not verify.
+    const other = try KeyPair.generateDeterministic(@splat(3));
+    const forged = try buildLeaf(gpa, .{
+        .key = pki.leaf_key.public_key,
+        .ca_key = other,
+        .ca_der = pki.ca_der,
+        .sans = &.{ip4(10, 8, 0, 1)},
+        .serial = @splat(1),
+        .now = now,
+    });
+    defer gpa.free(forged);
+    try testing.expectError(error.SignatureVerificationFailed, verifySignedBy(try parse(forged), ca));
+}
+
+test "certificate parser never panics on corrupted certificates" {
+    const gpa = testing.allocator;
+    var pki = try TestPki.init(gpa, 1_790_000_000, &.{ip4(127, 0, 0, 1)});
+    defer pki.deinit(gpa);
+    var buf: [2048]u8 = undefined;
+    const n = pki.leaf_der.len;
+    var prng: std.Random.DefaultPrng = .init(42);
+    const rand = prng.random();
+    for (0..n) |cut| _ = parse(pki.leaf_der[0..cut]) catch {};
+    for (0..5000) |_| {
+        @memcpy(buf[0..n], pki.leaf_der);
+        const flips = rand.uintLessThan(usize, 4) + 1;
+        for (0..flips) |_| buf[rand.uintLessThan(usize, n)] = rand.int(u8);
+        const info = parse(buf[0..n]) catch continue;
+        _ = verifySignedBy(info, info) catch {};
+    }
+}
+
+/// Reads back the permitted subtrees of a nameConstraints value written by
+/// `nameConstraintsValue`. DNS names point into `val`.
+pub fn parseConstraints(val: []const u8) !Constraints {
+    var c: Constraints = .{};
+    var r: der.Reader = .init(val);
+    const nc = try r.expect(Tag.sequence);
+    var nr: der.Reader = .init(nc.content);
+    while (!nr.atEnd()) {
+        const part = try nr.next();
+        if (part.tag != Tag.contextConstructed(0)) continue; // excluded subtrees: none written
+        var sr: der.Reader = .init(part.content);
+        while (!sr.atEnd()) {
+            const subtree = try sr.expect(Tag.sequence);
+            var gr: der.Reader = .init(subtree.content);
+            const base = try gr.next();
+            if (base.tag == Tag.contextPrimitive(7)) {
+                if (base.content.len != 8 and base.content.len != 32) return error.DerMalformed;
+                if (c.n_subnets == max_subnets) return error.TooManyConstraints;
+                const half = base.content.len / 2;
+                var s: Subnet = .{ .v6 = half == 16 };
+                @memcpy(s.addr[0..half], base.content[0..half]);
+                @memcpy(s.mask[0..half], base.content[half..]);
+                c.subnets[c.n_subnets] = s;
+                c.n_subnets += 1;
+            } else if (base.tag == Tag.contextPrimitive(2)) {
+                if (c.n_dns == max_dns) return error.TooManyConstraints;
+                c.dns[c.n_dns] = base.content;
+                c.n_dns += 1;
+            }
+        }
+    }
+    return c;
+}
+
+test "name constraints read back" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const d: der.Writer = .{ .arena = arena.allocator() };
+    var c = testConstraints();
+    c.subnets[c.n_subnets] = try Subnet.parse("fd00::/8");
+    c.n_subnets += 1;
+    c.dns[0] = "portal.home";
+    c.n_dns = 1;
+    const v = try nameConstraintsValue(d, &c);
+    const back = try parseConstraints(v);
+    try testing.expectEqual(@as(usize, 3), back.n_subnets);
+    try testing.expect(back.ipPermitted(&.{ 10, 8, 0, 9 }));
+    try testing.expect(back.ipPermitted(&.{ 127, 0, 0, 1 }));
+    try testing.expect(!back.ipPermitted(&.{ 127, 0, 0, 2 }));
+    try testing.expect(back.subnets[2].v6);
+    try testing.expectEqual(@as(usize, 1), back.n_dns);
+    try testing.expect(back.dnsPermitted("x.portal.home"));
+}
