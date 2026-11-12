@@ -173,6 +173,8 @@ fn statusWord(st: client_mod.Status) []const u8 {
         .connected => "connected",
         .retrying => "reconnecting",
         .session_ended => "session ended",
+        .desktop_offline => "desktop offline",
+        .network_error => "network error",
         .store_unavailable => "credential store unavailable",
     };
 }
@@ -219,6 +221,8 @@ pub const View = struct {
     code: ?[4]u8 = null,
     /// The last connection error, if any.
     err: ?anyerror = null,
+    /// The ended session's exit code, kept while the desktop is offline.
+    exit_code: ?i64 = null,
     /// "AB:CD:..." of the pinned Portal CA ("" without TLS).
     pin_fp: []const u8 = "",
 };
@@ -279,6 +283,19 @@ pub fn overlay(v: View, b: *Bufs) TermView.Overlay {
         },
         .store_unavailable => {
             o.screen = .{ .message = .{ .title = "Cannot store the device credential", .title_tone = .bad, .detail = v.detail } };
+            return o;
+        },
+        // A clear end state instead of the last picture behind a status
+        // word: what ended, and whether the desktop is still there.
+        .session_ended, .desktop_offline => {
+            const t = if (v.exit_code) |code| client_mod.endedText(code, &b.txt[3]) else client_mod.offline_text;
+            b.lines[0] = if (st == .session_ended)
+                "Waiting for the desktop to start a new session."
+            else if (v.exit_code != null)
+                client_mod.offline_text ++ "."
+            else
+                "Portal is not answering on the desktop; this window resumes when it runs again.";
+            o.screen = .{ .message = .{ .title = t, .title_tone = .warn, .lines = b.lines[0..1] } };
             return o;
         },
         .connected => if (v.mode) |mode| {
@@ -397,6 +414,27 @@ test "overlay: the data column beside the terminal, its badge while hidden" {
     v.status = .need_pairing;
     v.data = col;
     try std.testing.expect(overlay(v, &b).data == null);
+}
+
+test "overlay: session ended, then desktop offline, are explicit screens" {
+    var b: Bufs = .{};
+    const ended = overlay(.{ .status = .session_ended, .mode = .keys, .detail = "", .host = "h", .has_grid = true, .exit_code = 1 }, &b);
+    try std.testing.expectEqualStrings("session ended", ended.status.label);
+    try std.testing.expectEqualStrings("Session ended on the desktop (exit code 1)", ended.screen.message.title);
+    try std.testing.expectEqualStrings("Waiting for the desktop to start a new session.", ended.screen.message.lines[0]);
+    try std.testing.expect(!ended.show_answers);
+    const off = overlay(.{ .status = .desktop_offline, .mode = null, .detail = "", .host = "h", .has_grid = true, .exit_code = 1, .err = error.ConnectionRefused }, &b);
+    try std.testing.expectEqualStrings("desktop offline", off.status.label);
+    try std.testing.expectEqualStrings("Session ended on the desktop (exit code 1)", off.screen.message.title);
+    try std.testing.expectEqualStrings("Desktop offline \u{2014} reconnects automatically.", off.screen.message.lines[0]);
+    // Offline without an ended session (the desktop was off from the start).
+    const cold = overlay(.{ .status = .desktop_offline, .mode = null, .detail = "", .host = "h", .has_grid = false, .err = error.TimedOut }, &b);
+    try std.testing.expectEqualStrings("Desktop offline \u{2014} reconnects automatically", cold.screen.message.title);
+    // A network error keeps the picture and says so in the status line.
+    const net_err = overlay(.{ .status = .network_error, .mode = null, .detail = "Network error: network unreachable", .host = "h", .has_grid = true, .err = error.NetworkUnreachable }, &b);
+    try std.testing.expectEqualStrings("network error", net_err.status.label);
+    try std.testing.expect(net_err.screen == .grid);
+    try std.testing.expectEqualStrings("Network error: network unreachable", net_err.status.extra);
 }
 
 test "keyboard focus: the instruction line in instruct mode only" {
