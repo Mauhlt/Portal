@@ -33,10 +33,22 @@ home.trainNow(); home.cancelTraining(); home.setSchedule(cfg); home.setListener(
 
 * **Build:** stt depends on `../Audio` (path dependency). The Audio repo must
   be checked out next to SpeechToText.
-* **Event-driven:** stt suggests calling `tick()` about once a second.
-  Portal's rule is no polling, so Portal needs a next-deadline from stt (when
-  the next silence confirmation or schedule start is due). Requested from the
-  stt side.
+* **Event-driven (agreed, implemented in stt):**
+  * `home.tick()` returns `?i64`: the unix-ms deadline of its next timed
+    work, or null when nothing is pending. Timed work means auto-confirming
+    a transcript after 60 s of silence, or starting training when the window
+    opens. Calling it early is harmless.
+  * `home.setWakeup(.{ .ctx, .onWakeup = fn (ctx, deadline_unix_ms: ?i64) void })`
+    fires on set and whenever the deadline can move: transcribe, feedback,
+    setLearning, importBundle, setSchedule, or a training run finishing. It
+    may fire on the training thread, so Portal only re-arms its wait in it
+    and never calls into Home from inside it.
+  * Training completes on its own thread. That thread commits the version,
+    merges the adapter, and fires finished/failed/canceled, then onWakeup.
+  * **Portal's loop:** one waiter sleeps until the latest deadline (from
+    onWakeup or tick's return), calls tick() at that deadline, and sleeps
+    until tick's return value; null means wait for the next event. Nothing
+    wakes on a fixed interval.
 
 ## Training schedule and status
 
@@ -56,7 +68,9 @@ home.trainNow(); home.cancelTraining(); home.setSchedule(cfg); home.setListener(
   Status.
   * `started` and `progress` fire on the training thread. Keep the handler
     quick and don't call back into Home from it.
-  * `finished`, `failed` and `canceled` fire inside `tick()`.
+  * `started` fires from whichever call started the run (tick or trainNow).
+  * `finished`, `failed` and `canceled` fire from the training thread when
+    the run ends, with no tick needed.
 * **Portal UI:**
   * a top-bar banner on every viewer while running: "Training on GPU —
     other GPU work may be slower (ETA …)";
