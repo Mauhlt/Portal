@@ -1,7 +1,7 @@
 # Speech-to-text sync: contract on file (not implemented)
 
 **Status:** parked. The owner will say when to integrate their `stt` module
-(TextToSpeech repo). Nothing in Portal implements this yet.
+(SpeechToText repo, formerly named TextToSpeech). Nothing in Portal implements this yet.
 
 ## Proposed Portal endpoints
 
