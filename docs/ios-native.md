@@ -1,63 +1,82 @@
 # Native iPhone app (branch feat/ios-native)
 
-**Status (2026-11-12):** planned. Waiting on the owner's toolchain choice
-(below). Until it exists the iPhone uses the browser app, which runs the same
-shared UI on the Renderer's CPU backend.
+**Owner decisions (2026-11-12):**
+* Assume the toolchain exists: the iOS SDK (Xcode) and the ability to sign and
+  install on the owner's iPhone, so Vulkan runs on the iPhone through
+  MoltenVK.
+* **One code path, branching per device only where a device really differs.**
+  One renderer (Vulkan, the owner's Renderer), one UI, one network client.
+  The iPhone section adds only what iOS needs: MoltenVK, a UIKit window
+  backend, the app bundle and signing.
+* The Safari/wasm browser app and the Renderer CPU backend are dropped. The
+  browser app stays only until the native app is installed on the phone, then
+  `src/wasm/` and the web app assets are removed.
 
-## Why native
+## Structure: shared core, thin device sections
 
-The browser can't reach the iPhone's GPU through Vulkan. A native app can:
-MoltenVK translates Vulkan to Metal, so the owner's Renderer (Instanced2D,
-Window, Font) runs unchanged on the GPU, with the same shared Portal UI as the
-desktop and laptop. It also gets Face ID / passkeys directly and could later
-run the owner's own speech model on-device.
+```
+Portal UI (shared, every device)      top bar + tabs, conversation/terminal,
+                                      data, interaction bar, theme, panels
+        │ draw list (quads, glyphs, images)
+Renderer (owner's repo)
+  Instanced2D (Vulkan)                one renderer everywhere
+  Font                                one font stack
+  Window  ── win32 (../Windows) │ wayland (../Wayland) │ macos (../MacOS) │ ios (UIKit)
+        │ Vulkan
+  Vulkan loader ── Windows/Linux: system loader │ macOS + iOS: MoltenVK
+Network client (shared)               TLS pinning, pairing, rotating credential,
+                                      WebSocket, sync (client/src)
+Per-device glue (small)               desk: ConPTY + server │ laptop/macOS/Linux:
+                                      `portal connect` │ iPhone: app entry, Keychain,
+                                      passkey (AuthenticationServices)
+```
 
-## Getting the kit (owner)
+Rules:
+* A feature is written once in the shared layer. A device section contains
+  only OS bindings and lifecycle glue, never UI or protocol logic.
+* Per-device choices are a `switch (builtin.os.tag)` at one seam (Window
+  backend, Vulkan loader, credential store), not scattered `if`s.
+* The iPhone section never forks shared code; if iOS needs something
+  different from shared code, the shared code gets a parameter.
 
-Xcode, and with it the iOS SDK, only runs on macOS. Pick one way to get a Mac
-and one way to sign:
+## iPhone section
 
-| Build on | Cost | Notes |
-|---|---|---|
-| Used Mac mini (M1 or newer) | one-off | Simplest; cable to the iPhone for install and debugging. |
-| Cloud Mac (MacinCloud, AWS EC2 Mac, Scaleway) | monthly / hourly | Remote desktop to a real Mac. |
-| Hosted CI (GitHub Actions macOS runner, Codemagic) | free tier / minutes | No Mac at all; every push builds an `.ipa`. |
+1. **Build:** Zig cross-compiles `aarch64-ios` against the iOS SDK
+   (`--sysroot` to the SDK; frameworks UIKit, QuartzCore, Metal, Foundation,
+   Security, AuthenticationServices). No Swift. `zig build ios` produces the
+   `.app` bundle (Info.plist, entry, launch screen, icon) with MoltenVK
+   embedded as Apple requires (`Frameworks/`), plus a signing step that takes
+   the owner's identity/profile from the environment. A CI workflow builds the
+   same on a hosted macOS runner.
+2. **Vulkan on iOS:** the Renderer's Vulkan loader opens the embedded MoltenVK
+   (`libMoltenVK.dylib` / framework) instead of a system loader; the surface is
+   `VK_EXT_metal_surface` from a CAMetalLayer (`SurfaceSource.metal`, shared
+   with macOS). MoltenVK portability: enable
+   `VK_KHR_portability_enumeration` / `_subset` where required.
+3. **Window backend `ios` in the Renderer's Window module** (UIKit via the
+   Objective-C runtime, same style as the macOS backend on ../MacOS):
+   UIApplicationMain + app/scene delegate classes registered at runtime,
+   UIWindow + a UIView whose layer is CAMetalLayer, touches → pointer/tap
+   events (and scroll by pan), safe-area insets, keyboard show/hide with the
+   inset it takes, content scale, background/foreground events (stop drawing
+   in background), wake from other threads via a main-queue dispatch.
+   Event-driven only. Same interface as every other backend (checkInterface).
+4. **Text input + dictation:** a real UITextView placed over the
+   interaction bar's input slot, so Apple dictation and the keyboard work; its
+   text flows into the shared input logic. Must be verified on the phone.
+5. **Credentials:** the device credential and CA pin in the iOS Keychain
+   (shared credstore interface, iOS implementation). Passkey / Face ID via
+   AuthenticationServices on sign-in.
+6. **Tunnel:** iOS has no per-app VPN without MDM; keep the Shortcuts
+   automations (pairing page shows them).
 
-| Sign / install with | Cost | Notes |
-|---|---|---|
-| Free Apple ID + SideStore | free | App must be re-signed every 7 days (SideStore does it on the phone over Wi-Fi); max 3 sideloaded apps. First install from Windows via AltServer. |
-| Apple Developer Program + TestFlight | $99/year | 1-year signatures; install and update over the air; works with hosted CI. |
+## What is shared vs per device (target)
 
-No jailbreak: none exists for iPhone 16 / iOS 18+, it wouldn't provide the SDK,
-and it would break the sandbox and Secure Enclave guarantees Portal's iPhone
-security relies on.
-
-## What gets built (once the kit exists)
-
-1. **Toolchain:** Zig cross-compiles for `aarch64-ios` against the iOS SDK from
-   Xcode (`--sysroot` to the SDK; no Swift). A minimal app bundle: Info.plist,
-   entry point, launch screen, icon. Build step `zig build ios` (+ a CI
-   workflow for the hosted-Mac route that produces the `.ipa`).
-2. **Window:** an iOS backend in the Renderer's Window module (UIKit via the
-   Objective-C runtime, like the macOS backend on ../MacOS): UIWindow +
-   CAMetalLayer surface, touch → pointer/tap events, safe-area insets,
-   keyboard show/hide, wake via a posted event; event-driven only.
-3. **GPU:** MoltenVK (bundled in the app, as Apple requires) behind the
-   Renderer's existing Vulkan path; `SurfaceSource.metal` already exists.
-4. **App:** the same shared Portal UI as every other device (top bar + tabs,
-   Conversation view by default, Data slice, big interaction bar), the same
-   network client as `portal connect` (TLS pinning, pairing, rotating
-   credential), credentials in the iOS Keychain, passkey/Face ID via
-   AuthenticationServices.
-5. **Speech:** keep Apple dictation in the input field first (needs a native
-   UITextField/UITextView bridged into the Renderer's input slot — verify
-   dictation works there). Owner's on-device model later, as an option.
-6. **Tunnel:** iOS still has no per-app VPN without MDM; keep the Shortcuts
-   automations (see docs/wireguard.md / pairing page).
-
-## Open questions
-
-* Which build/sign route the owner picks (drives the CI workflow).
-* Whether Apple dictation works in a native text view composited over the
-  Renderer's surface (expected yes; must be tested on the phone).
-* App Store distribution is out of scope (personal use).
+| Concern | Shared | Desk (Windows) | Laptop (Win/Linux/macOS) | iPhone |
+|---|---|---|---|---|
+| UI + theme | ✓ | – | – | – |
+| Drawing | Renderer Instanced2D (Vulkan) | system loader | system loader / MoltenVK on macOS | MoltenVK |
+| Window | Renderer Window interface | win32 | win32 / wayland / macos | ios |
+| Network client | ✓ | (server instead) | ✓ | ✓ |
+| Credentials | interface | DPAPI | Credential Manager / libsecret / Keychain | Keychain |
+| Session | – | ConPTY + server | – | – |
