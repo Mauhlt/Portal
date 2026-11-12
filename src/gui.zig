@@ -346,7 +346,7 @@ pub const LocalHost = struct {
     /// Hides the window (shutdown can take a moment; the user already
     /// asked to close, or the program ended).
     pub fn hide(h: *LocalHost) void {
-        _ = ShowWindow(@ptrCast(h.tv.window.hwnd), 0);
+        h.tv.window.hide();
     }
 
     fn liveRedraw(ctx: *anyopaque) void {
@@ -840,8 +840,6 @@ fn localClock(t: i64, buf: []u8) []const u8 {
     if (FileTimeToLocalFileTime(&ft, &local) == 0 or FileTimeToSystemTime(&local, &st) == 0) return buf[0..0];
     return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ st.hour, st.minute }) catch buf[0..0];
 }
-
-extern "user32" fn ShowWindow(hwnd: *anyopaque, cmd: i32) callconv(.winapi) i32;
 
 test "selection range normalises drag direction" {
     var s: Select = .{ .anchor = .{ 5, 3 }, .head = .{ 2, 1 }, .active = true };

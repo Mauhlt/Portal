@@ -176,8 +176,34 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&release_exe.step);
     test_step.dependOn(&launcher_exe.step);
     test_step.dependOn(&launcher_con.step);
+    // The laptop client (client/src/main.zig) for Linux and macOS, compile
+    // only: a gap in one OS's window backend fails here, not in a later
+    // cross build.
+    for ([_]std.Target.Query{
+        .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
+        .{ .cpu_arch = .aarch64, .os_tag = .macos },
+    }) |q| test_step.dependOn(&laptopClientCheck(b, b.resolveTargetQuery(q)).step);
 
     addE2e(b, target, optimize, gui_mods, ctl_exe, show_exe);
+}
+
+/// The laptop client's executable (as client/build.zig builds it) for `t`.
+fn laptopClientCheck(b: *std.Build, t: std.Build.ResolvedTarget) *std.Build.Step.Compile {
+    const inputrules = inputrulesModule(b, t, .Debug);
+    const scratch = b.createModule(.{ .target = t, .optimize = .Debug });
+    const gui = addGuiModules(b, scratch, t, .Debug, inputrules);
+    return b.addExecutable(.{ .name = b.fmt("portal-client-check-{t}", .{t.result.os.tag}), .root_module = b.createModule(.{
+        .root_source_file = b.path("client/src/main.zig"),
+        .target = t,
+        .optimize = .Debug,
+        .link_libc = true, // libsecret / Security.framework via dlopen
+        .imports = &.{
+            .{ .name = "view", .module = gui.view },
+            .{ .name = "shared", .module = sharedModule(b, t, .Debug) },
+            .{ .name = "inputrules", .module = inputrules },
+            .{ .name = "datafeed", .module = datafeedModule(b, t, .Debug) },
+        },
+    }) });
 }
 
 /// "inputrules" (src/inputrules): the input policy, the allowed key names
@@ -365,6 +391,8 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
         .link_libc = link_libc,
         .imports = &.{
             .{ .name = "Renderer", .module = renderer.module("Renderer") },
+            // The native window (Win32 / Wayland / macOS).
+            .{ .name = "Window", .module = renderer.module("Window") },
             .{ .name = "Font", .module = renderer.module("Font") },
             .{ .name = "imgdec", .module = img.imgdec },
             .{ .name = "shared", .module = shared },

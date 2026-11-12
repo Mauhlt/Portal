@@ -22,7 +22,7 @@
 const std = @import("std");
 const Renderer = @import("Renderer");
 const Instanced2D = Renderer.Instanced2D;
-const platform = @import("platform/platform.zig");
+const Window = @import("Window");
 const input = @import("input.zig");
 const grid_mod = @import("grid.zig");
 const Font = @import("Font");
@@ -266,7 +266,7 @@ fn toneColor(t: Tone) Rgb {
 }
 
 gpa: std.mem.Allocator,
-window: *platform.Window,
+window: *Window.Window,
 /// Null after releaseGpu().
 renderer: ?*Instanced2D,
 fonts: fontset.FontSet,
@@ -287,19 +287,19 @@ regions: Layout = .{},
 /// Where the last built grid was drawn (pixels), for mouse -> cell.
 layout: struct { ox: f32 = 0, oy: f32 = 0, cw: f32 = 1, ch: f32 = 1, cols: u16 = 0, rows: u16 = 0 } = .{},
 live_ctx: ?*anyopaque = null,
-live_fn: ?platform.LiveFn = null,
+live_fn: ?Window.LiveFn = null,
 /// Inline images (decode, scale, pack into the texture's image region).
 img: images.Layer,
 /// Host events (keys, text, mouse, close) that arrived during a modal
 /// move/size loop, kept for the next pollEvents instead of being dropped.
-deferred: platform.Queue = .{},
+deferred: Window.Queue = .{},
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*TermView {
     const self = try gpa.create(TermView);
     errdefer gpa.destroy(self);
     var fonts = try fontset.FontSet.load(gpa, io);
     errdefer fonts.deinit();
-    const window = try platform.Window.init(gpa, options.title, options.width, options.height);
+    const window = try Window.Window.init(gpa, options.title, options.width, options.height);
     errdefer window.deinit();
     const fb = window.framebufferSize();
     const renderer = try Instanced2D.init(gpa, window.surfaceSource(), fb[0], fb[1], .{
@@ -336,7 +336,7 @@ pub fn deinit(tv: *TermView) void {
 
 /// Called while the OS runs a modal resize loop (Win32); the host should
 /// build + present from its current state.
-pub fn setLiveRedraw(tv: *TermView, ctx: *anyopaque, f: platform.LiveFn) void {
+pub fn setLiveRedraw(tv: *TermView, ctx: *anyopaque, f: Window.LiveFn) void {
     tv.live_ctx = ctx;
     tv.live_fn = f;
 }
@@ -350,7 +350,7 @@ fn liveThunk(ctx: *anyopaque) void {
 /// Inside a modal loop: apply view events now, keep host events for later.
 fn liveEvent(tv: *TermView, e: input.Event) void {
     switch (e) {
-        .resize, .scale, .expose, .zoom => tv.handleViewEvent(e),
+        .resize, .scale, .expose, .zoom, .scroll => tv.handleViewEvent(e),
         .close, .key, .char, .mouse_down, .mouse_move, .mouse_up => tv.deferred.push(e),
     }
 }
@@ -366,7 +366,7 @@ pub fn wake(tv: *TermView) void {
 }
 
 /// waitEvents timeout meaning "until an event or wake()" (no idle polling).
-pub const forever = platform.forever;
+pub const forever = Window.forever;
 
 /// Sleeps until window input, a wake() from any thread, or the timeout
 /// (`forever`: no timeout). Returns at once if a redraw is pending.
@@ -415,6 +415,8 @@ pub fn pollEvents(tv: *TermView, sink: input.InputSink) bool {
             },
             .mouse_move => |m| sink.mouse(tv.mouseAt(.move, .left, m.x, m.y, .{})),
             .mouse_up => |m| sink.mouse(tv.mouseAt(.up, m.button, m.x, m.y, .{})),
+            // No scrollback in the view yet: wheel input needs no redraw.
+            .scroll => continue,
             else => tv.handleViewEvent(e),
         }
         tv.dirty = true;

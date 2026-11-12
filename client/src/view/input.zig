@@ -1,43 +1,20 @@
-//! Input types shared by the platform backends, TermView and hosts.
+//! Input types shared by the window, TermView and hosts.
 //!
-//! Platform code produces `Event`s; TermView handles view-local ones (zoom,
+//! The Renderer's Window module (one window API for Win32, Wayland and
+//! macOS) produces `Event`s and defines `Key`, `Mods` and `MouseButton`;
+//! they are re-exported here. TermView handles view-local ones (zoom,
 //! close, resize, button clicks) and forwards keyboard input to an
 //! `InputSink`. The sink decides what a key means: the remote client turns
 //! it into protocol key names ("k:enter", "t:x"); a local terminal host
 //! would encode VT bytes for its PTY.
 
 const std = @import("std");
+const Window = @import("Window");
 
-pub const Key = enum {
-    enter,
-    escape,
-    backspace,
-    tab,
-    up,
-    down,
-    left,
-    right,
-    home,
-    end,
-    page_up,
-    page_down,
-    delete,
-    insert,
-    f1,
-    f2,
-    f3,
-    f4,
-    f5,
-    f6,
-    f7,
-    f8,
-    f9,
-    f10,
-    f11,
-    f12,
-};
-
-pub const MouseButton = enum { left, right, middle };
+pub const Key = Window.Key;
+pub const MouseButton = Window.MouseButton;
+pub const Mods = Window.Mods;
+pub const Event = Window.Event;
 
 /// Mouse input in grid cells, for hosts (selection, paste). `col`/`row` are
 /// clamped to the grid; `inside` is false when the pointer is outside it.
@@ -48,31 +25,6 @@ pub const Mouse = struct {
     row: u16,
     inside: bool,
     mods: Mods = .{},
-};
-
-pub const Mods = packed struct(u8) {
-    ctrl: bool = false,
-    shift: bool = false,
-    alt: bool = false,
-    super: bool = false,
-    _: u4 = 0,
-};
-
-pub const Event = union(enum) {
-    close,
-    resize: struct { width: u32, height: u32 },
-    /// Device scale changed (moved to another monitor).
-    scale: f32,
-    expose,
-    key: struct { key: Key, mods: Mods },
-    /// Typed text. Control characters are never delivered here; Ctrl+letter
-    /// arrives as the lowercase letter with `mods.ctrl`.
-    char: struct { cp: u21, mods: Mods = .{} },
-    mouse_down: struct { x: f32, y: f32, button: MouseButton = .left, mods: Mods = .{} },
-    /// Pointer moved; `left_held` while dragging with the left button.
-    mouse_move: struct { x: f32, y: f32, left_held: bool = false },
-    mouse_up: struct { x: f32, y: f32, button: MouseButton = .left },
-    zoom: enum { in, out, reset },
 };
 
 /// On-screen answer buttons. `key` uses the protocol key names

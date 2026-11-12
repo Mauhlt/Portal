@@ -4,8 +4,9 @@
 //!   zig build test                    unit tests (view module + client), plus
 //!                                     compile checks of the exe in Debug and
 //!                                     ReleaseSafe
-//!   zig build -Dtarget=x86_64-linux-gnu   cross-compile (no SDK needed: X11,
-//!   zig build -Dtarget=aarch64-macos      Cocoa, Vulkan are loaded at runtime)
+//!   zig build -Dtarget=x86_64-linux-gnu   cross-compile (no SDK needed: Wayland,
+//!   zig build -Dtarget=aarch64-macos      AppKit, Vulkan are loaded at runtime;
+//!                                         `test` compile-checks both too)
 //!
 //! Module layout (for merging into Portal's root build later):
 //!   "view"   src/view/root.zig   window, Vulkan drawing, fonts, input types.
@@ -53,7 +54,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sharedModule(b, target, optimize) })).step);
     test_step.dependOn(&exe.step);
     test_step.dependOn(&addClient(b, "portal-client-releasesafe-check", target, .ReleaseSafe).step);
+    // The laptop client on the other OSes, compile only (they cannot run
+    // here): a gap in a window backend (a method one OS lacks) fails
+    // `zig build test` instead of a later cross build.
+    for (cross_targets) |q| {
+        const t = b.resolveTargetQuery(q);
+        test_step.dependOn(&addClient(b, b.fmt("portal-client-check-{t}", .{q.os_tag.?}), t, .Debug).step);
+    }
 }
+
+/// Laptop-client targets compile-checked by `zig build test`.
+pub const cross_targets = [_]std.Target.Query{
+    .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
+    .{ .cpu_arch = .aarch64, .os_tag = .macos },
+};
 
 /// Portal's shared protocol module (../shared/root.zig).
 pub fn sharedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
@@ -86,11 +100,14 @@ pub fn viewModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
         .root_source_file = b.path("src/view/root.zig"),
         .target = target,
         .optimize = optimize,
-        // dlopen (X11, Vulkan loader, Objective-C runtime) needs libc off
-        // Windows; Windows talks to kernel32/user32 directly.
+        // dlopen (Wayland, Vulkan loader, Objective-C runtime) needs libc
+        // off Windows; Windows talks to kernel32/user32 directly.
         .link_libc = target.result.os.tag != .windows,
         .imports = &.{
             .{ .name = "Renderer", .module = renderer.module("Renderer") },
+            // The native window (Win32 / Wayland / macOS): the Renderer's
+            // Window module.
+            .{ .name = "Window", .module = renderer.module("Window") },
             // Fonts and cell widths: the Renderer's Font module.
             .{ .name = "Font", .module = renderer.module("Font") },
             .{ .name = "imgdec", .module = imgdec },
