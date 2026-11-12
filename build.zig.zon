@@ -9,7 +9,7 @@
         // (client/src/view) for `portal run`'s window and `portal connect`.
         // The de-facto Renderer: the owner's main checkout next to this repo,
         // no worktree, no pin.
-        .Renderer = .{ .path = "../Renderer" },
+        .Renderer = .{ .path = "../Renderer-wt-ios" }, // TEMPORARY (feat/ios-native): the Renderer ios-window branch; back to ../Renderer once merged
         // The owner's Image package: Image.check validates inline images
         // (server and every client, client/src/image/imgcheck.zig) and its
         // PNG decoder decodes them (client/src/image/imgdec.zig). Its own
@@ -19,5 +19,9 @@
         // Protocol and crypto code shared by the server, both clients and
         // the e2e tests (shared/root.zig; client/ depends on it too).
         .shared = .{ .path = "shared" },
+        // The owner's pure-Zig WireGuard: the iPhone app's packet tunnel
+        // extension (client/src/ios/tunnel_ext) runs it. Only iOS builds
+        // and the extension's host tests compile it.
+        .WireGuard = .{ .path = "../WireGuard" },
     },
 }

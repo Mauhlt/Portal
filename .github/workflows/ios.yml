@@ -1,0 +1,63 @@
+# CONFIGURATION, NOT CODE: GitHub Actions only reads YAML. This is the one
+# file type in the iPhone work that is not Zig (the owner's "all code in
+# Zig" rule makes an exception for config files); every step below just
+# runs `zig build`, all logic lives in build.zig and src/tools/*.zig.
+#
+# Builds the iPhone app on a hosted macOS runner (Xcode's iOS SDK is
+# preinstalled there): the aarch64-ios compile check, then an UNSIGNED
+# Portal.app with MoltenVK embedded, uploaded as an artifact. Signing stays
+# on the owner's Mac (no certificates in CI).
+#
+# Portal builds against sibling checkouts (../Renderer, ../Image, ../Vulkan,
+# ../Windows, ../Wayland, ../MacOS), so the job checks those out next to it.
+# Private repos need a token with read access in the PORTAL_DEPS_TOKEN
+# secret. ZIG_URL must point at the exact Zig build Portal requires
+# (build.zig.zon minimum_zig_version), a macOS aarch64 tarball.
+name: ios
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/ios-native]
+
+jobs:
+  ios:
+    runs-on: macos-15
+    env:
+      ZIG_URL: ${{ vars.ZIG_URL }}
+      MOLTENVK_URL: https://github.com/KhronosGroup/MoltenVK/releases/download/v1.3.0/MoltenVK-ios.tar
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: Portal }
+      - uses: actions/checkout@v4
+        with: { repository: Mauhlt/Renderer, path: Renderer, token: "${{ secrets.PORTAL_DEPS_TOKEN || github.token }}" }
+      - uses: actions/checkout@v4
+        with: { repository: Mauhlt/Image, path: Image, token: "${{ secrets.PORTAL_DEPS_TOKEN || github.token }}" }
+      - uses: actions/checkout@v4
+        with: { repository: Mauhlt/Vulkan, path: Vulkan, token: "${{ secrets.PORTAL_DEPS_TOKEN || github.token }}" }
+      - uses: actions/checkout@v4
+        with: { repository: Mauhlt/Windows, path: Windows, token: "${{ secrets.PORTAL_DEPS_TOKEN || github.token }}" }
+      - uses: actions/checkout@v4
+        with: { repository: Mauhlt/Wayland, path: Wayland, token: "${{ secrets.PORTAL_DEPS_TOKEN || github.token }}" }
+      - uses: actions/checkout@v4
+        with: { repository: Mauhlt/MacOS, path: MacOS, token: "${{ secrets.PORTAL_DEPS_TOKEN || github.token }}" }
+      - name: Zig
+        run: |
+          curl -fsSL "$ZIG_URL" -o zig.tar.xz
+          mkdir zig && tar -xf zig.tar.xz -C zig --strip-components=1
+          echo "$PWD/zig" >> "$GITHUB_PATH"
+      - name: MoltenVK (iOS)
+        run: |
+          curl -fsSL "$MOLTENVK_URL" -o mvk.tar
+          tar -xf mvk.tar
+          echo "MOLTENVK_PATH=$PWD/MoltenVK/MoltenVK/dynamic/MoltenVK.xcframework/ios-arm64/MoltenVK.framework" >> "$GITHUB_ENV"
+      - name: Compile check (aarch64-ios)
+        working-directory: Portal
+        run: zig build ios-check
+      - name: Portal.app (unsigned)
+        working-directory: Portal
+        run: zig build ios -Doptimize=ReleaseSafe -Dmoltenvk="$MOLTENVK_PATH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Portal-unsigned.app
+          path: Portal/zig-out/ios/Portal.app

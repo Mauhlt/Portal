@@ -15,4 +15,5 @@ test {
     _ = @import("remote.zig");
     _ = @import("setup.zig");
     _ = @import("sync/root.zig");
+    _ = @import("ios/wgkey.zig");
 }

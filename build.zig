@@ -193,6 +193,7 @@ pub fn build(b: *std.Build) void {
     }) |q| test_step.dependOn(&laptopClientCheck(b, b.resolveTargetQuery(q)).step);
 
     addE2e(b, target, optimize, gui_mods, ctl_exe, show_exe);
+    addIos(b, optimize, test_step);
 }
 
 /// The laptop client's executable (as client/build.zig builds it) for `t`.
@@ -416,4 +417,271 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
     // src/vt.zig (a file of the root module) validates transmitted images.
     mod.addImport("imgcheck", img.imgcheck);
     return .{ .view = view, .client = client, .imgdec = img.imgdec, .imgcheck = img.imgcheck, .inputrules = inputrules };
+}
+
+// ---- iPhone app (client/src/ios; docs/ios-native.md) ----
+
+/// The iPhone app: the same viewer as `portal connect` (module "client")
+/// with the iPhone section (client/src/ios) as its entry.
+///
+///   zig build ios-check      compile it for aarch64-ios (object only: no
+///                            iOS SDK needed; part of `zig build test`)
+///   zig build ios            build zig-out/ios/Portal.app (on a Mac: needs
+///                            the iOS SDK and MoltenVK, see the options)
+///   zig build ios-sign       sign it (env: PORTAL_SIGN_IDENTITY,
+///                            PORTAL_PROVISIONING_PROFILE, PORTAL_TEAM_ID)
+///
+/// Both build against a copy of Zig's lib dir with one std line fixed
+/// (src/tools/ios_zig_lib.zig: std.Io.Threaded does not compile for iOS
+/// in this Zig).
+fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Build.Step) void {
+    const bundle_id = b.option([]const u8, "ios-bundle-id", "iPhone app bundle id (default local.portal.Portal; must match the provisioning profile)") orelse "local.portal.Portal";
+    const tunnel = b.option(bool, "ios-tunnel", "iPhone app: control the per-app WireGuard tunnel extension (needs the Network Extension entitlement, paid account)") orelse false;
+    const env = &b.graph.environ_map;
+    const moltenvk = b.option([]const u8, "moltenvk", "iOS MoltenVK: path to libMoltenVK.dylib or MoltenVK.framework for iOS arm64 (env MOLTENVK_PATH)") orelse env.get("MOLTENVK_PATH");
+    const sdk = b.option([]const u8, "ios-sdk", "iPhoneOS SDK path (env IOS_SDK; default: xcrun --sdk iphoneos --show-sdk-path on a Mac)") orelse env.get("IOS_SDK") orelse if (b.graph.host.result.os.tag == .macos)
+        std.mem.trim(u8, b.run(&.{ "xcrun", "--sdk", "iphoneos", "--show-sdk-path" }), " \r\n")
+    else
+        null;
+
+    const t = b.resolveTargetQuery(.{
+        .cpu_arch = .aarch64,
+        .os_tag = .ios,
+        .os_version_min = .{ .semver = .{ .major = 16, .minor = 0, .patch = 0 } },
+    });
+
+    // The Zig lib dir with the std fix (cached by the build system).
+    const lib_tool = b.addExecutable(.{ .name = "ios-zig-lib", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/ios_zig_lib.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lib_tool.root_module })).step);
+    const lib_run = b.addRunArtifact(lib_tool);
+    lib_run.addDirectoryArg(.zig_lib);
+    const zig_lib = lib_run.addOutputDirectoryArg("zig-lib");
+
+    // Compile check (object): the whole iPhone app and its tunnel extension
+    // without the SDK.
+    const check = b.addObject(.{ .name = "portal-ios-check", .root_module = iosModule(b, t, .Debug, bundle_id, tunnel), .zig_lib_dir = zig_lib });
+    const ext_check = b.addObject(.{ .name = "portal-tunnel-check", .root_module = tunnelExtModule(b, t, .Debug), .zig_lib_dir = zig_lib });
+    const ios_check = b.step("ios-check", "Compile the iPhone app and its tunnel extension for aarch64-ios (objects only, no SDK needed)");
+    ios_check.dependOn(&check.step);
+    ios_check.dependOn(&ext_check.step);
+    test_step.dependOn(ios_check);
+    // The extension's backend logic (config -> network settings) on this host.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("client/src/ios/tunnel_ext/backend.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .imports = &.{.{ .name = "WireGuard", .module = b.dependency("WireGuard", .{ .target = b.graph.host, .optimize = .Debug }).module("WireGuard") }},
+    }) })).step);
+
+    // Placeholder icon and the tools' own tests.
+    const icon_tool = b.addExecutable(.{ .name = "ios-icon", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/ios_icon.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = icon_tool.root_module })).step);
+    const sign_tool = b.addExecutable(.{ .name = "ios-sign", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/ios_sign.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sign_tool.root_module })).step);
+
+    const ios_step = b.step("ios", "Build zig-out/ios/Portal.app (Mac: iOS SDK + -Dmoltenvk=...)");
+    const sign_step = b.step("ios-sign", "Sign zig-out/ios/Portal.app (env PORTAL_SIGN_IDENTITY, PORTAL_PROVISIONING_PROFILE, PORTAL_TEAM_ID)");
+    const sdk_path = sdk orelse {
+        const fail = b.addFail("zig build ios needs the iPhoneOS SDK: run it on a Mac with Xcode, or pass -Dios-sdk=<path> / IOS_SDK");
+        ios_step.dependOn(&fail.step);
+        sign_step.dependOn(&fail.step);
+        return;
+    };
+    const mvk = moltenvk orelse {
+        const fail = b.addFail("zig build ios needs MoltenVK for iOS: -Dmoltenvk=<.../MoltenVK/dynamic/dylib/iOS/libMoltenVK.dylib or MoltenVK.framework> (or MOLTENVK_PATH); see docs/ios-native.md");
+        ios_step.dependOn(&fail.step);
+        sign_step.dependOn(&fail.step);
+        return;
+    };
+
+    const mod = iosModule(b, t, optimize, bundle_id, tunnel);
+    mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
+    mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/lib" }) });
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/include" }) });
+    for ([_][]const u8{ "UIKit", "QuartzCore", "Foundation", "CoreGraphics", "Metal", "Security", "AVFoundation", "LocalAuthentication" }) |fw|
+        mod.linkFramework(fw, .{});
+    if (tunnel) mod.linkFramework("NetworkExtension", .{});
+    mod.linkSystemLibrary("objc", .{});
+    // MoltenVK is opened from the bundle at run time (the Vulkan package's
+    // loader); the rpath lets a framework build of MoltenVK find itself.
+    mod.addRPathSpecial("@executable_path/Frameworks");
+    const exe = b.addExecutable(.{ .name = "Portal", .root_module = mod, .zig_lib_dir = zig_lib });
+    exe.headerpad_max_install_names = true;
+    // The packet tunnel extension (with -Dios-tunnel): Foundation +
+    // NetworkExtension, no UIKit window.
+    const ext_exe: ?*std.Build.Step.Compile = if (tunnel) blk: {
+        const em = tunnelExtModule(b, t, optimize);
+        em.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
+        em.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/lib" }) });
+        em.linkFramework("Foundation", .{});
+        em.linkFramework("NetworkExtension", .{});
+        em.linkSystemLibrary("objc", .{});
+        break :blk b.addExecutable(.{ .name = "PortalTunnel", .root_module = em, .zig_lib_dir = zig_lib });
+    } else null;
+    const libc_txt = b.addWriteFiles().add("libc-ios.txt", b.fmt(
+        \\include_dir={s}/usr/include
+        \\sys_include_dir={s}/usr/include
+        \\crt_dir={s}/usr/lib
+        \\msvc_lib_dir=
+        \\kernel32_lib_dir=
+        \\gcc_dir=
+        \\
+    , .{ sdk_path, sdk_path, sdk_path }));
+    exe.setLibCFile(libc_txt);
+    if (ext_exe) |e| e.setLibCFile(libc_txt);
+
+    // Portal.app
+    const app = b.addWriteFiles();
+    _ = app.addCopyFile(exe.getEmittedBin(), "Portal.app/Portal");
+    _ = app.add("Portal.app/Info.plist", infoPlist(b, bundle_id));
+    _ = app.add("Portal.app/PkgInfo", "APPL????");
+    if (ext_exe) |e| {
+        _ = app.addCopyFile(e.getEmittedBin(), "Portal.app/PlugIns/PortalTunnel.appex/PortalTunnel");
+        _ = app.add("Portal.app/PlugIns/PortalTunnel.appex/Info.plist", tunnelPlist(b, bundle_id));
+    }
+    if (std.mem.endsWith(u8, std.mem.trimEnd(u8, mvk, "/"), ".framework")) {
+        _ = app.addCopyDirectory(.{ .cwd_relative = mvk }, "Portal.app/Frameworks/MoltenVK.framework", .{});
+    } else {
+        _ = app.addCopyFile(.{ .cwd_relative = mvk }, "Portal.app/Frameworks/libMoltenVK.dylib");
+    }
+    for ([_]struct { px: []const u8, name: []const u8 }{
+        .{ .px = "120", .name = "AppIcon60x60@2x.png" },
+        .{ .px = "180", .name = "AppIcon60x60@3x.png" },
+    }) |ic| {
+        const r = b.addRunArtifact(icon_tool);
+        r.addArg(ic.px);
+        _ = app.addCopyFile(r.addOutputFileArg(ic.name), b.fmt("Portal.app/{s}", .{ic.name}));
+    }
+    const install = b.addInstallDirectory(.{ .source_dir = app.getDirectory().path(b, "Portal.app"), .install_dir = .prefix, .install_subdir = "ios/Portal.app" });
+    ios_step.dependOn(&install.step);
+
+    // Signs a copy (the cached bundle stays unsigned) and installs it over
+    // zig-out/ios/Portal.app.
+    const sign = b.addRunArtifact(sign_tool);
+    sign.addDirectoryArg(app.getDirectory().path(b, "Portal.app"));
+    const signed = sign.addOutputDirectoryArg("signed");
+    sign.addArgs(&.{ bundle_id, if (tunnel) "1" else "0" });
+    sign.has_side_effects = true; // reads the signing identity from the environment
+    const install_signed = b.addInstallDirectory(.{ .source_dir = signed.path(b, "Portal.app"), .install_dir = .prefix, .install_subdir = "ios/Portal.app" });
+    install_signed.step.dependOn(&install.step);
+    sign_step.dependOn(&install_signed.step);
+}
+
+/// The iPhone app's root module for `t`: client/src/ios/main.zig on the
+/// shared "view" and "client" modules.
+fn iosModule(b: *std.Build, t: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, bundle_id: []const u8, tunnel: bool) *std.Build.Module {
+    const inputrules = inputrulesModule(b, t, optimize);
+    const scratch = b.createModule(.{ .target = t, .optimize = optimize });
+    const gui = addGuiModules(b, scratch, t, optimize, inputrules);
+    const opts = b.addOptions();
+    opts.addOption(bool, "tunnel", tunnel);
+    opts.addOption([]const u8, "bundle_id", bundle_id);
+    return b.createModule(.{
+        .root_source_file = b.path("client/src/ios/main.zig"),
+        .target = t,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "view", .module = gui.view },
+            .{ .name = "client", .module = gui.client },
+            .{ .name = "ios_options", .module = opts.createModule() },
+        },
+    });
+}
+
+/// The packet tunnel extension's root module: client/src/ios/tunnel_ext
+/// on the owner's Zig WireGuard and the Renderer's IosObjC runtime layer.
+fn tunnelExtModule(b: *std.Build, t: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("client/src/ios/tunnel_ext/main.zig"),
+        .target = t,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "WireGuard", .module = b.dependency("WireGuard", .{ .target = t, .optimize = optimize }).module("WireGuard") },
+            .{ .name = "IosObjC", .module = rendererDep(b, t, optimize).module("IosObjC") },
+        },
+    });
+}
+
+/// The tunnel extension's Info.plist (configuration text).
+fn tunnelPlist(b: *std.Build, bundle_id: []const u8) []const u8 {
+    return b.fmt(
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>CFBundleExecutable</key><string>PortalTunnel</string>
+        \\    <key>CFBundleIdentifier</key><string>{s}.tunnel</string>
+        \\    <key>CFBundleName</key><string>PortalTunnel</string>
+        \\    <key>CFBundleDisplayName</key><string>Portal tunnel</string>
+        \\    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+        \\    <key>CFBundlePackageType</key><string>XPC!</string>
+        \\    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+        \\    <key>CFBundleVersion</key><string>1</string>
+        \\    <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
+        \\    <key>MinimumOSVersion</key><string>16.0</string>
+        \\    <key>NSExtension</key>
+        \\    <dict>
+        \\        <key>NSExtensionPointIdentifier</key><string>com.apple.networkextension.packet-tunnel</string>
+        \\        <key>NSExtensionPrincipalClass</key><string>PortalPacketTunnelProvider</string>
+        \\    </dict>
+        \\</dict>
+        \\</plist>
+            , .{bundle_id});
+}
+
+/// Info.plist (configuration text, not code): what iOS reads before the
+/// app runs. Scene-based (the Renderer's Window backend provides the scene
+/// delegate), launch screen without a storyboard, camera and Face ID
+/// usage strings, local-network note for the desk on the LAN.
+fn infoPlist(b: *std.Build, bundle_id: []const u8) []const u8 {
+    return b.fmt(
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>CFBundleDevelopmentRegion</key><string>en</string>
+        \\    <key>CFBundleExecutable</key><string>Portal</string>
+        \\    <key>CFBundleIdentifier</key><string>{s}</string>
+        \\    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+        \\    <key>CFBundleName</key><string>Portal</string>
+        \\    <key>CFBundleDisplayName</key><string>Portal</string>
+        \\    <key>CFBundlePackageType</key><string>APPL</string>
+        \\    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+        \\    <key>CFBundleVersion</key><string>1</string>
+        \\    <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
+        \\    <key>DTPlatformName</key><string>iphoneos</string>
+        \\    <key>MinimumOSVersion</key><string>16.0</string>
+        \\    <key>LSRequiresIPhoneOS</key><true/>
+        \\    <key>UIDeviceFamily</key><array><integer>1</integer></array>
+        \\    <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string><string>metal</string></array>
+        \\    <key>UILaunchScreen</key><dict><key>UIColorName</key><string></string></dict>
+        \\    <key>UIApplicationSceneManifest</key>
+        \\    <dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
+        \\    <key>UISupportedInterfaceOrientations</key>
+        \\    <array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+        \\    <key>UIStatusBarStyle</key><string>UIStatusBarStyleLightContent</string>
+        \\    <key>UIUserInterfaceStyle</key><string>Dark</string>
+        \\    <key>CFBundleIcons</key>
+        \\    <dict><key>CFBundlePrimaryIcon</key><dict><key>CFBundleIconFiles</key><array><string>AppIcon60x60</string></array></dict></dict>
+        \\    <key>NSCameraUsageDescription</key><string>Portal scans the pairing QR code shown on your desktop.</string>
+        \\    <key>NSFaceIDUsageDescription</key><string>Portal asks for Face ID before it shows your session or signs in.</string>
+        \\    <key>NSLocalNetworkUsageDescription</key><string>Portal connects to the Portal running on your desktop.</string>
+        \\</dict>
+        \\</plist>
+        \\
+    , .{bundle_id});
 }
