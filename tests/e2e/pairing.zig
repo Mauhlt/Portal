@@ -41,6 +41,22 @@ fn logCount(inst: *proc.Instance, needle: []const u8) usize {
     return std.mem.count(u8, text, needle);
 }
 
+/// A GET /pair/wait loop on its own thread, to see that the server holds
+/// the request (long poll) until the desk answers.
+const HeldWait = struct {
+    inst: *proc.Instance,
+    cookie: []const u8,
+    done: std.atomic.Value(bool) = .init(false),
+    finished_at: u64 = 0,
+    result: anyerror!client.Collected = error.NotRun,
+
+    fn run(h: *HeldWait) void {
+        h.result = client.collect(h.inst, h.cookie, null, 10_000);
+        h.finished_at = net.now();
+        h.done.store(true, .release);
+    }
+};
+
 const SignInJob = struct {
     inst: *proc.Instance,
     cookie: []const u8,
@@ -176,8 +192,17 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
             defer resp.deinit();
             _ = r.check("device page shows the same request code as the desk", resp.bodyContains(code), "code={s}", .{code});
         }
+        // The page above was the first answer for this request; asking
+        // again is held until the desk answers (no poll interval).
+        var held: HeldWait = .{ .inst = inst, .cookie = rq.cookie() };
+        const held_thread = try std.Thread.spawn(.{}, HeldWait.run, .{&held});
+        net.sleep(1500);
+        _ = r.check("a repeated /pair/wait is held while the desk has not answered (long poll)", !held.done.load(.acquire), "", .{});
+        const t_answer = net.now();
         pc.answer("y\r\n");
-        const got = try client.collect(inst, rq.cookie(), null, 10_000);
+        held_thread.join();
+        _ = r.check("...and answered as soon as the desk approves", held.finished_at -| t_answer < 5000, "after {d} ms", .{held.finished_at -| t_answer});
+        const got = try held.result;
         switch (got) {
             .creds => |c| c1 = c,
             else => {
@@ -408,6 +433,30 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         var resp4 = try get(inst, "/", "portal_session=" ++ &rep(43, 'A'));
         defer resp4.deinit();
         _ = r.check("forged session cookie is not accepted", resp4.status == 303 and std.mem.eql(u8, resp4.location(), "/pair"), "{d}", .{resp4.status});
+    }
+
+    // ------------- re-pairing a name removes the old record and its sessions
+    {
+        const old = try client.pair(inst, "laptop");
+        const v = try client.Viewer.open(inst, old.sessionCookie());
+        defer v.deinit();
+        const fresh = try client.pair(inst, "laptop");
+        // The old record's sessions end before the new credential is
+        // issued, so the logout is already on its way when pair() returns.
+        _ = r.check("re-pair: the old device's open viewer is told to log out at once", v.waitLogout(3000), "", .{});
+        _ = r.check("re-pair: ...and its connection is closed", v.waitClose(12_000), "", .{});
+        var resp = try get(inst, "/", old.sessionCookie());
+        defer resp.deinit();
+        _ = r.check("re-pair: the old session no longer opens the viewer", resp.status == 303 and std.mem.eql(u8, resp.location(), "/pair"), "{d} {s}", .{ resp.status, resp.location() });
+        var resp2 = try get(inst, "/sync/index", old.sessionCookie());
+        defer resp2.deinit();
+        _ = r.check("re-pair: the old session gets no /sync", resp2.status == 401, "{d}", .{resp2.status});
+        var resp3 = try get(inst, "/", fresh.sessionCookie());
+        defer resp3.deinit();
+        _ = r.check("re-pair: the new device's session works", resp3.status == 200, "{d}", .{resp3.status});
+        _ = r.ok("re-pair logged with the old record's sessions ended", inst.logHas("re-pair: previous device record 'laptop' removed; 1 of its session(s) ended"));
+        const d = try inst.cli(&.{"devices"});
+        _ = r.check("re-pair: one 'laptop' record", std.mem.count(u8, d.out, "laptop ") == 1, "{s}", .{d.out});
     }
 
     // ----------------------------- unpair at the desk drops open viewers

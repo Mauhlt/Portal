@@ -35,7 +35,8 @@ Content-Length: 0
 * Too many pending requests (8 per window, 2 per address): `303` to `/pair?e=busy`.
 * This address was denied in this window: `303` to `/pair?e=denied`.
 
-Then poll, from the same source address and with the request cookie:
+Then wait for the answer, from the same source address and with the
+request cookie. `GET /pair/wait` is a long poll:
 
 ```
 GET /pair/wait HTTP/1.1
@@ -43,12 +44,20 @@ Cookie: __Host-portal_pairreq=<43 chars>
 ```
 
 * Waiting for the desk: `200`, an HTML page showing the 4-hex-digit
-  request code that the desk also shows (browsers re-load it every 2 s
-  with `<meta http-equiv="refresh">`). The same code is in the header
+  request code that the desk also shows. The same code is in the header
   `X-Portal-Request-Code: 7f3a`, for native clients, which read only the
-  response head. Show the code to the user. Native clients re-ask every
-  2 s (a real deadline, not a busy loop), back off on network errors, and
-  give up when the request's 10-minute lifetime is over.
+  response head. Show the code to the user.
+  The first `GET /pair/wait` for a request token is answered at once.
+  Every later one, while the request is still pending, is **held** by
+  the server until the pairing window changes (a request answered, the
+  window closed, replaced or expired, its `portalctl pair` gone) or 25 s
+  pass, and is then answered exactly as described here (the same waiting
+  page if still pending). Clients re-ask immediately after each answer:
+  there is no poll interval. Allow at least 30 s for the response; back
+  off only on network errors, and give up when the request's 10-minute
+  lifetime is over. Browsers do the same without script: the waiting
+  page has `<meta http-equiv="refresh" content="0">`, and the browser
+  keeps showing it while the held reload is pending.
 * Approved: `303`, `Location: /`, with three `Set-Cookie` headers:
   * `__Host-portal_device=<name>.<43 chars>; Path=/; HttpOnly; SameSite=Strict; Max-Age=7776000; Secure`
     is the device credential;

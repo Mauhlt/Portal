@@ -11,8 +11,8 @@
 //!      session cookie
 //!
 //! Pairing needs desk approval (devices.zig): POST /pair only registers a
-//! request; the device's page (GET /pair/wait, a plain meta refresh) gets
-//! its credential once the owner answers "y" in `portal pair`. Requests
+//! request; the device's page (GET /pair/wait, a long poll: see `pairWait`)
+//! gets its credential once the owner answers "y" at the desk. Requests
 //! before sign-in never touch the device file except to create or collect
 //! a request: the pairing window is read from `pair_view`, which the
 //! pairing watcher (main.zig) refreshes when the file changes. Every log
@@ -104,8 +104,16 @@ const revoke_grace_ms = 10_000;
 const no_deadline = std.math.maxInt(i64);
 /// Pre-auth log lines: at most `burst` per this interval per kind.
 const pre_auth_log_interval_ms = 10_000;
-/// The waiting page re-asks for its outcome this often (meta refresh).
-const pair_wait_refresh_s = 2;
+/// GET /pair/wait for a request still pending, whose waiting page this
+/// device has already been shown, is held until the request's window
+/// changes (or at most this long): a long poll, so neither the page nor a
+/// native client needs a poll interval.
+pub const pair_wait_hold_ms: i64 = 25_000;
+/// The connection deadline while a /pair/wait is held: the hold plus
+/// room to send the answer.
+const pair_wait_slack_ms: i64 = 5_000;
+/// Waiting pages remembered (by request token) for the long poll.
+const pair_seen_slots = 2 * devices.max_requests;
 /// Per-WebSocket input limits (messages and bytes per second, with bursts
 /// twice that). Answering prompts needs a few per second; more is dropped.
 pub const input_msgs_per_s = 40;
@@ -377,6 +385,15 @@ pub const Server = struct {
     pair_view: ?devices.Pairing = null,
     /// A window whose `portal pair` process has exited: treated as closed.
     pair_dead_nonce: ?u64 = null,
+    /// Guarded by pair_mutex. Bumped whenever `pair_view` or
+    /// `pair_dead_nonce` is set; `pair_cond` is broadcast then, which ends
+    /// held GET /pair/wait long polls.
+    pair_gen: u64 = 0,
+    pair_cond: Io.Condition = .init,
+    /// Guarded by pair_mutex. Request tokens (hashed) that were already
+    /// answered "still waiting": their next GET /pair/wait is held.
+    pair_seen: [pair_seen_slots]?auth.Hash = @splat(null),
+    pair_seen_next: usize = 0,
     /// Times the pairing watcher woke up (for the wakeup measurement).
     pairwatch_wakes: std.atomic.Value(u32) = .init(0),
     /// Optional hook, like Session.notify_fn: called whenever the pairing
@@ -478,11 +495,15 @@ pub const Server = struct {
     pub fn setPairing(srv: *Server, p: ?devices.Pairing) void {
         srv.pair_mutex.lockUncancelable(srv.io);
         srv.pair_view = p;
+        srv.pair_gen +%= 1;
         srv.pair_mutex.unlock(srv.io);
         srv.notifyPairing();
     }
 
+    /// The pairing view may have changed: held /pair/wait long polls
+    /// re-check, and the Portal window's hook runs.
     fn notifyPairing(srv: *Server) void {
+        srv.pair_cond.broadcast(srv.io);
         if (srv.pairing_notify_fn) |f| if (srv.pairing_notify_ctx) |c| f(c);
     }
 
@@ -490,8 +511,51 @@ pub const Server = struct {
     pub fn pairingProcessGone(srv: *Server, nonce: u64) void {
         srv.pair_mutex.lockUncancelable(srv.io);
         srv.pair_dead_nonce = nonce;
+        srv.pair_gen +%= 1;
         srv.pair_mutex.unlock(srv.io);
         srv.notifyPairing();
+    }
+
+    const PairWaitView = struct {
+        view: ?devices.Pairing,
+        gen: u64,
+        /// This request token was already answered "still waiting".
+        seen: bool,
+    };
+
+    /// `pairingSnapshot` plus what a held /pair/wait needs, in one look.
+    fn pairWaitView(srv: *Server, now_s: i64, token: auth.Hash) PairWaitView {
+        const view = srv.pairingSnapshot(now_s);
+        srv.pair_mutex.lockUncancelable(srv.io);
+        defer srv.pair_mutex.unlock(srv.io);
+        var seen = false;
+        for (srv.pair_seen) |s| if (s) |h| {
+            seen = seen or std.crypto.timing_safe.eql(auth.Hash, h, token);
+        };
+        return .{ .view = view, .gen = srv.pair_gen, .seen = seen };
+    }
+
+    fn markPairSeen(srv: *Server, token: auth.Hash) void {
+        srv.pair_mutex.lockUncancelable(srv.io);
+        defer srv.pair_mutex.unlock(srv.io);
+        for (srv.pair_seen) |s| if (s) |h| if (std.crypto.timing_safe.eql(auth.Hash, h, token)) return;
+        srv.pair_seen[srv.pair_seen_next] = token;
+        srv.pair_seen_next = (srv.pair_seen_next + 1) % srv.pair_seen.len;
+    }
+
+    /// Blocks until the pairing view changes from generation `gen`, or
+    /// `ms` pass. Cancelable: the connection's supervisor can always end
+    /// it (error.Canceled is returned, never swallowed).
+    fn waitPairChange(srv: *Server, gen: u64, ms: i64) Io.Cancelable!void {
+        const timeout: Io.Timeout = (Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(@max(ms, 1)), .clock = .awake } }).toDeadline(srv.io);
+        srv.pair_mutex.lockUncancelable(srv.io);
+        defer srv.pair_mutex.unlock(srv.io);
+        while (srv.pair_gen == gen) {
+            srv.pair_cond.waitTimeout(srv.io, &srv.pair_mutex, timeout) catch |err| switch (err) {
+                error.Timeout => return,
+                error.Canceled => return error.Canceled,
+            };
+        }
     }
 
     // ------------------------------------------- desk approval, in-process
@@ -1262,10 +1326,13 @@ pub const Server = struct {
     }
 
     /// The device's page while its request waits for the desk: shows the
-    /// request code the desk sees and reloads itself (no script).
+    /// request code the desk sees and reloads itself at once, with no
+    /// script. That reload is a held GET /pair/wait (the long poll in
+    /// `pairWait`), so the browser keeps showing this page until the desk
+    /// answers; it is not a timer.
     fn pairWaitPage(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, view: *const devices.Pairing, r: *const devices.Request) !bool {
-        var head_buf: [96]u8 = undefined;
-        const head = try std.fmt.bufPrint(&head_buf, "<meta http-equiv=\"refresh\" content=\"{d}\">", .{pair_wait_refresh_s});
+        srv.markPairSeen(r.token);
+        const head = "<meta http-equiv=\"refresh\" content=\"0\">";
         var fp_buf: [256]u8 = undefined;
         var action_buf: [1024]u8 = undefined;
         // Name, address and code are validated by devices.zig ([a-z0-9-],
@@ -1529,24 +1596,48 @@ pub const Server = struct {
         return srv.redirect(conn, w, req, "/pair/wait", &.{cookie});
     }
 
-    /// GET /pair/wait: the requesting device asks for its outcome (its page
-    /// reloads itself). Pending: the waiting page. Approved at the desk:
-    /// the device credential and a session, once, to the same address and
-    /// request token only. Denied or gone: back to /pair with the reason.
+    /// GET /pair/wait: the requesting device asks for its outcome. A long
+    /// poll (docs/protocol.md section 1):
+    ///   * Pending, first ask with this request token: the waiting page at
+    ///     once (it carries the request code, also as X-Portal-Request-Code).
+    ///   * Pending, asked again: held until the pairing window changes
+    ///     (a request answered, the window closed or replaced, its
+    ///     `portalctl pair` gone, its expiry) or `pair_wait_hold_ms`
+    ///     pass, then answered exactly like a fresh ask: the outcome
+    ///     below, or the same waiting page if still pending. Clients
+    ///     re-ask at once; there is no poll interval.
+    ///   * Approved at the desk: the device credential and a session, once,
+    ///     to the same address and request token only.
+    ///   * Denied or gone: back to /pair with the reason.
     fn pairWait(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, h: Headers) !bool {
         const peer = conn.peer();
         const ip = devices.ipOnly(peer);
-        const now = srv.nowUnix();
         var clear_buf: [128]u8 = undefined;
         const clear = try srv.clearPairReq(&clear_buf);
         const tok = h.pairreq orelse return srv.redirect(conn, w, req, "/pair?e=expired", &.{});
         const tok_hash = auth.hashSecret(tok);
-        const view = srv.pairingSnapshot(now) orelse return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear});
-        const i = view.findToken(tok_hash) orelse return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear});
-        const r = view.requests[i].?;
-        if (!std.mem.eql(u8, r.ip.get(), ip)) return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear});
+        const hold_until = srv.nowMs() +| pair_wait_hold_ms;
+        var now: i64 = undefined;
+        var view: devices.Pairing = undefined;
+        var r: devices.Request = undefined;
+        while (true) {
+            now = srv.nowUnix();
+            const look = srv.pairWaitView(now, tok_hash);
+            view = look.view orelse return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear});
+            const i = view.findToken(tok_hash) orelse return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear});
+            r = view.requests[i].?;
+            if (!std.mem.eql(u8, r.ip.get(), ip)) return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear});
+            if (r.state != .pending) break;
+            const left = @min(hold_until -| srv.nowMs(), (view.expires -| now +| 1) *| 1000);
+            if (!look.seen or left <= 0) return srv.pairWaitPage(conn, w, req, &view, &r);
+            // Hold. The window's expiry and every change to it bump the
+            // generation (the pairing watcher re-reads the store at the
+            // expiry), so this sleeps until something can have changed.
+            conn.setDeadline(srv.nowMs() +| left +| pair_wait_slack_ms);
+            try srv.waitPairChange(look.gen, left);
+        }
         switch (r.state) {
-            .pending => return srv.pairWaitPage(conn, w, req, &view, &r),
+            .pending => unreachable, // the loop above answers those
             .denied => return srv.redirect(conn, w, req, "/pair?e=denied", &.{clear}),
             .done => return srv.redirect(conn, w, req, "/pair?e=expired", &.{clear}),
             .approved => {},
