@@ -93,6 +93,9 @@ const max_ws_header = websocket.max_header_len;
 
 /// Minimum gap between grid frames to one viewer (~30 per second).
 const frame_interval_ms = 33;
+/// After the exit notice, how long a viewer gets to close its end
+/// (wsGoodbye). main.zig's viewer_goodbye_ms bounds the whole shutdown.
+pub const goodbye_ms = 1500;
 /// A request head (and body) must arrive within this long of its first byte,
 /// or of the connection being accepted.
 const head_timeout_ms = 10_000;
@@ -337,6 +340,9 @@ const Conn = struct {
     stop: std.atomic.Value(bool) = .init(false),
     /// Set (release) once `ws_cookie` is filled in, for revocation checks.
     ws_active: std.atomic.Value(bool) = .init(false),
+    /// Worker-only (the supervisor reads it once the worker finished):
+    /// counted in Session.viewer_sockets until the socket is closed.
+    viewer_socket: bool = false,
     ws_cookie: [auth.encoded_len]u8 = undefined,
     /// Worker-only: already promoted to an authenticated slot.
     authed: bool = false,
@@ -877,8 +883,6 @@ pub const Server = struct {
     fn supervise(srv: *Server, stream: net.Stream, slot: usize) void {
         const io = srv.io;
         defer srv.releaseSlot(slot);
-        // Safe: the worker has finished (cancel/await below) before this runs.
-        defer stream.close(io);
 
         var conn: Conn = .{
             .stream = stream,
@@ -887,6 +891,13 @@ pub const Server = struct {
             .wake = &srv.conn_wake[slot],
             .io = io,
         };
+        // Safe: the worker has finished (cancel/await below) before this
+        // runs. A viewer's socket counts until it is closed here, so a
+        // shutting-down Portal outlives every exit notice in flight.
+        defer {
+            stream.close(io);
+            if (conn.viewer_socket) srv.session.viewerSocketDelta(-1);
+        }
         const peer = std.fmt.bufPrint(&conn.peer_buf, "{f}", .{stream.socket.address}) catch blk: {
             conn.peer_buf[0] = '?';
             break :blk conn.peer_buf[0..1];
@@ -1974,6 +1985,8 @@ pub const Server = struct {
         conn.ws_active.store(true, .release);
         conn.wake.set(srv.io); // the supervisor now also watches the session
 
+        srv.session.viewerSocketDelta(1);
+        conn.viewer_socket = true;
         const viewers = srv.session.viewerDelta(1);
         srv.log.print("viewer connected from {s} ({d} watching)", .{ peer, viewers });
         srv.updateTitle(viewers);
@@ -2110,7 +2123,7 @@ pub const Server = struct {
             }
             if (!changed and closed) {
                 const m = std.fmt.bufPrint(&msg, "{{\"t\":\"exit\",\"code\":{d}}}", .{exit_code}) catch return;
-                _ = ws.send(srv, m, .text);
+                if (ws.send(srv, m, .text)) srv.wsGoodbye(ws);
                 return;
             }
 
@@ -2124,6 +2137,32 @@ pub const Server = struct {
             }
             // Coalesce bursts of output into at most ~30 frames per second.
             if (changed) srv.io.sleep(.fromMilliseconds(frame_interval_ms), .awake) catch return;
+        }
+    }
+
+    /// After the exit notice: starts the closing handshake (1000, "session
+    /// ended") and waits, at most `goodbye_ms`, for the viewer to close
+    /// its end (its close frame or EOF ends the reader). Closing first
+    /// with the viewer's frames unread would reset the connection, and a
+    /// reset can discard the exit notice before the viewer has read it.
+    /// Event-driven: the reader ending broadcasts `session.cond`.
+    fn wsGoodbye(srv: *Server, ws: *WsConn) void {
+        _ = ws.send(srv, "\x03\xe8session ended", .close);
+        const s = srv.session;
+        const deadline = srv.nowMs() +| goodbye_ms;
+        s.mutex.lockUncancelable(srv.io);
+        defer s.mutex.unlock(srv.io);
+        while (!ws.dead.load(.acquire)) {
+            const left = deadline -| srv.nowMs();
+            if (left <= 0) return;
+            s.cond.waitTimeout(srv.io, &s.mutex, .{ .duration = .{
+                .raw = .fromMilliseconds(left),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => {},
+                // waitTimeout re-acquired the mutex before returning.
+                error.Canceled => return,
+            };
         }
     }
 
