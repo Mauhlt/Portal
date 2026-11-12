@@ -60,6 +60,35 @@ never open or close projects. That stays desk-only: Ctrl+T folder picker, or
 * Unpairing a device deletes its recent-projects list. It is metadata, not
   training data.
 
+## Privacy rules (owner's requirement: nothing reveals closed projects or other folders)
+
+These are hard requirements for the tabs and recent-projects work, enforced by
+`tests/e2e/privacy.zig`. Extend those tests as features land.
+
+1. **No paths leave the desktop.** Remote clients get only a display name (the
+   folder's basename, or a desk-set name) and a colour. Full paths, drive
+   letters, parent folders, the data directory and the user name never appear
+   in any protocol message, header or page. The terminal grid itself is
+   exempt; it is the session.
+2. **No file-system API.** No route or message lists, opens, reads or browses
+   folders or files. Routing stays exact-path; assets are compiled into the
+   binary.
+3. **Opaque, unguessable ids.** Sessions are addressed by random 128-bit ids
+   that are never reused, not by index or path. A viewer may subscribe only
+   to ids of **currently open** sessions; anything else gets the same "no such
+   session" answer, so probing can't tell closed from never-existed.
+4. **Per-device history.** A device sees only its own recent list. Closed
+   entries carry name + colour + last-used time only (no id, no path), and
+   can't be subscribed to. Closed sessions keep no screen buffer to replay.
+5. **Program-controlled strings stay in the grid.** Window titles set by
+   programs (OSC 0/2, which the agent uses and which can contain paths) are
+   not sent as metadata. Tab names are desk-assigned.
+6. **Nothing without a session.** Without a live session, every route except
+   `/pair` and the static assets reveals nothing: 303 to `/pair` with an empty
+   body, or 401.
+7. **Logs stay local.** Rejected probes are logged on the desktop (rate
+   limited) and never echoed back to the client.
+
 ## Protocol changes (v2)
 
 * `hello` lists sessions: `{id, name, color, state}`. A new `tabs` message
