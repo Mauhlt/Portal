@@ -121,8 +121,9 @@ fn appendQuoted(list: *std.ArrayList(u8), gpa: Allocator, arg: []const u8) !void
 const SpawnMode = union(enum) {
     /// New hidden console window.
     console,
-    /// No window; stdout and stderr go to this inheritable pipe handle.
-    capture: w.HANDLE,
+    /// No window; stdout and stderr go to `out` (an inheritable pipe
+    /// handle), stdin comes from `in` if set.
+    capture: struct { out: w.HANDLE, in: ?w.HANDLE = null },
 };
 
 fn spawn(h: *Harness, argv: []const []const u8, local_app_data: []const u8, mode: SpawnMode) !w.PROCESS_INFORMATION {
@@ -151,21 +152,27 @@ fn spawn(h: *Harness, argv: []const []const u8, local_app_data: []const u8, mode
         w.DeleteProcThreadAttributeList(m.ptr);
         gpa.free(m);
     };
-    var handles: [1]w.HANDLE = undefined;
+    var handles: [2]w.HANDLE = undefined;
     switch (mode) {
         .console => {
             flags |= w.CREATE_NEW_CONSOLE;
             si.StartupInfo.dwFlags = w.STARTF_USESHOWWINDOW;
             si.StartupInfo.wShowWindow = w.SW_HIDE;
         },
-        .capture => |pipe| {
+        .capture => |pipes| {
             flags |= w.CREATE_NO_WINDOW;
             si.StartupInfo.dwFlags = w.STARTF_USESTDHANDLES;
-            si.StartupInfo.hStdOutput = pipe;
-            si.StartupInfo.hStdError = pipe;
+            si.StartupInfo.hStdOutput = pipes.out;
+            si.StartupInfo.hStdError = pipes.out;
+            if (pipes.in) |in| si.StartupInfo.hStdInput = in;
             inherit = 1;
-            // Inherit only the pipe, never the harness's sockets.
-            handles[0] = pipe;
+            // Inherit only the pipes, never the harness's sockets.
+            handles[0] = pipes.out;
+            var n_handles: usize = 1;
+            if (pipes.in) |in| {
+                handles[1] = in;
+                n_handles = 2;
+            }
             var size: usize = 0;
             _ = w.InitializeProcThreadAttributeList(null, 1, 0, &size);
             const m = try gpa.alignedAlloc(u8, .@"16", size);
@@ -175,7 +182,7 @@ fn spawn(h: *Harness, argv: []const []const u8, local_app_data: []const u8, mode
                 attr_mem = null;
                 return error.AttributeList;
             }
-            if (w.UpdateProcThreadAttribute(m.ptr, 0, w.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &handles, @sizeOf(w.HANDLE), null, null) == 0)
+            if (w.UpdateProcThreadAttribute(m.ptr, 0, w.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &handles, n_handles * @sizeOf(w.HANDLE), null, null) == 0)
                 return error.AttributeList;
             si.lpAttributeList = m.ptr;
         },
@@ -210,7 +217,7 @@ pub fn runCli(h: *Harness, local_app_data: []const u8, args: []const []const u8)
     if (w.CreatePipe(&rd, &wr, &sa, 64 * 1024) == 0) return error.PipeFailed;
     defer _ = w.CloseHandle(rd);
     _ = w.SetHandleInformation(rd, w.HANDLE_FLAG_INHERIT, 0);
-    const pi = spawn(h, args, local_app_data, .{ .capture = wr }) catch |err| {
+    const pi = spawn(h, args, local_app_data, .{ .capture = .{ .out = wr } }) catch |err| {
         _ = w.CloseHandle(wr);
         return err;
     };
@@ -233,6 +240,135 @@ pub fn runCli(h: *Harness, local_app_data: []const u8, args: []const []const u8)
     _ = w.GetExitCodeProcess(pi.hProcess, &code);
     return .{ .code = code, .out = try out.toOwnedSlice(h.gpa) };
 }
+
+/// A long-running CLI child (`portal pair`) whose output can be watched
+/// while it runs and which can be answered through its stdin.
+pub const LiveCli = struct {
+    h: *Harness,
+    process: ?w.HANDLE,
+    out_rd: w.HANDLE,
+    in_wr: ?w.HANDLE,
+    out: std.ArrayList(u8) = .empty,
+    code: ?u32 = null,
+
+    pub fn start(h: *Harness, local_app_data: []const u8, args: []const []const u8) !*LiveCli {
+        var sa: w.SECURITY_ATTRIBUTES = .{ .bInheritHandle = 1 };
+        var out_rd: w.HANDLE = undefined;
+        var out_wr: w.HANDLE = undefined;
+        if (w.CreatePipe(&out_rd, &out_wr, &sa, 64 * 1024) == 0) return error.PipeFailed;
+        _ = w.SetHandleInformation(out_rd, w.HANDLE_FLAG_INHERIT, 0);
+        var in_rd: w.HANDLE = undefined;
+        var in_wr: w.HANDLE = undefined;
+        if (w.CreatePipe(&in_rd, &in_wr, &sa, 4096) == 0) return error.PipeFailed;
+        _ = w.SetHandleInformation(in_wr, w.HANDLE_FLAG_INHERIT, 0);
+        const pi = spawn(h, args, local_app_data, .{ .capture = .{ .out = out_wr, .in = in_rd } }) catch |err| {
+            for ([_]w.HANDLE{ out_rd, out_wr, in_rd, in_wr }) |x| _ = w.CloseHandle(x);
+            return err;
+        };
+        _ = w.CloseHandle(out_wr);
+        _ = w.CloseHandle(in_rd);
+        const c = try h.gpa.create(LiveCli);
+        c.* = .{ .h = h, .process = pi.hProcess, .out_rd = out_rd, .in_wr = in_wr };
+        return c;
+    }
+
+    /// Reads whatever output is available without blocking.
+    fn drain(c: *LiveCli) void {
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            var avail: w.DWORD = 0;
+            if (w.PeekNamedPipe(c.out_rd, null, 0, null, &avail, null) == 0 or avail == 0) return;
+            var n: w.DWORD = 0;
+            if (w.ReadFile(c.out_rd, &buf, @min(avail, buf.len), &n, null) == 0 or n == 0) return;
+            c.out.appendSlice(c.h.gpa, buf[0..n]) catch return;
+        }
+    }
+
+    pub fn output(c: *LiveCli) []const u8 {
+        c.drain();
+        return c.out.items;
+    }
+
+    pub fn has(c: *LiveCli, needle: []const u8) bool {
+        return std.mem.indexOf(u8, c.output(), needle) != null;
+    }
+
+    pub fn count(c: *LiveCli, needle: []const u8) usize {
+        return std.mem.count(u8, c.output(), needle);
+    }
+
+    /// Waits until the output contains `needle` at least `n` times.
+    pub fn waitForCount(c: *LiveCli, needle: []const u8, n: usize, ms: u32) bool {
+        const deadline = net.now() + ms;
+        while (true) {
+            if (c.count(needle) >= n) return true;
+            if (net.now() >= deadline or !c.alive()) return c.count(needle) >= n;
+            net.sleep(20);
+        }
+    }
+
+    pub fn waitFor(c: *LiveCli, needle: []const u8, ms: u32) bool {
+        return c.waitForCount(needle, 1, ms);
+    }
+
+    /// Text after the last `prefix` in the output, up to `len` bytes.
+    pub fn lastAfter(c: *LiveCli, prefix: []const u8, len: usize) ?[]const u8 {
+        const o = c.output();
+        const i = std.mem.lastIndexOf(u8, o, prefix) orelse return null;
+        const s = i + prefix.len;
+        if (o.len < s + len) return null;
+        return o[s .. s + len];
+    }
+
+    /// Types a line into its stdin.
+    pub fn answer(c: *LiveCli, line: []const u8) void {
+        const h = c.in_wr orelse return;
+        var n: w.DWORD = 0;
+        _ = w.WriteFile(h, line.ptr, @intCast(line.len), &n, null);
+    }
+
+    pub fn closeInput(c: *LiveCli) void {
+        if (c.in_wr) |h| _ = w.CloseHandle(h);
+        c.in_wr = null;
+    }
+
+    pub fn alive(c: *LiveCli) bool {
+        const p = c.process orelse return false;
+        return w.WaitForSingleObject(p, 0) == w.WAIT_TIMEOUT;
+    }
+
+    /// Exit code once it has exited within `ms`, else null.
+    pub fn wait(c: *LiveCli, ms: u32) ?u32 {
+        if (c.code) |code| return code;
+        const p = c.process orelse return null;
+        const deadline = net.now() + ms;
+        while (w.WaitForSingleObject(p, 20) != w.WAIT_OBJECT_0) {
+            c.drain();
+            if (net.now() >= deadline) return null;
+        }
+        c.drain();
+        var code: w.DWORD = 1;
+        _ = w.GetExitCodeProcess(p, &code);
+        c.code = code;
+        return code;
+    }
+
+    pub fn kill(c: *LiveCli) void {
+        const p = c.process orelse return;
+        if (c.alive()) _ = w.TerminateProcess(p, 1);
+        _ = w.WaitForSingleObject(p, 10_000);
+        c.drain();
+    }
+
+    pub fn deinit(c: *LiveCli) void {
+        c.kill();
+        if (c.process) |p| _ = w.CloseHandle(p);
+        c.closeInput();
+        _ = w.CloseHandle(c.out_rd);
+        c.out.deinit(c.h.gpa);
+        c.h.gpa.destroy(c);
+    }
+};
 
 pub const Instance = struct {
     h: *Harness,
@@ -291,6 +427,11 @@ pub const Instance = struct {
 
     pub fn cli(inst: *Instance, args: []const []const u8) !CliResult {
         return runCli(inst.h, inst.data_dir, args);
+    }
+
+    /// Starts a long-running CLI command (e.g. `portal pair`) for this instance.
+    pub fn liveCli(inst: *Instance, args: []const []const u8) !*LiveCli {
+        return LiveCli.start(inst.h, inst.data_dir, args);
     }
 
     /// Current contents of portal.log.

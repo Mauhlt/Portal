@@ -157,13 +157,20 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("pages and assets (incl. app.wasm) contain no paths or user names", dirty == 0, "{s}", .{first[0..first_len]});
     }
 
-    // Pairing page while a window is open shows only the device name.
+    // Pairing pages while a window is open show only the device name (and,
+    // to the requesting device, its own address and request code).
     {
-        const res = try inst.cli(&.{ "pair", "phone" });
-        _ = res;
+        const pc = try inst.liveCli(&.{ "pair", "phone" });
+        defer pc.deinit();
+        _ = pc.waitFor("Waiting for the device", 15_000);
+        _ = client.waitPairOpen(inst, 10_000);
         var resp = try get(inst, "/pair", null);
         defer resp.deinit();
         _ = r.check("open pairing window reveals only the device name", resp.bodyContains("phone") and leaks.find(resp.raw) == null, "{?s}", .{leaks.find(resp.raw)});
+        const rq = try client.requestPair(inst, null);
+        var wait = try client.waitPage(inst, rq.cookie(), null);
+        defer wait.deinit();
+        _ = r.check("waiting page reveals no paths or names", wait.status == 200 and leaks.find(wait.raw) == null, "{d} {?s}", .{ wait.status, leaks.find(wait.raw) });
     }
 
     // Protocol text messages carry no paths (the grid is exempt by design).

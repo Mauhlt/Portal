@@ -13,6 +13,7 @@ pub const Instance = proc.Instance;
 
 pub const device_cookie = "portal_device";
 pub const session_cookie = "portal_session";
+pub const pairreq_cookie = "portal_pairreq";
 
 /// GET with an optional Cookie header value.
 pub fn get(inst: *Instance, path: []const u8, cookie: ?[]const u8) !http.Response {
@@ -61,15 +62,111 @@ pub const Creds = struct {
     }
 };
 
-/// `portal pair <name>` then POST /pair.
-pub fn pair(inst: *Instance, name: []const u8) !Creds {
-    const res = try inst.cli(&.{ "pair", name });
-    inst.h.gpa.free(res.out);
-    if (res.code != 0) return error.PairCommandFailed;
-    var r = try post(inst, "/pair", null, true);
+/// A device's outstanding pairing request: its `portal_pairreq` cookie.
+pub const PairReq = struct {
+    status: u16 = 0,
+    location_buf: [64]u8 = undefined,
+    location_len: usize = 0,
+    cookie_buf: [96]u8 = undefined,
+    cookie_len: usize = 0,
+    set_cookies: usize = 0,
+
+    pub fn location(p: *const PairReq) []const u8 {
+        return p.location_buf[0..p.location_len];
+    }
+    /// "portal_pairreq=<token>", or "" if none was set.
+    pub fn cookie(p: *const PairReq) []const u8 {
+        return p.cookie_buf[0..p.cookie_len];
+    }
+    /// The server accepted the request and sent the device to wait.
+    pub fn waiting(p: *const PairReq) bool {
+        return p.status == 303 and std.mem.eql(u8, p.location(), "/pair/wait") and p.cookie_len > 0;
+    }
+};
+
+/// POST /pair (optionally from another loopback source address).
+pub fn requestPair(inst: *Instance, source: ?[4]u8) !PairReq {
+    var r = try http.request(inst.h.gpa, inst.port, .{
+        .method = "POST",
+        .path = "/pair",
+        .host = inst.host,
+        .origin = inst.origin,
+        .body = "",
+        .source = source,
+    });
     defer r.deinit();
-    if (r.status != 303 or !std.mem.eql(u8, r.location(), "/")) return error.PairingRefused;
-    return Creds.fromResponse(&r) orelse error.NoCookies;
+    var p: PairReq = .{ .status = r.status, .set_cookies = r.setCookieCount() };
+    const loc = r.location();
+    p.location_len = @min(loc.len, p.location_buf.len);
+    @memcpy(p.location_buf[0..p.location_len], loc[0..p.location_len]);
+    if (r.cookie(pairreq_cookie)) |v| if (v.len > 0) {
+        const s: []const u8 = std.fmt.bufPrint(&p.cookie_buf, "{s}={s}", .{ pairreq_cookie, v }) catch "";
+        p.cookie_len = s.len;
+    };
+    return p;
+}
+
+/// GET /pair/wait with the request cookie.
+pub fn waitPage(inst: *Instance, req: []const u8, source: ?[4]u8) !http.Response {
+    return http.request(inst.h.gpa, inst.port, .{ .path = "/pair/wait", .host = inst.host, .cookie = req, .source = source });
+}
+
+pub const Collected = union(enum) {
+    creds: Creds,
+    /// Sent back to /pair with this reason (e.g. "/pair?e=denied").
+    refused: [64]u8,
+    timeout,
+};
+
+/// Polls GET /pair/wait (as the page's meta refresh would) until the
+/// outcome is decided.
+pub fn collect(inst: *Instance, req: []const u8, source: ?[4]u8, ms: u32) !Collected {
+    const deadline = net.now() + ms;
+    while (net.now() < deadline) {
+        var r = try waitPage(inst, req, source);
+        defer r.deinit();
+        if (r.status == 303) {
+            if (std.mem.eql(u8, r.location(), "/")) return .{ .creds = Creds.fromResponse(&r) orelse return error.NoCookies };
+            var why: [64]u8 = @splat(0);
+            const loc = r.location();
+            @memcpy(why[0..@min(loc.len, 64)], loc[0..@min(loc.len, 64)]);
+            return .{ .refused = why };
+        }
+        net.sleep(50);
+    }
+    return .timeout;
+}
+
+/// Waits until GET /pair offers the "Pair this device" button.
+pub fn waitPairOpen(inst: *Instance, ms: u32) bool {
+    const deadline = net.now() + ms;
+    while (net.now() < deadline) {
+        var r = get(inst, "/pair", null) catch return false;
+        defer r.deinit();
+        if (r.bodyContains("type=\"submit\"")) return true;
+        net.sleep(30);
+    }
+    return false;
+}
+
+/// The full desk-approval flow: `portal pair <name>` (kept running),
+/// POST /pair, answer "y" at the desk prompt, collect the credential.
+pub fn pair(inst: *Instance, name: []const u8) !Creds {
+    const pc = try inst.liveCli(&.{ "pair", name });
+    defer pc.deinit();
+    if (!pc.waitFor("Waiting for the device", 15_000)) return error.PairCommandFailed;
+    if (!waitPairOpen(inst, 10_000)) return error.PairWindowNotSeen;
+    const rq = try requestPair(inst, null);
+    if (!rq.waiting()) return error.PairingRefused;
+    if (!pc.waitFor("[y/N]", 10_000)) return error.NoDeskPrompt;
+    pc.answer("y\r\n");
+    const got = try collect(inst, rq.cookie(), null, 10_000);
+    const creds = switch (got) {
+        .creds => |c| c,
+        else => return error.PairingRefused,
+    };
+    if (pc.wait(10_000) != 0) return error.PairCommandFailed;
+    return creds;
 }
 
 /// Device sign-in (GET / with only the device cookie). Returns the new

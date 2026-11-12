@@ -47,6 +47,11 @@ pub const Session = struct {
     /// Guarded by input_mutex. Keys mode lets through at most one Esc per
     /// second, so a viewer can't send Esc Esc (the agent's rewind menu).
     last_web_esc_ms: i64 = std.math.minInt(i64),
+    /// Guarded by input_mutex. When a bare Esc from a web viewer was last
+    /// written. Any web input that follows within `esc_gap_ms` is held back
+    /// until the gap has passed, so the program can't read Esc + key as
+    /// Alt+key (a different shortcut).
+    last_esc_write_ms: i64 = std.math.minInt(i64),
     /// Guarded by input_mutex. Text mode's leading-`!` filter.
     text_guard: keymap.TextGuard = .{},
     /// Guarded by input_mutex. False once shutdown has begun; no write may
@@ -77,7 +82,20 @@ pub const Session = struct {
             s.last_web_esc_ms = now_ms;
         }
         s.text_guard.onKey(name);
+        s.escGap();
         s.pty.write(bytes) catch {};
+        if (std.mem.eql(u8, bytes, "\x1b")) s.last_esc_write_ms = s.clockMs();
+    }
+
+    fn clockMs(s: *Session) i64 {
+        return Io.Timestamp.now(s.io, .awake).toMilliseconds();
+    }
+
+    /// Caller holds input_mutex. Waits out the rest of the gap after a web
+    /// Esc (at most `esc_gap_ms`), keeping later input in order behind it.
+    fn escGap(s: *Session) void {
+        const d = escGapDelay(s.clockMs(), s.last_esc_write_ms, esc_gap_ms);
+        if (d > 0) s.io.sleep(.fromMilliseconds(d), .awake) catch {};
     }
 
     /// Text typed in a web viewer (text mode only), reduced to printable
@@ -92,7 +110,9 @@ pub const Session = struct {
         defer s.input_mutex.unlock(s.io);
         if (!s.input_open) return;
         const allowed = s.text_guard.filter(clean);
-        if (allowed.len > 0) s.pty.write(allowed) catch {};
+        if (allowed.len == 0) return;
+        s.escGap();
+        s.pty.write(allowed) catch {};
     }
 
     /// A whole instruction line from a web viewer (instruct and text modes).
@@ -109,6 +129,7 @@ pub const Session = struct {
         s.input_mutex.lockUncancelable(s.io);
         defer s.input_mutex.unlock(s.io);
         if (!s.input_open) return;
+        s.escGap();
         if (paste) s.pty.write("\x1b[200~") catch return;
         s.pty.write(text) catch return;
         if (paste) s.pty.write("\x1b[201~") catch return;
@@ -185,6 +206,16 @@ pub const Session = struct {
     }
 };
 
+/// Gap enforced after a web Esc before the next web input is written.
+pub const esc_gap_ms: i64 = 50;
+
+/// How long to wait before writing input at `now` when a bare Esc was
+/// written at `last_esc`: the rest of `gap`, or 0.
+pub fn escGapDelay(now: i64, last_esc: i64, gap: i64) i64 {
+    if (!withinWindow(now, last_esc, gap)) return 0;
+    return gap - (now - last_esc);
+}
+
 /// True if `now` is less than `window` ms after `last`. A clock that went
 /// backwards (now < last) counts as outside the window, so a time jump can't
 /// lock a rate-limited action out for hours. Saturating, never overflows.
@@ -202,6 +233,15 @@ test "withinWindow" {
     try std.testing.expect(withinWindow(1000, 0, 2000));
     try std.testing.expect(!withinWindow(2000, 0, 2000));
     try std.testing.expect(!withinWindow(0, 1000, 2000)); // clock went back
+}
+
+test "escGapDelay" {
+    const min = std.math.minInt(i64);
+    try std.testing.expectEqual(@as(i64, 0), escGapDelay(1000, min, 50));
+    try std.testing.expectEqual(@as(i64, 50), escGapDelay(1000, 1000, 50));
+    try std.testing.expectEqual(@as(i64, 20), escGapDelay(1030, 1000, 50));
+    try std.testing.expectEqual(@as(i64, 0), escGapDelay(1050, 1000, 50));
+    try std.testing.expectEqual(@as(i64, 0), escGapDelay(900, 1000, 50)); // clock went back
 }
 
 test "viewerDelta saturates" {

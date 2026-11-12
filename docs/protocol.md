@@ -15,8 +15,10 @@ Every POST needs `Host` on the server's allowlist and `Origin: https://<that
 host>`, sent exactly; native clients must send both. POST bodies are empty
 (`Content-Length: 0`).
 
-**Pair (once per device).** The owner runs `portal pair <name>` at the
-desktop, which opens a 2-minute, single-use window. The client then sends:
+**Pair (once per device), approved at the desk.** The owner runs `portal
+pair <name>` at the desktop (or opens a window from the Portal window),
+which opens a 2-minute window and asks the owner about every device that
+requests pairing. Nothing is typed on the device. The client sends:
 
 ```
 POST /pair HTTP/1.1
@@ -25,12 +27,33 @@ Origin: https://10.8.0.1:8420
 Content-Length: 0
 ```
 
-* Success: `303`, `Location: /`, with two `Set-Cookie` headers:
+* Request registered: `303`, `Location: /pair/wait`, with
+  `Set-Cookie: __Host-portal_pairreq=<43 chars>; Path=/; HttpOnly; SameSite=Strict; Max-Age=600; Secure`,
+  the request token. No credential yet.
+* No window open, or the window already approved a device: `303` to `/pair?e=closed`.
+* Too many pending requests (8 per window, 2 per address): `303` to `/pair?e=busy`.
+* This address was denied in this window: `303` to `/pair?e=denied`.
+
+Then poll, from the same source address and with the request cookie:
+
+```
+GET /pair/wait HTTP/1.1
+Cookie: __Host-portal_pairreq=<43 chars>
+```
+
+* Waiting for the desk: `200`, an HTML page showing the 4-hex-digit
+  request code that the desk also shows (browsers re-load it every 2 s
+  with `<meta http-equiv="refresh">`). Show the code to the user.
+* Approved: `303`, `Location: /`, with three `Set-Cookie` headers:
   * `__Host-portal_device=<name>.<43 chars>; Path=/; HttpOnly; SameSite=Strict; Max-Age=7776000; Secure`
     is the device credential;
-  * `__Host-portal=<43 chars>; ...; Secure` is a session.
-* No window open: `303` to `/pair?e=closed`.
-* With `--no-tls` the names are `portal_device` / `portal_session`, without `Secure`.
+  * `__Host-portal=<43 chars>; ...; Secure` is a session;
+  * the request cookie, cleared (`Max-Age=0`).
+  This happens once; the request is then used up.
+* Denied: `303` to `/pair?e=denied`. Expired, unknown, used, or asked from
+  another address: `303` to `/pair?e=expired`. Both clear the request cookie.
+* With `--no-tls` the names are `portal_device` / `portal_session` /
+  `portal_pairreq`, without `Secure`.
 
 **Sign in (every launch or reconnect).** Present the device credential:
 
@@ -41,15 +64,20 @@ Content-Length: 0
   device is unknown or revoked.
 
 The device secret **rotates on every sign-in**, so clients must replace the
-stored value immediately. The previous value stays valid for 10 minutes to
-survive a lost response. Presenting anything older or wrong revokes the
-device (theft detection), and re-pairing is then required. Credentials are
-bound to the device's source (WireGuard) address. Native clients store the
-device credential only in the OS credential store and keep the session in
-memory.
+stored value immediately. Each superseded value stays valid for 10 minutes
+from the sign-in that replaced it (the last 4 are remembered), which
+survives a lost response and several tabs signing in at once; that window
+is never extended. Presenting anything older or wrong revokes the device
+(theft detection), and re-pairing is then required. Credentials are bound
+to the device's source (WireGuard) address; a credential from another
+address, and an unknown one, both get the same answer (`303 /pair`, or
+`401`). Native clients store the device credential only in the OS
+credential store and keep the session in memory.
 
-`POST /logout` with the session cookie unpairs this device and ends its
-sessions.
+`POST /logout` unpairs this device and ends its sessions. It uses the
+session cookie, or, if the session has expired, the device credential
+(checked like a sign-in). Success: `303 /pair?bye`; nothing to unpair:
+`303 /pair`.
 
 ## 2. Open the stream
 
@@ -116,7 +144,10 @@ repeat n_rows:
 
 ## 4. Client → server
 
-Text frames only, at most 4096 bytes.
+Text frames only, at most 4096 bytes. Each connection may send about 40
+messages and 16 KiB per second (bursts of twice that); the excess is
+dropped. A key sent within 50 ms of an `esc` is delayed until 50 ms have
+passed, so the program can't read the pair as Alt+key.
 
 | frame | meaning |
 |---|---|
