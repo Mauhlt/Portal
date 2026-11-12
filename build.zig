@@ -107,6 +107,31 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tool_tests).step);
     test_step.dependOn(&release_exe.step);
     test_step.dependOn(&launcher_exe.step);
+
+    addE2e(b, target, optimize, exe);
+}
+
+/// `zig build e2e [-- group...]`: end-to-end tests (tests/e2e) that launch
+/// real `portal` processes in hidden consoles and drive them over sockets.
+/// Deliberately not part of `test`: it spawns processes and takes minutes.
+fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, portal: *std.Build.Step.Compile) void {
+    const e2e_exe = b.addExecutable(.{
+        .name = "portal-e2e",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/e2e/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run = b.addRunArtifact(e2e_exe);
+    run.addArtifactArg(portal);
+    run.has_side_effects = true;
+    if (@hasDecl(@TypeOf(run.*), "addPassthruArgs")) {
+        run.addPassthruArgs();
+    } else if (b.args) |args| {
+        run.addArgs(args);
+    }
+    b.step("e2e", "Run end-to-end tests against real portal processes (minutes)").dependOn(&run.step);
 }
 
 /// The browser client's module graph: `vt` (src/vt.zig, for the colour
