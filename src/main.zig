@@ -1,7 +1,7 @@
 //! Portal: watch (and answer prompts in) a terminal session running on this
 //! desktop from a browser elsewhere, over a private network (WireGuard).
 //!
-//!   portal token                     create or rotate the access token
+//!   portal token [--force]           create or rotate the access token
 //!   portal run [options] [-- cmd...] start a session (default cmd: claude)
 //!   portal version
 
@@ -15,10 +15,12 @@ const guard = @import("guard.zig");
 const cmdline = @import("cmdline.zig");
 const input_filter = @import("input_filter.zig");
 const conpty = @import("conpty.zig");
-const Console = @import("console.zig").Console;
+const console_mod = @import("console.zig");
+const Console = console_mod.Console;
 const Session = @import("session.zig").Session;
 const Log = @import("log.zig").Log;
 const Ring = @import("ring.zig").Ring;
+const w = @import("win32.zig");
 const web = @import("web.zig");
 
 pub const portal_version = "0.1.0";
@@ -29,9 +31,13 @@ const usage =
     \\Portal {s} - remote viewer for a desktop terminal session
     \\
     \\Usage:
-    \\  portal token
+    \\  portal token [--force]
     \\      Generate a new access token and print it once. Only its hash is
-    \\      stored. Restart any running `portal run` for it to take effect.
+    \\      stored. A `portal run` that is already running keeps accepting
+    \\      the OLD token until it is restarted.
+    \\      Refuses unless stdout and stderr are an interactive console, so
+    \\      the token is not captured by a redirect, pipe or agent
+    \\      transcript. --force overrides that check.
     \\
     \\  portal run [options] [-- command args...]
     \\      Run `command` (default: claude) in this console and share it.
@@ -39,10 +45,13 @@ const usage =
     \\                         Use your WireGuard address, e.g. 10.8.0.1:8420.
     \\                         Wildcard and public addresses are refused.
     \\      --host NAME[:PORT] Extra Host header value to accept (repeatable).
-    \\      --input MODE       none | keys | text   (default: text)
+    \\      --input MODE       none | keys | text   (default: keys)
     \\                           none: view only
-    \\                           keys: digits, y/n, Enter, Esc, arrows
-    \\                           text: typing allowed
+    \\                           keys: digits, y/n, Enter, single Esc
+    \\                                 (enough to answer prompts)
+    \\                           text: FULL REMOTE CONTROL: new prompts,
+    \\                                 ! shell commands, slash commands,
+    \\                                 permission-mode changes, Ctrl+C exit
     \\      --https            Set when a TLS proxy (e.g. `tailscale serve`)
     \\                         fronts Portal: Secure cookies, https Origin.
     \\
@@ -65,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len == 0) return printUsage();
     const cmd = args[0];
-    if (std.mem.eql(u8, cmd, "token")) return cmdToken(gpa, io, init.environ_map);
+    if (std.mem.eql(u8, cmd, "token")) return cmdToken(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "version")) {
         std.debug.print("portal {s} (built with zig {s})\n", .{ portal_version, builtin.zig_version_string });
@@ -78,9 +87,17 @@ fn printUsage() void {
     std.debug.print(usage, .{ portal_version, default_listen });
 }
 
+/// Set (by the main thread only) once the console is in raw mode, so fatal()
+/// can put it back before exiting.
+var raw_console: ?*Console = null;
+
+/// Exits the process. Safe to call after threads have been spawned: unlike
+/// returning an error from cmdRun, it does not unwind the stack (freeing the
+/// session, ring buffer, pty...) under threads that are still using them.
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    if (raw_console) |c| c.restore();
     std.debug.print("portal: " ++ fmt ++ "\n", args);
-    std.process.exit(1);
+    w.ExitProcess(1);
 }
 
 // ------------------------------------------------------------- data paths
@@ -98,7 +115,26 @@ fn tokenPath(gpa: Allocator, env: *const std.process.Environ.Map) ![]u8 {
 
 // ------------------------------------------------------------------ token
 
-fn cmdToken(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) !void {
+/// Returns whether --force was given, or null for an unknown argument.
+fn parseTokenArgs(args: []const []const u8) ?bool {
+    var force = false;
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--force")) force = true else return null;
+    }
+    return force;
+}
+
+fn cmdToken(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
+    const force = parseTokenArgs(args) orelse fatal("usage: portal token [--force]", .{});
+    // Checked before anything is generated, so a refusal leaves the current
+    // token untouched.
+    if (!force and !console_mod.stdioIsInteractive()) fatal(
+        \\refusing to print a new token: stdout/stderr is not an interactive
+        \\console (redirected, piped, or run by a tool or agent), so the token
+        \\would end up in a file or transcript. The existing token was NOT changed.
+        \\Run `portal token` yourself in a console window, or pass --force.
+    , .{});
+
     const dir = try dataDir(gpa, env);
     defer gpa.free(dir);
     try Io.Dir.cwd().createDirPath(io, dir);
@@ -115,13 +151,30 @@ fn cmdToken(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) !void {
     const contents = try auth.formatTokenFile(auth.hashSecret(token), &file_buf);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
 
+    const log_path = try std.fs.path.join(gpa, &.{ dir, "portal.log" });
+    defer gpa.free(log_path);
+    if (Log.open(gpa, io, log_path)) |opened| {
+        var log = opened;
+        defer log.close();
+        log.print("token rotated{s}; running instances keep accepting the old token until restarted", .{
+            if (force) " (--force: console check skipped)" else "",
+        });
+    } else |err| {
+        std.debug.print("portal: warning: could not open {s} ({t}); the rotation was not logged.\n", .{ log_path, err });
+    }
+
     std.debug.print(
         \\New access token (shown once, store it in your password manager):
         \\
         \\    {s}
         \\
         \\Only its SHA-256 hash was saved to {s}
-        \\Restart any running `portal run` to use it; old browser sessions end then.
+        \\
+        \\IMPORTANT: a `portal run` that is already running keeps accepting the
+        \\OLD token (and its logged-in browsers) until you restart it.
+        \\
+        \\Clear this screen now (Clear-Host / cls) so the token does not stay in
+        \\the console scrollback.
         \\
     , .{ token, path });
     std.crypto.secureZero(u8, &encoded);
@@ -143,7 +196,9 @@ fn loadTokenHash(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) !a
 const RunOptions = struct {
     listen: []const u8 = default_listen,
     hosts: std.ArrayList([]const u8) = .empty,
-    policy: input_filter.Policy = .text,
+    /// `keys` by default: a remote viewer can answer prompts but cannot
+    /// start new work. `text` (full remote control) must be chosen explicitly.
+    policy: input_filter.Policy = .keys,
     https: bool = false,
     command: []const []const u8 = &.{"claude"},
 };
@@ -188,11 +243,47 @@ fn parseListen(text: []const u8) !std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parse(host, port);
 }
 
+/// Suffix for the log line and banner when the remote side has full control.
+fn policyNote(policy: input_filter.Policy) []const u8 {
+    return if (policy == .text) " (FULL REMOTE CONTROL)" else "";
+}
+
+const text_warning =
+    \\
+    \\  *****************************************************************
+    \\  *  WARNING: --input text gives anyone logged in to the web page *
+    \\  *  FULL REMOTE CONTROL of this session: new prompts, ! shell    *
+    \\  *  commands, slash commands, permission-mode changes, Ctrl+C    *
+    \\  *  exit. Use --input keys (the default) to only answer prompts. *
+    \\  *****************************************************************
+    \\
+    \\
+;
+
+/// Consecutive non-EOF read failures after which the drain thread gives up
+/// (about 10 s at 10 ms apart). Without a limit a permanently failing handle
+/// would spin forever; without retries one transient failure would stop
+/// draining and could leave ClosePseudoConsole waiting on conhost.
+const max_read_failures = 1000;
+
+/// How long shutdown waits for ClosePseudoConsole plus the output drain
+/// before exiting anyway (process exit closes the job, which kills the child).
+const shutdown_timeout_ms = 10_000;
+
 const Threads = struct {
-    fn ptyOutput(session: *Session, console: *Console, pty: *conpty.Pty) void {
+    fn ptyOutput(session: *Session, console: *Console, pty: *conpty.Pty, io: Io, done: *std.atomic.Value(bool)) void {
+        defer done.store(true, .release);
         var buf: [32 * 1024]u8 = undefined;
+        var failures: u32 = 0;
         while (true) {
-            const n = pty.read(&buf) catch 0;
+            const n = pty.read(&buf) catch {
+                // Keep draining until EOF: see max_read_failures.
+                failures +|= 1;
+                if (failures >= max_read_failures) return;
+                io.sleep(.fromMilliseconds(10), .awake) catch {};
+                continue;
+            };
+            failures = 0;
             if (n == 0) return;
             console.write(buf[0..n]);
             session.appendOutput(buf[0..n]);
@@ -213,6 +304,11 @@ const Threads = struct {
             session.setSize(console.size());
         }
     }
+
+    fn closePty(session: *Session, done: *std.atomic.Value(bool)) void {
+        session.shutdownPty();
+        done.store(true, .release);
+    }
 };
 
 fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
@@ -228,7 +324,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     };
 
     // Host header allowlist: the listen address as browsers write it, plus --host values.
-    var listen_host_buf: [64]u8 = undefined;
+    var listen_host_buf: [128]u8 = undefined;
     const listen_host = try std.fmt.bufPrint(&listen_host_buf, "{f}", .{addr});
     try opts.hosts.append(gpa, listen_host);
 
@@ -237,10 +333,13 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     try Io.Dir.cwd().createDirPath(io, dir);
     const log_path = try std.fs.path.join(gpa, &.{ dir, "portal.log" });
     defer gpa.free(log_path);
-    var log = Log.open(gpa, io, log_path);
+    // Fail closed: logins and viewer connections must be auditable.
+    var log = Log.open(gpa, io, log_path) catch |err|
+        fatal("cannot open audit log {s} ({t}); refusing to run without it.", .{ log_path, err });
     defer log.close();
 
     // Listen before starting the child so a port conflict fails fast.
+    // The listener is never closed (see the end of this function).
     const listener = addr.listen(io, .{ .reuse_address = false }) catch |err|
         fatal("cannot listen on {s}: {t}", .{ opts.listen, err });
 
@@ -251,12 +350,15 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         fatal("cannot find program '{s}': {t}", .{ opts.command[0], err });
     defer resolved.deinit(gpa);
 
+    const ring_buf = gpa.alloc(u8, scrollback_bytes) catch fatal("out of memory", .{});
+    defer gpa.free(ring_buf);
+
     var attr_buf: [256]u8 align(@alignOf(usize)) = undefined;
     var pty = conpty.Pty.spawn(resolved.app, resolved.cmdline, null, initial, &attr_buf) catch |err|
         fatal("could not start '{s}': {t}", .{ opts.command[0], err });
+    // From here on the child is running. Exit only via fatal()/ExitProcess:
+    // process exit closes the job handle, which kills the child's tree.
 
-    const ring_buf = try gpa.alloc(u8, scrollback_bytes);
-    defer gpa.free(ring_buf);
     var session: Session = .{
         .io = io,
         .pty = &pty,
@@ -280,38 +382,66 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         },
     };
 
-    log.print("start: v{s} zig {s}, listening on {s}, input={t}, command={s}", .{
-        portal_version, builtin.zig_version_string, opts.listen, opts.policy, opts.command[0],
+    log.print("start: v{s} zig {s}, listening on {s}, input={t}{s}, command={s}", .{
+        portal_version, builtin.zig_version_string, opts.listen, opts.policy, policyNote(opts.policy), opts.command[0],
     });
-    std.debug.print("portal: sharing '{s}' on http://{s}/  (input: {t})\n", .{ opts.command[0], listen_host, opts.policy });
+    if (opts.policy == .text) std.debug.print(text_warning, .{});
+    std.debug.print("portal: sharing '{s}' on http://{s}/  (input: {t}{s})\n", .{
+        opts.command[0], listen_host, opts.policy, policyNote(opts.policy),
+    });
 
     console.enableRaw() catch fatal("could not switch console to raw mode", .{});
-    defer console.restore();
+    raw_console = &console;
     console.setTitle("Portal - no remote viewers");
 
-    const out_thread = try std.Thread.spawn(.{}, Threads.ptyOutput, .{ &session, &console, &pty });
-    const in_thread = try std.Thread.spawn(.{}, Threads.consoleInput, .{ &session, &console });
+    // ------------------------------------------------------------------
+    // Threads below use stack and heap memory owned by this frame. After the
+    // first spawn this function must never return (no `try`, no `return`):
+    // every exit goes through fatal() or ExitProcess.
+    var out_done: std.atomic.Value(bool) = .init(false);
+    const out_thread = std.Thread.spawn(.{}, Threads.ptyOutput, .{ &session, &console, &pty, io, &out_done }) catch |err|
+        fatal("cannot start output thread: {t}", .{err});
+    out_thread.detach(); // waited for via out_done, with a timeout
+    const in_thread = std.Thread.spawn(.{}, Threads.consoleInput, .{ &session, &console }) catch |err|
+        fatal("cannot start input thread: {t}", .{err});
     in_thread.detach(); // parked in ReadConsoleW; ends with the process
-    const resize_thread = try std.Thread.spawn(.{}, Threads.resizePoller, .{ &session, &console, io });
+    const resize_thread = std.Thread.spawn(.{}, Threads.resizePoller, .{ &session, &console, io }) catch |err|
+        fatal("cannot start resize thread: {t}", .{err});
     resize_thread.detach();
-    const accept_thread = try std.Thread.spawn(.{}, web.Server.run, .{&server});
+    const accept_thread = std.Thread.spawn(.{}, web.Server.run, .{&server}) catch |err|
+        fatal("cannot start web server thread: {t}", .{err});
     accept_thread.detach();
 
     const code = pty.wait();
     // Let trailing output drain before tearing down the pseudo console.
     io.sleep(.fromMilliseconds(200), .awake) catch {};
-    session.input_mutex.lockUncancelable(io);
-    pty.close();
-    session.input_mutex.unlock(io);
-    out_thread.join();
+
+    // ClosePseudoConsole can block (pre-24H2 it waits for conhost to flush),
+    // so run it on its own thread and stop waiting after a timeout rather
+    // than leaving the user's console hung. Session.shutdownPty stops resizes
+    // and writes first, so nothing touches the freed HPCON or input pipe.
+    var close_done: std.atomic.Value(bool) = .init(false);
+    if (std.Thread.spawn(.{}, Threads.closePty, .{ &session, &close_done })) |t| {
+        t.detach();
+    } else |_| {
+        Threads.closePty(&session, &close_done);
+    }
+    var waited: u32 = 0;
+    while (!(close_done.load(.acquire) and out_done.load(.acquire)) and waited < shutdown_timeout_ms) : (waited += 20) {
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    const clean = close_done.load(.acquire) and out_done.load(.acquire);
+
     session.markClosed(code);
-    log.print("stop: child exited with code {d}", .{code});
+    log.print("stop: child exited with code {d}{s}", .{ code, if (clean) "" else " (pseudo console did not close in time)" });
     // Give viewers a moment to receive the exit notice.
     io.sleep(.fromMilliseconds(500), .awake) catch {};
     // Do NOT close the listener: the accept thread is blocked on it and std
     // hits `unreachable` on the cancelled accept. Process exit reclaims it.
     console.restore();
-    std.process.exit(@truncate(code));
+    // Full 32-bit exit code (std.process.exit takes a u8). Exiting here, not
+    // returning, also keeps every thread's memory valid to the very end.
+    w.ExitProcess(code);
 }
 
 test {
@@ -321,6 +451,8 @@ test {
     _ = @import("guard.zig");
     _ = @import("cmdline.zig");
     _ = @import("console.zig");
+    _ = @import("session.zig");
+    _ = @import("log.zig");
 }
 
 test "parseListen" {
@@ -330,4 +462,22 @@ test "parseListen" {
     try std.testing.expectError(error.MissingPort, parseListen("10.8.0.1"));
     try std.testing.expectError(error.BadPort, parseListen("10.8.0.1:0"));
     try std.testing.expectError(error.BadPort, parseListen("10.8.0.1:99999"));
+}
+
+test "run defaults to keys input" {
+    var o = try parseRunArgs(std.testing.allocator, &.{});
+    defer o.hosts.deinit(std.testing.allocator);
+    try std.testing.expectEqual(input_filter.Policy.keys, o.policy);
+    var t = try parseRunArgs(std.testing.allocator, &.{ "--input", "text" });
+    defer t.hosts.deinit(std.testing.allocator);
+    try std.testing.expectEqual(input_filter.Policy.text, t.policy);
+    try std.testing.expectEqualStrings("", policyNote(.keys));
+    try std.testing.expect(std.mem.indexOf(u8, policyNote(.text), "FULL REMOTE CONTROL") != null);
+}
+
+test "parseTokenArgs" {
+    try std.testing.expectEqual(@as(?bool, false), parseTokenArgs(&.{}));
+    try std.testing.expectEqual(@as(?bool, true), parseTokenArgs(&.{"--force"}));
+    try std.testing.expectEqual(@as(?bool, null), parseTokenArgs(&.{"--forc"}));
+    try std.testing.expectEqual(@as(?bool, null), parseTokenArgs(&.{ "--force", "x" }));
 }

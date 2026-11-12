@@ -18,6 +18,7 @@ pub const WAIT_OBJECT_0: DWORD = 0;
 
 pub const STD_INPUT_HANDLE: DWORD = @bitCast(@as(i32, -10));
 pub const STD_OUTPUT_HANDLE: DWORD = @bitCast(@as(i32, -11));
+pub const STD_ERROR_HANDLE: DWORD = @bitCast(@as(i32, -12));
 
 // Console input modes
 pub const ENABLE_PROCESSED_INPUT: DWORD = 0x0001;
@@ -45,6 +46,7 @@ pub const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x00002000;
 
 pub const ERROR_BROKEN_PIPE: DWORD = 109;
 pub const ERROR_OPERATION_ABORTED: DWORD = 995;
+pub const ERROR_INVALID_HANDLE: DWORD = 6;
 
 pub const COORD = extern struct { X: i16, Y: i16 };
 pub const SMALL_RECT = extern struct { Left: i16, Top: i16, Right: i16, Bottom: i16 };
@@ -150,6 +152,9 @@ pub extern "kernel32" fn ResumeThread(h: HANDLE) callconv(.winapi) DWORD;
 pub extern "kernel32" fn TerminateProcess(h: HANDLE, code: u32) callconv(.winapi) BOOL;
 pub extern "kernel32" fn WaitForSingleObject(h: HANDLE, ms: DWORD) callconv(.winapi) DWORD;
 pub extern "kernel32" fn GetExitCodeProcess(h: HANDLE, code: *DWORD) callconv(.winapi) BOOL;
+/// Used instead of std.process.exit, which only takes a u8: Windows exit
+/// codes are 32 bits and Portal passes the child's code through unchanged.
+pub extern "kernel32" fn ExitProcess(code: u32) callconv(.winapi) noreturn;
 
 pub extern "kernel32" fn CreateJobObjectW(attrs: ?*anyopaque, name: ?[*:0]const u16) callconv(.winapi) ?HANDLE;
 pub extern "kernel32" fn SetInformationJobObject(job: HANDLE, class: c_int, info: *const anyopaque, len: DWORD) callconv(.winapi) BOOL;
@@ -174,6 +179,8 @@ pub fn validHandle(h: ?HANDLE) ?HANDLE {
 
 pub const FILE_APPEND_DATA: DWORD = 0x0004;
 pub const FILE_SHARE_READ: DWORD = 0x0001;
+pub const FILE_SHARE_WRITE: DWORD = 0x0002;
+pub const MOVEFILE_REPLACE_EXISTING: DWORD = 0x1;
 pub const OPEN_ALWAYS: DWORD = 4;
 pub const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
 
@@ -186,3 +193,5 @@ pub extern "kernel32" fn CreateFileW(
     flags: DWORD,
     template: ?HANDLE,
 ) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn GetFileSizeEx(h: HANDLE, size: *i64) callconv(.winapi) BOOL;
+pub extern "kernel32" fn MoveFileExW(from: [*:0]const u16, to: [*:0]const u16, flags: DWORD) callconv(.winapi) BOOL;

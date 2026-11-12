@@ -95,13 +95,17 @@ pub const Pty = struct {
         return .{ .hpc = hpc, .in_write = in_write, .out_read = out_read, .process = pi.hProcess, .job = job };
     }
 
-    /// Blocking read of terminal output. Returns 0 at end of stream.
+    /// Blocking read of terminal output. Returns 0 at end of stream (the
+    /// pseudo console closed its end). Any other failure is error.ReadFailed,
+    /// which the caller should treat as transient and keep reading: the
+    /// output pipe must be drained until EOF or ClosePseudoConsole can hang.
     pub fn read(p: *Pty, buf: []u8) !usize {
         var n: w.DWORD = 0;
         const len: w.DWORD = @intCast(@min(buf.len, std.math.maxInt(w.DWORD)));
         if (w.ReadFile(p.out_read, buf.ptr, len, &n, null) == 0) {
             const err = w.GetLastError();
-            if (err == w.ERROR_BROKEN_PIPE) return 0;
+            // INVALID_HANDLE: the handle is gone, so no further data can come.
+            if (err == w.ERROR_BROKEN_PIPE or err == w.ERROR_INVALID_HANDLE) return 0;
             return error.ReadFailed;
         }
         return n;
@@ -118,6 +122,7 @@ pub const Pty = struct {
         }
     }
 
+    /// Caller must guarantee `close` has not started (Session.pty_live).
     pub fn resize(p: *Pty, size: Size) void {
         _ = w.ResizePseudoConsole(p.hpc, size.coord());
     }
@@ -132,7 +137,10 @@ pub const Pty = struct {
 
     /// Closes the pseudo console (which ends the output stream) and kills
     /// anything left in the job. The output reader must still be draining
-    /// when this is called, or ClosePseudoConsole can block.
+    /// when this is called, or ClosePseudoConsole can block (before Windows
+    /// 11 24H2 it waits for conhost to flush all output). Not thread safe:
+    /// the caller must first stop every resize (Session.pty_live) and every
+    /// write (Session.input_open), since HPCON and in_write are freed here.
     pub fn close(p: *Pty) void {
         if (p.closed) return;
         p.closed = true;
