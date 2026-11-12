@@ -6,6 +6,11 @@
 //!   * subject = issuer = CN "Portal Local CA (<8 hex>)", O "Portal"
 //!   * basicConstraints  critical  CA:TRUE, pathLenConstraint 0
 //!   * keyUsage          critical  keyCertSign | cRLSign
+//!   * extKeyUsage       serverAuth only. Not an RFC 5280 CA field, but
+//!     Windows CryptoAPI, Chrome, Firefox, Apple and OpenSSL treat a CA's
+//!     EKU as a ceiling for the chain, so a leaked CA key cannot mint
+//!     code-signing, S/MIME or TLS client certificates that a device
+//!     trusting this root would accept.
 //!   * subjectKeyIdentifier
 //!   * nameConstraints   critical  permitted iPAddress subtrees (the
 //!     WireGuard subnet and loopback by default) plus permitted dNSName
@@ -14,7 +19,11 @@
 //!     constrained too: a constraint on iPAddress alone would leave every
 //!     DNS name unconstrained (RFC 5280 4.2.1.10 only restricts name forms
 //!     that have a constraint), and a leaked CA key could then mint a
-//!     certificate for any web site.
+//!     certificate for any web site. The same trick closes the other name
+//!     forms a relying party might accept: rfc822Name "invalid" (mailboxes
+//!     at the host "invalid" only), uniformResourceIdentifier ".invalid"
+//!     (hosts under "invalid" only) and directoryName O=Portal (exactly the
+//!     leaf's subject).
 //!   * validity ~10 years
 //!
 //! Leaf profile (also Apple's TLS server requirements, support.apple.com
@@ -23,7 +32,8 @@
 //!   * subjectAltName iPAddress (+ dNSName when configured and permitted)
 //!   * extKeyUsage serverAuth, keyUsage critical digitalSignature
 //!   * basicConstraints CA:FALSE, authority/subject key identifiers
-//!   * ECDSA P-256, SHA-256, validity 397 days (Apple: <= 398)
+//!   * ECDSA P-256, SHA-256, validity 397 days (Apple: <= 398), but never
+//!     past the CA's own notAfter
 //!   * serial: 16 random bytes, positive
 
 const std = @import("std");
@@ -120,6 +130,12 @@ pub const Constraints = struct {
     n_subnets: usize = 0,
     dns: [max_dns][]const u8 = undefined,
     n_dns: usize = 0,
+    /// Set by parseConstraints when the closed rfc822Name,
+    /// uniformResourceIdentifier and directoryName subtrees are present
+    /// (always written now; missing in CAs made by older versions).
+    closed_rfc822: bool = false,
+    closed_uri: bool = false,
+    directory_portal: bool = false,
 
     pub fn ipPermitted(c: *const Constraints, ip: []const u8) bool {
         for (c.subnets[0..c.n_subnets]) |s| if (s.contains(ip)) return true;
@@ -199,17 +215,40 @@ fn extension(d: der.Writer, oid: []const u8, critical: bool, value: []const u8) 
     return d.seq(&.{ try d.oid(oid), try d.octets(value) });
 }
 
+/// ExtKeyUsageSyntax with id-kp-serverAuth only (CA and leaf).
+fn ekuServerAuth(d: der.Writer) ![]u8 {
+    return d.seq(&.{try d.oid(&oids.kp_server_auth)});
+}
+
+/// The encoded extKeyUsage value Portal writes (for profile checks).
+pub const eku_server_auth_der = [_]u8{ Tag.sequence, 2 + oids.kp_server_auth.len, Tag.oid, oids.kp_server_auth.len } ++ oids.kp_server_auth;
+
+/// True if `info` (a Portal CA) has the current profile: extKeyUsage
+/// serverAuth only and the closed rfc822Name / URI / directoryName
+/// subtrees. CAs made by older versions lack these; they keep working,
+/// but are only as narrow as their iPAddress/dNSName constraints.
+pub fn isCurrentCaProfile(info: Info, c: *const Constraints) bool {
+    return std.mem.eql(u8, info.eku, &eku_server_auth_der) and
+        c.closed_rfc822 and c.closed_uri and c.directory_portal;
+}
+
 fn sigAlg(d: der.Writer) ![]u8 {
     return d.seq(&.{try d.oid(&oids.ecdsa_with_sha256)});
 }
 
 /// Signs `tbs` and wraps it into a Certificate.
-fn finish(d: der.Writer, tbs: []const u8, signer: KeyPair, noise: ?[Ecdsa.noise_length]u8) ![]u8 {
+fn finish(d: der.Writer, tbs: []const u8, signer: *const KeyPair, noise: ?[Ecdsa.noise_length]u8) ![]u8 {
     const sig = try signer.sign(tbs, noise);
     var sig_buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
     const sig_der = sig.toDer(&sig_buf);
     return d.seq(&.{ tbs, try sigAlg(d), try d.bitString(sig_der) });
 }
+
+/// rfc822Name constraint: a host name, so only mailboxes "x@invalid".
+const closed_rfc822 = "invalid";
+/// uniformResourceIdentifier constraint: a leading "." means hosts within
+/// that domain, so only URIs whose host ends in ".invalid".
+const closed_uri = ".invalid";
 
 /// The nameConstraints extension value.
 pub fn nameConstraintsValue(d: der.Writer, c: *const Constraints) ![]u8 {
@@ -225,11 +264,16 @@ pub fn nameConstraintsValue(d: der.Writer, c: *const Constraints) ![]u8 {
     } else for (c.dns[0..c.n_dns]) |n| {
         try subtrees.append(d.arena, try d.seq(&.{try d.tlv(Tag.contextPrimitive(2), n)}));
     }
+    // Close the other name forms (see the profile notes at the top).
+    try subtrees.append(d.arena, try d.seq(&.{try d.tlv(Tag.contextPrimitive(1), closed_rfc822)}));
+    try subtrees.append(d.arena, try d.seq(&.{try d.tlv(Tag.contextPrimitive(6), closed_uri)}));
+    try subtrees.append(d.arena, try d.seq(&.{try d.tlv(Tag.contextConstructed(4), try leafSubject(d))}));
     return d.seq(&.{try d.constructed(Tag.contextConstructed(0), subtrees.items)});
 }
 
 pub const CaParams = struct {
-    key: KeyPair,
+    /// By pointer: the private key is not copied into the parameters.
+    key: *const KeyPair,
     /// 8 lowercase hex characters, shown in the CA's name.
     tag: [8]u8,
     serial: [16]u8,
@@ -250,6 +294,7 @@ pub fn buildCa(gpa: Allocator, p: CaParams) ![]u8 {
     const exts = try d.seq(&.{
         try extension(d, &oids.basic_constraints, true, try d.seq(&.{ try d.boolean(true), try d.uint(0) })),
         try extension(d, &oids.key_usage, true, try d.namedBits(0x0600)), // keyCertSign | cRLSign
+        try extension(d, &oids.ext_key_usage, false, try ekuServerAuth(d)),
         try extension(d, &oids.subject_key_identifier, false, try d.octets(&kid)),
         try extension(d, &oids.name_constraints, true, try nameConstraintsValue(d, p.constraints)),
     });
@@ -285,7 +330,8 @@ pub fn sanValue(d: der.Writer, sans: []const SanEntry) ![]u8 {
 
 pub const LeafParams = struct {
     key: Ecdsa.PublicKey,
-    ca_key: KeyPair,
+    /// By pointer: the CA private key is not copied into the parameters.
+    ca_key: *const KeyPair,
     /// The CA certificate (its subject becomes the issuer).
     ca_der: []const u8,
     sans: []const SanEntry,
@@ -301,12 +347,16 @@ pub fn buildLeaf(gpa: Allocator, p: LeafParams) ![]u8 {
     const d: der.Writer = .{ .arena = arena.allocator() };
 
     const ca = try parse(p.ca_der);
+    // A certificate must not outlive its issuer: path validation checks
+    // every certificate's validity (RFC 5280 6.1.3).
+    if (ca.not_after <= p.now) return error.CaExpired;
+    const not_after = @min(p.now - backdate_s + leaf_validity_s, ca.not_after);
     const aki = keyId(p.ca_key.public_key);
     const ski = keyId(p.key);
     const exts = try d.seq(&.{
         try extension(d, &oids.basic_constraints, true, try d.seq(&.{})), // CA:FALSE
         try extension(d, &oids.key_usage, true, try d.namedBits(0x8000)), // digitalSignature
-        try extension(d, &oids.ext_key_usage, false, try d.seq(&.{try d.oid(&oids.kp_server_auth)})),
+        try extension(d, &oids.ext_key_usage, false, try ekuServerAuth(d)),
         try extension(d, &oids.subject_alt_name, false, try sanValue(d, p.sans)),
         try extension(d, &oids.authority_key_identifier, false, try d.seq(&.{try d.tlv(Tag.contextPrimitive(0), &aki)})),
         try extension(d, &oids.subject_key_identifier, false, try d.octets(&ski)),
@@ -316,7 +366,7 @@ pub fn buildLeaf(gpa: Allocator, p: LeafParams) ![]u8 {
         try d.uintBytes(&positiveSerial(p.serial)),
         try sigAlg(d),
         ca.subject_raw,
-        try d.seq(&.{ try d.time(p.now - backdate_s), try d.time(p.now - backdate_s + leaf_validity_s) }),
+        try d.seq(&.{ try d.time(p.now - backdate_s), try d.time(not_after) }),
         try leafSubject(d),
         try spki(d, p.key),
         try d.tlv(Tag.contextConstructed(3), exts),
@@ -520,11 +570,11 @@ pub const TestPki = struct {
         const ca_key = try KeyPair.generateDeterministic(@splat(7));
         const leaf_key = try KeyPair.generateDeterministic(@splat(9));
         const c = testConstraints();
-        const ca_der = try buildCa(gpa, .{ .key = ca_key, .tag = "0123abcd".*, .serial = @splat(0x11), .now = now, .constraints = &c });
+        const ca_der = try buildCa(gpa, .{ .key = &ca_key, .tag = "0123abcd".*, .serial = @splat(0x11), .now = now, .constraints = &c });
         errdefer gpa.free(ca_der);
         const leaf_der = try buildLeaf(gpa, .{
             .key = leaf_key.public_key,
-            .ca_key = ca_key,
+            .ca_key = &ca_key,
             .ca_der = ca_der,
             .sans = sans,
             .serial = @splat(0x22),
@@ -614,14 +664,22 @@ test "certificate profile fields" {
     try testing.expect(ca.key_usage_critical);
     try testing.expectEqualSlices(u8, &.{ 0x03, 0x02, 0x01, 0x06 }, ca.key_usage);
     try testing.expect(ca.name_constraints_critical);
-    // permittedSubtrees [0] { iPAddress 10.8.0.0/255.255.255.0, iPAddress 127.0.0.1/32, dNSName "invalid" }
+    // permittedSubtrees [0] { iPAddress 10.8.0.0/255.255.255.0, iPAddress 127.0.0.1/32,
+    //   dNSName "invalid", rfc822Name "invalid", URI ".invalid", directoryName O=Portal }
     const expected_nc = [_]u8{
-        0x30, 0x25, 0xa0, 0x23,
+        0x30, 0x53, 0xa0, 0x51,
         0x30, 0x0a, 0x87, 0x08, 10,   8,    0,    0,    255,  255,  255,  0,
         0x30, 0x0a, 0x87, 0x08, 127,  0,    0,    1,    255,  255,  255,  255,
         0x30, 0x09, 0x82, 0x07, 'i',  'n',  'v',  'a',  'l',  'i',  'd',
+        0x30, 0x09, 0x81, 0x07, 'i',  'n',  'v',  'a',  'l',  'i',  'd',
+        0x30, 0x0a, 0x86, 0x08, '.',  'i',  'n',  'v',  'a',  'l',  'i',  'd',
+        0x30, 0x15, 0xa4, 0x13, 0x30, 0x11, 0x31, 0x0f, 0x30, 0x0d, 0x06, 0x03, 0x55, 0x04, 0x0a,
+        0x0c, 0x06, 'P',  'o',  'r',  't',  'a',  'l',
     };
     try testing.expectEqualSlices(u8, &expected_nc, ca.name_constraints);
+    try testing.expectEqualSlices(u8, &eku_server_auth_der, ca.eku);
+    const cc = try parseConstraints(ca.name_constraints);
+    try testing.expect(isCurrentCaProfile(ca, &cc));
     try testing.expectEqual(@as(usize, 22), ca.ski.len); // 04 14 <20>
     try testing.expectEqualSlices(u8, ca.subject_raw, ca.issuer_raw);
     try testing.expectEqual(@as(u8, 0x40), ca.serial[0] & 0xc0); // positive, 16 bytes
@@ -645,7 +703,7 @@ test "certificate profile fields" {
     const other = try KeyPair.generateDeterministic(@splat(3));
     const forged = try buildLeaf(gpa, .{
         .key = pki.leaf_key.public_key,
-        .ca_key = other,
+        .ca_key = &other,
         .ca_der = pki.ca_der,
         .sans = &.{ip4(10, 8, 0, 1)},
         .serial = @splat(1),
@@ -701,6 +759,15 @@ pub fn parseConstraints(val: []const u8) !Constraints {
                 if (c.n_dns == max_dns) return error.TooManyConstraints;
                 c.dns[c.n_dns] = base.content;
                 c.n_dns += 1;
+            } else if (base.tag == Tag.contextPrimitive(1)) {
+                if (std.mem.eql(u8, base.content, closed_rfc822)) c.closed_rfc822 = true;
+            } else if (base.tag == Tag.contextPrimitive(6)) {
+                if (std.mem.eql(u8, base.content, closed_uri)) c.closed_uri = true;
+            } else if (base.tag == Tag.contextConstructed(4)) {
+                var arena_buf: [256]u8 = undefined;
+                var fba: std.heap.FixedBufferAllocator = .init(&arena_buf);
+                const want = leafSubject(.{ .arena = fba.allocator() }) catch return error.DerMalformed;
+                if (std.mem.eql(u8, base.content, want)) c.directory_portal = true;
             }
         }
     }
@@ -725,4 +792,49 @@ test "name constraints read back" {
     try testing.expect(back.subnets[2].v6);
     try testing.expectEqual(@as(usize, 1), back.n_dns);
     try testing.expect(back.dnsPermitted("x.portal.home"));
+    try testing.expect(back.closed_rfc822 and back.closed_uri and back.directory_portal);
+}
+
+test "old CA profile is detected" {
+    // A CA as made before extKeyUsage and the closed name forms: iPAddress
+    // and dNSName subtrees only, no EKU.
+    const old_nc = [_]u8{
+        0x30, 0x0e, 0xa0, 0x0c,
+        0x30, 0x0a, 0x87, 0x08, 127, 0, 0, 1, 255, 255, 255, 255,
+        // (no dNSName: still parses)
+    };
+    const c = try parseConstraints(&old_nc);
+    try testing.expect(!c.closed_rfc822 and !c.closed_uri and !c.directory_portal);
+    var pki = try TestPki.init(testing.allocator, 1_790_000_000, &.{ip4(127, 0, 0, 1)});
+    defer pki.deinit(testing.allocator);
+    var info = try parse(pki.ca_der);
+    try testing.expect(!isCurrentCaProfile(info, &c));
+    const cur = try parseConstraints(info.name_constraints);
+    try testing.expect(isCurrentCaProfile(info, &cur));
+    info.eku = "";
+    try testing.expect(!isCurrentCaProfile(info, &cur));
+}
+
+test "leaf never outlives the CA" {
+    const gpa = testing.allocator;
+    const ca_key = try KeyPair.generateDeterministic(@splat(7));
+    const leaf_key = try KeyPair.generateDeterministic(@splat(9));
+    const c = testConstraints();
+    const ca_made: i64 = 1_790_000_000;
+    const ca_der = try buildCa(gpa, .{ .key = &ca_key, .tag = "0123abcd".*, .serial = @splat(0x11), .now = ca_made, .constraints = &c });
+    defer gpa.free(ca_der);
+    const ca = try parse(ca_der);
+    // 100 days before the CA expires: the leaf ends with the CA.
+    const now = ca.not_after - 100 * 86400;
+    const leaf_der = try buildLeaf(gpa, .{ .key = leaf_key.public_key, .ca_key = &ca_key, .ca_der = ca_der, .sans = &.{ip4(127, 0, 0, 1)}, .serial = @splat(0x22), .now = now });
+    defer gpa.free(leaf_der);
+    const leaf = try parse(leaf_der);
+    try testing.expectEqual(ca.not_after, leaf.not_after);
+    try verifySignedBy(leaf, ca);
+    // std's verifier agrees.
+    const ca_p = try (Certificate{ .buffer = ca_der, .index = 0 }).parse();
+    const leaf_p = try (Certificate{ .buffer = leaf_der, .index = 0 }).parse();
+    try leaf_p.verify(ca_p, now);
+    // An expired CA issues nothing.
+    try testing.expectError(error.CaExpired, buildLeaf(gpa, .{ .key = leaf_key.public_key, .ca_key = &ca_key, .ca_der = ca_der, .sans = &.{ip4(127, 0, 0, 1)}, .serial = @splat(0x22), .now = ca.not_after }));
 }

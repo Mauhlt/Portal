@@ -466,7 +466,12 @@ pub const Server = struct {
     fn serveTls(srv: *Server, conn: *Conn, creds: *const tls.Credentials) void {
         const io = srv.io;
         const st = srv.gpa.create(TlsConn) catch return;
-        defer srv.gpa.destroy(st);
+        defer {
+            // Plaintext buffers and traffic keys: wipe before the memory
+            // goes back to the allocator.
+            std.crypto.secureZero(u8, std.mem.asBytes(st));
+            srv.gpa.destroy(st);
+        }
         var sr = conn.stream.reader(io, &st.in);
         var sw = conn.stream.writer(io, &st.out);
         var entropy: [tls.entropy_len]u8 = undefined;

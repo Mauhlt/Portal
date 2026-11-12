@@ -300,6 +300,8 @@ fn printConstraints(c: *const x509.Constraints) void {
     if (c.n_dns == 1 and std.mem.eql(u8, c.dns[0], "invalid")) {
         std.debug.print("    DNS (none: only the reserved name 'invalid')\n", .{});
     } else for (c.dns[0..c.n_dns]) |d| std.debug.print("    DNS {s}\n", .{d});
+    if (c.closed_rfc822 and c.closed_uri and c.directory_portal)
+        std.debug.print("    email / URI names: none; directory name: O=Portal only\n", .{});
 }
 
 fn printDate(label: []const u8, unix_s: i64) void {
@@ -389,6 +391,15 @@ fn cmdCa(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []co
 
     std.debug.print("{s}\n  SHA-256 {s}\n  files   {s}\n", .{ ca.commonName(), fingerprint, store.dir });
     printDate("  valid until ", ca.info.not_after);
+    const ca_left = ca.secondsLeft(nowUnix(io));
+    if (ca_left <= 0) {
+        std.debug.print("  EXPIRED: run `portal ca init --force` (devices must re-trust)\n", .{});
+    } else {
+        std.debug.print("  remaining {d} days{s}\n", .{ @divFloor(ca_left, 86400), if (ca_left < pki.ca_warn_before_s) " (renew soon: `portal ca init --force`, devices must re-trust)" else "" });
+    }
+    if (!ca.currentProfile())
+        std.debug.print("  old CA profile (no extKeyUsage serverAuth / closed name forms) - run `portal ca init --force` to upgrade (devices must re-trust)\n", .{});
+    std.debug.print("  key     DPAPI, current user: any program running as you can use it\n", .{});
     std.debug.print("  permitted names (name constraints):\n", .{});
     printConstraints(&ca.constraints);
     const leaf_path = std.fs.path.join(gpa, &.{ store.dir, "leaf.crt" }) catch return;
@@ -445,6 +456,16 @@ fn setupTls(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, addr: s
         log.print("created {s}", .{created.commonName()});
         break :blk created;
     };
+    const ca_left = ca.secondsLeft(now);
+    if (ca_left <= 0)
+        fatal("the Portal CA has expired. Run `portal ca init --force`, then trust the new CA on every device.", .{});
+    if (ca_left < pki.ca_warn_before_s) {
+        std.debug.print("portal: warning: the Portal CA expires in {d} days; server certificates end with it. " ++
+            "Run `portal ca init --force` and re-trust it on each device.\n", .{@divFloor(ca_left, 86400)});
+        log.print("CA expires in {d} days", .{@divFloor(ca_left, 86400)});
+    }
+    if (!ca.currentProfile())
+        std.debug.print("portal: note: old CA profile - run `portal ca init --force` to upgrade (devices must re-trust).\n", .{});
 
     var sans: [1 + 16]x509.SanEntry = undefined;
     var n: usize = 0;

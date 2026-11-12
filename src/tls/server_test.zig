@@ -672,6 +672,10 @@ test "record layer: padding, key update, close_notify, and bad records" {
         .{ .kind = 8, .err = error.TlsAlertReceived, .alert = null }, // fatal alert from peer
         .{ .kind = 9, .err = error.TlsUnexpectedMessage, .alert = .unexpected_message }, // CCS after handshake
         .{ .kind = 10, .err = error.TlsUnexpectedMessage, .alert = .unexpected_message }, // unknown record type
+        .{ .kind = 11, .err = error.TlsUnexpectedMessage, .alert = .unexpected_message }, // plaintext alert after handshake
+        .{ .kind = 12, .err = error.TlsUnexpectedMessage, .alert = .unexpected_message }, // KeyUpdate split: 3 + 2 bytes
+        .{ .kind = 13, .err = error.TlsUnexpectedMessage, .alert = .unexpected_message }, // KeyUpdate split: header, then body
+        .{ .kind = 14, .err = error.TlsUnexpectedMessage, .alert = .unexpected_message }, // KeyUpdate + more in its record
     };
     for (bads) |b| {
         var list: std.ArrayList(u8) = .empty;
@@ -695,6 +699,16 @@ test "record layer: padding, key update, close_notify, and bad records" {
             8 => try sealInto(&list, gpa, &client, &.{ 2, 40 }, 21, 0),
             9 => try list.appendSlice(gpa, &.{ 20, 3, 3, 0, 1, 1 }),
             10 => try list.appendSlice(gpa, &.{ 99, 3, 3, 0, 1, 1 }),
+            11 => try list.appendSlice(gpa, &.{ 21, 3, 3, 0, 2, 2, 40 }),
+            12 => {
+                try sealInto(&list, gpa, &client, &.{ 24, 0, 0 }, 22, 0);
+                try sealInto(&list, gpa, &client, &.{ 1, 0 }, 22, 0);
+            },
+            13 => {
+                try sealInto(&list, gpa, &client, &.{ 24, 0, 0, 1 }, 22, 0);
+                try sealInto(&list, gpa, &client, &.{0}, 22, 0);
+            },
+            14 => try sealInto(&list, gpa, &client, &.{ 24, 0, 0, 1, 0, 24, 0, 0, 1, 0 }, 22, 0),
             else => unreachable,
         }
         var in = try FixedInput.init(gpa, list.items);
@@ -717,6 +731,23 @@ test "record layer: padding, key update, close_notify, and bad records" {
         try testing.expectError(error.ReadFailed, h.conn.readSome(&got));
     }
 
+    // A protected close_notify is still a clean end; a protected fatal
+    // alert is reported (and not answered).
+    {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        var client = Traffic.init(.aes_128_gcm_sha256, cs);
+        try sealInto(&list, gpa, &client, "x", 23, 0);
+        try sealInto(&list, gpa, &client, &.{ 1, 0 }, 21, 0);
+        var in = try FixedInput.init(gpa, list.items);
+        defer in.deinit(gpa);
+        var out: Io.Writer = .fixed(&h.out_buf);
+        appConn(gpa, h, &in, &out, cs, ss);
+        var got: [8]u8 = undefined;
+        try testing.expectEqual(@as(usize, 1), try h.conn.readSome(&got));
+        try testing.expectEqual(@as(usize, 0), try h.conn.readSome(&got));
+    }
+
     // Random record soup never panics.
     var prng: std.Random.DefaultPrng = .init(0xdec0de);
     const rand = prng.random();
@@ -737,6 +768,120 @@ test "record layer: padding, key update, close_notify, and bad records" {
     }
 }
 
+
+test "reader interface: std.Io.Reader end to end, any buffer size, no spin" {
+    const gpa = testing.allocator;
+    const h = try gpa.create(Harness);
+    defer gpa.destroy(h);
+    const cs: [32]u8 = @splat(1);
+    const ss: [32]u8 = @splat(2);
+
+    // Records: 6000 bytes (more than h.rbuf), an empty record, a KeyUpdate,
+    // a line, then close_notify.
+    var big: [6000]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i % 26));
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    var client = Traffic.init(.aes_128_gcm_sha256, cs);
+    try sealInto(&list, gpa, &client, &big, 23, 0);
+    try sealInto(&list, gpa, &client, "", 23, 0);
+    try sealInto(&list, gpa, &client, &.{ 24, 0, 0, 1, 0 }, 22, 0);
+    client.update();
+    try sealInto(&list, gpa, &client, "line one\nline two\n", 23, 5);
+    try sealInto(&list, gpa, &client, &.{ 1, 0 }, 21, 0);
+    const expected = big ++ "line one\nline two\n".*;
+
+    const Mode = enum { alloc_remaining, read_slice, take_lines, discard, tiny_buffer, no_buffer };
+    for (std.enums.values(Mode)) |mode| {
+        var in = try FixedInput.init(gpa, list.items);
+        defer in.deinit(gpa);
+        var out: Io.Writer = .fixed(&h.out_buf);
+        appConn(gpa, h, &in, &out, cs, ss);
+        var tiny: [7]u8 = undefined;
+        switch (mode) {
+            .tiny_buffer => h.conn.reader.buffer = &tiny,
+            .no_buffer => h.conn.reader.buffer = &.{},
+            else => {},
+        }
+        const r = &h.conn.reader;
+        switch (mode) {
+            .alloc_remaining, .tiny_buffer, .no_buffer => {
+                // stream() path (Writer.Allocating), and readVec with data
+                // for the no-buffer reader.
+                const all = try r.allocRemaining(gpa, .unlimited);
+                defer gpa.free(all);
+                try testing.expectEqualSlices(u8, &expected, all);
+                if (mode == .no_buffer) {
+                    var one: [1]u8 = undefined;
+                    try testing.expectEqual(@as(usize, 0), try r.readSliceShort(&one));
+                }
+            },
+            .read_slice => {
+                // readVec with a destination larger and smaller than a record.
+                var got: [expected.len]u8 = undefined;
+                try r.readSliceAll(got[0..100]);
+                try r.readSliceAll(got[100..]);
+                try testing.expectEqualSlices(u8, &expected, &got);
+                try testing.expectError(error.EndOfStream, r.takeByte());
+            },
+            .take_lines => {
+                // fill/peek path: readVec with an empty data[0] fills `buffer`.
+                try r.discardAll(big.len);
+                try testing.expectEqualStrings("line one", (try r.takeDelimiter('\n')).?);
+                try testing.expectEqualStrings("line two", (try r.takeDelimiter('\n')).?);
+                try testing.expectEqual(@as(?[]u8, null), try r.takeDelimiter('\n'));
+            },
+            .discard => {
+                try testing.expectEqual(expected.len, try r.discardRemaining());
+            },
+        }
+        try testing.expect(h.conn.received_close);
+    }
+
+    // A full buffer with nothing consumed and no destination: an error,
+    // not a zero-progress loop.
+    {
+        var in = try FixedInput.init(gpa, list.items);
+        defer in.deinit(gpa);
+        var out: Io.Writer = .fixed(&h.out_buf);
+        appConn(gpa, h, &in, &out, cs, ss);
+        var tiny: [4]u8 = undefined;
+        h.conn.reader.buffer = &tiny;
+        try h.conn.reader.fill(4);
+        var none: [1][]u8 = .{""};
+        try testing.expectError(error.ReadFailed, Connection.reader_vtable.readVec(&h.conn.reader, &none));
+        // A consumed prefix is moved out of the way instead.
+        h.conn.reader.toss(3);
+        try testing.expectEqual(@as(usize, 0), try Connection.reader_vtable.readVec(&h.conn.reader, &none));
+        try testing.expectEqualSlices(u8, expected[3..7], h.conn.reader.buffered());
+    }
+}
+
+test "handshake: a plaintext alert from the client is still accepted before Finished" {
+    const gpa = testing.allocator;
+    var pki = try x509.TestPki.init(gpa, 1_790_000_000, &.{x509.ip4(127, 0, 0, 1)});
+    defer pki.deinit(gpa);
+    var chain: [2][]const u8 = undefined;
+    const creds = testCredentials(&pki, &chain);
+    const entropy: [server.entropy_len]u8 = @splat(0x33);
+    const h = try gpa.create(Harness);
+    defer gpa.destroy(h);
+    // ClientHello, then (instead of Finished) a plaintext bad_certificate
+    // alert, as a client that rejects our chain may send.
+    const input = rfc_ch_record ++ [_]u8{ 21, 3, 3, 0, 2, 2, 42 };
+    var in = try FixedInput.init(gpa, &input);
+    defer in.deinit(gpa);
+    var out: Io.Writer = .fixed(&h.out_buf);
+    try testing.expectError(error.TlsAlertReceived, h.conn.handshake(&in.reader, &out, .{
+        .credentials = &creds,
+        .entropy = &entropy,
+        .read_buffer = &h.rbuf,
+        .write_buffer = &h.wbuf,
+    }));
+    try testing.expectEqual(server.AlertDescription.bad_certificate, h.conn.diag.received_alert.?);
+    try testing.expectEqual(@as(?server.AlertDescription, null), h.conn.diag.sent_alert);
+    h.conn.wipe();
+}
 
 // ---------------------------------------------------------- loopback tests
 
@@ -876,7 +1021,7 @@ test "interop: std client refuses a leaf from a different CA" {
     var c: x509.Constraints = .{};
     c.subnets[0] = try x509.Subnet.parse("127.0.0.1/32");
     c.n_subnets = 1;
-    const other_ca = try x509.buildCa(gpa, .{ .key = other_key, .tag = "ffffffff".*, .serial = @splat(3), .now = now, .constraints = &c });
+    const other_ca = try x509.buildCa(gpa, .{ .key = &other_key, .tag = "ffffffff".*, .serial = @splat(3), .now = now, .constraints = &c });
     defer gpa.free(other_ca);
 
     var ls: LoopServer = undefined;

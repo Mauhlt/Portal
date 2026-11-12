@@ -14,7 +14,9 @@
 //!     (and dropped) during the handshake, as RFC 8446 D.4 requires
 //!   * record layer: 16 KiB plaintext limit, padding removal, per-direction
 //!     sequence numbers, incoming KeyUpdate (answered with our own when
-//!     requested), our own KeyUpdate before AES-GCM usage limits, close_notify
+//!     requested), our own KeyUpdate before AES-GCM usage limits, close_notify;
+//!     after the handshake every record must be protected (a plaintext
+//!     alert is refused with unexpected_message)
 //!
 //! Refused (fatal alert): TLS <= 1.2, PSK/resumption is ignored (we never
 //! issue tickets), early data (0-RTT) offers, client certificates (never
@@ -219,7 +221,8 @@ pub const Traffic = struct {
 
     /// KeyUpdate: next generation of this direction's secret.
     pub fn update(t: *Traffic) void {
-        const next = expandLabel(t.secret, "traffic upd", "", 32);
+        var next = expandLabel(t.secret, "traffic upd", "", 32);
+        defer crypto.secureZero(u8, &next);
         const suite = t.suite;
         t.wipe();
         t.* = init(suite, next);
@@ -645,7 +648,7 @@ pub const Connection = struct {
     ccs_allowed: bool = false,
     ccs_seen: u8 = 0,
 
-    pub const reader_vtable: *const Io.Reader.VTable = &.{ .stream = readerStream, .readVec = readerReadVec };
+    pub const reader_vtable: *const Io.Reader.VTable = &.{ .stream = readerStream, .discard = readerDiscard, .readVec = readerReadVec };
     pub const writer_vtable: *const Io.Writer.VTable = &.{ .drain = writerDrain, .flush = writerFlush };
 
     /// Performs the server handshake on `c` (which must stay at this
@@ -847,7 +850,8 @@ pub const Connection = struct {
 
         if (!c.read_protected or ct != @backingInt(ContentType.application_data)) {
             // Plaintext. Once protection is on, only the legacy CCS and
-            // (unauthenticated, terminal) alerts may appear in the clear.
+            // (unauthenticated, terminal) alerts may appear in the clear,
+            // and only during the handshake: nextRecord refuses both.
             if (c.read_protected and ct == @backingInt(ContentType.handshake)) return c.fail(.unexpected_message);
             if (ct == @backingInt(ContentType.application_data)) return c.fail(.unexpected_message);
             if (len > max_plaintext) return c.fail(.record_overflow);
@@ -921,10 +925,13 @@ pub const Connection = struct {
     fn nextRecord(c: *Connection) Error!void {
         errdefer c.read_failed = true;
         const rec = try c.readRecord();
-        if (!rec.protected) {
-            if (rec.ct == @backingInt(ContentType.alert)) return c.alertReceived(rec.data);
-            return c.fail(.unexpected_message);
-        }
+        // After the handshake every record must be protected, alerts
+        // included (RFC 8446 5, 6). A plaintext alert here is
+        // unauthenticated: anyone on the path could inject one to tear the
+        // connection down with a forged reason. Plaintext alerts stay
+        // accepted during the handshake (readHandshake), where a client may
+        // not have keys yet.
+        if (!rec.protected) return c.fail(.unexpected_message);
         switch (rec.ct) {
             @backingInt(ContentType.application_data) => {
                 c.plain_pos = 0;
@@ -943,10 +950,15 @@ pub const Connection = struct {
             @backingInt(ContentType.handshake) => {
                 // Only KeyUpdate is valid after the handshake (no client
                 // auth, no tickets from a client). It precedes a key change,
-                // so it must be alone in its record.
+                // so it must be alone in its record: a KeyUpdate split
+                // across records, or followed by more data in its record,
+                // is unexpected_message (RFC 8446 5.1); a wrong length
+                // field is decode_error.
                 if (rec.data.len < 4) return c.fail(.unexpected_message);
                 if (rec.data[0] != @backingInt(HandshakeType.key_update)) return c.fail(.unexpected_message);
-                if (rec.data.len != 5 or rec.data[1] != 0 or rec.data[2] != 0 or rec.data[3] != 1) return c.fail(.decode_error);
+                const blen = std.mem.readInt(u24, rec.data[1..4], .big);
+                if (blen != 1) return c.fail(.decode_error);
+                if (rec.data.len != 5) return c.fail(.unexpected_message);
                 switch (rec.data[4]) {
                     0 => {},
                     1 => c.key_update_due.store(true, .release),
@@ -975,14 +987,58 @@ pub const Connection = struct {
         }
     }
 
-    fn readerFill(c: *Connection) Io.Reader.Error!void {
-        const r = &c.reader;
+    // `reader` interface. Decrypted bytes wait in `plain`; each vtable call
+    // either hands some of them out or reads one more record (which may
+    // carry no data: a KeyUpdate, an empty record). Either way it makes
+    // progress, so no caller loop can spin.
+
+    /// Pending plaintext, reading records until there is some, or returns
+    /// an empty slice after one record without data.
+    fn pendingPlain(c: *Connection) Io.Reader.Error![]const u8 {
         if (c.plain_pos == c.plain_end) {
             if (c.received_close) return error.EndOfStream;
             if (c.read_failed) return error.ReadFailed;
             c.nextRecord() catch return error.ReadFailed;
             if (c.received_close) return error.EndOfStream;
-            return;
+        }
+        return c.plain[c.plain_pos..c.plain_end];
+    }
+
+    fn readerStream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const c: *Connection = @alignCast(@fieldParentPtr("reader", r));
+        const pending = limit.sliceConst(try c.pendingPlain());
+        if (pending.len == 0) return 0;
+        const n = try w.write(pending);
+        c.plain_pos += n;
+        return n;
+    }
+
+    fn readerDiscard(r: *Io.Reader, limit: Io.Limit) Io.Reader.Error!usize {
+        const c: *Connection = @alignCast(@fieldParentPtr("reader", r));
+        const n = limit.minInt((try c.pendingPlain()).len);
+        c.plain_pos += n;
+        return n;
+    }
+
+    /// Copies into `data` first; only when that has no room (data[0] empty:
+    /// a fill/peek) into `reader.buffer`, moving buffered bytes to the front
+    /// if the free tail is full. With no room anywhere (a zero-length or
+    /// full buffer and no destination) it fails rather than returning 0
+    /// forever.
+    fn readerReadVec(r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const c: *Connection = @alignCast(@fieldParentPtr("reader", r));
+        const pending = try c.pendingPlain();
+        if (pending.len == 0) return 0;
+        var n: usize = 0;
+        for (data) |d| {
+            const k = @min(d.len, pending.len - n);
+            @memcpy(d[0..k], pending[n..][0..k]);
+            n += k;
+            if (n == pending.len) break;
+        }
+        if (n > 0) {
+            c.plain_pos += n;
+            return n;
         }
         if (r.end == r.buffer.len and r.seek > 0) {
             const keep = r.end - r.seek;
@@ -990,24 +1046,11 @@ pub const Connection = struct {
             r.seek = 0;
             r.end = keep;
         }
-        const n = @min(r.buffer.len - r.end, c.plain_end - c.plain_pos);
-        @memcpy(r.buffer[r.end..][0..n], c.plain[c.plain_pos..][0..n]);
-        r.end += n;
-        c.plain_pos += n;
-    }
-
-    fn readerStream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
-        _ = w;
-        _ = limit;
-        const c: *Connection = @alignCast(@fieldParentPtr("reader", r));
-        try c.readerFill();
-        return 0;
-    }
-
-    fn readerReadVec(r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
-        _ = data;
-        const c: *Connection = @alignCast(@fieldParentPtr("reader", r));
-        try c.readerFill();
+        const k = @min(r.buffer.len - r.end, pending.len);
+        if (k == 0) return error.ReadFailed;
+        @memcpy(r.buffer[r.end..][0..k], pending[0..k]);
+        r.end += k;
+        c.plain_pos += k;
         return 0;
     }
 

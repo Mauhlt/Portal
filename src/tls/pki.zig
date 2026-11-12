@@ -10,6 +10,29 @@
 //! account. The CA key is decrypted only while signing a new server
 //! certificate and wiped right after.
 //!
+//! What DPAPI (CurrentUser) does and does not protect: the blobs are
+//! useless on another machine or account, and to anyone reading the disk
+//! offline without the user's password. They are NOT protected from
+//! software running as this user: any such process can call
+//! CryptUnprotectData and get the CA key (the "purpose" entropy is not a
+//! secret; it is in this file). That is the residual risk the CA's
+//! profile limits: a stolen CA key can only mint TLS server certificates
+//! for the permitted addresses (see x509.zig).
+//!
+//! Why there is no "prompt on unprotect" option
+//! (CRYPTPROTECT_PROMPT_ON_UNPROTECT): it makes CryptUnprotectData show a
+//! modal GUI dialog, which (a) blocks `portal run` whenever the server
+//! certificate is renewed, including unattended starts and sessions
+//! without a desktop (with CRYPTPROTECT_UI_FORBIDDEN the call fails with
+//! ERROR_PASSWORD_RESTRICTION, checked on Windows 11); (b) at the
+//! default "medium" security level is a click-through confirmation,
+//! which any malware running as the user can trigger and wait for, so it
+//! adds little against the threat above; and (c) only the
+//! "high" level adds a password, which is an extra secret to manage once
+//! a year. A user who wants the CA key off this machine can instead keep
+//! %LOCALAPPDATA%\Portal\tls\ca.key offline and restore it before the
+//! server certificate is due for renewal (`portal ca` shows when).
+//!
 //! Also produces the device exports: portal-ca.cer (DER), portal-ca.pem
 //! and portal-ca.mobileconfig (Apple configuration profile).
 
@@ -85,8 +108,10 @@ pub const Store = struct {
             s.gpa.free(plain);
         }
         if (plain.len != 32) return error.BadKeyFile;
-        const sk = try x509.Ecdsa.SecretKey.fromBytes(plain[0..32].*);
-        const kp = try KeyPair.fromSecretKey(sk);
+        var sk = try x509.Ecdsa.SecretKey.fromBytes(plain[0..32].*);
+        defer std.crypto.secureZero(u8, &sk.bytes);
+        var kp = try KeyPair.fromSecretKey(sk);
+        errdefer wipeKey(&kp);
         if (!std.mem.eql(u8, &kp.public_key.toUncompressedSec1(), public_key)) return error.KeyDoesNotMatchCertificate;
         return kp;
     }
@@ -116,6 +141,18 @@ pub const Ca = struct {
         gpa.free(ca.der);
     }
 
+    /// False for a CA made by an older version (no extKeyUsage, open
+    /// rfc822Name/URI/directoryName forms). It still works; upgrading
+    /// means `portal ca init --force` and trusting the new CA again.
+    pub fn currentProfile(ca: *const Ca) bool {
+        return x509.isCurrentCaProfile(ca.info, &ca.constraints);
+    }
+
+    /// Seconds until the CA expires (negative once it has).
+    pub fn secondsLeft(ca: *const Ca, now: i64) i64 {
+        return ca.info.not_after -| now;
+    }
+
     pub fn commonName(ca: *const Ca) []const u8 {
         // Last RDN of the subject is the CN we wrote.
         const s = ca.info.subject_raw;
@@ -126,8 +163,17 @@ pub const Ca = struct {
     }
 };
 
-fn caFromDer(gpa: Allocator, der_bytes: []u8) !Ca {
-    errdefer gpa.free(der_bytes);
+/// Warn when the CA has less than this left: a new server certificate
+/// (397 days) would then be cut short at the CA's expiry.
+pub const ca_warn_before_s: i64 = 400 * 86400;
+
+/// Test hook: makes caFromDer fail, to exercise the callers' error paths.
+var test_fail_ca_from_der = false;
+
+/// Wraps `der_bytes` into a Ca. Takes ownership only on success: on error
+/// the caller still owns (and frees) `der_bytes`.
+fn caFromDer(der_bytes: []u8) !Ca {
+    if (@import("builtin").is_test and test_fail_ca_from_der) return error.NotAPortalCa;
     const info = try x509.parse(der_bytes);
     if (!info.is_ca or info.name_constraints.len == 0) return error.NotAPortalCa;
     try x509.verifySignedBy(info, info);
@@ -140,7 +186,8 @@ pub fn loadCa(s: Store) !?Ca {
         error.FileNotFound => return null,
         else => return err,
     };
-    return try caFromDer(s.gpa, der_bytes);
+    errdefer s.gpa.free(der_bytes);
+    return try caFromDer(der_bytes);
 }
 
 pub fn defaultConstraints() x509.Constraints {
@@ -163,18 +210,19 @@ pub fn initCa(s: Store, constraints: *const x509.Constraints, now: i64, force: b
     try s.io.randomSecure(&rnd);
     const tag = std.fmt.bytesToHex(rnd[0..4], .lower);
     const der_bytes = try x509.buildCa(s.gpa, .{
-        .key = key,
+        .key = &key,
         .tag = tag,
         .serial = rnd[4..20].*,
         .now = now,
         .constraints = constraints,
         .noise = rnd[20..52].*,
     });
+    // Owned here until caFromDer succeeds (it never frees on error).
     errdefer s.gpa.free(der_bytes);
     // Key first: a certificate without its key would be useless.
     try s.writeKey("ca.key", key, ca_key_purpose);
     try s.writeAtomic("ca.crt", der_bytes);
-    return caFromDer(s.gpa, der_bytes);
+    return caFromDer(der_bytes);
 }
 
 // -------------------------------------------------------------------- leaf
@@ -206,7 +254,11 @@ pub fn ensureLeaf(s: Store, ca: *const Ca, sans: []const x509.SanEntry, now: i64
         defer if (!keep) s.gpa.free(der_bytes);
         const info = x509.parse(der_bytes) catch break :check "stored certificate unreadable";
         x509.verifySignedBy(info, ca.info) catch break :check "issued by a different CA";
-        if (info.not_after -| now < x509.renew_before_s) break :check "expires within 30 days";
+        if (info.not_after > ca.info.not_after) break :check "outlives the CA";
+        // A certificate already cut short at the CA's expiry cannot get
+        // any longer: keep it rather than re-issue on every start.
+        if (info.not_after -| now < x509.renew_before_s and info.not_after < ca.info.not_after)
+            break :check "expires within 30 days";
         if (info.not_before > now +| 300) break :check "not valid yet (clock changed?)";
         if (!std.mem.eql(u8, info.san, want_san)) break :check "addresses changed";
         if (!std.mem.eql(u8, info.subject_raw, want_subject)) break :check "certificate profile changed";
@@ -223,7 +275,7 @@ pub fn ensureLeaf(s: Store, ca: *const Ca, sans: []const x509.SanEntry, now: i64
     try s.io.randomSecure(&rnd);
     const der_bytes = try x509.buildLeaf(s.gpa, .{
         .key = key.public_key,
-        .ca_key = ca_key,
+        .ca_key = &ca_key,
         .ca_der = ca.der,
         .sans = sans,
         .serial = rnd[0..16].*,
@@ -463,4 +515,63 @@ test "pki: CA init, leaf issue/reuse/renew, export" {
     var raw: [2048]u8 = undefined;
     const n = try dec.decode(&raw, mc[start..end]);
     try testing.expectEqualSlices(u8, ca2.der, raw[0..n]);
+}
+
+test "pki: CA load/create failures free the certificate exactly once" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [1024]u8 = undefined;
+    const base_len = try tmp.dir.realPath(io, &path_buf);
+    const dir = try std.fmt.allocPrint(gpa, "{s}\\tls", .{path_buf[0..base_len]});
+    defer gpa.free(dir);
+    const s: Store = .{ .gpa = gpa, .io = io, .dir = dir };
+    const c = defaultConstraints();
+
+    // initCa: caFromDer fails after the certificate was built and written.
+    // (Before the fix both caFromDer's errdefer and initCa's freed it; the
+    // testing allocator reports the double free.)
+    test_fail_ca_from_der = true;
+    defer test_fail_ca_from_der = false;
+    try testing.expectError(error.NotAPortalCa, initCa(s, &c, 1_790_000_000, false));
+    try testing.expectError(error.NotAPortalCa, loadCa(s));
+    test_fail_ca_from_der = false;
+
+    // loadCa on a corrupt file and on a certificate that is not a CA.
+    try s.writeAtomic("ca.crt", "not a certificate");
+    try testing.expectError(error.DerMalformed, loadCa(s));
+    var pki = try x509.TestPki.init(gpa, 1_790_000_000, &.{x509.ip4(127, 0, 0, 1)});
+    defer pki.deinit(gpa);
+    try s.writeAtomic("ca.crt", pki.leaf_der);
+    try testing.expectError(error.NotAPortalCa, loadCa(s));
+}
+
+test "pki: CA expiry caps the server certificate and is reported" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [1024]u8 = undefined;
+    const base_len = try tmp.dir.realPath(io, &path_buf);
+    const dir = try std.fmt.allocPrint(gpa, "{s}\\tls", .{path_buf[0..base_len]});
+    defer gpa.free(dir);
+    const s: Store = .{ .gpa = gpa, .io = io, .dir = dir };
+    const c = defaultConstraints();
+    var ca = try initCa(s, &c, 1_790_000_000, false);
+    defer ca.deinit(gpa);
+    try testing.expect(ca.currentProfile());
+    try testing.expect(ca.secondsLeft(1_790_000_000) > ca_warn_before_s);
+
+    const late = ca.info.not_after - 200 * 86400;
+    try testing.expect(ca.secondsLeft(late) < ca_warn_before_s);
+    const sans = [_]x509.SanEntry{x509.ip4(127, 0, 0, 1)};
+    var l1 = try ensureLeaf(s, &ca, &sans, late);
+    defer l1.deinit(gpa);
+    try testing.expectEqual(ca.info.not_after, l1.not_after);
+    // 10 days before the end: capped, so kept instead of re-issued.
+    var l2 = try ensureLeaf(s, &ca, &sans, ca.info.not_after - 10 * 86400);
+    defer l2.deinit(gpa);
+    try testing.expect(l2.renewed == null);
+    try testing.expect(ca.secondsLeft(ca.info.not_after + 1) < 0);
 }
