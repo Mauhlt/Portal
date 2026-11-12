@@ -7,9 +7,9 @@
     .dependencies = .{
         // The owner's Renderer (Vulkan), used by the shared view module
         // (client/src/view) for `portal run`'s window and `portal connect`.
-        // Branch portal-client in a worktree for now; once the owner merges
-        // that branch, change this to "../Renderer".
-        .Renderer = .{ .path = "../Renderer-wt-portal" },
+        // The de-facto Renderer: the owner's main checkout next to this repo,
+        // no worktree, no pin.
+        .Renderer = .{ .path = "../Renderer" },
         // The owner's Image package: Image.check validates inline images
         // (server and every client, client/src/image/imgcheck.zig) and its
         // PNG decoder decodes them (client/src/image/imgdec.zig). Its own

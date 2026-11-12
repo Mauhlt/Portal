@@ -445,8 +445,8 @@ zig build          # debug build in zig-out\bin: portal.exe, portalctl.exe, port
 zig build e2e      # end-to-end tests against real portalctl processes (minutes)
 ```
 
-The build needs the owner's Renderer next to this repo (`build.zig.zon`:
-`../Renderer-wt-portal` for now, `../Renderer` once that branch is merged).
+The build needs the owner's Renderer checkout next to this repo
+(`build.zig.zon`: `../Renderer`, the de-facto Renderer, no worktree, no pin).
 `client/` still builds the standalone `portal-client` on its own (for Linux
 and macOS laptops); its `src/view` and `src/connect.zig` are also the
 "view" and "client" modules of the root build.

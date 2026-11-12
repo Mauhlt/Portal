@@ -4,9 +4,9 @@
     .minimum_zig_version = "0.18.0-dev.4+5a23bf4b2",
     .fingerprint = 0xd9ed1b14d35f6f61,
     .dependencies = .{
-        // The owner's Renderer (branch portal-client). Once merged into the
-        // main Renderer checkout, change this to "../../Renderer".
-        .Renderer = .{ .path = "../../Renderer-wt-portal" },
+        // The owner's Renderer (Font, Window, Instanced2D): the de-facto
+        // checkout, no worktree, no pin.
+        .Renderer = .{ .path = "../../Renderer" },
         // The owner's Image package (Image.check + PNG decoder): the de-facto
         // checkout, no pin.
         .Image = .{ .path = "../../Image" },

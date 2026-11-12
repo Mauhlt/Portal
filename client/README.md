@@ -72,9 +72,8 @@ zig build -Dtarget=x86_64-linux-gnu        # cross-compiles without any SDK
 zig build -Dtarget=aarch64-macos
 ```
 
-`build.zig.zon` points at the Renderer worktree (`../../Renderer-wt-portal`,
-branch `portal-client`). After that branch is merged, change it to
-`../../Renderer`.
+`build.zig.zon` points at the owner's Renderer checkout next to this repo
+(`../../Renderer`): the de-facto Renderer, no worktree, no pin.
 
 ## Layout
 
