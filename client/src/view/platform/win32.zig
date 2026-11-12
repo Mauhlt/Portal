@@ -182,7 +182,7 @@ pub const Window = struct {
         while (PeekMessageW(&msg, null, 0, 0, PM_REMOVE) != 0) {
             _ = TranslateMessage(&msg);
             _ = DispatchMessageW(&msg);
-            if (self.queue.len > 0) break;
+            if (self.queue.pending()) break;
         }
         return self.queue.pop();
     }
@@ -192,8 +192,12 @@ pub const Window = struct {
         return self.queue.pop();
     }
 
+    /// `platform.forever` (= INFINITE) waits with no timeout; wake()'s
+    /// posted WM_APP (QS_POSTMESSAGE, part of QS_ALLINPUT) still ends it,
+    /// and MWMO_INPUTAVAILABLE makes a message posted before the call
+    /// count too, so a wake cannot be lost between pollEvent and here.
     pub fn waitEvents(self: *Window, timeout_ms: u32) void {
-        if (self.queue.len > 0) return;
+        if (self.queue.pending()) return;
         _ = MsgWaitForMultipleObjectsEx(0, null, timeout_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
     }
 
@@ -371,7 +375,7 @@ pub const Window = struct {
             self.queue.push(.{ .key = .{ .key = k, .mods = mods } });
             // F-keys are consumed (F10 would otherwise enter menu mode);
             // the others are still translated (their WM_CHAR is filtered).
-            return @intFromEnum(k) >= @intFromEnum(input.Key.f1);
+            return @backingInt(k) >= @backingInt(input.Key.f1);
         }
         if (mods.ctrl and !mods.alt) {
             switch (vk) {
@@ -509,9 +513,78 @@ fn wndProc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) callconv(WINAPI) LRESU
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-fn utf16Title(title: []const u8, out: *[256:0]u16) void {
-    const n = std.unicode.utf8ToUtf16Le(out[0..255], title) catch 0;
-    out[n] = 0;
+/// Encodes `title` into `out`, NUL-terminated, truncating at the buffer
+/// limit on a code point boundary (a BMP code point takes one unit, an
+/// astral one two; a pair never splits). Invalid UTF-8 yields an empty
+/// title. The program in the terminal controls the title (OSC 0/2), so this
+/// must never write past `out` whatever its length (std's utf8ToUtf16Le
+/// does not bounds-check the destination).
+pub fn utf16Title(title: []const u8, out: *[256:0]u16) void {
+    const cap: usize = out.len; // 256 units; out[256] is the sentinel slot
+    var n: usize = 0;
+    defer out[n] = 0;
+    const v = std.unicode.Utf8View.init(title) catch return;
+    var it = v.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp < 0x10000) {
+            if (n + 1 > cap) return;
+            out[n] = std.mem.nativeToLittle(u16, @intCast(cp));
+            n += 1;
+        } else {
+            if (n + 2 > cap) return;
+            const u = cp - 0x10000;
+            out[n] = std.mem.nativeToLittle(u16, @intCast(0xD800 + (u >> 10)));
+            out[n + 1] = std.mem.nativeToLittle(u16, @intCast(0xDC00 + (u & 0x3FF)));
+            n += 2;
+        }
+    }
+}
+
+test "utf16Title truncates long titles inside the buffer" {
+    var title: [600]u8 = undefined;
+    @memset(&title, 'A');
+    var out: [256:0]u16 = undefined;
+    @memset(&out, 0xBEEF);
+    utf16Title(&title, &out);
+    const n = std.mem.len(@as([*:0]const u16, &out));
+    try std.testing.expectEqual(@as(usize, 256), n);
+    for (out[0..n]) |u| try std.testing.expectEqual(@as(u16, 'A'), u);
+    try std.testing.expectEqual(@as(u16, 0), out[256]);
+}
+
+test "utf16Title keeps surrogate pairs whole" {
+    // 300 x U+1F600 (4 bytes, 2 units each): 128 fit exactly.
+    var title: [300 * 4]u8 = undefined;
+    var i: usize = 0;
+    while (i < title.len) : (i += 4) _ = try std.unicode.utf8Encode(0x1F600, title[i..][0..4]);
+    var out: [256:0]u16 = undefined;
+    utf16Title(&title, &out);
+    try std.testing.expectEqual(@as(usize, 256), std.mem.len(@as([*:0]const u16, &out)));
+    try std.testing.expectEqual(@as(u16, 0xD83D), out[254]);
+    try std.testing.expectEqual(@as(u16, 0xDE00), out[255]);
+
+    // One ASCII unit first: the 128th emoji no longer fits and is dropped
+    // whole rather than leaving a lone high surrogate.
+    var mixed: [1 + 300 * 4]u8 = undefined;
+    mixed[0] = 'x';
+    @memcpy(mixed[1..], &title);
+    utf16Title(&mixed, &out);
+    const n = std.mem.len(@as([*:0]const u16, &out));
+    try std.testing.expectEqual(@as(usize, 255), n);
+    try std.testing.expectEqual(@as(u16, 0xDE00), out[254]);
+    const back = try std.unicode.utf16LeToUtf8Alloc(std.testing.allocator, out[0..n]);
+    defer std.testing.allocator.free(back);
+    try std.testing.expectEqual(@as(usize, 1 + 127 * 4), back.len);
+}
+
+test "utf16Title: short, empty and invalid input" {
+    var out: [256:0]u16 = undefined;
+    utf16Title("h\u{e9}", &out);
+    try std.testing.expectEqualSlices(u16, &.{ 'h', 0xE9, 0 }, out[0..3]);
+    utf16Title("", &out);
+    try std.testing.expectEqual(@as(u16, 0), out[0]);
+    utf16Title("ok\xff", &out);
+    try std.testing.expectEqual(@as(u16, 0), out[0]);
 }
 
 fn enableDpiAwareness() void {

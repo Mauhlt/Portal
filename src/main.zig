@@ -35,6 +35,9 @@ const tls_server = @import("tls/server.zig");
 const x509 = @import("tls/x509.zig");
 const pki = @import("tls/pki.zig");
 
+/// [fix2/desk] Root panic handler: logs to portal.log, message box in GUI mode.
+pub const panic = @import("panic.zig").handler;
+
 pub const portal_version = "0.1.0";
 const default_listen = "127.0.0.1:8420";
 
@@ -86,6 +89,13 @@ const usage =
     \\                         program is itself a shell (cmd, PowerShell,
     \\                         bash, wsl...). Refused by default: remote
     \\                         typing into a shell is a remote shell.
+    \\      --project NAME     Project name for the window title ("Portal -
+    \\                         NAME"; printable, one line, at most 64 bytes).
+    \\                         Without it the title is "Portal - No project";
+    \\                         the program's own title is never shown.
+    \\      --allow-elevated   Run even as administrator. Refused by default:
+    \\                         the session program, and everything a paired
+    \\                         device types into it, would run as admin.
     \\      --no-tls           Serve plain HTTP instead of HTTPS (tests and
     \\                         debugging only; WireGuard is then the only
     \\                         protection for cookies and keystrokes).
@@ -599,6 +609,10 @@ const RunOptions = struct {
     no_tls: bool = false,
     /// Allow instruct/text input when the session program is a shell.
     allow_remote_shell: bool = false,
+    /// `--project`: shown in the window title (gui.validProject).
+    project: ?[]const u8 = null,
+    /// `--allow-elevated`: run even with an administrator token.
+    allow_elevated: bool = false,
     command: []const []const u8 = &.{"claude"},
 };
 
@@ -613,7 +627,7 @@ fn parseRunArgs(gpa: Allocator, args: []const []const u8) !RunOptions {
             break;
         }
         const needs_value = std.mem.eql(u8, a, "--listen") or std.mem.eql(u8, a, "--host") or
-            std.mem.eql(u8, a, "--input") or std.mem.eql(u8, a, "--cwd");
+            std.mem.eql(u8, a, "--input") or std.mem.eql(u8, a, "--cwd") or std.mem.eql(u8, a, "--project");
         if (needs_value and i + 1 >= args.len) fatal("{s} needs a value", .{a});
         if (std.mem.eql(u8, a, "--listen")) {
             i += 1;
@@ -626,6 +640,12 @@ fn parseRunArgs(gpa: Allocator, args: []const []const u8) !RunOptions {
             o.policy = keymap.Policy.parse(args[i]) orelse fatal("--input must be none, keys, instruct or text", .{});
         } else if (std.mem.eql(u8, a, "--allow-remote-shell")) {
             o.allow_remote_shell = true;
+        } else if (std.mem.eql(u8, a, "--allow-elevated")) {
+            o.allow_elevated = true;
+        } else if (std.mem.eql(u8, a, "--project")) {
+            i += 1;
+            if (!gui.validProject(args[i])) fatal("--project must be 1-{d} bytes of printable text on one line", .{gui.max_project_bytes});
+            o.project = args[i];
         } else if (std.mem.eql(u8, a, "--no-tls")) {
             o.no_tls = true;
         } else if (std.mem.eql(u8, a, "--https")) {
@@ -750,9 +770,10 @@ const Threads = struct {
 
     /// GUI mode: the main thread runs the window, so the child is waited
     /// for here.
-    fn waitChild(pty: *conpty.Pty, code: *std.atomic.Value(u32), done: *std.atomic.Value(bool)) void {
+    fn waitChild(pty: *conpty.Pty, code: *std.atomic.Value(u32), done: *std.atomic.Value(bool), host: *gui.LocalHost) void {
         code.store(pty.wait(), .release);
         done.store(true, .release);
+        host.wakeChildExited(); // the GUI loop sleeps until woken
     }
 };
 
@@ -760,6 +781,9 @@ const Threads = struct {
 /// inherit Portal's. `--cwd` must name an existing directory (relative to
 /// Portal's current directory); otherwise workdir.defaultCwd decides.
 fn childCwd(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, data_dir: []const u8, arg: ?[]const u8) ?[:0]u16 {
+    // [fix2/desk] verify PORTAL_VIA_LAUNCHER against the parent pid and
+    // remove it from our environment before the child is spawned.
+    const via_launcher = workdir.takeLauncherFlag(env.get(workdir.launcher_env));
     const here: ?[:0]u8 = std.process.currentPathAlloc(io, gpa) catch null;
     defer if (here) |h| gpa.free(h);
     var chosen: []const u8 = undefined;
@@ -779,7 +803,7 @@ fn childCwd(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, data_di
     } else {
         const releases = std.fs.path.join(gpa, &.{ data_dir, "releases" }) catch null;
         defer if (releases) |r| gpa.free(r);
-        const has_parent = workdir.hasParentConsole(env.get(workdir.launcher_env) != null);
+        const has_parent = workdir.hasParentConsole(via_launcher);
         chosen = workdir.defaultCwd(has_parent, here, env.get("USERPROFILE"), releases) orelse return null;
         // A missing home folder is not worth failing over: inherit instead.
         var d = Io.Dir.cwd().openDir(io, chosen, .{}) catch return null;
@@ -791,6 +815,15 @@ fn childCwd(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, data_di
 fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
     var opts = try parseRunArgs(gpa, args);
     defer opts.hosts.deinit(gpa);
+
+    // [fix2/desk] Never run elevated by accident: the child and all remote
+    // input would run as administrator. A double-clicked Portal's console
+    // closes at once, so explain it in a message box too.
+    const elevation = conpty.elevationCheck(conpty.isElevated(), opts.allow_elevated);
+    if (elevation == .refuse) {
+        if (!opts.console) console_freed = true; // fatal() then shows a message box
+        fatal("Portal is running as administrator, so the session program and everything a paired device types would run as administrator. Run Portal from a normal (non-admin) terminal, or pass --allow-elevated if you really mean it.", .{});
+    }
 
     // Remote typing into a shell is a remote shell: refuse unless explicit.
     if ((opts.policy == .instruct or opts.policy == .text) and isShellProgram(opts.command[0]) and !opts.allow_remote_shell)
@@ -818,6 +851,10 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     var log = Log.open(gpa, io, log_path) catch |err|
         fatal("cannot open audit log {s} ({t}); refusing to run without it.", .{ log_path, err });
     defer log.close();
+    if (elevation == .warn) { // [fix2/desk]
+        std.debug.print("portal: WARNING: ELEVATED: remote input runs as administrator (--allow-elevated)\n", .{});
+        log.print("start: ELEVATED: remote input runs as administrator (--allow-elevated)", .{});
+    }
 
     // HTTPS: Portal's CA and a server certificate for the listen address.
     // Everything here lives until the process exits.
@@ -877,10 +914,12 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         std.debug.print("portal: opening the Portal window; this console is not used by the session.\n", .{});
         _ = FreeConsole();
         console_freed = true;
+        @import("panic.zig").gui_mode.store(true, .release); // [fix2/desk] panics show a message box
         const h = gui.LocalHost.init(gpa, io, .{
             .command_name = std.fs.path.basename(opts.command[0]),
             .listen_host = listen_host,
             .policy = opts.policy,
+            .project = opts.project,
         }, &child_done) catch |err| fatal("cannot open the Portal window: {t}", .{err});
         const sz = h.initialSize();
         initial = .{ .cols = sz[0], .rows = sz[1] };
@@ -994,7 +1033,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         // GUI: the window owns the main thread; a waiter thread watches
         // the child. Closing the window ends the session the same way the
         // child exiting does (below): ClosePseudoConsole ends the child.
-        const waiter = std.Thread.spawn(.{}, Threads.waitChild, .{ &pty, &child_code, &child_done }) catch |err|
+        const waiter = std.Thread.spawn(.{}, Threads.waitChild, .{ &pty, &child_code, &child_done, h }) catch |err|
             fatal("cannot start child waiter thread: {t}", .{err});
         waiter.detach();
         switch (h.run()) {
@@ -1005,6 +1044,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
                 log.print("local window closed: ending the session", .{});
             },
         }
+        log.print("local window: {d} wake-ups, {d} frames presented", .{ h.wakeups, h.presents }); // [fix2/desk]
         code = child_code.load(.acquire);
     } else {
         code = pty.wait();
@@ -1049,6 +1089,8 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
 }
 
 test {
+    _ = @import("panic.zig");
+    _ = @import("conpty.zig");
     _ = @import("gui.zig");
     _ = @import("localgrid.zig");
     _ = @import("localinput.zig");
@@ -1077,6 +1119,17 @@ test "parseListen" {
     try std.testing.expectError(error.MissingPort, parseListen("10.8.0.1"));
     try std.testing.expectError(error.BadPort, parseListen("10.8.0.1:0"));
     try std.testing.expectError(error.BadPort, parseListen("10.8.0.1:99999"));
+}
+
+test "run: --project and --allow-elevated" {
+    var o = try parseRunArgs(std.testing.allocator, &.{});
+    defer o.hosts.deinit(std.testing.allocator);
+    try std.testing.expect(o.project == null);
+    try std.testing.expect(!o.allow_elevated);
+    var p = try parseRunArgs(std.testing.allocator, &.{ "--project", "acme-api", "--allow-elevated", "--", "cmd.exe" });
+    defer p.hosts.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("acme-api", p.project.?);
+    try std.testing.expect(p.allow_elevated);
 }
 
 test "run defaults to HTTPS; --https is gone" {

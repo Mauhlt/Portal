@@ -26,6 +26,7 @@ pub const font = struct {
 test {
     _ = TermView;
     _ = grid;
+    _ = platform;
     _ = wcwidth;
     _ = font.ttf;
     _ = font.raster;

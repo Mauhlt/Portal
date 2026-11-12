@@ -177,19 +177,20 @@ pub const Window = struct {
             var ev: XEvent = undefined;
             _ = xlib.XNextEvent(self.display, &ev);
             self.translate(&ev);
-            if (self.queue.len > 0) break;
+            if (self.queue.pending()) break;
         }
         return self.queue.pop();
     }
 
     pub fn waitEvents(self: *Window, timeout_ms: u32) void {
-        if (self.queue.len > 0 or xlib.XPending(self.display) > 0) return;
+        if (self.queue.pending() or xlib.XPending(self.display) > 0) return;
         var fds = [_]std.c.pollfd{
             .{ .fd = xlib.XConnectionNumber(self.display), .events = std.c.POLL.IN, .revents = 0 },
             .{ .fd = self.wake_pipe[0], .events = std.c.POLL.IN, .revents = 0 },
         };
         const n: usize = if (self.wake_pipe[0] >= 0) 2 else 1;
-        _ = std.c.poll(&fds, @intCast(n), @intCast(@min(timeout_ms, std.math.maxInt(i32))));
+        const t: i32 = if (timeout_ms == platform.forever) -1 else @intCast(@min(timeout_ms, std.math.maxInt(i32)));
+        _ = std.c.poll(&fds, @intCast(n), t);
         if (n == 2 and fds[1].revents != 0) {
             var buf: [64]u8 = undefined;
             _ = std.c.read(self.wake_pipe[0], &buf, buf.len);

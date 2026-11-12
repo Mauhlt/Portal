@@ -190,7 +190,7 @@ pub const Window = struct {
     }
 
     pub fn waitEvents(self: *Window, timeout_ms: u32) void {
-        if (self.queue.len > 0) return;
+        if (self.queue.pending()) return;
         self.pump(@as(f64, @floatFromInt(@min(timeout_ms, 50))) / 1000.0);
     }
 

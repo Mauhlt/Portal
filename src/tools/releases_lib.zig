@@ -35,6 +35,9 @@ pub fn isValidId(s: []const u8) bool {
     // A folder being pruned is renamed to "<id>.deleting"; never treat it as
     // a release (its suffix would otherwise pass as part of the version).
     if (std.mem.endsWith(u8, s, deleting_suffix)) return false;
+    // Windows drops trailing dots from path components: "<id>." would name
+    // the same folder as "<id>" while comparing unequal to it.
+    if (s[s.len - 1] == '.') return false;
     return true;
 }
 
@@ -67,14 +70,21 @@ pub fn parsePointer(contents: []const u8) ?[]const u8 {
     return v;
 }
 
+/// Release ids name folders on a case-insensitive file system, so every
+/// comparison between them ignores ASCII case.
+pub fn sameId(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
 fn descending(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.lessThan(u8, b, a);
+    return std.ascii.lessThanIgnoreCase(b, a);
 }
 
 /// Chooses which release directories to delete. Never selects `current`,
 /// `known_good`, or the newest release for each distinct zig version; of the
 /// rest, the `keep` newest survive. Names that are not valid ids are ignored.
-/// Returned slices point into `names`; caller frees the outer slice.
+/// Ids compare case-insensitively (see sameId). Returned slices point into
+/// `names`; caller frees the outer slice.
 pub fn selectPrune(
     gpa: Allocator,
     names: []const []const u8,
@@ -94,14 +104,14 @@ pub fn selectPrune(
     var kept_others: usize = 0;
     var prev: ?[]const u8 = null;
     for (valid.items) |n| {
-        if (prev) |p| if (std.mem.eql(u8, p, n)) continue; // duplicate name
+        if (prev) |p| if (sameId(p, n)) continue; // duplicate name
         prev = n;
         var protected = false;
-        if (current) |c| protected = protected or std.mem.eql(u8, c, n);
-        if (known_good) |k| protected = protected or std.mem.eql(u8, k, n);
+        if (current) |c| protected = protected or sameId(c, n);
+        if (known_good) |k| protected = protected or sameId(k, n);
         const z = zigVersionOf(n);
         const first_for_zig = for (seen_zig.items) |s| {
-            if (std.mem.eql(u8, s, z)) break false;
+            if (std.ascii.eqlIgnoreCase(s, z)) break false;
         } else true;
         if (first_for_zig) {
             try seen_zig.append(gpa, z);
@@ -115,6 +125,34 @@ pub fn selectPrune(
         try out.append(gpa, n);
     }
     return out.toOwnedSlice(gpa);
+}
+
+/// What reading a pointer file gave.
+pub const PointerRead = union(enum) {
+    /// The file does not exist (FileNotFound).
+    missing,
+    /// It exists but could not be read (any other error, e.g. access
+    /// denied, sharing violation, too large).
+    unreadable,
+    contents: []const u8,
+};
+
+/// Whether pruning may run, given what reading known-good.txt gave. Pruning
+/// deletes releases, so it only runs when the known-good release is known
+/// for sure: there is none (no file), or the file holds a valid id. A file
+/// that exists but cannot be read or validated skips pruning entirely,
+/// since the known-good release could otherwise be deleted.
+pub const PruneGuard = union(enum) {
+    skip,
+    prune: ?[]const u8,
+};
+
+pub fn pruneGuard(known_good: PointerRead) PruneGuard {
+    return switch (known_good) {
+        .missing => .{ .prune = null },
+        .unreadable => .skip,
+        .contents => |c| if (parsePointer(c)) |id| .{ .prune = id } else .skip,
+    };
 }
 
 // ------------------------------------------------------------- BUILD-INFO
@@ -246,13 +284,50 @@ pub fn commandTail(comptime T: type, cmdline: []const T) []const T {
 
 pub const RootError = error{ NoLocalAppData, RelativeOverride } || Allocator.Error;
 
-/// Releases root: `override` (PORTAL_RELEASES_DIR, for testing) if set and
-/// non-empty, else %LOCALAPPDATA%\Portal\releases. The override must be an
-/// absolute path so it never depends on the current directory.
+pub const override_env = "PORTAL_RELEASES_DIR";
+/// PORTAL_RELEASES_DIR is honoured only while this is also set to "1", so a
+/// stray (or planted) variable cannot point the production launcher at
+/// another folder of executables.
+pub const testing_env = "PORTAL_TESTING";
+
+pub const Override = union(enum) {
+    none,
+    /// Set, but PORTAL_TESTING=1 is not: ignored (callers warn).
+    ignored: []const u8,
+    active: []const u8,
+};
+
+/// The effective PORTAL_RELEASES_DIR, given it and PORTAL_TESTING.
+pub fn releasesOverride(override: ?[]const u8, testing_flag: ?[]const u8) Override {
+    const o = override orelse return .none;
+    if (o.len == 0) return .none;
+    const t = testing_flag orelse return .{ .ignored = o };
+    if (!std.mem.eql(u8, t, "1")) return .{ .ignored = o };
+    return .{ .active = o };
+}
+
+/// `p` without trailing separators, but never shorter than its root: "C:\"
+/// stays "C:\" (trimming it to "C:" would mean "the current directory on
+/// drive C"), "\\" stays as is.
+pub fn trimTrailingSeps(p: []const u8) []const u8 {
+    var s = p;
+    while (s.len > 0 and (s[s.len - 1] == '\\' or s[s.len - 1] == '/')) {
+        const t = s[0 .. s.len - 1];
+        if (t.len == 2 and t[1] == ':') break; // "X:"
+        if (std.mem.indexOfNone(u8, t, "\\/") == null) break; // only separators left
+        s = t;
+    }
+    return s;
+}
+
+/// Releases root: `override` (an active PORTAL_RELEASES_DIR, for testing; see
+/// releasesOverride) if set and non-empty, else %LOCALAPPDATA%\Portal\releases.
+/// The override must be an absolute path so it never depends on the current
+/// directory.
 pub fn releasesRoot(gpa: Allocator, override: ?[]const u8, local_app_data: ?[]const u8) RootError![]u8 {
     if (override) |o| if (o.len > 0) {
         if (!std.fs.path.isAbsolute(o)) return error.RelativeOverride;
-        return gpa.dupe(u8, std.mem.trimEnd(u8, o, "\\/"));
+        return gpa.dupe(u8, trimTrailingSeps(o));
     };
     const base = local_app_data orelse return error.NoLocalAppData;
     if (base.len == 0) return error.NoLocalAppData;
@@ -269,6 +344,19 @@ pub fn launcherBinDir(gpa: Allocator, releases_root: []const u8) Allocator.Error
 pub fn isOldLauncherName(name: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(name, "portal.exe.") and std.ascii.endsWithIgnoreCase(name, ".old");
 }
+
+/// `pid` in decimal, NUL-terminated, in `buf` (the launcher's
+/// PORTAL_VIA_LAUNCHER value; see src/workdir.zig).
+pub fn pidWide(pid: u32, buf: *[16]u16) [*:0]const u16 {
+    var digits: [10]u8 = undefined;
+    const s = std.fmt.bufPrint(&digits, "{d}", .{pid}) catch unreachable; // a u32 has <= 10 digits
+    for (s, 0..) |c, i| buf[i] = c;
+    buf[s.len] = 0;
+    return buf[0..s.len :0].ptr;
+}
+
+/// Name of the lock file held for the whole of `portal-release release`.
+pub const lock_file = "release.lock";
 
 // ------------------------------------------------------------------ tests
 
@@ -303,6 +391,8 @@ test "isValidId rejects malformed ids" {
         "２0261111-185919_zig-0.1", // non-ASCII digit
         "20261111-185919_zig-0.1é",
         "20261111-185919_zig-0.1.deleting",
+        "20261111-185919_zig-0.1.",
+        "20261111-185919_zig-.",
     };
     for (bad) |b| {
         if (isValidId(b)) {
@@ -417,6 +507,62 @@ test "selectPrune ignores duplicate names" {
     try expectPrune(&names, null, null, 0, &.{"20260101-000000_zig-a"});
 }
 
+test "selectPrune compares ids case-insensitively" {
+    const names = [_][]const u8{
+        "20260101-000000_zig-a",
+        "20260102-000000_zig-a",
+        "20260103-000000_zig-a",
+        "20260104-000000_zig-A", // same zig version as -a on disk
+    };
+    // known-good written in another case must still protect its folder.
+    try expectPrune(&names, "20260104-000000_zig-a", "20260101-000000_zig-A", 0, &.{
+        "20260103-000000_zig-a",
+        "20260102-000000_zig-a",
+    });
+    // Duplicates differing only in case are one folder.
+    const dup = [_][]const u8{
+        "20260101-000000_zig-a",
+        "20260102-000000_zig-B",
+        "20260102-000000_zig-b",
+        "20260103-000000_zig-b",
+    };
+    try expectPrune(&dup, null, null, 0, &.{"20260102-000000_zig-B"});
+}
+
+test "pruneGuard skips pruning unless known-good is certain" {
+    const id = "20261111-185919_zig-0.18.0";
+    try testing.expectEqual(PruneGuard{ .prune = null }, pruneGuard(.missing));
+    try testing.expectEqual(PruneGuard.skip, pruneGuard(.unreadable));
+    try testing.expectEqual(PruneGuard.skip, pruneGuard(.{ .contents = "garbage" }));
+    try testing.expectEqual(PruneGuard.skip, pruneGuard(.{ .contents = "" }));
+    try testing.expectEqualStrings(id, pruneGuard(.{ .contents = id ++ "\r\n" }).prune.?);
+}
+
+test "releasesOverride needs PORTAL_TESTING=1" {
+    try testing.expectEqual(Override.none, releasesOverride(null, "1"));
+    try testing.expectEqual(Override.none, releasesOverride("", "1"));
+    try testing.expectEqualStrings("C:\\t", releasesOverride("C:\\t", "1").active);
+    try testing.expectEqualStrings("C:\\t", releasesOverride("C:\\t", null).ignored);
+    try testing.expectEqualStrings("C:\\t", releasesOverride("C:\\t", "0").ignored);
+    try testing.expectEqualStrings("C:\\t", releasesOverride("C:\\t", "yes").ignored);
+}
+
+test "trimTrailingSeps keeps the root" {
+    try testing.expectEqualStrings("C:\\", trimTrailingSeps("C:\\"));
+    try testing.expectEqualStrings("C:\\", trimTrailingSeps("C:\\\\"));
+    try testing.expectEqualStrings("C:/", trimTrailingSeps("C:/"));
+    try testing.expectEqualStrings("C:\\rel", trimTrailingSeps("C:\\rel\\/"));
+    try testing.expectEqualStrings("\\", trimTrailingSeps("\\"));
+    try testing.expectEqualStrings("\\\\srv\\share", trimTrailingSeps("\\\\srv\\share\\"));
+    try testing.expectEqualStrings("rel", trimTrailingSeps("rel"));
+}
+
+test pidWide {
+    var buf: [16]u16 = undefined;
+    try testing.expectEqualSlices(u16, &.{ '4', '2', 0 }, pidWide(42, &buf)[0..3]);
+    try testing.expectEqual(@as(usize, 10), std.mem.len(pidWide(std.math.maxInt(u32), &buf)));
+}
+
 test "formatBuildInfo" {
     const s = try formatBuildInfo(testing.allocator, .{
         .portal = "portal 0.1.0 (built with zig 0.18.0)",
@@ -525,6 +671,9 @@ test "releasesRoot and launcherBinDir" {
     const r2 = try releasesRoot(a, "C:\\tmp\\rel\\", "C:\\ignored");
     defer a.free(r2);
     try testing.expectEqualStrings("C:\\tmp\\rel", r2);
+    const r4 = try releasesRoot(a, "C:\\", "C:\\ignored");
+    defer a.free(r4);
+    try testing.expectEqualStrings("C:\\", r4);
     const r3 = try releasesRoot(a, "", "C:\\L");
     defer a.free(r3);
     try testing.expectEqualStrings("C:\\L\\Portal\\releases", r3);

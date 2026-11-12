@@ -154,3 +154,56 @@ pub const Pty = struct {
         _ = w.CloseHandle(p.process);
     }
 };
+
+// ------------------------------------------------------------- elevation
+
+/// What `portal run` does about its own token. The child (and so every
+/// key a paired device sends it) runs with Portal's token: elevated Portal
+/// means remote input runs as administrator.
+pub const ElevationCheck = enum {
+    /// Not elevated: run.
+    ok,
+    /// Elevated (or unknown) without --allow-elevated: refuse to start.
+    refuse,
+    /// Elevated with --allow-elevated: run, with a loud warning.
+    warn,
+};
+
+/// `elevated` is null when the token could not be queried; that counts as
+/// elevated (fail closed).
+pub fn elevationCheck(elevated: ?bool, allow_elevated: bool) ElevationCheck {
+    const e = elevated orelse true;
+    if (!e) return .ok;
+    return if (allow_elevated) .warn else .refuse;
+}
+
+/// True if this process runs with an elevated token (TokenElevation), null
+/// if that cannot be determined.
+pub fn isElevated() ?bool {
+    var token: ?w.HANDLE = null;
+    const current: w.HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1)))); // GetCurrentProcess()
+    if (OpenProcessToken(current, TOKEN_QUERY, &token) == 0) return null;
+    const t = token orelse return null;
+    defer _ = w.CloseHandle(t);
+    var elevation: u32 = 0;
+    var len: u32 = 0;
+    if (GetTokenInformation(t, TokenElevation, &elevation, @sizeOf(u32), &len) == 0) return null;
+    return elevation != 0;
+}
+
+const TOKEN_QUERY: u32 = 0x0008;
+const TokenElevation: u32 = 20;
+extern "advapi32" fn OpenProcessToken(process: w.HANDLE, access: u32, token: *?w.HANDLE) callconv(.winapi) w.BOOL;
+extern "advapi32" fn GetTokenInformation(token: w.HANDLE, class: u32, info: ?*anyopaque, len: u32, ret_len: *u32) callconv(.winapi) w.BOOL;
+
+test "elevation check" {
+    try std.testing.expectEqual(ElevationCheck.ok, elevationCheck(false, false));
+    try std.testing.expectEqual(ElevationCheck.ok, elevationCheck(false, true));
+    try std.testing.expectEqual(ElevationCheck.refuse, elevationCheck(true, false));
+    try std.testing.expectEqual(ElevationCheck.warn, elevationCheck(true, true));
+    // Unknown token state fails closed.
+    try std.testing.expectEqual(ElevationCheck.refuse, elevationCheck(null, false));
+    try std.testing.expectEqual(ElevationCheck.warn, elevationCheck(null, true));
+    // The query itself works here (the test shell's elevation is whatever it is).
+    try std.testing.expect(isElevated() != null);
+}

@@ -129,7 +129,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
 
     while (tv.pollEvents(host.sink.sink())) {
         if (tv.needsRedraw() or shared.version.load(.acquire) != host.drawn_version) host.frame();
-        tv.waitEvents(250);
+        // Event-driven: the network thread wakes us on every Shared change
+        // (Client.notify), input wakes us too; no idle polling.
+        tv.waitEvents(TermView.forever);
     }
     tv.deinit();
     std.process.exit(0);
