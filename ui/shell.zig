@@ -48,6 +48,8 @@ pub const ids = struct {
     pub const view_conversation: u32 = 906;
     pub const pair: u32 = 907;
     pub const cancel_pair: u32 = 908;
+    /// The interaction bar's on-screen keyboard button (touch).
+    pub const keyboard: u32 = 909;
     /// tab0 + position: show that tab; close0 + position: close it.
     pub const tab0: u32 = 1000;
     pub const close0: u32 = 1100;
@@ -121,6 +123,17 @@ pub fn standby(bar_title: ?[]const u8, label: []const u8, extra: []const u8, pan
         .panel = panel,
     };
 }
+
+/// What the device's input hardware offers (the glue asks the OS each
+/// frame; client/src/touchkbd.zig on Windows).
+pub const Touch = struct {
+    /// A touch screen: finger-sized targets.
+    enabled: bool = false,
+    /// No hardware keyboard attached (tablet posture): offer the on-screen
+    /// keyboard (a button in the interaction bar; shown when the input line
+    /// is tapped, hidden when it loses the keyboard).
+    on_screen_keyboard: bool = false,
+};
 
 /// What the desk's window shows besides the tabs.
 pub const Desk = struct {
@@ -259,6 +272,11 @@ pub const Shell = struct {
     main: MainView = .terminal,
     /// The conversation view, once the device has one (ui/convo).
     conversation: ?frame.ContentView = null,
+    /// Set by the glue from the OS (Touch).
+    touch: Touch = .{},
+    /// The on-screen keyboard should be up: the glue shows or hides the
+    /// OS keyboard when this changes (after a frame).
+    keyboard: bool = false,
     /// As of the last overlay: the viewer's status and mode, the tab count
     /// and the one shown.
     status: Status = .starting,
@@ -341,7 +359,21 @@ pub const Shell = struct {
         };
         o.panel = st.panel;
         if (o.panel != null) o.selection = null;
+        o.touch = sh.touch.enabled;
+        // The keyboard goes when the line loses the keyboard (or a hardware
+        // one is attached).
+        if (sh.keyboard and (!sh.touch.on_screen_keyboard or sh.focusFor(st) != .line)) sh.keyboard = false;
         return o;
+    }
+
+    /// `focus` as of `st` (without asking the modal: the glue may hold its
+    /// lock while building the overlay).
+    fn focusFor(sh: *const Shell, st: State) Focus {
+        if (st.panel != null) return .panel;
+        return switch (sh.device) {
+            .desk => if (sh.line_focus) .line else .terminal,
+            .viewer => if (st.viewer.status == .connected and st.viewer.mode == .instruct) .line else .terminal,
+        };
     }
 
     fn tabBar(sh: *Shell, st: State, closable: bool) []const frame.TopTab {
@@ -369,7 +401,7 @@ pub const Shell = struct {
             .hint = hint,
             .id = ids.line,
             .focused = focused,
-        } }, .send = .{ .label = "Send", .id = ids.send } };
+        } }, .send = .{ .label = "Send", .id = ids.send }, .keyboard = if (sh.touch.on_screen_keyboard) .{ .label = "Keyboard", .id = ids.keyboard, .focused = sh.keyboard } else null };
         return sh.bufs.panes[0..1];
     }
 
@@ -648,8 +680,15 @@ pub const Shell = struct {
             ids.tab0...ids.tab0 + tabs_wire.max_tabs - 1 => if (id - ids.tab0 < sh.n_tabs) sh.command(.{ .select_tab = id - ids.tab0 }),
             ids.close0...ids.close0 + tabs_wire.max_tabs - 1 => if (id - ids.close0 < sh.n_tabs) sh.command(.{ .close_tab = id - ids.close0 }),
             ids.tab_add => sh.command(.open_tab),
-            ids.line => if (sh.device == .desk) {
-                sh.line_focus = true;
+            // A tap on the line: it takes the keyboard (desk), and on a
+            // touch device without a keyboard the on-screen one comes up.
+            ids.line => {
+                if (sh.device == .desk) sh.line_focus = true;
+                if (sh.touch.on_screen_keyboard and sh.focus() == .line) sh.keyboard = true;
+            },
+            ids.keyboard => {
+                if (sh.device == .desk) sh.line_focus = true;
+                sh.keyboard = !sh.keyboard and sh.focus() == .line;
             },
             // Send: what Enter in the line does.
             ids.send => if (sh.focus() == .line or sh.device == .desk) {
@@ -920,6 +959,33 @@ test "desk: tabs with close and +, viewer badge, the input box takes the keyboar
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("no remote viewers", viewerText(0, &buf));
     try testing.expectEqualStrings("1 REMOTE VIEWER WATCHING", viewerText(1, &buf));
+}
+
+test "touch: the keyboard button, the keyboard follows the line's focus" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    sh.touch = .{ .enabled = true, .on_screen_keyboard = true };
+    var o = sh.overlay(.{});
+    try testing.expect(o.touch);
+    try testing.expectEqual(ids.keyboard, o.bottom[0].keyboard.?.id);
+    Shell.onButton(&sh, ids.line);
+    try testing.expect(sh.keyboard and sh.focus() == .line);
+    _ = sh.overlay(.{});
+    try testing.expect(sh.keyboard);
+    // Esc on the empty line: back to the terminal, the keyboard goes.
+    Shell.onKey(&sh, .escape, .{});
+    _ = sh.overlay(.{});
+    try testing.expect(!sh.keyboard);
+    // The button toggles it (and gives the line the keyboard).
+    Shell.onButton(&sh, ids.keyboard);
+    try testing.expect(sh.keyboard);
+    Shell.onButton(&sh, ids.keyboard);
+    try testing.expect(!sh.keyboard);
+    // A hardware keyboard attached: no button.
+    sh.touch.on_screen_keyboard = false;
+    o = sh.overlay(.{});
+    try testing.expect(o.bottom[0].keyboard == null);
 }
 
 test "desk: drag selects, right-click copies, Ctrl+Shift+V pastes" {

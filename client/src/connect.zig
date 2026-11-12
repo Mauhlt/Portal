@@ -45,6 +45,8 @@ const setup_mod = ui.panels.setup;
 pub const sync = @import("sync/root.zig");
 /// The input line and the Data slice, shared with the desk's window.
 pub const inputline = ui.inputline;
+/// Touch input and the on-screen keyboard (Windows), shared with the desk.
+pub const touchkbd = @import("touchkbd.zig");
 pub const dataview = ui.dataview;
 // For portalctl's headless sync-device (src/sync_cli.zig).
 pub const net_client = client_mod;
@@ -133,6 +135,8 @@ const Host = struct {
     pin_fp_len: usize = 0,
     sync: *SyncState,
     sync_bufs: sync.ui.Ui.Bufs = .{},
+    /// Whether the OS touch keyboard was last asked to show.
+    keyboard_shown: bool = false,
 
     fn uiStatus(st: client_mod.Status) shell_mod.Status {
         return switch (st) {
@@ -144,6 +148,7 @@ const Host = struct {
     fn frame(h: *Host) void {
         const s = h.shared;
         const version = s.version.load(.acquire);
+        h.shell.touch = touchkbd.query();
         var detail_buf: [160]u8 = undefined;
         s.mutex.lockUncancelable(h.client.io);
         const st = s.status;
@@ -190,6 +195,11 @@ const Host = struct {
         // (h.sync.mutex is still held here: the defer above.)
         if (panel != null) h.sync.ui.presented(watchdog.nowMs(h.client.io));
         h.drawn_version = version;
+        // The on-screen keyboard follows the input line (touch, no keyboard).
+        if (h.shell.keyboard != h.keyboard_shown) {
+            h.keyboard_shown = h.shell.keyboard;
+            touchkbd.setVisible(h.p.nativeHandle(), h.keyboard_shown);
+        }
         var tbuf: [160]u8 = undefined;
         const t = shell_mod.title(uiStatus(st), project, &tbuf);
         if (!std.mem.eql(u8, t, h.title_buf[0..h.title_len])) {

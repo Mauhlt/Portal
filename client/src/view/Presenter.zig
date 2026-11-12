@@ -148,6 +148,15 @@ pub fn releaseGpu(p: *Presenter) void {
     p.renderer = null;
 }
 
+/// The native window handle (Win32 HWND), null elsewhere: for OS services
+/// tied to the window (the touch keyboard).
+pub fn nativeHandle(p: *const Presenter) ?*anyopaque {
+    return switch (p.window.surfaceSource()) {
+        .win32 => |w| w.hwnd,
+        else => null,
+    };
+}
+
 pub fn setTitle(p: *Presenter, title: []const u8) void {
     p.window.setTitle(title);
 }

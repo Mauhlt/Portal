@@ -125,13 +125,21 @@ pub const PanelRow = struct {
     button: ?PanelButton = null,
 };
 
+/// A QR code to show in a panel: `size` x `size` modules, row-major, 1 =
+/// dark (drawn with a light quiet zone).
+pub const PanelQr = struct {
+    size: u16,
+    modules: []const u8,
+};
+
 /// A modal box drawn over everything else (pairing approval, device list,
-/// first-run settings). Layout, top to bottom: title, lines, rows, fields,
-/// after, note, buttons.
+/// first-run settings). Layout, top to bottom: title, lines, qr, rows,
+/// fields, after, note, buttons.
 pub const Panel = struct {
     title: []const u8,
     title_tone: Tone = .normal,
     lines: []const PanelText = &.{},
+    qr: ?PanelQr = null,
     rows: []const PanelRow = &.{},
     fields: []const PanelField = &.{},
     after: []const PanelText = &.{},
@@ -194,6 +202,9 @@ pub const Pane = struct {
     height: f32 = 0,
     /// A button at the right end of a `.field` pane (the input box's Send).
     send: ?PanelButton = null,
+    /// A button left of Send that brings up the on-screen keyboard (touch
+    /// devices without a hardware keyboard).
+    keyboard: ?PanelButton = null,
     content: union(enum) {
         /// The answer buttons (input.answers): InputSink.answer.
         answers,
@@ -273,7 +284,13 @@ pub const Overlay = struct {
     status: StatusLine = .{},
     /// A modal layer over the whole layout (pairing, devices, settings).
     panel: ?Panel = null,
+    /// Touch input: finger-sized targets (tabs at least `touch_target`
+    /// logical px tall).
+    touch: bool = false,
 };
+
+/// Smallest height (logical px) of a tab's hit area on touch devices.
+pub const touch_target: f32 = 40;
 
 pub const Sizing = union(enum) {
     /// Scale the font to the host's grid (remote view): its columns fill the
@@ -302,6 +319,39 @@ pub const CellLayout = struct { ox: f32 = 0, oy: f32 = 0, cw: f32 = 1, ch: f32 =
 
 pub const Zoom = enum { in, out, reset };
 
+/// Window edges the UI must keep clear (pixels): the iPhone's safe area and
+/// on-screen keyboard; zero on desktops.
+pub const Insets = struct { left: f32 = 0, top: f32 = 0, right: f32 = 0, bottom: f32 = 0 };
+
+/// The focused text field of the last frame (pixels): where a platform's
+/// native text field goes (iOS: dictation and the system keyboard), and
+/// what it should contain.
+pub const TextSlot = struct {
+    rect: Rect,
+    id: u32,
+    font_px: f32,
+    value_buf: [cap]u8 = undefined,
+    value_len: usize = 0,
+
+    pub const cap = 1024;
+
+    pub fn value(t: *const TextSlot) []const u8 {
+        return t.value_buf[0..t.value_len];
+    }
+};
+
+/// Turning `old` into `new` by editing at the end: how many code points
+/// to delete from `old`, then what to append. A native text field's edits
+/// reach the UI as these Backspaces and characters.
+pub fn textEdit(old: []const u8, new: []const u8) struct { deletes: usize, insert: []const u8 } {
+    var p: usize = 0;
+    while (p < old.len and p < new.len and old[p] == new[p]) p += 1;
+    // Back to a code point boundary in both.
+    while (p > 0 and ((p < old.len and (old[p] & 0xC0) == 0x80) or (p < new.len and (new[p] & 0xC0) == 0x80))) p -= 1;
+    const removed = std.unicode.utf8CountCodepoints(old[p..]) catch old.len - p;
+    return .{ .deletes = removed, .insert = new[p..] };
+}
+
 pub const Frame = struct {
     gpa: std.mem.Allocator,
     /// The last built frame.
@@ -317,6 +367,10 @@ pub const Frame = struct {
     /// The regions of the last built frame (see Layout).
     regions: Layout = .{},
     cells: CellLayout = .{},
+    /// Edges to keep clear, set by the window layer before build.
+    insets: Insets = .{},
+    /// The focused text field of the last frame (see TextSlot).
+    text_slot: ?TextSlot = null,
     /// Set during build.
     fonts: *const fontset.FontSet = undefined,
     scale: f32 = 1,
@@ -407,14 +461,18 @@ pub const Frame = struct {
         f.list.reset();
         f.list.clear = f.term.bg;
         f.n_hits = 0;
-        const W: f32 = @floatFromInt(fb[0]);
-        const H: f32 = @floatFromInt(fb[1]);
+        f.text_slot = null;
+        // Lay out inside the insets (all zero on desktops), then shift.
+        const ins = f.insets;
+        defer f.shift(ins.left, ins.top);
+        const W: f32 = @max(0, @as(f32, @floatFromInt(fb[0])) - ins.left - ins.right);
+        const H: f32 = @max(0, @as(f32, @floatFromInt(fb[1])) - ins.top - ins.bottom);
         if (W < 1 or H < 1) return;
         const s = scale;
         const ui = fonts.metrics(@round(chrome_em * s));
         const act = fonts.metrics(@round(action_em * s));
         const status_h: f32 = @round(@as(f32, @floatFromInt(ui.cell_h)) * 1.6);
-        const top_h: f32 = if (overlay.top_bar != null) topBarHeight(ui) else 0;
+        const top_h: f32 = if (overlay.top_bar != null) topBarHeight(ui, overlay.touch, s) else 0;
         // The bottom region (interaction slice): its panes' heights, but never
         // more than half the window (the main slice and data keep the rest).
         var panes: [max_panes]Pane = undefined;
@@ -481,10 +539,93 @@ pub const Frame = struct {
         for (panes[0..n_panes], 0..) |p, i| f.drawPane(act, p, f.regions.panes[i], s);
         f.drawStatus(ui, overlay.status, H - status_h, W, status_h, s);
         if (overlay.panel) |p| {
-            // Modal: buttons under the panel stop reacting.
+            // Modal: buttons (and the text field) under the panel stop reacting.
             f.n_hits = 0;
+            f.text_slot = null;
             f.drawPanel(ui, p, W, H, s);
         }
+    }
+
+    /// Moves everything built this frame by (dx, dy) (see Insets).
+    fn shift(f: *Frame, dx: f32, dy: f32) void {
+        if (dx == 0 and dy == 0) return;
+        for (f.list.cmds.items) |*c| switch (c.*) {
+            inline .rect, .glyph, .text => |*v| {
+                v.x += dx;
+                v.y += dy;
+            },
+            .image => |*v| {
+                v.x += dx;
+                v.y += dy;
+                v.clip[0] += dx;
+                v.clip[1] += dy;
+                v.clip[2] += dx;
+                v.clip[3] += dy;
+            },
+        };
+        for (f.hits[0..f.n_hits]) |*b| {
+            b.x += dx;
+            b.y += dy;
+        }
+        const rs = [_]*Rect{ &f.regions.top, &f.regions.terminal, &f.regions.bottom, &f.regions.status, &f.regions.data };
+        for (rs) |r| {
+            r.x += dx;
+            r.y += dy;
+        }
+        for (f.regions.panes[0..f.regions.n_panes]) |*r| {
+            r.x += dx;
+            r.y += dy;
+        }
+        f.cells.ox += dx;
+        f.cells.oy += dy;
+        if (f.text_slot) |*t| {
+            t.rect.x += dx;
+            t.rect.y += dy;
+        }
+    }
+
+    /// Remembers the focused text field being drawn (see text_slot).
+    fn noteTextField(f: *Frame, r: Rect, id: u32, value: []const u8, font_px: f32) void {
+        var t: TextSlot = .{ .rect = r, .id = id, .font_px = font_px };
+        const n = @min(value.len, t.value_buf.len);
+        @memcpy(t.value_buf[0..n], value[0..n]);
+        t.value_len = n;
+        f.text_slot = t;
+    }
+
+    /// A QR code centred in a `w` wide column at `y`, whole pixels per
+    /// module, light quiet zone of 4 modules. Returns the height used.
+    fn drawQr(f: *Frame, q: PanelQr, x: f32, y: f32, w: f32, lh: f32, paint: bool) f32 {
+        if (q.size == 0 or q.modules.len < @as(usize, q.size) * q.size) return 0;
+        const n: f32 = @floatFromInt(q.size + 8);
+        const side_max = @min(w, lh * 14);
+        const m = @max(1, @floor(side_max / n));
+        const side = m * n;
+        const gap = @round(lh * 0.4);
+        if (paint) {
+            const ox = x + @round((w - side) / 2);
+            const oy = y + gap;
+            // A QR code is dark on light whatever the theme.
+            f.rect(ox, oy, side, side, .{ 0xFF, 0xFF, 0xFF });
+            const qs: usize = q.size;
+            for (0..qs) |r| {
+                // One quad per run of dark modules.
+                var c: usize = 0;
+                while (c < qs) {
+                    if (q.modules[r * qs + c] == 0) {
+                        c += 1;
+                        continue;
+                    }
+                    const start = c;
+                    while (c < qs and q.modules[r * qs + c] != 0) c += 1;
+                    const fx: f32 = @floatFromInt(start + 4);
+                    const fy: f32 = @floatFromInt(r + 4);
+                    const run: f32 = @floatFromInt(c - start);
+                    f.rect(ox + fx * m, oy + fy * m, run * m, m, .{ 0, 0, 0 });
+                }
+            }
+        }
+        return gap + side + gap;
     }
 
     // ------------------------------------------------------------ primitives
@@ -953,6 +1094,12 @@ pub const Frame = struct {
                     f.sendButton(ui, r.x + r.w - pad - bw, r.y + pad, bw, bh, b, s);
                     send_w = bw + pad;
                 }
+                if (p.keyboard) |b| {
+                    const bh = @max(1, r.h - 2 * pad);
+                    const bw = textWidth(ui, b.label) + 4 * @as(f32, @floatFromInt(ui.cell_w));
+                    _ = f.panelButton(ui, r.x + r.w - pad - send_w - bw, r.y + pad, bh, b, s, true);
+                    send_w += bw + pad;
+                }
                 const box: Rect = .{ .x = r.x + pad, .y = r.y + pad, .w = @max(1, r.w - 2 * pad - send_w), .h = @max(1, r.h - 2 * pad) };
                 f.rect(box.x, box.y, box.w, box.h, theme.ui.field);
                 f.outline(box.x, box.y, box.w, box.h, if (fl.focused) @max(2, @round(2 * s)) else @max(1, @round(s)), if (fl.focused) theme.ui.focus else theme.ui.border);
@@ -971,6 +1118,7 @@ pub const Frame = struct {
                     if (fl.focused) f.rect(end, ty, @max(2, @round(2 * s)), lh, theme.ui.focus);
                 }
                 f.registerButton(box.x, box.y, box.w, box.h, fl.id);
+                if (fl.focused) f.noteTextField(box, fl.id, fl.value, lh);
             },
         }
     }
@@ -1002,6 +1150,7 @@ pub const Frame = struct {
         y += f.wrapped(big, x, y, w, .{ .text = p.title, .tone = p.title_tone, .bold = true }, paint);
         y += @round(lh * 0.4);
         for (p.lines) |l| y += f.wrapped(ui, x, y, w, l, paint);
+        if (p.qr) |q| y += f.drawQr(q, x, y, w, lh, paint);
         // Rows: text on the left, an optional button on the right.
         if (p.rows.len > 0) {
             y += @round(lh * 0.4);
@@ -1044,6 +1193,7 @@ pub const Frame = struct {
                     if (fl.focused) f.rect(end, ty, @max(2, @round(2 * s)), lh, theme.ui.focus); // caret
                 }
                 f.registerButton(x, y, w, fh, fl.id);
+                if (fl.focused and !fl.choice) f.noteTextField(.{ .x = x, .y = y, .w = w, .h = fh }, fl.id, fl.value, lh);
             }
             y += fh + @round(lh * 0.5);
         }
@@ -1176,8 +1326,11 @@ pub fn fitImage(w: u32, h: u32, box_w: f32, box_h: f32) [2]f32 {
     return .{ @max(1, @round(fw * k)), @max(1, @round(fh * k)) };
 }
 
-fn topBarHeight(ui: Metrics) f32 {
-    return @round(@as(f32, @floatFromInt(ui.cell_h)) * 1.8);
+/// The top bar's height; on touch, tall enough that the tabs (80% of it)
+/// are at least `touch_target` logical px.
+fn topBarHeight(ui: Metrics, touch: bool, s: f32) f32 {
+    const h = @round(@as(f32, @floatFromInt(ui.cell_h)) * 1.8);
+    return if (touch) @max(h, @ceil(touch_target * s / 0.8)) else h;
 }
 
 /// Mixes `c` towards `to` by `k` (0..1).
@@ -1369,6 +1522,26 @@ test "remote grid font: fills the width, readable minimum, rows follow the curso
     try std.testing.expectEqual(@as(u16, 15), followTop(40, 25, 30, 39));
     // Content below the cursor, but the cursor stays in view.
     try std.testing.expectEqual(@as(u16, 10), followTop(40, 5, 10, 39));
+}
+
+test "textEdit: append, delete, replace in the middle, multibyte" {
+    var e = textEdit("ab", "abc");
+    try std.testing.expectEqual(@as(usize, 0), e.deletes);
+    try std.testing.expectEqualStrings("c", e.insert);
+    e = textEdit("abc", "ab");
+    try std.testing.expectEqual(@as(usize, 1), e.deletes);
+    e = textEdit("hello world", "help world");
+    try std.testing.expectEqual(@as(usize, 8), e.deletes);
+    try std.testing.expectEqualStrings("p world", e.insert);
+    e = textEdit("caf\u{e9}", "caf\u{e8}");
+    try std.testing.expectEqual(@as(usize, 1), e.deletes);
+    try std.testing.expectEqualStrings("\u{e8}", e.insert);
+}
+
+test "touch: tabs at least 40 logical px tall" {
+    const m: Metrics = .{ .em = 13, .cell_w = 8, .cell_h = 16, .baseline = 12, .underline_y = 14, .stroke = 1 };
+    for ([_]f32{ 1, 1.5, 2 }) |s| try std.testing.expect(@round(topBarHeight(m, true, s) * 0.8) >= touch_target * s);
+    try std.testing.expectEqual(@round(16 * 1.8), topBarHeight(m, false, 1));
 }
 
 test "hit-testing maps clicks to what the last frame drew" {

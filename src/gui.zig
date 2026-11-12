@@ -152,6 +152,8 @@ pub const LocalHost = struct {
     until_len: usize = 0,
     /// runSetup: the panel was submitted.
     setup_submitted: bool = false,
+    /// Whether the OS touch keyboard was last asked to show.
+    keyboard_shown: bool = false,
 
     const title_max = title.max_title_bytes;
 
@@ -352,6 +354,7 @@ pub const LocalHost = struct {
         if (changed) _ = h.shell.data.sync(h.gpa, &h.grid.images);
 
         if (changed) h.shell.clampSelection(h.grid.cols, h.grid.rows);
+        h.shell.touch = client.touchkbd.query();
         if (!force and !changed and !list_changed and old == null and !h.p.needsRedraw() and h.viewers == h.drawn_viewers) return;
         h.drawn_viewers = h.viewers;
         h.updateTitle();
@@ -359,6 +362,11 @@ pub const LocalHost = struct {
         h.p.build(&h.grid, h.overlay());
         h.p.present();
         h.presents += 1;
+        // The on-screen keyboard follows the input box (touch, no keyboard).
+        if (h.shell.keyboard != h.keyboard_shown) {
+            h.keyboard_shown = h.shell.keyboard;
+            client.touchkbd.setVisible(h.p.nativeHandle(), h.keyboard_shown);
+        }
     }
 
     /// This frame's state for the shell: the tabs, the panel, the
