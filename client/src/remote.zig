@@ -17,6 +17,9 @@ pub const cancel_button_id = 2;
 /// `hello.input` mode.
 pub const RemoteSink = struct {
     client: *client_mod.Client,
+    /// A modal layer above the terminal (the sync panels): while it is
+    /// active it gets the keyboard and its buttons.
+    modal: ?Modal = null,
     /// Snapshot of the mode/status, refreshed each frame by the main loop.
     mode: keys.Mode = .unknown,
     status: client_mod.Status = .starting,
@@ -52,8 +55,25 @@ pub const RemoteSink = struct {
         return .terminal;
     }
 
+    pub const Modal = struct {
+        ctx: *anyopaque,
+        active: *const fn (*anyopaque) bool,
+        key: *const fn (*anyopaque, input.Key, input.Mods) void,
+        char: *const fn (*anyopaque, u21, input.Mods) void,
+        /// True if the id was the modal's.
+        button: *const fn (*anyopaque, u32) bool,
+        /// A shortcut that opens it from the terminal (true: consumed).
+        shortcut: *const fn (*anyopaque, u21, input.Mods) bool,
+    };
+
+    fn modalActive(r: *const RemoteSink) ?Modal {
+        const m = r.modal orelse return null;
+        return if (m.active(m.ctx)) m else null;
+    }
+
     fn onKey(ctx: *anyopaque, key: input.Key, mods: input.Mods) void {
         const r: *RemoteSink = @ptrCast(@alignCast(ctx));
+        if (r.modalActive()) |m| return m.key(m.ctx, key, mods);
         switch (r.focus()) {
             .pair_screen => if (key == .enter) r.client.requestPairing(),
             .wait_screen => if (key == .escape) r.client.cancelPairing(),
@@ -65,6 +85,8 @@ pub const RemoteSink = struct {
 
     fn onChar(ctx: *anyopaque, cp: u21, mods: input.Mods) void {
         const r: *RemoteSink = @ptrCast(@alignCast(ctx));
+        if (r.modalActive()) |m| return m.char(m.ctx, cp, mods);
+        if (r.modal) |m| if (m.shortcut(m.ctx, cp, mods)) return;
         switch (r.focus()) {
             .pair_screen => if (!mods.ctrl and (cp == 'p' or cp == 'P')) r.client.requestPairing(),
             .wait_screen => {},
@@ -82,6 +104,7 @@ pub const RemoteSink = struct {
 
     fn onButton(ctx: *anyopaque, id: u32) void {
         const r: *RemoteSink = @ptrCast(@alignCast(ctx));
+        if (r.modal) |m| if (m.button(m.ctx, id)) return;
         if (id == pair_button_id) r.client.requestPairing();
         if (id == cancel_button_id) r.client.cancelPairing();
     }

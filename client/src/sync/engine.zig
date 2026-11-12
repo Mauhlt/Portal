@@ -178,12 +178,17 @@ pub const Options = struct {
     approved: []const Approval = &.{},
     /// Restrict the pass to one package.
     only: ?[]const u8 = null,
+    /// Packages to offer instead of installing (the app's "Install voice
+    /// model?" right after pairing): reported as `.offered`.
+    hold: []const []const u8 = &.{},
 };
 
 pub const Outcome = enum {
     installed,
     up_to_date,
     pending_approval,
+    /// Held for the user's answer (Options.hold).
+    offered,
     rejected,
     refused,
 };
@@ -209,6 +214,11 @@ pub const Item = struct {
     }
     pub fn detail(it: *const Item) []const u8 {
         return it.detail_buf[0..it.detail_len];
+    }
+    pub fn setDetailText(it: *Item, t: []const u8) void {
+        const n = @min(t.len, it.detail_buf.len);
+        @memcpy(it.detail_buf[0..n], t[0..n]);
+        it.detail_len = @intCast(n);
     }
     fn setDetail(it: *Item, comptime fmt: []const u8, args: anytype) void {
         it.detail_len = @intCast((std.fmt.bufPrint(&it.detail_buf, fmt, args) catch @as([]u8, it.detail_buf[0..0])).len);
@@ -348,6 +358,11 @@ fn passOne(r: *const Remote, st: *store_mod.Store, pinned: keypin.Key, opts: Opt
             return;
         },
     }
+    for (opts.hold) |held| if (std.mem.eql(u8, held, m.package)) {
+        it.outcome = .offered;
+        it.setDetail("offered: waiting for your answer", .{});
+        return;
+    };
     if (m.kind == .executable and !approvedFor(opts, &m, digest)) {
         it.outcome = .pending_approval;
         it.setDetail("waiting for approval on this device", .{});

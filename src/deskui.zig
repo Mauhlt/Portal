@@ -18,7 +18,7 @@ const input = view.input;
 const devices = @import("devices.zig");
 const keymap = @import("keymap.zig");
 
-pub const Screen = enum { none, setup, pair_name, pairing, pair_result, devices, export_form, export_done };
+pub const Screen = enum { none, setup, pair_name, pairing, pair_result, devices, dev_packages, export_form, export_done };
 
 /// Button and field ids (TermView reports clicks by id).
 pub const id = struct {
@@ -40,6 +40,8 @@ pub const id = struct {
     pub const field0: u32 = 100;
     /// Device rows' Unpair buttons: row0 + index.
     pub const row0: u32 = 200;
+    /// Package rows' Subscribe / Unsubscribe buttons: pkg0 + index.
+    pub const pkg0: u32 = 260;
 };
 
 pub const Action = union(enum) {
@@ -55,6 +57,10 @@ pub const Action = union(enum) {
     unpair: usize,
     /// Write the CA files to `ui.export_dir`.
     export_ca,
+    /// Fill `ui.pkgs` for `ui.devs[i]` (setPackages): Portal sync.
+    load_subs: usize,
+    /// Flip the subscription of `ui.devs[ui.sub_dev]` to `ui.pkgs[i]`.
+    toggle_sub: usize,
     /// The setup values in `ui.setup` were submitted.
     setup_submit,
     setup_cancel,
@@ -66,7 +72,18 @@ pub const DevRow = struct {
     name: devices.Text = .{},
     ip: devices.Text = .{},
     last_seen: i64 = 0,
+    /// Sync packages the device is subscribed to.
+    n_subs: u8 = 0,
 };
+
+/// One package in a device's sync subscriptions screen.
+pub const PkgRow = struct {
+    name: devices.Text = .{},
+    on: bool = false,
+    /// Latest published version, "" if none.
+    latest: devices.Text = .{},
+};
+pub const max_pkgs = 16;
 
 pub const PairResult = enum { paired, expired, closed, failed };
 
@@ -106,6 +123,10 @@ pub const Ui = struct {
     devs: [devices.max_devices]DevRow = undefined,
     n_devs: usize = 0,
     confirm: ?usize = null,
+    /// The device whose sync packages are shown (dev_packages).
+    sub_dev: usize = 0,
+    pkgs: [max_pkgs]PkgRow = undefined,
+    n_pkgs: usize = 0,
 
     // ---- export
     export_dir: form.TextField(512) = .{},
@@ -256,6 +277,20 @@ pub const Ui = struct {
         if (ui.screen == .devices) ui.focus.reset(ui.focusCount(), @min(ui.focus.index, ui.focusCount() - 1));
     }
 
+    pub fn setPackages(ui: *Ui, rows: []const PkgRow) void {
+        const n = @min(rows.len, ui.pkgs.len);
+        @memcpy(ui.pkgs[0..n], rows[0..n]);
+        ui.n_pkgs = n;
+        if (ui.screen == .dev_packages) ui.focus.reset(ui.focusCount(), @min(ui.focus.index, ui.focusCount() - 1));
+    }
+
+    fn openPackages(ui: *Ui, row: usize) Action {
+        ui.sub_dev = row;
+        ui.n_pkgs = 0;
+        ui.show(.dev_packages);
+        return .{ .load_subs = row };
+    }
+
     pub fn exported(ui: *Ui, dir: []const u8) void {
         ui.exported_to.set(dir);
         ui.show(.export_done);
@@ -377,7 +412,7 @@ pub const Ui = struct {
                     add(out, &n, id.again);
                 },
             },
-            .devices => add(out, &n, id.ok),
+            .devices, .dev_packages => add(out, &n, id.ok),
             .export_form => {
                 add(out, &n, id.cancel);
                 add(out, &n, id.export_);
@@ -389,7 +424,11 @@ pub const Ui = struct {
 
     /// Device rows take focus too (before the Close button).
     fn rowCount(ui: *const Ui) u8 {
-        return if (ui.screen == .devices) @intCast(ui.n_devs) else 0;
+        return switch (ui.screen) {
+            .devices => @intCast(ui.n_devs),
+            .dev_packages => @intCast(ui.n_pkgs),
+            else => 0,
+        };
     }
 
     fn focusCount(ui: *const Ui) u8 {
@@ -420,7 +459,7 @@ pub const Ui = struct {
     }
 
     fn focusedRow(ui: *const Ui) ?usize {
-        if (ui.screen != .devices) return null;
+        if (ui.screen != .devices and ui.screen != .dev_packages) return null;
         if (ui.focus.index < ui.rowCount()) return ui.focus.index;
         return null;
     }
@@ -478,6 +517,8 @@ pub const Ui = struct {
             }
             return .none;
         }
+        // P on a device row: its sync packages.
+        if (ui.screen == .devices and (cp == 'p' or cp == 'P')) if (ui.focusedRow()) |r| return ui.openPackages(r);
         // The approval question answers to y / n like `portalctl pair`.
         if (ui.screen == .pairing) if (ui.asked) |code| {
             if (cp == 'y' or cp == 'Y') return .{ .answer = .{ .code = code, .approve = true } };
@@ -493,6 +534,10 @@ pub const Ui = struct {
             if (ui.screen == .setup and i == 3 and ui.focus.index == 3) ui.setup.input = cyclePolicy(ui.setup.input, true);
             ui.focus.index = i;
             return .none;
+        }
+        if (b >= id.pkg0 and b < id.pkg0 + ui.n_pkgs and ui.screen == .dev_packages) {
+            ui.focus.index = @intCast(b - id.pkg0);
+            return .{ .toggle_sub = b - id.pkg0 };
         }
         if (b >= id.row0 and b < id.row0 + ui.n_devs and ui.screen == .devices) {
             const r = b - id.row0;
@@ -521,6 +566,10 @@ pub const Ui = struct {
             .devices => if (ui.confirm != null) {
                 ui.confirm = null;
             } else ui.close(),
+            .dev_packages => {
+                ui.show(.devices);
+                return .load_devices;
+            },
             else => ui.close(),
         }
         return .none;
@@ -540,6 +589,7 @@ pub const Ui = struct {
             return ui.activate(ids[ids.len - 1]);
         }
         if (ui.focusedRow()) |r| {
+            if (ui.screen == .dev_packages) return .{ .toggle_sub = r };
             if (ui.confirm == r) {
                 ui.confirm = null;
                 return .{ .unpair = r };
@@ -558,7 +608,10 @@ pub const Ui = struct {
                 ui.close();
                 if (was_setup) return .setup_cancel;
             },
-            id.ok => ui.close(),
+            id.ok => if (ui.screen == .dev_packages) {
+                ui.show(.devices);
+                return .load_devices;
+            } else ui.close(),
             id.start => if (ui.screen == .setup) return .setup_submit,
             id.open_pair => if (ui.screen == .pair_name) {
                 if (!devices.validName(ui.name.text())) {
@@ -604,11 +657,11 @@ pub const Ui = struct {
     pub const Bufs = struct {
         lines: [14]TermView.PanelText = undefined,
         after: [6]TermView.PanelText = undefined,
-        rows: [devices.max_devices]TermView.PanelRow = undefined,
+        rows: [@max(devices.max_devices, max_pkgs)]TermView.PanelRow = undefined,
         fields: [4]TermView.PanelField = undefined,
         buttons: [4]TermView.PanelButton = undefined,
         txt: [14][200]u8 = undefined,
-        row_txt: [devices.max_devices][120]u8 = undefined,
+        row_txt: [@max(devices.max_devices, max_pkgs)][120]u8 = undefined,
         n_txt: usize = 0,
 
         fn fmt(b: *Bufs, comptime f: []const u8, args: anytype) []const u8 {
@@ -757,10 +810,10 @@ pub const Ui = struct {
             .devices => {
                 p.title = "Paired devices";
                 if (ui.n_devs == 0) L.add(&bufs.lines, &nl, .{ .text = "No paired devices yet. Use Pair a device (Ctrl+Shift+P)." });
-                if (ui.n_devs > 0) L.add(&bufs.lines, &nl, .{ .text = "Unpair revokes a device at once and disconnects its viewers. Enter or Delete on a row asks to confirm." });
+                if (ui.n_devs > 0) L.add(&bufs.lines, &nl, .{ .text = "Unpair revokes a device at once and disconnects its viewers. Enter or Delete on a row asks to confirm. P on a row: the packages it receives (Portal sync)." });
                 for (ui.devs[0..ui.n_devs], 0..) |d, i| {
                     var ago_buf: [32]u8 = undefined;
-                    const t = std.fmt.bufPrint(&bufs.row_txt[i], "{s: <16} {s: <16} last used {s}", .{ d.name.get(), d.ip.get(), ago(c.now, d.last_seen, &ago_buf) }) catch "";
+                    const t = std.fmt.bufPrint(&bufs.row_txt[i], "{s: <16} {s: <16} last used {s}, {d} package{s}", .{ d.name.get(), d.ip.get(), ago(c.now, d.last_seen, &ago_buf), d.n_subs, if (d.n_subs == 1) "" else "s" }) catch "";
                     const confirming = ui.confirm == i;
                     bufs.rows[i] = .{
                         .text = t,
@@ -769,6 +822,21 @@ pub const Ui = struct {
                     };
                 }
                 p.rows = bufs.rows[0..ui.n_devs];
+            },
+            .dev_packages => {
+                const dev = if (ui.sub_dev < ui.n_devs) ui.devs[ui.sub_dev].name.get() else "?";
+                p.title = bufs.fmt("Packages for {s}", .{dev});
+                L.add(&bufs.lines, &nl, .{ .text = "Signed with this desktop's release key and delivered when you publish (portalctl publish). Data installs by itself; programs wait for approval on the device. Voice packages are offered right after pairing." });
+                for (ui.pkgs[0..ui.n_pkgs], 0..) |pk, i| {
+                    const t = std.fmt.bufPrint(&bufs.row_txt[i], "{s: <16} {s: <14} {s}", .{ pk.name.get(), if (pk.on) "subscribed" else "-", if (pk.latest.len > 0) pk.latest.get() else "not published" }) catch "";
+                    bufs.rows[i] = .{
+                        .text = t,
+                        .tone = if (pk.on) .normal else .muted,
+                        .selected = ui.focus.index == i,
+                        .button = .{ .label = if (pk.on) "Unsubscribe" else "Subscribe", .id = id.pkg0 + @as(u32, @intCast(i)), .tone = if (pk.on) .normal else .good },
+                    };
+                }
+                p.rows = bufs.rows[0..ui.n_pkgs];
             },
             .export_form => {
                 p.title = "Export certificate";
@@ -964,6 +1032,32 @@ test "devices: confirm before unpair" {
     try testing.expectEqual(Screen.devices, ui.screen);
     _ = ui.key(.escape, .{});
     try testing.expectEqual(Screen.none, ui.screen);
+}
+
+test "devices: P opens a device's sync packages; Enter or a click toggles" {
+    var ui: Ui = .{};
+    _ = ui.openDevices();
+    var rows: [1]DevRow = .{.{}};
+    rows[0].name.set("laptop");
+    ui.setDevices(&rows);
+    const a = ui.char('p', .{});
+    try testing.expect(a == .load_subs and a.load_subs == 0);
+    try testing.expectEqual(Screen.dev_packages, ui.screen);
+    var pk: [2]PkgRow = .{ .{}, .{} };
+    pk[0].name.set("stt-model");
+    pk[0].on = true;
+    pk[1].name.set("npu-probe");
+    ui.setPackages(&pk);
+    const t = ui.key(.enter, .{});
+    try testing.expect(t == .toggle_sub and t.toggle_sub == 0);
+    const c = ui.button(id.pkg0 + 1);
+    try testing.expect(c == .toggle_sub and c.toggle_sub == 1);
+    var b: Ui.Bufs = .{};
+    const p = ui.panel(&b, .{}).?;
+    try testing.expectEqualStrings("Packages for laptop", p.title);
+    try testing.expectEqualStrings("Unsubscribe", p.rows[0].button.?.label);
+    try testing.expectEqual(Action.load_devices, ui.key(.escape, .{}));
+    try testing.expectEqual(Screen.devices, ui.screen);
 }
 
 test "setup: fields, choice, submit; settings can be cancelled" {

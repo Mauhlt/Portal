@@ -6,10 +6,12 @@ pub const manifest = @import("manifest.zig");
 pub const store = @import("store.zig");
 pub const keypin = @import("keypin.zig");
 pub const engine = @import("engine.zig");
+pub const ui = @import("ui.zig");
 
 test {
     _ = manifest;
     _ = store;
     _ = keypin;
     _ = engine;
+    _ = ui;
 }

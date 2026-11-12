@@ -42,6 +42,7 @@ const keypin = @import("../sync/keypin.zig");
 const sync_manifest = @import("../sync/manifest.zig");
 
 pub const max_frame_payload = 8 << 20;
+pub const http_Cookie = http.Cookie;
 
 pub const connect_timeout_ms = 15_000;
 pub const request_timeout_ms = 15_000;

@@ -111,6 +111,8 @@ const Host = struct {
     bufs: remote.Bufs = .{},
     pin_fp_buf: [95]u8 = undefined,
     pin_fp_len: usize = 0,
+    sync: *SyncState,
+    sync_bufs: sync.ui.Ui.Bufs = .{},
 
     /// Snapshot status under the lock, build the frame, then present.
     fn frame(h: *Host) void {
@@ -132,7 +134,11 @@ const Host = struct {
             .err = s.last_error,
             .pin_fp = h.pin_fp_buf[0..h.pin_fp_len],
         }, &h.bufs);
-        h.tv.build(&s.grid, o);
+        var oo = o;
+        h.sync.mutex.lockUncancelable(h.client.io);
+        defer h.sync.mutex.unlock(h.client.io);
+        if (h.sync.ui.panel(&h.sync_bufs)) |p| oo.panel = p;
+        h.tv.build(&s.grid, oo);
         s.mutex.unlock(h.client.io);
         h.tv.present();
         h.sink.mode = mode;
@@ -279,7 +285,15 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     pin_mod.saveLastServer(io, client.host()) catch {};
 
     const host_ui = gpa.create(Host) catch fatal(prog, "out of memory", .{});
-    host_ui.* = .{ .tv = tv, .shared = shared, .client = client, .sink = .{ .client = client } };
+    const sync_state = gpa.create(SyncState) catch fatal(prog, "out of memory", .{});
+    sync_state.* = .{ .client = client, .shared = shared };
+    host_ui.* = .{ .tv = tv, .shared = shared, .client = client, .sink = .{ .client = client, .modal = sync_state.modal() }, .sync = sync_state };
+    // Portal sync (docs/sync-design.md): a worker that runs a pass on
+    // every (re)connect and {"t":"updates"}; only over TLS, where the
+    // release key was pinned at pairing.
+    if (transport == .tls) {
+        if (std.Thread.spawn(.{}, SyncState.run, .{sync_state})) |t| t.detach() else |_| {}
+    }
     switch (transport) {
         .tls => |der| host_ui.pin_fp_len = x509check.formatFingerprint(x509check.fingerprint(der), &host_ui.pin_fp_buf).len,
         .insecure_plain_http => {},
@@ -309,6 +323,187 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     tv.deinit();
     std.process.exit(0);
 }
+
+/// The device side of Portal sync inside the viewer: a worker thread for
+/// the passes and the panels' state (approval, voice offer, Packages).
+const SyncState = struct {
+    client: *client_mod.Client,
+    shared: *client_mod.Shared,
+    mutex: std.Io.Mutex = .init,
+    ui: sync.ui.Ui = .{},
+    store: ?sync.store.Store = null,
+    root_buf: [pin_mod.max_path]u8 = undefined,
+    seen: u64 = 0,
+
+    fn io(s: *const SyncState) std.Io {
+        return s.client.io;
+    }
+
+    fn openStore(s: *SyncState) ?*sync.store.Store {
+        if (s.store == null) {
+            const root = sync.keypin.syncRoot(&s.root_buf) catch return null;
+            s.store = sync.store.Store.open(s.client.gpa, s.io(), root) catch return null;
+        }
+        return &s.store.?;
+    }
+
+    /// Event-driven: sleeps until the network thread bumps sync_gen (a
+    /// stream connected, or the desktop said {"t":"updates"}) or the user
+    /// approved something.
+    fn run(s: *SyncState) void {
+        while (true) {
+            s.shared.sync_wake.reset();
+            const gen = s.shared.sync_gen.load(.acquire);
+            if (gen == s.seen) {
+                s.shared.sync_wake.wait(s.io()) catch {};
+                continue;
+            }
+            s.seen = gen;
+            s.pass();
+        }
+    }
+
+    fn redraw(s: *SyncState) void {
+        _ = s.shared.version.fetchAdd(1, .release);
+        if (s.shared.wake_fn) |f| f(s.shared.wake_ctx.?);
+    }
+
+    fn pass(s: *SyncState) void {
+        const st = s.openStore() orelse return;
+        var session: ?client_mod.http_Cookie = null;
+        s.shared.mutex.lockUncancelable(s.io());
+        session = s.shared.session;
+        s.shared.mutex.unlock(s.io());
+        var sess = session orelse return;
+        defer sess.wipe();
+        const host = s.client.host();
+        const pinned = (sync.keypin.load(s.io(), host) catch null) orelse {
+            s.mutex.lockUncancelable(s.io());
+            s.ui.setNote("Sync is off for {s}: pair this device again to pin the desktop's release key.", .{host});
+            s.mutex.unlock(s.io());
+            return;
+        };
+        var approvals: [sync.ui.max_marks]sync.engine.Approval = undefined;
+        var marks: [sync.ui.max_marks]sync.ui.Mark = undefined;
+        var opts: sync.engine.Options = .{ .client_version = client_version };
+        s.mutex.lockUncancelable(s.io());
+        if (s.shared.just_paired.swap(false, .acq_rel)) s.ui.startVoiceOffer();
+        s.ui.setDesktop(host, pinned);
+        const n_marks = s.ui.n_approved;
+        @memcpy(marks[0..n_marks], s.ui.approved[0..n_marks]);
+        opts.approved = sync.ui.approvalsFrom(marks[0..n_marks], &approvals);
+        opts.hold = s.ui.holdList();
+        s.mutex.unlock(s.io());
+        const rep = s.client.gpa.create(sync.engine.Report) catch return;
+        defer s.client.gpa.destroy(rep);
+        rep.* = .{};
+        const rem = s.client.syncRemote(sess.value());
+        sync.engine.run(&rem, st, pinned, opts, rep, .{ .f = logLine }) catch |err| {
+            std.debug.print("portal connect: sync: {s}\n", .{sync.engine.describe(err)});
+            return;
+        };
+        var rows: [32]sync.ui.Installed = undefined;
+        const n = installedRows(st, &rows);
+        s.mutex.lockUncancelable(s.io());
+        s.ui.setReport(rep);
+        s.ui.setInstalled(rows[0..n]);
+        s.mutex.unlock(s.io());
+        s.redraw();
+    }
+
+    fn logLine(_: ?*anyopaque, line: []const u8) void {
+        std.debug.print("portal connect: sync: {s}\n", .{line});
+    }
+
+    fn installedRows(st: *sync.store.Store, rows: []sync.ui.Installed) usize {
+        var ids: [32][sync.manifest.max_package_id]u8 = undefined;
+        var lens: [32]u8 = undefined;
+        const n = st.installedPackages(&ids, &lens) catch return 0;
+        var k: usize = 0;
+        for (0..@min(n, rows.len)) |i| {
+            const id = ids[i][0..lens[i]];
+            const cur = (st.current(id) catch continue) orelse continue;
+            const prev = st.previous(id) catch null;
+            rows[k] = sync.ui.Installed.init(id, cur.version(), if (prev) |p| p.version() else null);
+            k += 1;
+        }
+        return k;
+    }
+
+    fn perform(s: *SyncState, a: sync.ui.Action) void {
+        switch (a) {
+            .none => {},
+            .rerun => {
+                _ = s.shared.sync_gen.fetchAdd(1, .release);
+                s.shared.sync_wake.set(s.io());
+            },
+            .rollback => |i| {
+                const st = s.openStore() orelse return;
+                s.mutex.lockUncancelable(s.io());
+                const pkg_row = if (i < s.ui.n_installed) s.ui.installed[i] else null;
+                s.mutex.unlock(s.io());
+                const row = pkg_row orelse return;
+                const r = st.rollback(row.package());
+                var rows: [32]sync.ui.Installed = undefined;
+                const n = installedRows(st, &rows);
+                s.mutex.lockUncancelable(s.io());
+                s.ui.setInstalled(rows[0..n]);
+                if (r) |p| s.ui.setNote("{s} rolled back to {s}.", .{ row.package(), p.version() }) else |err| s.ui.setNote("Roll back failed: {t}", .{err});
+                s.mutex.unlock(s.io());
+            },
+        }
+        s.redraw();
+    }
+
+    fn modal(s: *SyncState) remote.RemoteSink.Modal {
+        return .{ .ctx = s, .active = active, .key = key, .char = char, .button = button, .shortcut = shortcut };
+    }
+    fn self(p: *anyopaque) *SyncState {
+        return @ptrCast(@alignCast(p));
+    }
+    fn active(p: *anyopaque) bool {
+        const s = self(p);
+        s.mutex.lockUncancelable(s.io());
+        defer s.mutex.unlock(s.io());
+        return s.ui.open();
+    }
+    fn key(p: *anyopaque, k: view.input.Key, m: view.input.Mods) void {
+        const s = self(p);
+        s.mutex.lockUncancelable(s.io());
+        const a = s.ui.key(k, m);
+        s.mutex.unlock(s.io());
+        s.perform(a);
+    }
+    fn char(p: *anyopaque, cp: u21, m: view.input.Mods) void {
+        const s = self(p);
+        s.mutex.lockUncancelable(s.io());
+        const a = s.ui.char(cp, m);
+        s.mutex.unlock(s.io());
+        s.perform(a);
+    }
+    fn button(p: *anyopaque, b: u32) bool {
+        if (b < sync.ui.id.approve) return false;
+        const s = self(p);
+        s.mutex.lockUncancelable(s.io());
+        const a = s.ui.button(b);
+        s.mutex.unlock(s.io());
+        s.perform(a);
+        return true;
+    }
+    /// Ctrl+Shift+K opens Packages.
+    fn shortcut(p: *anyopaque, cp: u21, m: view.input.Mods) bool {
+        if (!(m.ctrl and m.shift and (cp == 'k' or cp == 'K'))) return false;
+        const s = self(p);
+        s.mutex.lockUncancelable(s.io());
+        s.ui.openPackages();
+        s.mutex.unlock(s.io());
+        s.redraw();
+        return true;
+    }
+};
+
+/// The version manifests' min-client is compared with (Portal's version).
+pub const client_version = "0.1.0";
 
 fn hasPin(io: std.Io, server: []const u8) bool {
     var hb: [64]u8 = undefined;

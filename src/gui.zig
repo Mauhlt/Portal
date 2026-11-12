@@ -30,6 +30,8 @@ const settings = @import("settings.zig");
 const guard = @import("guard.zig");
 const pki = @import("tls/pki.zig");
 const web = @import("web.zig");
+const sync = @import("sync.zig");
+const sync_manifest = @import("client").sync.manifest;
 
 /// Font size of the local terminal, in logical pixels (zoom with Ctrl+= / -).
 pub const font_em: f32 = 15;
@@ -492,7 +494,67 @@ pub const LocalHost = struct {
             .load_devices => h.loadDevices(),
             .unpair => |i| h.unpair(i),
             .export_ca => h.exportCa(),
+            .load_subs => |i| h.loadSubs(i),
+            .toggle_sub => |i| h.toggleSub(i),
         }
+    }
+
+    /// A device's sync packages: the known ids, everything published, and
+    /// anything it is already subscribed to.
+    fn loadSubs(h: *LocalHost, i: usize) void {
+        const d = h.desk orelse return;
+        if (i >= h.ui.n_devs) return;
+        const sp: sync.Paths = .{ .dir = d.paths.dir };
+        const dev = h.ui.devs[i].name.get();
+        const subs = sync.readSubs(h.gpa, h.io, sp) catch |err| {
+            h.ui.setNote(.bad, "Could not read the sync subscriptions: {t}.", .{err});
+            return;
+        };
+        var rows: [deskui.max_pkgs]deskui.PkgRow = undefined;
+        var n: usize = 0;
+        const Add = struct {
+            fn f(r: []deskui.PkgRow, k: *usize, name: []const u8) void {
+                for (r[0..k.*]) |x| if (std.mem.eql(u8, x.name.get(), name)) return;
+                if (k.* == r.len) return;
+                r[k.*] = .{};
+                r[k.*].name.set(name);
+                k.* += 1;
+            }
+        };
+        for (sync_manifest.known_packages) |p| Add.f(&rows, &n, p);
+        var published = sync.packages(h.gpa, h.io, sp) catch std.ArrayList([]u8).empty;
+        defer {
+            for (published.items) |p| h.gpa.free(p);
+            published.deinit(h.gpa);
+        }
+        for (published.items) |p| Add.f(&rows, &n, p);
+        var mine_buf: [deskui.max_pkgs][]const u8 = undefined;
+        for (subs.forDevice(dev, &mine_buf)) |p| Add.f(&rows, &n, p);
+        for (rows[0..n]) |*r| {
+            r.on = subs.has(dev, r.name.get());
+            if (sync.latest(h.gpa, h.io, sp, r.name.get()) catch null) |v| {
+                var vv = v;
+                defer vv.deinit(h.gpa);
+                var lb: [96]u8 = undefined;
+                r.latest.set(std.fmt.bufPrint(&lb, "{s} ({t})", .{ vv.m.version, vv.m.kind }) catch vv.m.version);
+            }
+        }
+        h.ui.setPackages(rows[0..n]);
+    }
+
+    fn toggleSub(h: *LocalHost, i: usize) void {
+        const d = h.desk orelse return;
+        if (i >= h.ui.n_pkgs or h.ui.sub_dev >= h.ui.n_devs) return;
+        const dev = h.ui.devs[h.ui.sub_dev].name.get();
+        const pkg = h.ui.pkgs[i].name.get();
+        const on = !h.ui.pkgs[i].on;
+        _ = sync.subscribe(h.gpa, h.io, .{ .dir = d.paths.dir }, dev, pkg, on) catch |err| {
+            h.ui.setNote(.bad, "Could not update the subscriptions: {t}.", .{err});
+            return;
+        };
+        d.srv.log.print("sync: '{s}' {s} '{s}' from the Portal window", .{ dev, if (on) "subscribed to" else "unsubscribed from", pkg });
+        h.ui.setNote(.good, "{s} '{s}' {s} {s}.", .{ if (on) "Subscribed" else "Unsubscribed", dev, if (on) "to" else "from", pkg });
+        h.loadSubs(h.ui.sub_dev);
     }
 
     fn loadDevices(h: *LocalHost) void {
@@ -518,6 +580,12 @@ pub const LocalHost = struct {
                 return std.mem.lessThan(u8, a.name.get(), b.name.get());
             }
         }.lt);
+        if (sync.readSubs(h.gpa, h.io, .{ .dir = d.paths.dir })) |subs| {
+            for (rows[0..n]) |*r| {
+                var b: [deskui.max_pkgs][]const u8 = undefined;
+                r.n_subs = @intCast(subs.forDevice(r.name.get(), &b).len);
+            }
+        } else |_| {}
         h.ui.setDevices(rows[0..n]);
     }
 
