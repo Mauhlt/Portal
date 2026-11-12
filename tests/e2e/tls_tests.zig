@@ -449,7 +449,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         };
         defer v.deinit();
         _ = r.check("WSS upgrade with the https:// Origin: 101, hello first, then a full snapshot", v.c.status == 101 and v.hello_first and v.first_full, "status={d} hello_first={} full={}", .{ v.c.status, v.hello_first, v.first_full });
-        _ = r.check("hello says keys", std.mem.eql(u8, v.helloText(), "{\"t\":\"hello\",\"input\":\"keys\"}"), "{s}", .{v.helloText()});
+        _ = r.check("hello says keys", std.mem.startsWith(u8, v.helloText(), "{\"t\":\"hello\",\"v\":2,\"input\":\"keys\","), "{s}", .{v.helloText()});
         scan.look("hello", v.helloText());
         _ = r.check("the snapshot carries the child's output", v.waitFor(marker, 10_000), "{s}", .{v.dump(&dump_buf)});
         _ = r.check("shell prompt reaches the viewer", waitLine(v, "E2E>", 10_000), "cursor '{s}'", .{v.cursorLine()});
