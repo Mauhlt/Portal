@@ -1261,7 +1261,11 @@ pub const Server = struct {
             .{ .name = "content-security-policy", .value = csp },
             .{ .name = "x-content-type-options", .value = "nosniff" },
             .{ .name = "x-frame-options", .value = "DENY" },
-            .{ .name = "referrer-policy", .value = "no-referrer" },
+            // same-origin, not no-referrer: under no-referrer, browsers
+            // (Fetch spec) send `Origin: null` with a form POST, which the
+            // origin check rightly refuses ("bad origin" on Pair this
+            // device and Unpair). Nothing is ever sent to another origin.
+            .{ .name = "referrer-policy", .value = "same-origin" },
             .{ .name = "cross-origin-opener-policy", .value = "same-origin" },
             .{ .name = "cross-origin-resource-policy", .value = "same-origin" },
             .{ .name = "cache-control", .value = "no-store" },
