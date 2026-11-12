@@ -229,8 +229,11 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
     var hb: [64]u8 = undefined;
     const host = http.canonicalHost(srv, &hb) catch fatal("bad --server '{s}'", .{srv});
     if (forget) {
-        const r = client.forgetDesktop(io, host);
-        var mb: [400]u8 = undefined;
+        // Both ways: the desktop removes this device first (if reachable).
+        var fca_buf: [client.x509check_mod.max_cert_len]u8 = undefined;
+        const fca: ?[]const u8 = if (ca_file) |p| (client.pin.readCaFile(io, p, &fca_buf) catch null) else null;
+        const r = client.forgetHost(gpa, io, host, fca);
+        var mb: [600]u8 = undefined;
         var w: Io.Writer = .fixed(&mb);
         r.describe(&w, host) catch {};
         std.debug.print("sync-device: {s}\n", .{w.buffered()});
@@ -314,7 +317,10 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
 
     const pinned = pinned_now orelse fatal("no release key pinned for {s}: pair this device first (--pair)", .{host});
     var st = st_opt.?;
-    var session = c.signIn() catch |err| fatal("sign-in failed: {t}", .{err});
+    var session = c.signIn() catch |err| {
+        if (err == error.DeviceGone) forgetGone(io, host);
+        fatal("sign-in failed: {t}", .{err});
+    };
     defer session.wipe();
     const remote = c.syncRemote(session.value());
     {
@@ -326,7 +332,7 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
             std.debug.print("sync-device: WARNING: the server's release key changed (pinned {s}, server {s}); packages signed by it will be rejected until this device is paired again\n", .{ fingerprintText(pinned, &a), fingerprintText(now_key, &b) });
         }
     }
-    if (wait_s) |secs| waitUpdates(gpa, io, &c, &session, secs);
+    if (wait_s) |secs| waitUpdates(gpa, io, &c, &session, secs, host);
 
     var rep: engine.Report = .{};
     engine.run(&remote, &st, pinned, .{ .client_version = client_version, .approve_all = approve, .only = only }, &rep, .{ .f = report }) catch |err| switch (err) {
@@ -340,7 +346,19 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
 
 /// Opens the WebSocket with the session and returns once the server says
 /// {"t":"updates"} (or after `secs`).
-fn waitUpdates(gpa: Allocator, io: Io, c: *Client, session: *const http.Cookie, secs: u32) void {
+/// The desktop said it no longer has this device (`X-Portal-Device: gone`,
+/// or logout reason "unpaired"): forget it here too, say why, exit 1.
+fn forgetGone(io: Io, host: []const u8) noreturn {
+    var r = client.forgetDesktop(io, host);
+    r.remote = .gone_by_desktop;
+    var mb: [600]u8 = undefined;
+    var w: Io.Writer = .fixed(&mb);
+    r.describe(&w, host) catch {};
+    std.debug.print("sync-device: {s}\n", .{w.buffered()});
+    std.process.exit(1);
+}
+
+fn waitUpdates(gpa: Allocator, io: Io, c: *Client, session: *const http.Cookie, secs: u32, host: []const u8) void {
     var wd: client.watchdog.Watchdog = .{ .io = io };
     wd.extend(@as(i64, secs) * 1000);
     const r = wd.run(waitTask, .{ gpa, io, c, session, &wd }, null);
@@ -348,7 +366,10 @@ fn waitUpdates(gpa: Allocator, io: Io, c: *Client, session: *const http.Cookie, 
         std.debug.print("sync-device: no updates announced within {d} s\n", .{secs});
         return;
     }
-    r catch |err| fatal("stream failed: {t}", .{err});
+    r catch |err| {
+        if (err == error.DeviceGone) forgetGone(io, host);
+        fatal("stream failed: {t}", .{err});
+    };
     std.debug.print("sync-device: server announced updates\n", .{});
 }
 
@@ -382,6 +403,10 @@ fn waitTask(gpa: Allocator, io: Io, c: *Client, session: *const http.Cookie, wd:
                 if (std.mem.indexOf(u8, f.payload, "\"t\":\"hello\"") != null)
                     std.debug.print("sync-device: listening for updates\n", .{});
                 if (std.mem.indexOf(u8, f.payload, "\"t\":\"updates\"") != null) return;
+                if (std.mem.indexOf(u8, f.payload, "\"t\":\"logout\"") != null) {
+                    if (std.mem.indexOf(u8, f.payload, "\"reason\":\"unpaired\"") != null) return error.DeviceGone;
+                    return error.LoggedOut;
+                }
             }
             std.mem.copyForwards(u8, buf.items[0 .. buf.items.len - f.len], buf.items[f.len..]);
             buf.shrinkRetainingCapacity(buf.items.len - f.len);

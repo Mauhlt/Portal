@@ -490,7 +490,7 @@ pub const Ui = struct {
                     p.title_tone = .bad;
                     b.lines[nl] = .{ .text = "Deletes from this device: the desktop's certificate pin and release-key pin, this device's credential for it, and its sync folder with every package it sent." };
                     nl += 1;
-                    b.lines[nl] = .{ .text = "The desktop still lists this device until you unpair it there. Portal closes afterwards; pairing again starts from scratch." };
+                    b.lines[nl] = .{ .text = "The desktop is asked to remove this device too (if it can be reached). Portal closes afterwards; pairing again starts from scratch." };
                     nl += 1;
                 },
             },

@@ -315,6 +315,8 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         defer lc.deinit();
         const listening = lc.waitFor("listening for updates", 15_000);
         _ = r.check("the device listens on its WebSocket", listening, "{s}", .{lc.output()});
+        _ = r.check("the shared store of earlier versions is deleted on start (desktops\\ untouched)", !c.exists(legacy_ptr) and
+            lc.has("removed the shared store of earlier versions") and c.exists(other_desk), "{s}", .{lc.output()});
         const sub = try c.desk(&.{ "sync", "subscribe", "laptop", "stt-model" });
         _ = r.check("sync subscribe", sub.code == 0, "{s}", .{sub.out});
         const code = lc.wait(30_000);
@@ -336,9 +338,8 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("staging is empty afterwards", it_count == 0, "{d} entries", .{it_count});
         const op = try std.fmt.allocPrint(gpa, "{s}\\state\\stt-model.txt", .{other_desk});
         const other_now = c.readFile(op) orelse "";
-        const legacy_now = c.readFile(legacy_ptr) orelse "";
-        _ = r.check("installs land in this desktop's own folder: another desktop's record (sequence 999999) and the old shared store neither block nor change",
-            std.mem.eql(u8, other_now, other_rec) and std.mem.eql(u8, legacy_now, legacy_rec) and std.mem.eql(u8, c.current("stt-model"), "1.0"), "other '{s}' legacy '{s}'", .{ other_now, legacy_now });
+        _ = r.check("installs land in this desktop's own folder: another desktop's record (sequence 999999) neither blocks nor changes",
+            std.mem.eql(u8, other_now, other_rec) and std.mem.eql(u8, c.current("stt-model"), "1.0"), "other '{s}'", .{other_now});
     }
     {
         const lc = try c.deviceLive(&.{ "--wait-updates", "30" });
@@ -455,10 +456,34 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
 
     _ = r.check("nothing in any sync response contains paths or user names", c.leaked == 0 and c.scanned > 15, "{d} of {d}; first: {s}", .{ c.leaked, c.scanned, c.first_leak[0..c.first_len] });
     {
+        // Forget is mutual: the desktop removes the device first.
         const f = try c.device(&.{"--forget"});
         _ = r.check("the device forgets its credential and pins", f.code == 0, "{s}", .{f.out});
-        _ = r.check("...and deletes this desktop's sync folder, only that one", !c.exists(c.desk_dir) and c.exists(other_desk) and
-            c.exists(legacy_ptr), "{s}", .{f.out});
+        _ = r.check("...and deletes this desktop's sync folder, only that one", !c.exists(c.desk_dir) and c.exists(other_desk), "{s}", .{f.out});
+        const d = try c.desk(&.{"devices"});
+        _ = r.check("Forget this desktop: the desktop removed the device too", has(f.out, "The desktop removed this device too") and !has(d.out, "laptop "), "{s} / {s}", .{ f.out, d.out });
+        _ = r.ok("...and logged it", inst.logHas("device 'laptop' forgot this desktop"));
+    }
+    // --------------- unpaired at the desk: the device forgets the desktop
+    {
+        const pc = try inst.liveCli(&.{ "pair", "laptop" });
+        defer pc.deinit();
+        _ = pc.waitFor("Waiting for the device", 15_000);
+        _ = client.waitPairOpen(inst, 10_000);
+        const dp = try c.deviceLive(&.{"--pair"});
+        defer dp.deinit();
+        if (pc.waitFor("[y/N]", 15_000)) pc.answer("y\r\n");
+        const paired = dp.wait(30_000) == 0 and dp.has("paired; release key pinned");
+        _ = r.check("re-paired for the unpair test", paired, "{s}", .{dp.output()});
+        const lc = try c.deviceLive(&.{ "--wait-updates", "30" });
+        defer lc.deinit();
+        _ = lc.waitFor("listening for updates", 15_000);
+        const u = try c.desk(&.{ "unpair", "laptop" });
+        const code = lc.wait(20_000);
+        _ = r.check("unpaired at the desk: a connected device is told (logout, reason unpaired) and forgets the desktop", u.code == 0 and code == 1 and
+            lc.has("no longer has this device paired") and lc.has("The desktop no longer lists this device"), "code={?d} {s}", .{ code, lc.output() });
+        const again = try c.device(&.{});
+        _ = r.check("...its credential is gone: nothing left to sign in with", again.code != 0 and !has(again.out, "installed"), "{s}", .{again.out});
     }
     _ = r.ok("portal still running at end of group", inst.alive() and client.alive(inst));
 }
