@@ -126,11 +126,11 @@ pub const Sender = struct {
 };
 
 const testing = std.testing;
-const pngcheck = @import("pngcheck");
+const imgcheck = @import("imgcheck");
 
 fn showImage(t: *vt.Terminal, w: u32, h: u32, keys: []const u8) !void {
     const gpa = testing.allocator;
-    const png = try pngcheck.testImage(gpa, w, h);
+    const png = try imgcheck.testImage(gpa, w, h);
     defer gpa.free(png);
     const b64 = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
     defer gpa.free(b64);

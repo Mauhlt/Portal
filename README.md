@@ -210,9 +210,11 @@ Resizing the window also clears them, because ConPTY repaints the whole
 screen. Programs can also use the kitty graphics protocol directly (PNG
 only; see `src/vt_gfx.zig`). Limits: 6 MiB per PNG, 8192 px per side and
 32 Mpx, 64 images and 64 MiB per session. Images only ever come from a
-program in the session; viewers can't request files. The browser client
-currently draws a labelled box instead of the pixels (see
-`docs/image-decoder-findings.md`).
+program in the session; viewers can't request files. Every image is checked
+with the owner's `Image.check` before it is stored, sent or decoded (see
+`docs/image-decoder-findings.md`); the browser decodes images up to
+1024 px per side within a 96 MiB budget and draws a labelled box for
+anything it can't decode.
 
 ### 4. Pair each device once (at the desk)
 
@@ -351,8 +353,8 @@ The page is made of **slices**, the same on every platform:
   `docs/protocol.md`).
 * **Interaction**: the input box and buttons, described below.
 * **Data**: what the session pushed, newest first. Today that is every
-  inline image it showed (a card with its size; the browser build has no
-  PNG decoder yet, so previews show only where pixels were decoded);
+  inline image it showed (a card with its size, and a preview where the
+  pixels were decoded);
   tables and charts can be added as further kinds in `src/wasm/data.zig`.
 
 On a phone (narrow) the interaction slice is pinned at the bottom and the

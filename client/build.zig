@@ -43,16 +43,23 @@ pub fn build(b: *std.Build) void {
 /// The reusable view module (src/view), wired to the Renderer package.
 pub fn viewModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     const renderer = b.dependency("Renderer", .{ .target = target, .optimize = optimize, .demo = false });
-    // Inline images: pngcheck + imgdec (src/image) on the owner's pinned
-    // Image package (see build.zig.zon), as in Portal's root build.
-    const pngcheck = b.createModule(.{ .root_source_file = b.path("src/image/pngcheck.zig"), .target = target, .optimize = optimize });
+    // Inline images: imgcheck + imgdec (src/image) on the owner's Image
+    // package (see build.zig.zon), as in Portal's root build.
+    // Same args as Renderer's, so both share Image's and Renderer's ../Vulkan module.
+    const image = b.dependency("Image", .{ .target = target, .optimize = optimize });
+    const imgcheck = b.createModule(.{
+        .root_source_file = b.path("src/image/imgcheck.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ImageCheck", .module = image.module("ImageCheck") }},
+    });
     const imgdec = b.createModule(.{
         .root_source_file = b.path("src/image/imgdec.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "Image", .module = b.dependency("Image", .{ .target = target }).module("Image") },
-            .{ .name = "pngcheck", .module = pngcheck },
+            .{ .name = "Image", .module = image.module("Image") },
+            .{ .name = "imgcheck", .module = imgcheck },
         },
     });
     return b.createModule(.{

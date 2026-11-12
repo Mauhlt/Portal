@@ -7,9 +7,10 @@
         // The owner's Renderer (branch portal-client). Once merged into the
         // main Renderer checkout, change this to "../../Renderer".
         .Renderer = .{ .path = "../../Renderer-wt-portal" },
-        // The owner's Image package (PNG decoder), PINNED by the owner's
-        // request to Image@065e8ec (a detached worktree, used read-only).
-        .Image = .{ .path = "../../Image-wt-portal" },
+        // The owner's Image package (Image.check + PNG decoder). Branch
+        // image-check in a worktree for now; once the owner merges it into
+        // their Image branch, change this to "../../Image".
+        .Image = .{ .path = "../../Image-wt-check" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "tools", "README.md" },
 }

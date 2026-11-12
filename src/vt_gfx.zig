@@ -21,12 +21,12 @@
 //! Hard limits (enforced before anything is stored, never by decoding):
 //! base64 per image <= 8 MiB, <= 64 images, <= 64 MiB stored (least
 //! recently used images evicted), PNG structure and IHDR <= 8192 x 8192
-//! and <= 32 Mpx (pngcheck.validate), <= 256 placements per screen. Never
+//! and <= 32 Mpx (imgcheck.validate), <= 256 placements per screen. Never
 //! panics; allocation failure drops the image being received.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const pngcheck = @import("pngcheck");
+const imgcheck = @import("imgcheck");
 
 pub const max_b64_per_image: usize = 8 << 20;
 pub const max_images: usize = 64;
@@ -302,7 +302,7 @@ pub const Graphics = struct {
         if (g.quad_n < 4) @memset(g.quad[g.quad_n..], 0);
         const q = g.quad;
         const bytes = [3]u8{ (q[0] << 2) | (q[1] >> 4), (q[1] << 4) | (q[2] >> 2), (q[2] << 6) | q[3] };
-        const cap = pngcheck.max_file_bytes;
+        const cap = imgcheck.max_file_bytes;
         if (g.pend.items.len + n > cap) return g.fail(gpa);
         if (g.pend.unusedCapacitySlice().len < n) {
             const want = @min(cap, @max(64 << 10, g.pend.capacity * 2, g.pend.items.len + n));
@@ -348,7 +348,7 @@ pub const Graphics = struct {
 
     /// Validates and keeps the received PNG; returns its image id.
     fn store(g: *Graphics, gpa: Allocator) ?u32 {
-        const info = pngcheck.validate(g.pend.items) catch return null;
+        const info = imgcheck.validate(g.pend.items) catch return null;
         const len = g.pend.items.len;
         if (len > max_total_bytes) return null;
         if (g.pend_cmd.i != 0) if (g.byClientId(g.pend_cmd.i)) |old| g.removeImage(gpa, old.image);
