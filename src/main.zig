@@ -1417,6 +1417,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .pty = &pty,
         .console = &console,
         .policy = opts.policy,
+        .project = opts.project,
         // Owned by the session for the life of the process (exit is via
         // ExitProcess, so it is never freed explicitly).
         .term = vt.Terminal.init(gpa, initial.cols, initial.rows) catch fatal("out of memory", .{}),

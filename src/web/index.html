@@ -14,35 +14,48 @@
 <body class="viewer">
 <!-- Measures env(safe-area-inset-top) as its height and -bottom as its width. -->
 <div id="safe" aria-hidden="true"></div>
-<header>
-  <span id="status" class="status">connecting…</span>
-  <span id="mode" class="mode"></span>
-  <span class="spacer"></span>
-  <button type="button" data-cmd="1" title="Fit terminal to window">Fit</button>
-  <button type="button" data-cmd="2" title="Smaller text">A−</button>
-  <button type="button" data-cmd="3" title="Larger text">A+</button>
-  <form method="post" action="/logout"><button type="submit" title="Forget this device">Unpair</button></form>
+<!-- Slices (src/wasm/slices.zig places them; the wasm client decides
+     everything): the terminal under its header, the data slice, and the
+     interaction slice (a native textarea, so keyboard dictation and Win+H
+     fill it, plus the button row). Narrow screens show Terminal or Data
+     via the segmented control; wide ones put Data in a right column. -->
+<header id="head">
+  <div class="ctl">
+    <div class="tabs" role="tablist" aria-label="View">
+      <button type="button" role="tab" data-tab="0">Terminal</button>
+      <button type="button" role="tab" data-tab="1">Data<span class="dot" aria-label="new data"></span></button>
+    </div>
+    <span class="spacer"></span>
+    <button type="button" class="zoom" data-cmd="1" title="Fit terminal to window">Fit</button>
+    <button type="button" class="zoom" data-cmd="2" title="Smaller text">A−</button>
+    <button type="button" class="zoom" data-cmd="3" title="Larger text">A+</button>
+    <form method="post" action="/logout"><button type="submit" title="Forget this device">Unpair</button></form>
+  </div>
+  <div class="statusline"><span id="project" class="project"></span><span class="sep">·</span><span id="status" class="status">connecting…</span><span class="sep">·</span><span id="mode" class="mode"></span><span class="sep">·</span><span id="state" class="state"></span></div>
 </header>
-<!-- Three panes, editor style: the terminal (drawn by the wasm client,
-     src/wasm), the input box (a native textarea, so keyboard dictation
-     and Win+H fill it), and the button row. The wasm client sizes them
-     (src/wasm/panes.zig) and decides what Send does (inputbox.zig). -->
-<main id="wrap"><canvas id="screen" aria-label="Terminal"></canvas></main>
-<section id="input" aria-label="Input">
-  <textarea id="box" rows="2" enterkeyhint="send" autocomplete="off" autocapitalize="sentences"
-    aria-label="Instruction or answer" aria-describedby="note"></textarea>
-  <p id="note" class="note" aria-live="polite"></p>
+<main id="wrap" aria-label="Terminal"><canvas id="screen" aria-label="Terminal"></canvas></main>
+<section id="dslice" aria-label="Data">
+  <div class="dhead">Data</div>
+  <div id="dwrap"><canvas id="data" aria-label="Data the session sent"></canvas></div>
 </section>
-<nav id="keys" aria-label="Answer keys">
-  <button type="button" data-btn="0">Yes</button>
-  <button type="button" data-btn="1">No</button>
-  <button type="button" data-btn="2">1</button>
-  <button type="button" data-btn="3">2</button>
-  <button type="button" data-btn="4">3</button>
-  <button type="button" data-btn="5">Esc</button>
-  <button type="button" data-btn="6">Enter</button>
-  <button type="button" data-btn="7" class="send">Send</button>
-</nav>
+<div id="split" role="separator" aria-orientation="vertical" title="Drag to resize"></div>
+<section id="inter" aria-label="Input">
+  <div id="input">
+    <textarea id="box" rows="2" enterkeyhint="send" autocomplete="off" autocapitalize="sentences"
+      aria-label="Instruction or answer" aria-describedby="note"></textarea>
+    <p id="note" class="note" aria-live="polite"></p>
+  </div>
+  <nav id="keys" aria-label="Answer keys">
+    <button type="button" data-btn="0">Yes</button>
+    <button type="button" data-btn="1">No</button>
+    <button type="button" data-btn="2">1</button>
+    <button type="button" data-btn="3">2</button>
+    <button type="button" data-btn="4">3</button>
+    <button type="button" data-btn="5">Esc</button>
+    <button type="button" data-btn="6">Enter</button>
+    <button type="button" data-btn="7" class="send">Send</button>
+  </nav>
+</section>
 <script src="/static/app.js"></script>
 </body>
 </html>

@@ -1,19 +1,21 @@
 //! Portal's browser client, compiled to wasm32-freestanding.
 //!
 //! The whole viewer lives here: protocol decoding (proto.zig), connection
-//! and reconnect policy (conn.zig), the page's panes (panes.zig: terminal,
-//! input box, button row, following the on-screen keyboard), the canvas
-//! layout (layout.zig), key mapping (keys.zig), what Send does with the
-//! input box's text (inputbox.zig), glyph rasterisation (glyphs.zig +
-//! font/) and drawing (render.zig). src/web/app.js is only the unavoidable
-//! browser glue: it instantiates this module, forwards DOM events and
-//! values to the exports below and implements the `host` imports as
-//! one-line browser API calls.
+//! and reconnect policy (conn.zig), the page's slices (slices.zig: the
+//! terminal, the interaction slice with the input box and buttons, and the
+//! data slice, arranged as tabs on narrow screens or columns on wide ones,
+//! following the on-screen keyboard), the terminal canvas layout
+//! (layout.zig), key mapping (keys.zig), what Send does with the input
+//! box's text (inputbox.zig), the data feed (data.zig), glyph rasterisation
+//! (glyphs.zig + font/) and drawing (render.zig). src/web/app.js is only
+//! the unavoidable browser glue: it instantiates this module, forwards DOM
+//! events and values to the exports below and implements the `host`
+//! imports as one-line browser API calls.
 //!
 //! Data in: the bridge asks `in_alloc(n)` for a buffer, copies the bytes
 //! (a WebSocket message, a key name, a URL path) there, then calls the
 //! handler with the length. Pixels out: `present` hands the bridge a view
-//! of the framebuffer for putImageData.
+//! of a framebuffer for putImageData.
 
 const std = @import("std");
 const proto = @import("proto.zig");
@@ -22,8 +24,9 @@ const layout = @import("layout.zig");
 const keys = @import("keys.zig");
 const glyphs = @import("glyphs.zig");
 const render = @import("render.zig");
-const panes = @import("panes.zig");
+const slices = @import("slices.zig");
 const inputbox = @import("inputbox.zig");
+const data = @import("data.zig");
 
 /// Host functions provided by src/web/app.js. This list is the entire
 /// surface between the page and the client; web.zig's tests check the
@@ -35,16 +38,16 @@ const host = struct {
     extern "env" fn ws_open(p: [*]const u8, n: usize) void;
     extern "env" fn ws_send(p: [*]const u8, n: usize) void;
     extern "env" fn ws_close() void;
-    extern "env" fn canvas_size(w: u32, h: u32) void;
-    /// putImageData of rows y0..y1 of the w x h RGBA image at p.
-    extern "env" fn present(p: [*]const u32, w: u32, h: u32, y0: u32, y1: u32) void;
+    /// Canvas `c` (Canvas: 0 terminal, 1 data) backing size.
+    extern "env" fn canvas_size(c: u32, w: u32, h: u32) void;
+    /// putImageData into canvas `c` of rows y0..y1 of the w x h RGBA image at p.
+    extern "env" fn present(c: u32, p: [*]const u32, w: u32, h: u32, y0: u32, y1: u32) void;
     extern "env" fn request_frame() void;
     extern "env" fn set_timer(ms: u32) void;
     /// GET / (following redirects); answers with on_check.
     extern "env" fn check_session() void;
     extern "env" fn navigate_pair() void;
-    /// slot 0 = status, 1 = mode, 2 = the note under the input box;
-    /// cls 0 neutral, 1 ok, 2 bad.
+    /// Text of a page element (TextSlot); cls 0 neutral, 1 ok, 2 bad.
     extern "env" fn set_text(slot: u32, p: [*]const u8, n: usize, cls: u32) void;
     /// The page's CSS variables (body style) and classes (body className).
     extern "env" fn set_layout(p: [*]const u8, n: usize) void;
@@ -55,6 +58,11 @@ const host = struct {
     extern "env" fn box_write(p: [*]const u8, n: usize) void;
     extern "env" fn box_hint(p: [*]const u8, n: usize) void;
 };
+
+/// The page's two canvases.
+const Canvas = enum(u32) { terminal = 0, data = 1 };
+/// set_text targets, in the bridge's order.
+const TextSlot = enum(u32) { status = 0, mode = 1, note = 2, project = 3, state = 4 };
 
 pub const panic = std.debug.FullPanic(struct {
     fn f(msg: []const u8, _: ?usize) noreturn {
@@ -76,16 +84,16 @@ const box_cap = inputbox.max_frame + 4;
 
 const Drag = struct { x: i32, y: i32, pan: [2]i32 };
 
+/// A canvas's CSS size and devicePixelRatio, from the bridge.
+const CanvasSize = struct { w: f64 = 0, h: f64 = 0, dpr: f64 = 1, known: bool = false };
+
 const App = struct {
     grid: proto.Grid = .{},
     conn: conn_mod.Conn = .{},
     policy: proto.Policy = .none,
     zoom: layout.Zoom = .{},
     touch: bool = false,
-    css_w: f64 = 0,
-    css_h: f64 = 0,
-    dpr: f64 = 1,
-    sized: bool = false,
+    term_size: CanvasSize = .{},
     l: layout.Layout = .{},
     pan: [2]i32 = .{ 0, 0 },
     term: glyphs.Glyphs,
@@ -97,10 +105,18 @@ const App = struct {
     in_buf: []u8 = &.{},
     canvas_w: u32 = 0,
     canvas_h: u32 = 0,
-    /// Last viewport report (on_viewport) and what was sent to the page.
-    vp: ?panes.Input = null,
-    panes: ?panes.Panes = null,
-    class_buf: [128]u8 = undefined,
+    /// The data slice: its feed, framebuffer and caption glyphs.
+    feed: data.Feed = .{},
+    data_size: CanvasSize = .{},
+    dfb: render.Framebuffer = .{},
+    ui: glyphs.Glyphs,
+    /// Slices: last viewport report, the user's choices, what the page has.
+    vp: ?slices.Input = null,
+    tab: slices.Tab = .terminal,
+    data_frac: f64 = slices.default_data_frac,
+    splitting: bool = false,
+    sl: ?slices.Slices = null,
+    class_buf: [160]u8 = undefined,
     class_len: usize = 0,
     /// The last instruction line sent: put back if the server rejects it
     /// while the box is still empty.
@@ -118,28 +134,37 @@ fn logMsg(comptime fmt: []const u8, args: anytype) void {
     host.log(s.ptr, s.len);
 }
 
-fn setText(slot: u32, s: []const u8, cls: conn_mod.Status) void {
-    host.set_text(slot, s.ptr, s.len, @intFromEnum(cls));
+fn setText(slot: TextSlot, s: []const u8, cls: conn_mod.Status) void {
+    host.set_text(@intFromEnum(slot), s.ptr, s.len, @intFromEnum(cls));
 }
 
 fn showStatus() void {
     var buf: [64]u8 = undefined;
     const st = app.conn.statusText(&buf);
-    setText(0, st.text, st.kind);
+    setText(.status, st.text, st.kind);
+}
+
+fn showState(s: proto.SessionState) void {
+    switch (s) {
+        .unknown => setText(.state, "state unknown", .neutral),
+        .working => setText(.state, "working", .ok),
+        .waiting => setText(.state, "waiting for you", .bad),
+        .done => setText(.state, "done", .neutral),
+    }
 }
 
 fn schedule() void {
-    if (app.frame_pending or !app.sized) return;
+    if (app.frame_pending or !(app.term_size.known or app.data_size.known)) return;
     app.frame_pending = true;
     host.request_frame();
 }
 
 fn relayout() void {
-    if (!app.sized) return;
+    if (!app.term_size.known) return;
     app.l = layout.compute(.{
-        .css_w = app.css_w,
-        .css_h = app.css_h,
-        .dpr = app.dpr,
+        .css_w = app.term_size.w,
+        .css_h = app.term_size.h,
+        .dpr = app.term_size.dpr,
         .cols = app.grid.cols,
         .rows = app.grid.rows,
         .zoom = app.zoom,
@@ -147,14 +172,14 @@ fn relayout() void {
     });
     app.r.fb.resize(gpa, app.l.w, app.l.h) catch {
         logMsg("out of memory for a {d}x{d} canvas", .{ app.l.w, app.l.h });
-        app.sized = false;
+        app.term_size.known = false;
         return;
     };
     if (app.l.w != app.canvas_w or app.l.h != app.canvas_h) {
         // Setting canvas.width clears it, so only on a real change.
         app.canvas_w = app.l.w;
         app.canvas_h = app.l.h;
-        host.canvas_size(app.l.w, app.l.h);
+        host.canvas_size(@intFromEnum(Canvas.terminal), app.l.w, app.l.h);
     }
     app.term.setSize(app.l.cw, app.l.ch, app.l.em);
     app.pan = app.l.clampPan(app.pan);
@@ -162,26 +187,54 @@ fn relayout() void {
     schedule();
 }
 
-/// Re-derives the panes from the last viewport report and the input mode,
-/// and tells the page only what changed. The canvas's ResizeObserver then
-/// reports the terminal pane's new size through `resize`.
-fn relayoutPanes() void {
+/// The data canvas was resized: new backing store, redraw the feed.
+fn relayoutData() void {
+    if (!app.data_size.known) return;
+    // Same limits as the terminal canvas (layout.compute sanitises).
+    const dl = layout.compute(.{ .css_w = app.data_size.w, .css_h = app.data_size.h, .dpr = app.data_size.dpr, .cols = 0, .rows = 0, .zoom = .{} });
+    if (dl.w != app.dfb.w or dl.h != app.dfb.h) {
+        app.dfb.resize(gpa, dl.w, dl.h) catch {
+            app.data_size.known = false;
+            return;
+        };
+        host.canvas_size(@intFromEnum(Canvas.data), dl.w, dl.h);
+    }
+    app.ui.setEm(13 * dl.dpr);
+    app.feed.dirty = true;
+    schedule();
+}
+
+fn dataVisible() bool {
+    const s = app.sl orelse return false;
+    return s.arrangement == .columns or s.tab == .data;
+}
+
+/// Re-derives the slices from the last viewport report, the input mode and
+/// the user's tab / splitter choices, and tells the page only what changed.
+/// The canvases' ResizeObservers then report their new sizes via `resize`.
+fn relayoutSlices() void {
     var in = app.vp orelse return;
     in.touch = app.touch;
     in.input = app.policy != .none;
-    const p = panes.compute(in);
-    if (app.panes == null or !app.panes.?.eql(p)) {
-        app.panes = p;
-        var buf: [512]u8 = undefined;
-        const s = panes.css(p, &buf);
-        host.set_layout(s.ptr, s.len);
+    in.tab = app.tab;
+    in.data_frac = app.data_frac;
+    const s = slices.compute(in);
+    if (app.sl == null or !app.sl.?.eql(s)) {
+        app.sl = s;
+        var buf: [1024]u8 = undefined;
+        const c = slices.css(s, &buf);
+        host.set_layout(c.ptr, c.len);
     }
-    var buf: [128]u8 = undefined;
-    const cls = std.fmt.bufPrint(&buf, "viewer mode-{t}{s}{s}{s}", .{
+    if (dataVisible() and app.feed.unseen > 0) app.feed.seen();
+    var buf: [160]u8 = undefined;
+    const cls = std.fmt.bufPrint(&buf, "viewer mode-{t} layout-{t} tab-{t}{s}{s}{s}{s}", .{
         app.policy,
+        s.arrangement,
+        s.tab,
         if (app.touch) " touch" else "",
-        if (p.keyboard) " kb" else "",
-        if (p.no_head) " nohead" else "",
+        if (s.keyboard) " kb" else "",
+        if (s.no_head) " nohead" else "",
+        if (app.feed.unseen > 0) " badge" else "",
     }) catch return;
     if (!std.mem.eql(u8, cls, app.class_buf[0..app.class_len])) {
         @memcpy(app.class_buf[0..cls.len], cls);
@@ -191,7 +244,7 @@ fn relayoutPanes() void {
 }
 
 fn note(text: []const u8, tone: inputbox.Tone) void {
-    host.set_text(2, text.ptr, text.len, @intFromEnum(tone));
+    host.set_text(@intFromEnum(TextSlot.note), text.ptr, text.len, @intFromEnum(tone));
 }
 
 fn readBox() []const u8 {
@@ -304,6 +357,15 @@ fn input(len: usize) ?[]const u8 {
     return app.in_buf[0..len];
 }
 
+/// A new image blob arrived ('I' frame): it becomes a data-feed card.
+fn noteImage(msg: []const u8) void {
+    if (msg.len < 5 or msg[0] != 'I') return;
+    const id = std.mem.readInt(u32, msg[1..5], .little);
+    const blob = app.grid.images.find(id) orelse return;
+    app.feed.addImage(gpa, id, blob.w, blob.h, dataVisible()) catch return;
+    relayoutSlices(); // badge
+}
+
 // ------------------------------------------------------------------ exports
 
 /// Called once after instantiation. `touch`: the page has a coarse pointer.
@@ -311,11 +373,14 @@ export fn init(touch: u32) void {
     const regular = @embedFile("font_regular");
     const bold = @embedFile("font_bold");
     const term = glyphs.Glyphs.init(gpa, regular, bold) catch {
-        setText(0, "font failed to load", .bad);
+        setText(.status, "font failed to load", .bad);
         return;
     };
-    app = .{ .term = term, .touch = touch != 0 };
+    const ui = glyphs.Glyphs.init(gpa, regular, bold) catch return;
+    app = .{ .term = term, .ui = ui, .touch = touch != 0 };
     ready = true;
+    setText(.project, "No project", .neutral);
+    showState(.unknown);
     perform(app.conn.start());
 }
 
@@ -332,14 +397,22 @@ export fn in_alloc(n: usize) usize {
     return @intFromPtr(app.in_buf.ptr);
 }
 
-/// Canvas CSS size and devicePixelRatio (on load and every resize).
-export fn resize(css_w: f64, css_h: f64, dpr: f64) void {
+/// Canvas `c` (0 terminal, 1 data): CSS size and devicePixelRatio (on load
+/// and every resize).
+export fn resize(c: u32, css_w: f64, css_h: f64, dpr: f64) void {
     if (!ready) return;
-    app.css_w = css_w;
-    app.css_h = css_h;
-    app.dpr = dpr;
-    app.sized = true;
-    relayout();
+    const which = std.enums.fromInt(Canvas, c) orelse return;
+    const sz: CanvasSize = .{ .w = css_w, .h = css_h, .dpr = dpr, .known = true };
+    switch (which) {
+        .terminal => {
+            app.term_size = sz;
+            relayout();
+        },
+        .data => {
+            app.data_size = sz;
+            relayoutData();
+        },
+    }
 }
 
 /// The visible viewport changed (load, resize, rotation, the on-screen
@@ -358,28 +431,58 @@ export fn on_viewport(inner_w: f64, inner_h: f64, vv_w: f64, vv_h: f64, vv_top: 
         .safe_bottom = safe_bottom,
         .touch = app.touch,
     };
-    relayoutPanes();
+    relayoutSlices();
+}
+
+/// Segmented control: 0 Terminal, 1 Data (tabs arrangement).
+export fn on_tab(id: u32) void {
+    if (!ready) return;
+    app.tab = std.enums.fromInt(slices.Tab, id) orelse return;
+    relayoutSlices();
+    schedule();
+}
+
+/// The splitter between the left column and the data column. kind: 0 down,
+/// 1 move, 2 up/cancel; x in CSS pixels from the page's left edge.
+export fn on_split(kind: u32, x: f64) void {
+    if (!ready) return;
+    switch (kind) {
+        0 => app.splitting = true,
+        1 => if (app.splitting) {
+            const vp = app.vp orelse return;
+            app.data_frac = slices.dragFrac(x, vp.inner_w);
+            relayoutSlices();
+        },
+        else => app.splitting = false,
+    }
 }
 
 /// requestAnimationFrame callback: draw what changed and present it.
 export fn frame() void {
     if (!ready) return;
     app.frame_pending = false;
-    if (!app.sized) return;
     // Inline images decode lazily, one per frame so a big one can't stall
     // several; the rows it covers redraw once it is ready.
     if (app.grid.images.decodeOne(gpa)) |id| {
         app.grid.markImage(id);
+        if (app.grid.images.find(id)) |b| if (b.rgba) |rgba| app.feed.imageDecoded(gpa, id, rgba);
         if (app.grid.images.nextToDecode() != null) schedule();
     }
-    const view: render.Renderer.View = .{ .l = app.l, .pan = app.pan, .show_cursor = app.policy != .none };
-    if (app.full) app.r.clearTerm(app.l);
-    var y: u16 = 0;
-    while (y < app.grid.rows) : (y += 1) {
-        if (app.full or app.grid.dirty[y]) app.r.drawRow(&app.grid, &app.term, view, y);
+    if (app.term_size.known) {
+        const view: render.Renderer.View = .{ .l = app.l, .pan = app.pan, .show_cursor = app.policy != .none };
+        if (app.full) app.r.clearTerm(app.l);
+        var y: u16 = 0;
+        while (y < app.grid.rows) : (y += 1) {
+            if (app.full or app.grid.dirty[y]) app.r.drawRow(&app.grid, &app.term, view, y);
+        }
+        app.full = false;
+        if (app.r.takeDirty()) |band| host.present(@intFromEnum(Canvas.terminal), app.r.fb.pixels.ptr, app.r.fb.w, app.r.fb.h, band[0], band[1]);
     }
-    app.full = false;
-    if (app.r.takeDirty()) |band| host.present(app.r.fb.pixels.ptr, app.r.fb.w, app.r.fb.h, band[0], band[1]);
+    // The data slice redraws only when it changed and can be seen.
+    if (app.data_size.known and app.feed.dirty and dataVisible() and app.dfb.w > 0) {
+        app.feed.draw(&app.dfb, &app.ui, app.r.theme, @floatCast(app.data_size.dpr));
+        host.present(@intFromEnum(Canvas.data), app.dfb.pixels.ptr, app.dfb.w, app.dfb.h, 0, app.dfb.h);
+    }
 }
 
 export fn on_ws_open() void {
@@ -395,19 +498,21 @@ export fn on_ws_close() void {
 /// A WebSocket message of `len` bytes is in the input buffer.
 export fn on_ws_message(binary: u32, len: usize) void {
     if (!ready) return;
-    const data = input(len) orelse return;
+    const msg = input(len) orelse return;
     if (binary == 0) {
-        switch (proto.parseControl(data)) {
+        switch (proto.parseControl(msg)) {
             .hello => |h| {
                 app.policy = h.policy;
-                setText(1, conn_mod.modeText(h.policy), .neutral);
+                setText(.mode, conn_mod.modeText(h.policy), .neutral);
+                setText(.project, if (h.project_len > 0) h.project() else "No project", .neutral);
                 const ph = inputbox.placeholder(h.policy);
                 host.box_hint(ph.ptr, ph.len);
-                relayoutPanes();
+                relayoutSlices();
                 showPreview();
                 relayout();
             },
             .rejected => |reason| onRejected(reason),
+            .state => |s| showState(s),
             .exit => |code| perform(app.conn.onExit(code)),
             .logout => perform(app.conn.onLogout()),
             .unknown => {},
@@ -416,10 +521,11 @@ export fn on_ws_message(binary: u32, len: usize) void {
     }
     const old_y = app.grid.cursor_y;
     // 'G' grid, 'I' image, 'P' placements; unknown types are ignored.
-    const res = proto.applyBinary(&app.grid, gpa, data) catch |err| blk: {
-        logMsg("bad {c} frame: {t}", .{ if (data.len > 0 and data[0] >= 0x20 and data[0] < 0x7f) data[0] else '?', err });
+    const res = proto.applyBinary(&app.grid, gpa, msg) catch |err| blk: {
+        logMsg("bad {c} frame: {t}", .{ if (msg.len > 0 and msg[0] >= 0x20 and msg[0] < 0x7f) msg[0] else '?', err });
         break :blk proto.FrameResult{};
     };
+    noteImage(msg);
     if (res.resized) {
         relayout();
     } else if (app.grid.rows > 0) {
@@ -488,10 +594,10 @@ export fn on_button(id: u32) void {
     }
 }
 
-/// Pointer events on the canvas, CSS pixels: dragging pans a zoomed view.
-/// kind: 0 down, 1 move, 2 up, 3 cancel.
+/// Pointer events on the terminal canvas, CSS pixels: dragging pans a
+/// zoomed view. kind: 0 down, 1 move, 2 up, 3 cancel.
 export fn on_pointer(kind: u32, x_css: f64, y_css: f64) void {
-    if (!ready or !app.sized) return;
+    if (!ready or !app.term_size.known) return;
     const x = layout.toInt(x_css * app.l.dpr);
     const y = layout.toInt(y_css * app.l.dpr);
     switch (kind) {
@@ -513,7 +619,7 @@ export fn on_pointer(kind: u32, x_css: f64, y_css: f64) void {
 /// Wheel / trackpad scrolling pans a zoomed-in view. mode: 0 pixels,
 /// 1 lines, 2 pages. Returns 1 when it panned (prevent default).
 export fn on_wheel(dx: f64, dy: f64, mode: u32) u32 {
-    if (!ready or !app.sized) return 0;
+    if (!ready or !app.term_size.known) return 0;
     const unit: f64 = switch (mode) {
         0 => app.l.dpr,
         1 => @floatFromInt(app.l.ch),

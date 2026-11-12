@@ -57,6 +57,7 @@ const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
 const tls = @import("tls/server.zig");
 const web_images = @import("web_images.zig");
+const keymap = @import("keymap.zig");
 
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 
@@ -1699,7 +1700,8 @@ pub const Server = struct {
         var images: web_images.Sender = .{ .last_ms = srv.nowMs() };
         defer images.deinit(srv.gpa);
 
-        const hello = std.fmt.bufPrint(&msg, "{{\"t\":\"hello\",\"input\":\"{t}\"}}", .{s.policy}) catch return;
+        var hello_buf: [256]u8 = undefined;
+        const hello = helloMessage(&hello_buf, s.policy, s.project) catch return;
         if (!ws.send(srv, hello, .text)) return;
 
         // Generation of the emulator state last sent; 0 plus `full` forces a
@@ -1873,6 +1875,33 @@ pub const Server = struct {
     }
 };
 
+/// `{"t":"hello","input":...}`, plus `"project"` when `portal run
+/// --project` was given (docs/protocol.md section 3). The name is printable
+/// (gui.validProject); `"` and `\` are escaped.
+fn helloMessage(buf: []u8, policy: keymap.Policy, project: ?[]const u8) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try w.print("{{\"t\":\"hello\",\"input\":\"{t}\"", .{policy});
+    if (project) |p| {
+        try w.writeAll(",\"project\":\"");
+        for (p) |c| {
+            if (c == '"' or c == '\\') try w.writeByte('\\');
+            try w.writeByte(c);
+        }
+        try w.writeByte('"');
+    }
+    try w.writeByte('}');
+    return w.buffered();
+}
+
+test "hello message" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("{\"t\":\"hello\",\"input\":\"instruct\"}", try helloMessage(&buf, .instruct, null));
+    try testing.expectEqualStrings("{\"t\":\"hello\",\"input\":\"keys\",\"project\":\"a \\\"b\\\" \\\\c\"}", try helloMessage(&buf, .keys, "a \"b\" \\c"));
+    // The longest valid name, fully escaped, still fits.
+    const worst: [64]u8 = @splat('"');
+    _ = try helloMessage(&buf, .text, &worst);
+}
+
 // -------------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -2014,7 +2043,7 @@ const bridge_imports = [_][]const u8{
 const client_exports = [_][]const u8{
     "memory",     "init",     "in_alloc", "resize",   "frame",    "on_ws_open", "on_ws_close",
     "on_ws_message", "on_timer", "on_check", "on_key", "on_pointer", "on_wheel", "on_cmd",
-    "on_viewport",   "on_box_input", "on_box_key", "on_button",
+    "on_viewport",   "on_box_input", "on_box_key", "on_button", "on_tab", "on_split",
 };
 
 const WasmReader = struct {
@@ -2109,7 +2138,7 @@ test "app.wasm imports only the bridge's host functions and exports what it call
         try std.testing.expect(std.mem.indexOf(u8, app_js, call) != null);
     }
     // The bridge stays small: it is glue, not an application.
-    try std.testing.expect(std.mem.count(u8, app_js, "\n") <= 100);
+    try std.testing.expect(std.mem.count(u8, app_js, "\n") <= 110);
 }
 
 test "csp allows wasm compilation but no eval or inline script" {

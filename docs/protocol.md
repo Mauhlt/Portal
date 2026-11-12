@@ -101,7 +101,8 @@ frames must be masked; no fragmentation; no extensions.
 
 | `t` | fields | meaning |
 |---|---|---|
-| `hello` | `input`: `"none"`, `"keys"`, `"instruct"` or `"text"` | sent first; which input is accepted. `portal run` defaults to `instruct` (`keys` when the session program is a shell); clients must ignore fields they don't know |
+| `hello` | `input`: `"none"`, `"keys"`, `"instruct"` or `"text"`; `project` (only with `portal run --project`): the name, printable, at most 64 bytes, with `"` and `\` escaped as `\"` and `\\` | sent first; which input is accepted. `portal run` defaults to `instruct` (`keys` when the session program is a shell); clients must ignore fields they don't know |
+| `state` | `state`: `"working"`, `"waiting"` or `"done"` | **planned, not sent yet**: what the session program is doing, from its OSC 7501 status. Clients show it in the status line ("waiting for you" for `waiting`) and treat unknown values as unknown |
 | `exit` | `code` | the session's program exited; stream ends |
 | `logout` | | session revoked or expired; sign in again |
 | `rejected` | `reason` | an `l:` instruction line was refused (e.g. `ShellEscape`, `SlashCommand`, `MemoryShortcut`, `ControlCharacter`, `TooLong`, `Empty`); nothing was typed |

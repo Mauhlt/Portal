@@ -59,7 +59,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     // is a shell, so this needs the explicit opt-in, but no --input.
     {
         const dir = try h.dataDir("webinput");
-        const inst = try proc.Instance.start(h, dir, port, &.{ "--allow-remote-shell", "--", "cmd.exe", "/k" });
+        const inst = try proc.Instance.start(h, dir, port, &.{ "--allow-remote-shell", "--project", "Web \"Demo\"", "--", "cmd.exe", "/k" });
         defer inst.kill();
         const creds = try client.pair(inst, "phone");
         const v = try client.Viewer.open(inst, creds.sessionCookie());
@@ -67,6 +67,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
 
         const policy = helloPolicy(v) orelse .none;
         _ = r.check("default input mode is instruct", policy == .instruct, "{s}", .{v.helloText()});
+        _ = r.check("hello carries the project name, escaped", std.mem.indexOf(u8, v.helloText(), "\"project\":\"Web \\\"Demo\\\"\"") != null, "{s}", .{v.helloText()});
         _ = r.check("cmd prompt visible", waitLine(v, "E2E>", 10_000), "{s}", .{v.dump(&dump_buf)});
 
         // A typed instruction (with a Shift+Enter line break, collapsed to
