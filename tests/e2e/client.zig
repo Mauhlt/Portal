@@ -197,8 +197,11 @@ pub fn signIn(inst: *Instance, device: []const u8) !?Creds {
 pub const Viewer = struct {
     c: ws.Client,
     g: grid.Grid,
-    hello: [96]u8 = undefined,
+    hello: [4096]u8 = undefined,
     hello_len: usize = 0,
+    /// Every text message after hello, in order (protocol v2 tabs:
+    /// `tabs`, `session`, `nosession`, `ended`; see tabs_tests.zig).
+    texts: std.ArrayList([]u8) = .empty,
     /// The first message was the hello text frame.
     hello_first: bool = false,
     /// The first grid frame was a full snapshot.
@@ -253,7 +256,36 @@ pub const Viewer = struct {
         const gpa = v.c.gpa;
         v.c.close();
         v.g.deinit();
+        for (v.texts.items) |t| gpa.free(t);
+        v.texts.deinit(gpa);
         gpa.destroy(v);
+    }
+
+    /// Number of text messages containing `needle`.
+    pub fn countText(v: *const Viewer, needle: []const u8) usize {
+        var n: usize = 0;
+        for (v.texts.items) |t| n += @intFromBool(std.mem.indexOf(u8, t, needle) != null);
+        return n;
+    }
+
+    /// The last text message containing `needle`.
+    pub fn lastText(v: *const Viewer, needle: []const u8) ?[]const u8 {
+        var i = v.texts.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.indexOf(u8, v.texts.items[i], needle) != null) return v.texts.items[i];
+        }
+        return null;
+    }
+
+    /// Waits until `n` text messages contain `needle`.
+    pub fn waitText(v: *Viewer, needle: []const u8, n: usize, ms: u32) bool {
+        const Ctx = struct { needle: []const u8, n: usize };
+        return v.pumpUntil(ms, Ctx{ .needle = needle, .n = n }, struct {
+            fn f(c: Ctx, vv: *Viewer) bool {
+                return vv.countText(c.needle) >= c.n;
+            }
+        }.f);
     }
 
     pub fn helloText(v: *const Viewer) []const u8 {
@@ -265,6 +297,11 @@ pub const Viewer = struct {
         switch (f.op) {
             .text => {
                 const p = f.payload;
+                if (std.mem.indexOf(u8, p, "\"hello\"") == null) {
+                    if (v.c.gpa.dupe(u8, p)) |copy| {
+                        v.texts.append(v.c.gpa, copy) catch v.c.gpa.free(copy);
+                    } else |_| {}
+                }
                 if (std.mem.indexOf(u8, p, "\"hello\"") != null) {
                     const n = @min(p.len, v.hello.len);
                     @memcpy(v.hello[0..n], p[0..n]);

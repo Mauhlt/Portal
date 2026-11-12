@@ -1,4 +1,32 @@
-# Project tabs: design notes (next step after the GUI terminal lands)
+# Project tabs: design notes
+
+**Status (2026-11-12): implemented**, except the per-device recent list
+and the hooks / terminal-bell fallbacks for "waiting". What exists:
+
+* `src/tabs.zig`: the tab hub (one program, pseudo console and screen per
+  tab, reference counted, random 128-bit ids, display names from the
+  folder's basename, "Home" for the profile folder). Colours from the name
+  (`shared/tabs.zig`, `colorFromName`) or `color = NAME #rrggbb` in
+  settings.txt.
+* Desk: Ctrl+Shift+T / "+" (folder picker), Ctrl+Shift+W / "×",
+  Ctrl+Tab; `portal open <dir>` and `portalctl open <dir>`
+  (`src/openreq.zig`: a request file in the data folder, answered by the
+  running Portal).
+* Protocol v2 (docs/protocol.md): `hello` lists the sessions, `tabs`,
+  `session`, `nosession`, `ended`; `s:<id>` from viewers. Both clients
+  (`portal connect`, the browser) draw the same top bar and switch tabs;
+  neither can open or close one.
+* OSC 7501 is parsed per session (`src/vt.zig`, `parseProgramState`) and
+  only highlights a tab (`waiting` = `state=blocked`). **Not confirmed**
+  that the agent emits it inside Portal's ConPTY without a capability
+  probe; if it doesn't, nothing is highlighted and the hook below is where
+  a fallback would plug in (Session.state / Hub.gen). No agent settings
+  were changed.
+* Privacy rules 1, 2, 3, 5, 6 and 7 are covered by `tests/e2e/privacy.zig`
+  and `tests/e2e/tabs_tests.zig` (no paths in hello/tabs/session/ended,
+  unknown, malformed and closed ids all get the same `nosession`, rejected
+  ids logged locally, no message opens or closes a tab). Rule 4 has
+  nothing to test until the recent list exists.
 
 ## Goal
 
@@ -94,10 +122,12 @@ These are hard requirements for the tabs and recent-projects work, enforced by
 7. **Logs stay local.** Rejected probes are logged on the desktop (rate
    limited) and never echoed back to the client.
 
-## Protocol changes (v2)
+## Protocol changes (v2) — implemented
 
 * `hello` lists sessions: `{id, name, color, state}`. A new `tabs` message
   announces any change: open/close, rename, state.
-* Grid frames carry a session id. A viewer subscribes to one session at a
-  time (`s:<id>`), and input goes to the selected session. There is no
-  message that opens or closes a session.
+* Grid and image frames are scoped to the session the viewer watches: the
+  server announces a switch with `session` and sends a full snapshot right
+  after it. A viewer subscribes to one session at a time (`s:<id>`), and
+  input goes to the selected session. There is no message that opens or
+  closes a session.

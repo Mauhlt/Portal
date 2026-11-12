@@ -1,4 +1,4 @@
-# Portal client protocol (v1)
+# Portal client protocol (v2: project tabs)
 
 Used by every client: the browser viewer, and the native Zig + Vulkan clients
 for Windows, Linux and macOS. Transport is HTTP/1.1 + WebSocket (RFC 6455)
@@ -142,12 +142,42 @@ frames must be masked; no fragmentation; no extensions.
 
 | `t` | fields | meaning |
 |---|---|---|
-| `hello` | `input`: `"none"`, `"keys"`, `"instruct"` or `"text"`; `project` (only with `portal run --project`): the name, printable, at most 64 bytes, with `"` and `\` escaped as `\"` and `\\` | sent first; which input is accepted. `portal run` defaults to `instruct` (`keys` when the session program is a shell); clients must ignore fields they don't know |
-| `state` | `state`: `"working"`, `"waiting"` or `"done"` | **planned, not sent yet**: what the session program is doing, from its OSC 7501 status. Clients show it in the status line ("waiting for you" for `waiting`) and treat unknown values as unknown |
-| `exit` | `code` | the session's program exited; stream ends |
+| `hello` | `v`: `2`; `input`: `"none"`, `"keys"`, `"instruct"` or `"text"`; `project`: the name of the tab shown (printable, at most 64 bytes, `"` and `\` escaped as `\"` and `\\`); `session`: its id; `sessions`: the open tabs (section 3a) | sent first; which input is accepted and what is open. `portal run` defaults to `instruct` (`keys` when the session program is a shell); clients must ignore fields they don't know |
+| `tabs` | `sessions` | the open tabs changed: one opened or closed at the desk, renamed, or a program's state changed. The whole list, in bar order |
+| `session` | `id` | the server now shows this tab (after `s:<id>`); its full snapshot follows. Clients drop cached image blobs of the previous tab |
+| `nosession` | | the id asked for is not an open tab: closed, never existed and malformed all get exactly this. Input now goes nowhere until the viewer picks an open tab |
+| `ended` | `id`, `code` | the tab shown ended (its program exited with `code`) while other tabs go on; it is already gone from the list (`tabs` came first). Input to it is dropped; the client picks another tab |
+| `state` | `state`: `"working"`, `"waiting"` or `"done"` | **not sent**: the per-tab state is the `state` field of each session in `hello` / `tabs` |
+| `exit` | `code` | the last tab's program exited (every tab has ended): Portal stops; stream ends |
 | `logout` | `reason` (optional): `"unpaired"` or `"replaced"` | the session ended. `"unpaired"`: the desktop removed this device (unpaired at the desk, forgotten, revoked): forget this desktop now. `"replaced"`: a re-pair under its name or address replaced it: sign in again, whose answer (`X-Portal-Device: gone` or not) decides. No reason (expired, logged out): sign in again |
 | `updates` | | Portal sync: this device's package index changed (a publish, or a subscription changed at the desk). Fetch `GET /sync/index` (section 7). Devices also look on every connect |
 | `rejected` | `reason` | an `l:` instruction line was refused (e.g. `ShellEscape`, `SlashCommand`, `MemoryShortcut`, `ControlCharacter`, `TooLong`, `Empty`); nothing was typed |
+
+### 3a. Project tabs (sessions)
+
+One Portal holds several projects ("tabs"), each with its own program and
+screen. A session entry is
+
+```
+{"id":"<32 lower-case hex>","name":"<name>","color":"#rrggbb","state":"<state>"}
+```
+
+* `id`: random, 128 bits, never reused while the desktop runs; never an
+  index or a path.
+* `name`: desk-assigned (the folder's name or `--project`), printable,
+  at most 64 bytes, escaped like `project`. Never a path.
+* `color`: the tab colour.
+* `state`: what the program reports through OSC 7501: `unknown`,
+  `working`, `waiting` (it needs an answer: highlight the tab), `idle`,
+  `done`, `error`. Untrusted (any program output can contain it): it only
+  changes a highlight.
+
+At most 12 tabs. Grid, image and placement frames always belong to the tab
+the viewer watches, which is the desk's tab at connect (`hello.session`)
+and then whatever the viewer chose with `s:<id>` (answered by `session`,
+then a full snapshot). Only the desk opens and closes tabs (the window,
+`portal open <dir>`); no message a client sends can create, start, close
+or reopen one. The shared parser and writer are `shared/tabs.zig`.
 
 **Binary frames**: grid updates, always starting with `'G'`, little-endian:
 
@@ -261,6 +291,11 @@ passed, so the program can't read the pair as Alt+key.
 | `k:<name>` | press a key |
 | `t:<utf8>` | type text (only when `input` is `"text"`; a `!` typed at the start of a line is dropped, where "start of a line" means after any key other than the character keys `0`…`9`, `y`, `n`: Enter, Esc, Ctrl+C, Backspace, the arrows, Home, End…) |
 | `l:<line>` | an instruction line (`"instruct"` and `"text"`): Portal rejects a leading `!` (shell), `/` (slash command) or `#` (memory), control characters, line breaks and bidi controls, max 2000 bytes; otherwise it types the line (as a bracketed paste when the program enabled it) and presses Enter |
+| `s:<id>` | watch the open tab `id` (32 hex digits; in every input mode, `none` included). Input sent after it goes to that tab. Answered by `session` (and a snapshot) or, for anything that is not an open tab, `nosession`; rejected ids are logged at the desk, rate limited, never echoed |
+
+`k:`, `t:` and `l:` go to the tab the viewer last chose with `s:` (at
+first, the tab in `hello.session`); while that tab has ended or the last
+`s:` named no open tab, they are dropped.
 
 Key names. `keys` and `instruct` mode accept only the first row; `text`
 mode accepts all (`none` accepts nothing):
@@ -287,6 +322,11 @@ except Ctrl+C in `text` mode; Shift+Tab is `shift-tab`.
   or pan, to fit `cols × rows`.
 * Show the input mode clearly ("view only", "answer keys", "instructions",
   "typing allowed").
+* Show the open tabs (names and colours, the shown one marked, `waiting`
+  highlighted) even when there is only one, and let the user switch with
+  `s:<id>`. After a reconnect, switch back to the tab the user had chosen
+  if it is still open. After `nosession` or `ended`, pick the tab shown if
+  it is still open, else the first.
 * Both Portal clients send instruction lines from an input line (the
   browser's text box, so phone dictation works; the native client's field
   under the answer bar) and map answer words to keys before sending

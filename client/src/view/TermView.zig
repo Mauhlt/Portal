@@ -61,11 +61,16 @@ pub const StatusLine = struct {
     right: []const u8 = "",
 };
 
-/// The strip above the grid. Today it shows one session's title and the
-/// remote-viewer badge; it is the reserved slot for a tab strip (one tab per
-/// session, coloured per project), which would replace `drawTopBar`.
+/// The strip above the grid: the project tabs (one per session, coloured
+/// per project; `title` instead when there are none), the remote-viewer
+/// badge and the host's buttons.
 pub const TopBar = struct {
     title: []const u8 = "",
+    /// Project tabs, left to right. A click reaches the host as
+    /// InputSink.button(tab.id) (or tab.close_id on its close box).
+    tabs: []const TopTab = &.{},
+    /// A "+" after the tabs (the desk's "open a project"); null: none.
+    add_id: ?u32 = null,
     /// Coloured strip at the left edge (a per-project colour later).
     accent: ?Rgb = null,
     right: []const u8 = "",
@@ -78,6 +83,18 @@ pub const TopBar = struct {
 };
 
 pub const TopButton = struct { label: []const u8, id: u32 };
+
+/// One project tab in the top bar.
+pub const TopTab = struct {
+    label: []const u8,
+    color: Rgb,
+    active: bool = false,
+    /// Its program waits for an answer (OSC 7501): drawn highlighted.
+    attention: bool = false,
+    id: u32,
+    /// A close box (the desk only; remote viewers can't close tabs).
+    close_id: ?u32 = null,
+};
 
 /// A line of panel text. Long lines wrap at spaces.
 pub const PanelText = struct {
@@ -866,6 +883,7 @@ fn drawTopBar(tv: *TermView, ui: fontset.Metrics, tb: TopBar, W: f32, h: f32, s:
             right_w += tw + pad;
         }
     }
+    if (tb.tabs.len > 0 or tb.add_id != null) return tv.drawTabs(ui, tb, x, W - right_w - pad, h, s);
     // Title, cut to the space left of the right-hand text.
     const avail = W - x - right_w - 2 * pad;
     var cut: usize = 0;
@@ -879,6 +897,69 @@ fn drawTopBar(tv: *TermView, ui: fontset.Metrics, tb: TopBar, W: f32, h: f32, s:
         cut = it.i;
     }
     _ = tv.text(ui, x, ty, tb.title[0..cut], button_fg, true);
+}
+
+/// Mixes `c` towards `to` by `k` (0..1).
+fn mixBy(c: Rgb, to: Rgb, k: f32) Rgb {
+    var out: Rgb = undefined;
+    for (0..3) |i| {
+        const a: f32 = @floatFromInt(c[i]);
+        const b: f32 = @floatFromInt(to[i]);
+        out[i] = @intFromFloat(@round(a + (b - a) * k));
+    }
+    return out;
+}
+
+const attention_color: Rgb = .{ 0xFF, 0xB0, 0x20 };
+
+/// The project tabs from `x0` to `x1`: each a box in its project colour
+/// (the active one bright, the others dimmed), a dot and an outline in
+/// amber while its program waits for an answer, an optional close box,
+/// then the optional "+". Tabs share the room when it is short.
+fn drawTabs(tv: *TermView, ui: fontset.Metrics, tb: TopBar, x0: f32, x1: f32, h: f32, s: f32) void {
+    const cw: f32 = @floatFromInt(ui.cell_w);
+    const gap = @round(4 * s);
+    const th = @round(h * 0.8);
+    const ty = h - th;
+    const add_w: f32 = if (tb.add_id != null) 3 * cw else 0;
+    const room = @max(0, x1 - x0 - add_w - gap);
+    const n: f32 = @floatFromInt(@max(tb.tabs.len, 1));
+    const max_each = @max(4 * cw, room / n - gap);
+    var x = x0;
+    for (tb.tabs) |t| {
+        const close_w: f32 = if (t.close_id != null) 2 * cw else 0;
+        const dot_w: f32 = if (t.attention) 2 * cw else 0;
+        const natural = textWidth(ui, t.label) + 2 * cw + close_w + dot_w;
+        const w = @min(natural, @max(max_each, 3 * cw));
+        if (x + w > x1) break;
+        const bg = if (t.active) mixBy(t.color, .{ 0, 0, 0 }, 0.25) else mixBy(t.color, ui_bg, 0.72);
+        tv.rect(x, ty, w, th, bg);
+        // The colour stripe on top (all tabs), thicker on the active one.
+        tv.rect(x, ty, w, if (t.active) @round(3 * s) else @round(2 * s), t.color);
+        if (t.attention) tv.outline(x, ty, w, th, @max(2, @round(2 * s)), attention_color);
+        var tx = x + cw;
+        const text_y = ty + @round((th - @as(f32, @floatFromInt(ui.cell_h))) / 2);
+        if (t.attention) {
+            _ = tv.text(ui, tx, text_y, "\u{25CF}", attention_color, true);
+            tx += 2 * cw;
+        }
+        const label_room = @max(0, x + w - cw - close_w - tx);
+        const fg: Rgb = if (t.active) .{ 0xFF, 0xFF, 0xFF } else .{ 0xC8, 0xCC, 0xD2 };
+        _ = tv.text(ui, tx, text_y, clipText(ui, t.label, label_room, false), fg, t.active);
+        tv.registerButton(x, ty, w - close_w, th, t.id);
+        if (t.close_id) |cid| {
+            const cx = x + w - close_w;
+            _ = tv.text(ui, cx + @round(cw / 2), text_y, "\u{00D7}", fg, false);
+            tv.registerButton(cx, ty, close_w, th, cid);
+        }
+        x += w + gap;
+    }
+    if (tb.add_id) |aid| if (x + add_w <= x1 + gap) {
+        tv.rect(x, ty, add_w, th, button_bg);
+        const text_y = ty + @round((th - @as(f32, @floatFromInt(ui.cell_h))) / 2);
+        _ = tv.text(ui, x + cw, text_y, "+", button_fg, true);
+        tv.registerButton(x, ty, add_w, th, aid);
+    };
 }
 
 fn zoomed(tv: *const TermView, em: f32) f32 {

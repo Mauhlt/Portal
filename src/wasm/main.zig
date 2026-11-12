@@ -52,6 +52,9 @@ const host = struct {
     /// The page's CSS variables (body style) and classes (body className).
     extern "env" fn set_layout(p: [*]const u8, n: usize) void;
     extern "env" fn set_class(p: [*]const u8, n: usize) void;
+    /// Project tab button `i` (0..11): its text, class list and style
+    /// (the tab colour as a CSS variable).
+    extern "env" fn set_tab(i: u32, p: [*]const u8, n: usize, cls: [*]const u8, cls_n: usize, css: [*]const u8, css_n: usize) void;
     /// Writes the input box's text (UTF-8) into p[0..cap]; returns the length.
     extern "env" fn box_read(p: [*]u8, cap: usize) usize;
     /// Replaces the input box's text; sets its placeholder.
@@ -122,6 +125,12 @@ const App = struct {
     dsum_len: usize = 0,
     class_buf: [160]u8 = undefined,
     class_len: usize = 0,
+    /// Project tabs (protocol v2): the open ones, the one shown, and the
+    /// one this page chose (kept across reconnects). The page can only
+    /// switch between open tabs; it can't open or close one.
+    tabs: proto.tabs.List = .{},
+    current: ?proto.tabs.Id = null,
+    chosen: ?proto.tabs.Id = null,
     /// The last instruction line sent: put back if the server rejects it
     /// while the box is still empty.
     last_line: [inputbox.max_frame]u8 = undefined,
@@ -159,6 +168,47 @@ fn showStatus() void {
     }
 }
 
+fn sameId(a: ?proto.tabs.Id, b: proto.tabs.Id) bool {
+    const x = a orelse return false;
+    return std.mem.eql(u8, &x, &b);
+}
+
+/// The project tab buttons (the header's control row, left of Fit / A− /
+/// A+) and the project name in the status line.
+fn showTabs() void {
+    var shown_name: ?[]const u8 = null;
+    for (0..proto.tabs.max_tabs) |i| {
+        var cls_buf: [32]u8 = undefined;
+        var css_buf: [24]u8 = undefined;
+        if (i >= app.tabs.len) {
+            host.set_tab(@intCast(i), "", 0, "ptab off", 8, "", 0);
+            continue;
+        }
+        const e = &app.tabs.items[i];
+        const on = sameId(app.current, e.id);
+        if (on) shown_name = e.name();
+        const cls = std.fmt.bufPrint(&cls_buf, "ptab{s}{s}", .{ if (on) " on" else "", if (e.state.attention()) " ask" else "" }) catch "ptab";
+        const css = std.fmt.bufPrint(&css_buf, "--c:{s}", .{&proto.tabs.colorHex(e.color)}) catch "";
+        const name = e.name();
+        host.set_tab(@intCast(i), name.ptr, name.len, cls.ptr, cls.len, css.ptr, css.len);
+    }
+    if (shown_name) |n| setText(.project, n, .neutral);
+}
+
+/// Shows tab `id`: "s:<id>", remembered as this page's choice.
+fn selectTab(id: proto.tabs.Id) void {
+    app.chosen = id;
+    if (app.conn.state != .live) return;
+    const f = proto.tabs.subscribeFrame(id);
+    host.ws_send(&f, f.len);
+}
+
+/// The tab asked for or shown is gone (`gone`, if known): pick the one
+/// shown if still open, else the first.
+fn repick(gone: ?proto.tabs.Id) void {
+    if (app.current) |cur| if (!sameId(gone, cur) and app.tabs.find(cur) != null) return selectTab(cur);
+    for (app.tabs.slice()) |e| if (!sameId(gone, e.id)) return selectTab(e.id);
+}
 /// The note under the box currently shows Conn.noteText.
 var conn_note = false;
 
@@ -495,6 +545,12 @@ export fn on_viewport(inner_w: f64, inner_h: f64, vv_w: f64, vv_h: f64, vv_top: 
     relayoutSlices();
 }
 
+/// Project tab button `i` (header): show that tab.
+export fn on_ptab(i: u32) void {
+    if (!ready or i >= app.tabs.len) return;
+    selectTab(app.tabs.items[i].id);
+}
+
 /// requestAnimationFrame callback: draw what changed and present it.
 export fn frame() void {
     if (!ready) return;
@@ -543,12 +599,30 @@ export fn on_ws_message(binary: u32, len: usize) void {
                 app.policy = h.policy;
                 setText(.mode, conn_mod.modeText(h.policy), .neutral);
                 setText(.project, if (h.project_len > 0) h.project() else "No project", .neutral);
+                app.tabs = h.list;
+                app.current = h.session;
+                showTabs();
+                // Reconnected: back to the tab this page was on, if open.
+                if (app.chosen) |c| if (!sameId(app.current, c) and app.tabs.find(c) != null) selectTab(c);
                 const ph = inputbox.placeholder(h.policy);
                 host.box_hint(ph.ptr, ph.len);
                 relayoutSlices();
                 showPreview();
                 relayout();
             },
+            .tabs => |l| {
+                app.tabs = l;
+                showTabs();
+            },
+            .session => |id| {
+                app.current = id;
+                // The new tab's full screen follows; its images are its own.
+                app.grid.images.deinit(gpa);
+                app.grid.images = .{};
+                showTabs();
+            },
+            .nosession => repick(null),
+            .ended => |id| if (sameId(app.current, id)) repick(id),
             .rejected => |reason| onRejected(reason),
             .state => |s| showState(s),
             .exit => |code| perform(app.conn.onExit(code)),

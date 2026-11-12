@@ -16,6 +16,7 @@ const client = @import("client.zig");
 const pairing = @import("pairing.zig");
 const http = @import("http.zig");
 const Runner = @import("runner.zig").Runner;
+const tabs_wire = @import("shared").tabs;
 
 const get = client.get;
 
@@ -191,7 +192,14 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         defer v.deinit();
         const hello = v.helloText();
         _ = r.check("hello message has no paths or names", hello.len > 0 and leaks.find(hello) == null, "{s}", .{hello});
-        _ = r.check("hello carries only the input mode", std.mem.eql(u8, hello, "{\"t\":\"hello\",\"input\":\"keys\"}"), "{s}", .{hello});
+        // v2: the input mode, the tab's display name (the folder's name,
+        // never a path), its random id, and the open tabs: nothing else.
+        const list = tabs_wire.parseList(hello);
+        const id = tabs_wire.idField(hello, "session");
+        _ = r.check("hello carries the input mode, the tab list and the tab shown, nothing else", std.mem.startsWith(u8, hello, "{\"t\":\"hello\",\"v\":2,\"input\":\"keys\",\"project\":\"") and
+            list != null and list.?.len == 1 and id != null and list.?.find(id.?) != null and
+            std.mem.indexOfScalar(u8, list.?.items[0].name(), '\\') == null and std.mem.indexOfScalar(u8, list.?.items[0].name(), '/') == null and
+            std.mem.indexOfScalar(u8, list.?.items[0].name(), ':') == null, "{s}", .{hello});
     }
 
     // Without a session, the stream is refused before any data.

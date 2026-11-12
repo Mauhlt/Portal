@@ -8,6 +8,7 @@
 //!   project = acme-api
 //!   program = agent --some-flag
 //!   cwd = C:\code\acme-api
+//!   color = acme-api #3366cc
 //!
 //! One `key = value` per line; blank lines and lines starting with '#' are
 //! ignored, so are unknown keys and values that are too long. `program` is
@@ -19,6 +20,7 @@ const std = @import("std");
 const Io = std.Io;
 const keymap = @import("keymap.zig");
 const fsutil = @import("fsutil.zig");
+const tabs_wire = @import("shared").tabs;
 
 pub const file_name = "settings.txt";
 
@@ -27,6 +29,13 @@ pub const max_project = 64;
 pub const max_program = 1024;
 pub const max_cwd = 1024;
 pub const max_args = 64;
+/// Tab colour choices (`color = NAME #rrggbb`, one line each).
+pub const max_colors = 16;
+
+pub const ColorEntry = struct {
+    name: Str(max_project) = .{},
+    color: u32 = 0,
+};
 
 fn Str(comptime cap: usize) type {
     return struct {
@@ -53,6 +62,15 @@ pub const Settings = struct {
     project: Str(max_project) = .{},
     program: Str(max_program) = .{},
     cwd: Str(max_cwd) = .{},
+    /// Tab colours overriding the one derived from the name.
+    colors: [max_colors]ColorEntry = undefined,
+    n_colors: usize = 0,
+
+    /// The colour choices for tabs.Hub (names point into `s`).
+    pub fn colorChoices(s: *const Settings, buf: *[max_colors]@import("tabs.zig").Hub.ColorChoice) []const @import("tabs.zig").Hub.ColorChoice {
+        for (s.colors[0..s.n_colors], 0..) |*c, i| buf[i] = .{ .name = c.name.get() orelse "", .color = c.color };
+        return buf[0..s.n_colors];
+    }
 
     pub fn parse(text: []const u8) Settings {
         var s: Settings = .{};
@@ -74,6 +92,16 @@ pub const Settings = struct {
                 _ = s.program.set(val);
             } else if (std.mem.eql(u8, key, "cwd")) {
                 _ = s.cwd.set(val);
+            } else if (std.mem.eql(u8, key, "color")) {
+                // NAME #rrggbb: the name may contain spaces.
+                const sp = std.mem.lastIndexOfScalar(u8, val, ' ') orelse continue;
+                const name = std.mem.trim(u8, val[0..sp], " \t");
+                const c = tabs_wire.parseColor(val[sp + 1 ..]) orelse continue;
+                if (name.len == 0 or s.n_colors == max_colors) continue;
+                var e: ColorEntry = .{ .color = c };
+                if (!e.name.set(name)) continue;
+                s.colors[s.n_colors] = e;
+                s.n_colors += 1;
             }
         }
         return s;
@@ -86,6 +114,10 @@ pub const Settings = struct {
         if (s.project.get()) |v| try out.print("project = {s}\r\n", .{v});
         if (s.program.get()) |v| try out.print("program = {s}\r\n", .{v});
         if (s.cwd.get()) |v| try out.print("cwd = {s}\r\n", .{v});
+        for (s.colors[0..s.n_colors]) |*c| {
+            const name = c.name.get() orelse continue;
+            try out.print("color = {s} {s}\r\n", .{ name, &tabs_wire.colorHex(c.color) });
+        }
     }
 };
 
@@ -158,6 +190,8 @@ test "settings parse and format round trip" {
         \\project =  acme api
         \\program = "C:\Program Files\tool\tool.exe" --flag
         \\cwd = C:\code\acme
+        \\color = acme api #3366CC
+        \\color = bad
         \\unknown = whatever
         \\no equals sign
         \\input2 = text
@@ -168,6 +202,9 @@ test "settings parse and format round trip" {
     try testing.expectEqualStrings("acme api", s.project.get().?);
     try testing.expectEqualStrings("\"C:\\Program Files\\tool\\tool.exe\" --flag", s.program.get().?);
     try testing.expectEqualStrings("C:\\code\\acme", s.cwd.get().?);
+    try testing.expectEqual(@as(usize, 1), s.n_colors);
+    try testing.expectEqualStrings("acme api", s.colors[0].name.get().?);
+    try testing.expectEqual(@as(u32, 0x3366CC), s.colors[0].color);
 
     var buf: [2048]u8 = undefined;
     var out: Io.Writer = .fixed(&buf);
@@ -178,6 +215,7 @@ test "settings parse and format round trip" {
     try testing.expectEqualStrings(s.project.get().?, again.project.get().?);
     try testing.expectEqualStrings(s.program.get().?, again.program.get().?);
     try testing.expectEqualStrings(s.cwd.get().?, again.cwd.get().?);
+    try testing.expectEqual(@as(u32, 0x3366CC), again.colors[0].color);
 }
 
 test "settings: bad values are ignored, nothing defaults" {

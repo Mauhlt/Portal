@@ -54,7 +54,8 @@ const guard = @import("guard.zig");
 const http1 = @import("http1.zig");
 const websocket = @import("shared").ws;
 const http_names = @import("shared").http;
-const Session = @import("session.zig").Session;
+const tabs = @import("tabs.zig");
+const tabs_wire = @import("shared").tabs;
 const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
 const tls = @import("tls/server.zig");
@@ -363,7 +364,8 @@ pub const Server = struct {
     gpa: Allocator,
     io: Io,
     cfg: Config,
-    session: *Session,
+    /// The open project tabs (tabs.zig); viewers watch one at a time.
+    hub: *tabs.Hub,
     log: *Log,
     listener: net.Server,
 
@@ -499,10 +501,9 @@ pub const Server = struct {
     /// After any revocation: every WebSocket writer and supervisor re-checks
     /// its session now (they do not poll).
     fn wakeViewers(srv: *Server) void {
-        const s = srv.session;
-        s.mutex.lockUncancelable(srv.io);
-        s.mutex.unlock(srv.io);
-        s.cond.broadcast(srv.io);
+        srv.hub.mutex.lockUncancelable(srv.io);
+        srv.hub.mutex.unlock(srv.io);
+        srv.hub.cond.broadcast(srv.io);
         for (&srv.conn_wake) |*e| e.set(srv.io);
     }
 
@@ -707,10 +708,9 @@ pub const Server = struct {
         srv.sync_n = n;
         srv.sync_mutex.unlock(srv.io);
         _ = srv.sync_gen.fetchAdd(1, .release);
-        const s = srv.session;
-        s.mutex.lockUncancelable(srv.io);
-        s.mutex.unlock(srv.io);
-        s.cond.broadcast(srv.io);
+        srv.hub.mutex.lockUncancelable(srv.io);
+        srv.hub.mutex.unlock(srv.io);
+        srv.hub.cond.broadcast(srv.io);
     }
 
     fn syncDigestFor(srv: *Server, device: []const u8) [32]u8 {
@@ -896,7 +896,7 @@ pub const Server = struct {
         // shutting-down Portal outlives every exit notice in flight.
         defer {
             stream.close(io);
-            if (conn.viewer_socket) srv.session.viewerSocketDelta(-1);
+            if (conn.viewer_socket) srv.hub.viewerSocketDelta(-1);
         }
         const peer = std.fmt.bufPrint(&conn.peer_buf, "{f}", .{stream.socket.address}) catch blk: {
             conn.peer_buf[0] = '?';
@@ -1929,8 +1929,19 @@ pub const Server = struct {
         device: ?auth.Device = null,
         /// Reader only: per-connection input rate limit.
         limit: InputLimit = .{},
+        /// Reader only: the tab this viewer's input goes to, with a
+        /// reference (null after asking for a session that is not open:
+        /// input is then dropped until it picks an open one).
+        sel: ?*tabs.Tab = null,
+        /// Guarded by hub.mutex: a switch the reader asks the writer to
+        /// show (`s:<id>`); the writer answers `session` or `nosession`.
+        want: Want = .none,
+        /// Reader only: unknown-session log lines (rate limited).
+        unknown_ids: u32 = 0,
         /// Writer loop iterations (for the wakeup measurement in the log).
         writer_wakes: u32 = 0,
+
+        const Want = union(enum) { none, tab: *tabs.Tab, unknown };
 
         /// Returns false if the connection should end. Cancelable: the
         /// supervisor can always tear down a sender stuck behind another.
@@ -1989,15 +2000,15 @@ pub const Server = struct {
         conn.ws_active.store(true, .release);
         conn.wake.set(srv.io); // the supervisor now also watches the session
 
-        srv.session.viewerSocketDelta(1);
+        srv.hub.viewerSocketDelta(1);
         conn.viewer_socket = true;
-        const viewers = srv.session.viewerDelta(1);
+        const viewers = srv.hub.viewerDelta(1);
         srv.log.print("viewer connected from {s} ({d} watching)", .{ peer, viewers });
         srv.updateTitle(viewers);
         const pairwatch_before = srv.pairwatch_wakes.load(.monotonic);
         const sup_before = conn.sup_wakes.load(.monotonic);
         defer {
-            const left = srv.session.viewerDelta(-1);
+            const left = srv.hub.viewerDelta(-1);
             // Wakeup counts make idle cost visible (and testable): an idle
             // viewer should cost no periodic wakeups at all.
             srv.log.print("viewer disconnected from {s} ({d} watching; wakeups while connected: supervisor {d}, writer {d}, pairing watcher {d})", .{
@@ -2008,8 +2019,26 @@ pub const Server = struct {
             srv.updateTitle(left);
         }
 
-        var reader = srv.io.concurrent(wsReadLoop, .{ srv, &ws, leftover }) catch return;
-        srv.wsWriteLoop(&ws);
+        // The viewer starts on the desk's tab: the writer shows it and the
+        // reader sends input to it, each with its own reference.
+        const initial = srv.hub.acquireInitial();
+        if (initial) |t| {
+            t.acquire();
+            ws.sel = t;
+        }
+        defer {
+            // Both tasks have ended: their references go.
+            if (ws.sel) |t| t.release();
+            switch (ws.want) {
+                .tab => |t| t.release(),
+                else => {},
+            }
+        }
+        var reader = srv.io.concurrent(wsReadLoop, .{ srv, &ws, leftover }) catch {
+            if (initial) |t| t.release();
+            return;
+        };
+        srv.wsWriteLoop(&ws, initial);
         ws.dead.store(true, .release);
         // Interrupts the reader if it is parked in a recv; never close a
         // socket another task is blocked on.
@@ -2020,22 +2049,71 @@ pub const Server = struct {
     /// window, which titles itself the same way): title.zig.
     fn updateTitle(srv: *Server, viewers: u32) void {
         var buf: [title.max_title_bytes]u8 = undefined;
-        srv.session.console.setTitle(title.windowTitle(srv.session.project, viewers, &buf));
+        var nb: [tabs_wire.max_name]u8 = undefined;
+        srv.hub.console.setTitle(title.windowTitle(srv.hub.deskName(&nb), viewers, &buf));
     }
 
-    fn wsWriteLoop(srv: *Server, ws: *WsConn) void {
-        const s = srv.session;
+    /// `s:<id>` from the viewer (reader task): watch another open tab. The
+    /// reader resolves the id itself, so input sent after it goes to the
+    /// new tab at once; the writer then switches what it shows and answers
+    /// `session`. Anything that is not an open tab's id (closed, never
+    /// existed, malformed) gets the same `nosession` and leaves the viewer
+    /// with no input target until it picks an open tab (privacy rule 3:
+    /// probing learns nothing). Rejected ids are logged locally, rate
+    /// limited, never echoed (rule 7).
+    fn subscribe(srv: *Server, ws: *WsConn, text: []const u8) void {
+        const hub = srv.hub;
+        const id = tabs_wire.parseId(text);
+        hub.mutex.lockUncancelable(srv.io);
+        const t: ?*tabs.Tab = if (id) |i| hub.acquireLocked(i) else null;
+        switch (ws.want) {
+            .tab => |old| old.release(),
+            else => {},
+        }
+        if (t) |tt| {
+            tt.acquire(); // the writer's
+            ws.want = .{ .tab = tt };
+        } else ws.want = .unknown;
+        const old_sel = ws.sel;
+        ws.sel = t;
+        hub.mutex.unlock(srv.io);
+        hub.cond.broadcast(srv.io);
+        if (old_sel) |o| o.release();
+        if (t == null) {
+            ws.unknown_ids +|= 1;
+            if (ws.unknown_ids <= 3 or std.math.isPowerOfTwo(ws.unknown_ids))
+                srv.notePreAuth(&srv.input_log, "viewer from {s} asked for a session that is not open ({d} so far)", .{ ws.conn.peer(), ws.unknown_ids });
+        }
+    }
+
+    fn wsWriteLoop(srv: *Server, ws: *WsConn, initial: ?*tabs.Tab) void {
+        const hub = srv.hub;
+        // The tab shown, with this task's reference.
+        var cur: ?*tabs.Tab = initial;
+        defer if (cur) |t| t.release();
         var msg: [128]u8 = undefined;
         var frame: std.ArrayList(u8) = .empty;
         defer frame.deinit(srv.gpa);
         var rows: std.ArrayList(u16) = .empty;
         defer rows.deinit(srv.gpa);
-        // Inline images: 'I' blobs and 'P' placements (web_images.zig).
+        // Inline images: 'I' blobs and 'P' placements (web_images.zig),
+        // of the tab shown (a switch starts over).
         var images: web_images.Sender = .{};
         defer images.deinit(srv.gpa);
+        // The tab list: hello, then `tabs` whenever it changes.
+        const text = srv.gpa.alloc(u8, tabs_wire.max_list_json + 256) catch return;
+        defer srv.gpa.free(text);
+        var list: tabs_wire.List = .{};
 
-        var hello_buf: [256]u8 = undefined;
-        const hello = helloMessage(&hello_buf, s.policy, s.project) catch return;
+        hub.mutex.lockUncancelable(srv.io);
+        hub.entriesLocked(&list);
+        var seen_gen = hub.gen;
+        var cur_entry: ?tabs_wire.Entry = null;
+        if (cur) |c| if (list.find(c.id)) |i| {
+            cur_entry = list.items[i];
+        };
+        hub.mutex.unlock(srv.io);
+        const hello = helloMessage(text, hub.policy, cur_entry, list.slice()) catch return;
         if (!ws.send(srv, hello, .text)) return;
         // Sync announcements: {"t":"updates"} when this device's index
         // changes (devices also look on every connect).
@@ -2049,17 +2127,23 @@ pub const Server = struct {
         var full = true;
         var sent_cols: u16 = 0;
         var sent_rows: u16 = 0;
+        // `ended` was sent for the tab shown (it closed while others run).
+        var ended_sent = false;
         while (true) {
             ws.writer_wakes +|= 1;
-            // Event-driven: wakes on output, resize, close, the reader
-            // ending, or a revocation (wakeViewers); otherwise sleeps until
-            // the session would expire. No periodic recheck.
+            // Event-driven: wakes on output, resize, a tab list change, a
+            // switch the reader asked for, the reader ending, or a
+            // revocation (wakeViewers); otherwise sleeps until the session
+            // would expire. No periodic recheck.
             const expires_in = srv.sessionExpiresIn(&ws.cookie) orelse 0;
-            s.mutex.lockUncancelable(srv.io);
-            if (!s.closed and !full and s.term.gen == sent_gen and !ws.dead.load(.acquire) and expires_in > 0 and
+            hub.mutex.lockUncancelable(srv.io);
+            const cur_closed = if (cur) |c| c.session.closed else false;
+            const cur_gen = if (cur) |c| c.session.term.gen else sent_gen;
+            if (!hub.finished and !full and cur_gen == sent_gen and !(cur_closed and !ended_sent) and
+                ws.want == .none and hub.gen == seen_gen and !ws.dead.load(.acquire) and expires_in > 0 and
                 srv.sync_gen.load(.acquire) == sync_seen)
             {
-                s.cond.waitTimeout(srv.io, &s.mutex, .{ .duration = .{
+                hub.cond.waitTimeout(srv.io, &hub.mutex, .{ .duration = .{
                     // Until the session expires, or sooner while an image
                     // blob waits for this viewer's byte budget: exactly
                     // when the budget will have refilled enough for it.
@@ -2069,48 +2153,97 @@ pub const Server = struct {
                     error.Timeout => {},
                     error.Canceled => {
                         // waitTimeout re-acquired the mutex before returning.
-                        s.mutex.unlock(srv.io);
+                        hub.mutex.unlock(srv.io);
                         return;
                     },
                 };
             }
+            // A switch the reader asked for.
+            const Answer = enum { none, session, nosession };
+            var answer: Answer = .none;
+            switch (ws.want) {
+                .none => {},
+                .tab => |t| {
+                    if (cur) |c| c.release(); // never takes the hub lock
+                    cur = t;
+                    full = true;
+                    ended_sent = false;
+                    images.deinit(srv.gpa);
+                    images = .{};
+                    answer = .session;
+                },
+                .unknown => answer = .nosession,
+            }
+            ws.want = .none;
+            const list_changed = hub.gen != seen_gen;
+            if (list_changed) {
+                hub.entriesLocked(&list);
+                seen_gen = hub.gen;
+            }
+            const finished = hub.finished;
+            const last_code = hub.last_code;
+            var ended: ?u32 = null;
+            if (cur) |c| if (c.session.closed and !ended_sent and !finished) {
+                ended = c.session.exit_code;
+                ended_sent = true;
+            };
             // Encode under the lock so the frame is a consistent snapshot.
-            const t = &s.term;
-            if (t.cols != sent_cols or t.rows != sent_rows) full = true;
             var encode_ok = true;
-            const changed = full or t.gen != sent_gen;
-            if (changed) {
-                rows.clearRetainingCapacity();
-                frame.clearRetainingCapacity();
-                var r: u16 = 0;
-                while (r < t.rows) : (r += 1) {
-                    if (full or t.rowGen(r) > sent_gen) {
-                        rows.append(srv.gpa, r) catch {
-                            encode_ok = false;
-                            break;
-                        };
+            var changed = false;
+            if (cur) |c| {
+                const t = &c.session.term;
+                if (t.cols != sent_cols or t.rows != sent_rows) full = true;
+                changed = full or t.gen != sent_gen;
+                if (changed) {
+                    rows.clearRetainingCapacity();
+                    frame.clearRetainingCapacity();
+                    var r: u16 = 0;
+                    while (r < t.rows) : (r += 1) {
+                        if (full or t.rowGen(r) > sent_gen) {
+                            rows.append(srv.gpa, r) catch {
+                                encode_ok = false;
+                                break;
+                            };
+                        }
+                    }
+                    if (encode_ok) t.encodeRows(rows.items, &frame, srv.gpa) catch {
+                        encode_ok = false;
+                    };
+                    if (encode_ok) {
+                        sent_gen = t.gen;
+                        sent_cols = t.cols;
+                        sent_rows = t.rows;
+                        full = false;
                     }
                 }
-                if (encode_ok) t.encodeRows(rows.items, &frame, srv.gpa) catch {
+                if (encode_ok) images.collect(srv.gpa, t, srv.nowMs()) catch {
                     encode_ok = false;
                 };
-                if (encode_ok) {
-                    sent_gen = t.gen;
-                    sent_cols = t.cols;
-                    sent_rows = t.rows;
-                    full = false;
-                }
             }
-            if (encode_ok) images.collect(srv.gpa, t, srv.nowMs()) catch {
-                encode_ok = false;
-            };
-            const closed = s.closed;
-            const exit_code = s.exit_code;
-            s.mutex.unlock(srv.io);
+            const cur_id: ?tabs.Id = if (cur) |c| c.id else null;
+            hub.mutex.unlock(srv.io);
 
             if (ws.dead.load(.acquire)) return;
             if (!encode_ok) return; // out of memory: drop this viewer, keep the session
 
+            // In order: what is shown now, the list, a tab's end, then
+            // that tab's screen.
+            switch (answer) {
+                .none => {},
+                .session => if (cur_id) |id| {
+                    const m = std.fmt.bufPrint(&msg, "{{\"t\":\"session\",\"id\":\"{s}\"}}", .{&tabs_wire.idHex(id)}) catch return;
+                    if (!ws.send(srv, m, .text)) return;
+                },
+                .nosession => if (!ws.send(srv, "{\"t\":\"nosession\"}", .text)) return,
+            }
+            if (list_changed) {
+                const m = tabsMessage(text, list.slice()) catch return;
+                if (!ws.send(srv, m, .text)) return;
+            }
+            if (ended) |code| if (cur_id) |id| {
+                const m = std.fmt.bufPrint(&msg, "{{\"t\":\"ended\",\"id\":\"{s}\",\"code\":{d}}}", .{ &tabs_wire.idHex(id), code }) catch return;
+                if (!ws.send(srv, m, .text)) return;
+            };
             if (changed) {
                 if (!ws.send(srv, frame.items, .binary)) return;
             }
@@ -2125,8 +2258,10 @@ pub const Server = struct {
                     if (!ws.send(srv, "{\"t\":\"updates\"}", .text)) return;
                 }
             }
-            if (!changed and closed) {
-                const m = std.fmt.bufPrint(&msg, "{{\"t\":\"exit\",\"code\":{d}}}", .{exit_code}) catch return;
+            // Every tab has ended: the last program's exit code, after
+            // the final screen, then the closing handshake.
+            if (!changed and finished) {
+                const m = std.fmt.bufPrint(&msg, "{{\"t\":\"exit\",\"code\":{d}}}", .{last_code}) catch return;
                 if (ws.send(srv, m, .text)) srv.wsGoodbye(ws);
                 return;
             }
@@ -2149,10 +2284,10 @@ pub const Server = struct {
     /// its end (its close frame or EOF ends the reader). Closing first
     /// with the viewer's frames unread would reset the connection, and a
     /// reset can discard the exit notice before the viewer has read it.
-    /// Event-driven: the reader ending broadcasts `session.cond`.
+    /// Event-driven: the reader ending broadcasts `hub.cond`.
     fn wsGoodbye(srv: *Server, ws: *WsConn) void {
         _ = ws.send(srv, "\x03\xe8session ended", .close);
-        const s = srv.session;
+        const s = srv.hub;
         const deadline = srv.nowMs() +| goodbye_ms;
         s.mutex.lockUncancelable(srv.io);
         defer s.mutex.unlock(srv.io);
@@ -2174,9 +2309,9 @@ pub const Server = struct {
         defer {
             ws.dead.store(true, .release);
             // Wake the writer so it notices promptly.
-            srv.session.mutex.lockUncancelable(srv.io);
-            srv.session.mutex.unlock(srv.io);
-            srv.session.cond.broadcast(srv.io);
+            srv.hub.mutex.lockUncancelable(srv.io);
+            srv.hub.mutex.unlock(srv.io);
+            srv.hub.cond.broadcast(srv.io);
         }
         var buf: [max_ws_header + max_ws_payload]u8 = undefined;
         if (leftover.len > buf.len) return;
@@ -2227,15 +2362,25 @@ pub const Server = struct {
             },
             .text, .binary => {
                 if (payload.len == 0) return true;
-                // "k:<name>" key press, "t:<text>" typing (docs/protocol.md section 4).
+                // "k:<name>" key press, "t:<text>" typing, "l:<line>"
+                // instruction, "s:<id>" watch another open tab
+                // (docs/protocol.md section 4).
                 if (payload.len < 2 or payload[1] != ':') return true;
-                if (srv.session.policy == .none) return true;
                 // Re-check on every input message, not just periodically.
                 if (!srv.sessionLive(&ws.cookie, false)) return false;
+                // Switching tabs is not input: also in view-only mode.
+                if (payload[0] == 's') {
+                    srv.subscribe(ws, payload[2..]);
+                    return true;
+                }
+                if (srv.hub.policy == .none) return true;
+                // Input goes to the tab this viewer last chose, and only
+                // while it is open (a closed one drops it: input_open).
+                const s = &(ws.sel orelse return true).session;
                 switch (payload[0]) {
-                    'k' => srv.session.writeWebKey(payload[2..], srv.nowMs()),
-                    't' => srv.session.writeWebText(payload[2..]),
-                    'l' => srv.session.writeWebLine(payload[2..]) catch |err| {
+                    'k' => s.writeWebKey(payload[2..], srv.nowMs()),
+                    't' => s.writeWebText(payload[2..]),
+                    'l' => s.writeWebLine(payload[2..]) catch |err| {
                         // Error names are Portal's own (keymap.LineError), so
                         // {t} is safe here; nothing from the peer is echoed.
                         srv.log.print("instruction from {s} rejected: {t}", .{ ws.conn.peer(), err });
@@ -2252,31 +2397,64 @@ pub const Server = struct {
     }
 };
 
-/// `{"t":"hello","input":...}`, plus `"project"` when `portal run
-/// --project` was given (docs/protocol.md section 3). The name is printable
-/// (title.validProject); `"` and `\` are escaped.
-fn helloMessage(buf: []u8, policy: keymap.Policy, project: ?[]const u8) ![]const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    try w.print("{{\"t\":\"hello\",\"input\":\"{t}\"", .{policy});
-    if (project) |p| {
-        try w.writeAll(",\"project\":\"");
-        for (p) |c| {
-            if (c == '"' or c == '\\') try w.writeByte('\\');
-            try w.writeByte(c);
-        }
-        try w.writeByte('"');
+/// Writes a JSON string body: `"` and `\` escaped (names are printable,
+/// tabs_wire.validName).
+fn writeEscaped(w: *std.Io.Writer, s: []const u8) !void {
+    for (s) |c| {
+        if (c == '"' or c == '\\') try w.writeByte('\\');
+        try w.writeByte(c);
     }
+}
+
+/// `{"t":"hello","v":2,"input":...,"project":<name>,"session":<id>,
+/// "sessions":[...]}` (docs/protocol.md section 3): the input mode, the
+/// tab this viewer starts on (its name also as `project`, for clients
+/// that predate tabs) and every open tab. No paths: names are
+/// desk-assigned, ids random.
+fn helloMessage(buf: []u8, policy: keymap.Policy, cur: ?tabs_wire.Entry, list: []const tabs_wire.Entry) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try w.print("{{\"t\":\"hello\",\"v\":2,\"input\":\"{t}\"", .{policy});
+    if (cur) |c| {
+        try w.writeAll(",\"project\":\"");
+        try writeEscaped(&w, c.name());
+        try w.print("\",\"session\":\"{s}\"", .{&tabs_wire.idHex(c.id)});
+    }
+    try w.writeByte(',');
+    try tabs_wire.writeList(&w, list);
     try w.writeByte('}');
     return w.buffered();
 }
 
-test "hello message" {
-    var buf: [256]u8 = undefined;
-    try testing.expectEqualStrings("{\"t\":\"hello\",\"input\":\"instruct\"}", try helloMessage(&buf, .instruct, null));
-    try testing.expectEqualStrings("{\"t\":\"hello\",\"input\":\"keys\",\"project\":\"a \\\"b\\\" \\\\c\"}", try helloMessage(&buf, .keys, "a \"b\" \\c"));
-    // The longest valid name, fully escaped, still fits.
+/// `{"t":"tabs","sessions":[...]}`: the open tabs changed (opened,
+/// closed, renamed, a program's state).
+fn tabsMessage(buf: []u8, list: []const tabs_wire.Entry) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try w.writeAll("{\"t\":\"tabs\",");
+    try tabs_wire.writeList(&w, list);
+    try w.writeByte('}');
+    return w.buffered();
+}
+
+test "hello and tabs messages" {
+    var buf: [tabs_wire.max_list_json + 256]u8 = undefined;
+    try testing.expectEqualStrings("{\"t\":\"hello\",\"v\":2,\"input\":\"instruct\",\"sessions\":[]}", try helloMessage(&buf, .instruct, null, &.{}));
+    var e: tabs_wire.Entry = .{ .id = @splat(0xab), .color = 0x3366CC, .state = .waiting };
+    e.setName("a \"b\" \\c");
+    const h = try helloMessage(&buf, .keys, e, &.{e});
+    try testing.expectEqualStrings("{\"t\":\"hello\",\"v\":2,\"input\":\"keys\",\"project\":\"a \\\"b\\\" \\\\c\",\"session\":\"abababababababababababababababab\"," ++
+        "\"sessions\":[{\"id\":\"abababababababababababababababab\",\"name\":\"a \\\"b\\\" \\\\c\",\"color\":\"#3366cc\",\"state\":\"waiting\"}]}", h);
+    // Clients parse it back with the shared parser.
+    try testing.expectEqualStrings("a \"b\" \\c", tabs_wire.parseList(h).?.items[0].name());
+    try testing.expectEqual(e.id, tabs_wire.idField(h, "session").?);
+    // The longest list, every name fully escaped, still fits.
+    var full: [tabs_wire.max_tabs]tabs_wire.Entry = undefined;
     const worst: [64]u8 = @splat('"');
-    _ = try helloMessage(&buf, .text, &worst);
+    for (&full) |*x| {
+        x.* = .{};
+        x.setName(&worst);
+    }
+    _ = try helloMessage(&buf, .text, full[0], &full);
+    try testing.expect(std.mem.startsWith(u8, try tabsMessage(&buf, &full), "{\"t\":\"tabs\",\"sessions\":[{"));
 }
 
 // -------------------------------------------------------------------- tests
@@ -2414,13 +2592,13 @@ const bridge_imports = [_][]const u8{
     "ws_close",      "canvas_size", "present",      "request_frame",
     "set_timer",     "check_session", "navigate_pair", "set_text",
     "set_layout",    "set_class",     "box_read",      "box_write",
-    "box_hint",
+    "box_hint",      "set_tab",
 };
 /// Every export the bridge calls.
 const client_exports = [_][]const u8{
     "memory",     "init",     "in_alloc", "resize",   "frame",    "on_ws_open", "on_ws_close",
     "on_ws_message", "on_timer", "on_check", "on_key", "on_pointer", "on_wheel", "on_cmd",
-    "on_viewport",   "on_box_input", "on_box_key", "on_button",
+    "on_viewport",   "on_box_input", "on_box_key", "on_button", "on_ptab",
 };
 
 const WasmReader = struct {

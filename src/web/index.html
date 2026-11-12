@@ -21,7 +21,12 @@
      keyboard dictation and Win+H fill it, plus the big buttons). -->
 <header id="head">
   <div class="ctl">
-    <span class="spacer"></span>
+    <!-- Project tabs (filled by wasm), left of the view controls: switch
+         between the desktop's open projects. Opening and closing projects is
+         the desk's only. -->
+    <nav class="ptabs" aria-label="Projects">
+      <button type="button" class="ptab off" data-ptab="0"></button><button type="button" class="ptab off" data-ptab="1"></button><button type="button" class="ptab off" data-ptab="2"></button><button type="button" class="ptab off" data-ptab="3"></button><button type="button" class="ptab off" data-ptab="4"></button><button type="button" class="ptab off" data-ptab="5"></button><button type="button" class="ptab off" data-ptab="6"></button><button type="button" class="ptab off" data-ptab="7"></button><button type="button" class="ptab off" data-ptab="8"></button><button type="button" class="ptab off" data-ptab="9"></button><button type="button" class="ptab off" data-ptab="10"></button><button type="button" class="ptab off" data-ptab="11"></button>
+    </nav>
     <button type="button" class="zoom" data-cmd="1" title="Fit terminal to window">Fit</button>
     <button type="button" class="zoom" data-cmd="2" title="Smaller text">A−</button>
     <button type="button" class="zoom" data-cmd="3" title="Larger text">A+</button>

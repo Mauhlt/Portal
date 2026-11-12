@@ -10,7 +10,7 @@
 //! portal-show.exe must sit next to portalctl.exe (the build arranges it).
 //!
 //! Groups: pairing, grid, keys, text, transport, privacy, images, instruct,
-//! console, idle, tls, sync, webinput, ended (default: all).
+//! console, idle, tls, sync, webinput, ended, tabs (default: all).
 
 const std = @import("std");
 const net = @import("net.zig");
@@ -29,6 +29,7 @@ const tls_tests = @import("tls_tests.zig");
 const webinput = @import("webinput.zig");
 const sync_tests = @import("sync_tests.zig");
 const ended = @import("ended.zig");
+const tabs_tests = @import("tabs_tests.zig");
 
 /// Each run picks its own base port (a multiple of 200 in 20000..59800),
 /// so concurrent runs don't collide; `--base-port N` fixes it. Portal binds
@@ -64,6 +65,7 @@ const groups = [_]Group{
     .{ .name = "sync", .run = sync_tests.run, .port_offset = 110 },
     .{ .name = "webinput", .run = webinput.run, .port_offset = 120 },
     .{ .name = "ended", .run = ended.run, .port_offset = 130 },
+    .{ .name = "tabs", .run = tabs_tests.run, .port_offset = 140 },
 };
 
 pub fn main(init: std.process.Init) !void {
