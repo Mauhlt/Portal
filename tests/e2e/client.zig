@@ -14,10 +14,14 @@ pub const Instance = proc.Instance;
 pub const device_cookie = "portal_device";
 pub const session_cookie = "portal_session";
 pub const pairreq_cookie = "portal_pairreq";
+/// The names over HTTPS (`__Host-` prefix, always Secure).
+pub const tls_device_cookie = "__Host-portal_device";
+pub const tls_session_cookie = "__Host-portal";
+pub const tls_pairreq_cookie = "__Host-portal_pairreq";
 
 /// GET with an optional Cookie header value.
 pub fn get(inst: *Instance, path: []const u8, cookie: ?[]const u8) !http.Response {
-    return http.request(inst.h.gpa, inst.port, .{ .path = path, .host = inst.host, .cookie = cookie });
+    return http.request(inst.h.gpa, inst.port, .{ .path = path, .host = inst.host, .cookie = cookie, .tls = inst.tls });
 }
 
 /// Empty-bodied POST; `origin` false omits the Origin header.
@@ -29,6 +33,7 @@ pub fn post(inst: *Instance, path: []const u8, cookie: ?[]const u8, origin: bool
         .origin = if (origin) inst.origin else null,
         .cookie = cookie,
         .body = "",
+        .tls = inst.tls,
     });
 }
 
@@ -47,17 +52,22 @@ pub const Creds = struct {
     }
     /// The bare device value "<name>.<secret>".
     pub fn deviceValue(c: *const Creds) []const u8 {
-        return c.deviceCookie()[device_cookie.len + 1 ..];
+        const d = c.deviceCookie();
+        return d[(std.mem.indexOfScalar(u8, d, '=') orelse return d) + 1 ..];
     }
 
-    /// Fills from a response's Set-Cookie headers; false if either is missing.
+    /// Fills from a response's Set-Cookie headers (plain or `__Host-`
+    /// names); null if either is missing.
     pub fn fromResponse(r: *const http.Response) ?Creds {
         var c: Creds = .{};
-        const d = r.cookie(device_cookie) orelse return null;
-        const s = r.cookie(session_cookie) orelse return null;
+        const tls = r.setCookieLine(tls_device_cookie) != null;
+        const dn = if (tls) tls_device_cookie else device_cookie;
+        const sn = if (tls) tls_session_cookie else session_cookie;
+        const d = r.cookie(dn) orelse return null;
+        const s = r.cookie(sn) orelse return null;
         if (d.len == 0 or s.len == 0) return null;
-        c.device_len = (std.fmt.bufPrint(&c.device, "{s}={s}", .{ device_cookie, d }) catch return null).len;
-        c.session_len = (std.fmt.bufPrint(&c.session, "{s}={s}", .{ session_cookie, s }) catch return null).len;
+        c.device_len = (std.fmt.bufPrint(&c.device, "{s}={s}", .{ dn, d }) catch return null).len;
+        c.session_len = (std.fmt.bufPrint(&c.session, "{s}={s}", .{ sn, s }) catch return null).len;
         return c;
     }
 };
@@ -93,14 +103,16 @@ pub fn requestPair(inst: *Instance, source: ?[4]u8) !PairReq {
         .origin = inst.origin,
         .body = "",
         .source = source,
+        .tls = inst.tls,
     });
     defer r.deinit();
     var p: PairReq = .{ .status = r.status, .set_cookies = r.setCookieCount() };
     const loc = r.location();
     p.location_len = @min(loc.len, p.location_buf.len);
     @memcpy(p.location_buf[0..p.location_len], loc[0..p.location_len]);
-    if (r.cookie(pairreq_cookie)) |v| if (v.len > 0) {
-        const s: []const u8 = std.fmt.bufPrint(&p.cookie_buf, "{s}={s}", .{ pairreq_cookie, v }) catch "";
+    const qn = if (r.setCookieLine(tls_pairreq_cookie) != null) tls_pairreq_cookie else pairreq_cookie;
+    if (r.cookie(qn)) |v| if (v.len > 0) {
+        const s: []const u8 = std.fmt.bufPrint(&p.cookie_buf, "{s}={s}", .{ qn, v }) catch "";
         p.cookie_len = s.len;
     };
     return p;
@@ -108,7 +120,7 @@ pub fn requestPair(inst: *Instance, source: ?[4]u8) !PairReq {
 
 /// GET /pair/wait with the request cookie.
 pub fn waitPage(inst: *Instance, req: []const u8, source: ?[4]u8) !http.Response {
-    return http.request(inst.h.gpa, inst.port, .{ .path = "/pair/wait", .host = inst.host, .cookie = req, .source = source });
+    return http.request(inst.h.gpa, inst.port, .{ .path = "/pair/wait", .host = inst.host, .cookie = req, .source = source, .tls = inst.tls });
 }
 
 pub const Collected = union(enum) {
@@ -155,7 +167,11 @@ pub fn pair(inst: *Instance, name: []const u8) !Creds {
     const pc = try inst.liveCli(&.{ "pair", name });
     defer pc.deinit();
     if (!pc.waitFor("Waiting for the device", 15_000)) return error.PairCommandFailed;
-    if (!waitPairOpen(inst, 10_000)) return error.PairWindowNotSeen;
+    if (!waitPairOpen(inst, 10_000)) {
+        const text: []const u8 = inst.log() catch "";
+        std.debug.print("---- pair window not seen; `portal pair` said:\n{s}\n---- portal.log\n{s}\n----\n", .{ pc.output(), text });
+        return error.PairWindowNotSeen;
+    }
     const rq = try requestPair(inst, null);
     if (!rq.waiting()) return error.PairingRefused;
     if (!pc.waitFor("[y/N]", 10_000)) return error.NoDeskPrompt;
@@ -209,7 +225,7 @@ pub const Viewer = struct {
         const v = try gpa.create(Viewer);
         errdefer gpa.destroy(v);
         v.* = .{
-            .c = try ws.Client.connect(gpa, inst.port, .{ .host = inst.host, .origin = inst.origin, .cookie = session }),
+            .c = try ws.Client.connect(gpa, inst.port, .{ .host = inst.host, .origin = inst.origin, .cookie = session, .tls = inst.tls }),
             .g = grid.Grid.init(gpa),
         };
         errdefer v.c.close();

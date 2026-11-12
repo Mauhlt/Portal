@@ -5,6 +5,7 @@
 const std = @import("std");
 const net = @import("net.zig");
 const http = @import("http.zig");
+const tlsnet = @import("tlsnet.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Op = enum(u4) {
@@ -35,6 +36,8 @@ pub const ConnectOptions = struct {
     rcvbuf: ?c_int = null,
     /// Bytes sent in the same write as the handshake (pipelined frames).
     trailing: []const u8 = "",
+    /// WSS, trusting only this CA; null is plain ws://.
+    tls: ?*tlsnet.Trust = null,
 };
 
 var seed_counter = std.atomic.Value(u64).init(0x9e3779b97f4a7c15);
@@ -46,7 +49,7 @@ fn newRng() std.Random.DefaultPrng {
 
 pub const Client = struct {
     gpa: Allocator,
-    sock: net.Socket,
+    sock: tlsnet.Stream,
     /// HTTP status of the handshake response.
     status: u16,
     buf: std.ArrayList(u8) = .empty,
@@ -55,7 +58,7 @@ pub const Client = struct {
     rng: std.Random.DefaultPrng,
 
     pub fn connect(gpa: Allocator, port: u16, o: ConnectOptions) !Client {
-        var sock = try net.Socket.connect(port, .{ .rcvbuf = o.rcvbuf });
+        var sock = try tlsnet.Stream.connect(gpa, port, .{ .rcvbuf = o.rcvbuf }, o.tls);
         errdefer sock.close();
         var rng = newRng();
         var key_buf: [24]u8 = undefined;

@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const w = @import("win.zig");
 const net = @import("net.zig");
 const http = @import("http.zig");
+const tlsnet = @import("tlsnet.zig");
 
 pub const Harness = struct {
     gpa: Allocator,
@@ -382,6 +383,10 @@ pub const Instance = struct {
     origin_buf: [40]u8 = undefined,
     host: []const u8 = "",
     origin: []const u8 = "",
+    /// Set by startTls: HTTPS/WSS trusting only this instance's exported CA.
+    tls: ?*tlsnet.Trust = null,
+    /// startTls: where `portal ca export` wrote the CA files.
+    ca_dir: []const u8 = "",
 
     /// Starts `portalctl run --console --listen 127.0.0.1:<port> <run_args...>`
     /// and waits until it answers HTTP.
@@ -410,6 +415,51 @@ pub const Instance = struct {
                 if (resp.status == 200) return inst;
             } else |_| {}
             net.sleep(100);
+        }
+        return error.PortalDidNotStart;
+    }
+
+    /// Like `start`, but with TLS on (Portal's default: no `--no-tls`).
+    /// Once the port listens (the CA exists by then), exports the CA with
+    /// `portal ca export --out <data_dir>\ca-export` and trusts only that
+    /// for every request made through this instance; waits until
+    /// GET /pair answers 200 over HTTPS.
+    pub fn startTls(h: *Harness, data_dir: []const u8, port: u16, run_args: []const []const u8) !*Instance {
+        const inst = try h.gpa.create(Instance);
+        inst.* = .{ .h = h, .port = port, .data_dir = data_dir };
+        inst.host = try std.fmt.bufPrint(&inst.host_buf, "127.0.0.1:{d}", .{port});
+        inst.origin = try std.fmt.bufPrint(&inst.origin_buf, "https://127.0.0.1:{d}", .{port});
+
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(h.gpa);
+        try argv.appendSlice(h.gpa, &.{ "run", "--console", "--listen", inst.host });
+        try argv.appendSlice(h.gpa, run_args);
+        const pi = try spawn(h, argv.items, data_dir, .console);
+        inst.process = pi.hProcess;
+        h.track(inst);
+
+        const deadline = net.now() + 20_000;
+        while (true) : (net.sleep(100)) {
+            if (!inst.alive()) return error.PortalExited;
+            if (net.now() >= deadline) return error.PortalDidNotStart;
+            var s = net.Socket.connect(port, .{}) catch continue;
+            s.close();
+            break;
+        }
+        inst.ca_dir = try std.fmt.allocPrint(h.gpa, "{s}\\ca-export", .{data_dir});
+        const ex = try runCli(h, data_dir, &.{ "ca", "export", "--out", inst.ca_dir });
+        if (ex.code != 0) {
+            std.debug.print("portal ca export failed:\n{s}\n", .{ex.out});
+            return error.CaExportFailed;
+        }
+        const pem = try std.fmt.allocPrint(h.gpa, "{s}\\portal-ca.pem", .{inst.ca_dir});
+        defer h.gpa.free(pem);
+        inst.tls = try tlsnet.Trust.load(h.gpa, h.io, pem);
+        while (net.now() < deadline) : (net.sleep(100)) {
+            if (!inst.alive()) return error.PortalExited;
+            var resp = http.request(h.gpa, port, .{ .path = "/pair", .host = inst.host, .tls = inst.tls }) catch continue;
+            defer resp.deinit();
+            if (resp.status == 200) return inst;
         }
         return error.PortalDidNotStart;
     }

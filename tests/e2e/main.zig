@@ -10,7 +10,7 @@
 //! portal-show.exe must sit next to portalctl.exe (the build arranges it).
 //!
 //! Groups: pairing, grid, keys, text, transport, privacy, images, instruct,
-//! console, idle (default: all).
+//! console, idle, tls (default: all).
 
 const std = @import("std");
 const net = @import("net.zig");
@@ -25,6 +25,7 @@ const privacy = @import("privacy.zig");
 const console_tests = @import("console_tests.zig");
 const images = @import("images.zig");
 const idle = @import("idle.zig");
+const tls_tests = @import("tls_tests.zig");
 
 pub const base_port: u16 = 18420;
 
@@ -46,6 +47,7 @@ const groups = [_]Group{
     .{ .name = "console", .run = console_tests.run, .port_offset = 80 },
     .{ .name = "images", .run = images.run, .port_offset = 60 },
     .{ .name = "idle", .run = idle.run, .port_offset = 90 },
+    .{ .name = "tls", .run = tls_tests.run, .port_offset = 100 },
 };
 
 pub fn main(init: std.process.Init) !void {

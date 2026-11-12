@@ -56,18 +56,43 @@ fn allowed(target: []const u8, list: []const []const u8) bool {
     return false;
 }
 
-const Leaks = struct {
+pub const Leaks = struct {
     needles: std.ArrayList([]const u8) = .empty,
     gpa: std.mem.Allocator,
 
-    fn add(l: *Leaks, s: []const u8) !void {
+    pub fn add(l: *Leaks, s: []const u8) !void {
         if (s.len >= 4) try l.needles.append(l.gpa, s);
     }
 
     /// First needle found (case-insensitive), or null.
-    fn find(l: *const Leaks, data: []const u8) ?[]const u8 {
+    pub fn find(l: *const Leaks, data: []const u8) ?[]const u8 {
         for (l.needles.items) |n| if (client.containsIgnoreCase(data, n)) return n;
         return null;
+    }
+
+    pub fn deinit(l: *Leaks) void {
+        l.needles.deinit(l.gpa);
+    }
+
+    /// What must never appear in anything Portal sends outside the grid,
+    /// for an instance whose LOCALAPPDATA is `dir`.
+    pub fn standard(h: *proc.Harness, dir: []const u8) !Leaks {
+        var l: Leaks = .{ .gpa = h.gpa };
+        errdefer l.deinit();
+        try l.add(dir);
+        try l.add(h.root);
+        try l.add("\\Portal\\");
+        try l.add("LOCALAPPDATA");
+        try l.add("USERPROFILE");
+        try l.add(":\\Users\\");
+        try l.add(":/Users/");
+        try l.add("\\AppData\\");
+        try l.add("\\code\\zig");
+        try l.add("/code/zig");
+        if (h.env.get("USERPROFILE")) |v| try l.add(v);
+        if (h.env.get("USERNAME")) |v| if (v.len >= 4) try l.add(v);
+        if (h.env.get("COMPUTERNAME")) |v| try l.add(v);
+        return l;
     }
 };
 
@@ -78,21 +103,8 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     defer inst.kill();
 
     // What must never appear in anything Portal sends outside the grid.
-    var leaks: Leaks = .{ .gpa = gpa };
-    defer leaks.needles.deinit(gpa);
-    try leaks.add(dir);
-    try leaks.add(h.root);
-    try leaks.add("\\Portal\\");
-    try leaks.add("LOCALAPPDATA");
-    try leaks.add("USERPROFILE");
-    try leaks.add(":\\Users\\");
-    try leaks.add(":/Users/");
-    try leaks.add("\\AppData\\");
-    try leaks.add("\\code\\zig");
-    try leaks.add("/code/zig");
-    if (h.env.get("USERPROFILE")) |v| try leaks.add(v);
-    if (h.env.get("USERNAME")) |v| if (v.len >= 4) try leaks.add(v);
-    if (h.env.get("COMPUTERNAME")) |v| try leaks.add(v);
+    var leaks = try Leaks.standard(h, dir);
+    defer leaks.deinit();
 
     // Without a session: nothing about the session is visible.
     {
