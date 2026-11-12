@@ -23,6 +23,12 @@
 //! thread is blocked on hits `unreachable` inside std, and shutdown() does
 //! not unblock a pending recv.
 //!
+//! TLS. By default every connection is HTTPS: the worker first runs the
+//! TLS 1.3 handshake (src/tls/server.zig), then speaks HTTP/1.1 and
+//! WebSocket (wss) through the TLS connection. The handshake runs under the
+//! same deadline as the first request head, and a cancelled read or write
+//! in the middle of a record simply ends the connection.
+//!
 //! HTTP parsing is src/http1.zig, never std.http.Server (which had remotely
 //! reachable panics). Any panic on any thread kills the user's live session,
 //! so nothing here may assert, unwrap or overflow on peer-controlled data.
@@ -38,6 +44,7 @@ const http1 = @import("http1.zig");
 const Session = @import("session.zig").Session;
 const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
+const tls = @import("tls/server.zig");
 
 const index_html = @embedFile("web/index.html");
 const pair_html = @embedFile("web/pair.html");
@@ -83,12 +90,27 @@ const no_deadline = std.math.maxInt(i64);
 pub const Config = struct {
     /// Exact Host header values accepted, e.g. "10.8.0.1:8420".
     allowed_hosts: []const []const u8,
-    /// "http" normally (WireGuard already encrypts); "https" behind a TLS proxy.
+    /// "https" with TLS (the default); "http" only with --no-tls.
     scheme: []const u8,
     /// Adds `Secure` and uses the `__Host-` cookie prefix. Only valid over HTTPS.
     secure_cookie: bool,
     /// Where the paired-device store lives (%LOCALAPPDATA%\Portal).
     devices: devices.Paths,
+    /// Serve HTTPS with these credentials; null means plain HTTP.
+    tls: ?*const tls.Credentials = null,
+    /// Set only on the plain-HTTP listener that runs while a pairing window
+    /// is open: it serves nothing but the CA certificate downloads.
+    ca_download: ?*const CaDownload = null,
+};
+
+/// What the pairing-time certificate download listener serves.
+pub const CaDownload = struct {
+    cer: []const u8,
+    mobileconfig: []const u8,
+    /// "AB:CD:..." SHA-256 of the CA certificate.
+    fingerprint: []const u8,
+    /// Port of the HTTPS server, for the link to /pair.
+    https_port: u16,
 };
 
 // ------------------------------------------------------------ pure helpers
@@ -236,6 +258,8 @@ const Conn = struct {
     ws_cookie: [auth.encoded_len]u8 = undefined,
     /// Worker-only: already promoted to an authenticated slot.
     authed: bool = false,
+    /// Set once the TLS handshake is done (HTTPS connections only).
+    tls: ?*tls.Connection = null,
 
     fn peer(c: *const Conn) []const u8 {
         return c.peer_buf[0..c.peer_len];
@@ -264,6 +288,11 @@ pub const Server = struct {
 
     note_mutex: Io.Mutex = .init,
     host_reject_log: LogLimiter = .{},
+    tls_fail_log: LogLimiter = .{},
+
+    /// Makes `run` return (the pairing-time download listener is stopped
+    /// this way, together with cancelling its accept).
+    stop: std.atomic.Value(bool) = .init(false),
 
     fn cookieName(srv: *const Server) []const u8 {
         return if (srv.cfg.secure_cookie) "__Host-portal" else "portal_session";
@@ -293,8 +322,9 @@ pub const Server = struct {
         var backoff: Backoff = .{};
         var accept_log: LogLimiter = .{};
         var full_log: LogLimiter = .{};
-        while (true) {
+        while (!srv.stop.load(.acquire)) {
             const stream = srv.listener.accept(srv.io) catch |err| {
+                if (err == error.Canceled or srv.stop.load(.acquire)) return;
                 if (accept_log.check(srv.nowMs(), std.time.ms_per_min)) |n|
                     srv.log.print("accept error: {t} ({d} more since last report)", .{ err, n });
                 srv.io.sleep(.fromMilliseconds(backoff.next()), .awake) catch {};
@@ -418,24 +448,96 @@ pub const Server = struct {
             conn.done.store(true, .release);
             srv.conn_wake[conn.slot].set(srv.io);
         }
-        srv.serveHttp(conn) catch {};
+        if (srv.cfg.tls) |creds| return srv.serveTls(conn, creds);
+        var send_buf: [16 * 1024]u8 = undefined;
+        var sw = conn.stream.writer(srv.io, &send_buf);
+        srv.serveHttp(conn, &sw.interface) catch {};
+    }
+
+    /// Socket buffers and state for one HTTPS connection (heap, ~100 KiB).
+    const TlsConn = struct {
+        tls: tls.Connection,
+        in: [tls.min_input_buffer]u8,
+        out: [tls.min_output_buffer]u8,
+        plain_out: [16 * 1024]u8,
+    };
+
+    fn serveTls(srv: *Server, conn: *Conn, creds: *const tls.Credentials) void {
+        const io = srv.io;
+        const st = srv.gpa.create(TlsConn) catch return;
+        defer srv.gpa.destroy(st);
+        var sr = conn.stream.reader(io, &st.in);
+        var sw = conn.stream.writer(io, &st.out);
+        var entropy: [tls.entropy_len]u8 = undefined;
+        io.randomSecure(&entropy) catch return;
+        defer std.crypto.secureZero(u8, &entropy);
+        defer st.tls.wipe();
+        st.tls.handshake(&sr.interface, &sw.interface, .{
+            .credentials = creds,
+            .entropy = &entropy,
+            .read_buffer = &.{},
+            .write_buffer = &st.plain_out,
+        }) catch |err| {
+            srv.noteTlsFailure(conn, err, st.tls.diag, &sw.interface);
+            return;
+        };
+        conn.tls = &st.tls;
+        srv.serveHttp(conn, &st.tls.writer) catch return;
+        // Clean end (peer closed, Connection: close, request limit): send
+        // close_notify, bounded by a short deadline in case the peer stalls.
+        conn.setDeadline(srv.nowMs() +| 5000);
+        st.tls.close();
+    }
+
+    fn noteTlsFailure(srv: *Server, conn: *Conn, err: tls.Error, diag: tls.Diagnostics, raw: *Io.Writer) void {
+        if (diag.http_on_tls) {
+            // A browser asked for http:// on the HTTPS port: say so.
+            conn.setDeadline(srv.nowMs() +| 5000);
+            http1.writeResponse(raw, .bad_request, &.{
+                .{ .name = "content-type", .value = "text/plain; charset=utf-8" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+            }, "This Portal port speaks HTTPS: use https:// in the address.\n", false) catch {};
+            return;
+        }
+        switch (err) {
+            // Peer went away, or the deadline cancelled us: not worth a line.
+            error.EndOfStream, error.ReadFailed, error.WriteFailed => return,
+            else => {},
+        }
+        srv.note_mutex.lockUncancelable(srv.io);
+        const n = srv.tls_fail_log.check(srv.nowMs(), 10_000);
+        srv.note_mutex.unlock(srv.io);
+        const suppressed = n orelse return;
+        var abuf: [64]u8 = undefined;
+        // Never `{t}` a peer-supplied alert: it may have no name.
+        const alert: []const u8 = if (diag.received_alert) |a|
+            std.fmt.bufPrint(&abuf, ", client alert {s} ({d})", .{ tls.alertName(a), @backingInt(a) }) catch ""
+        else if (diag.sent_alert) |a|
+            std.fmt.bufPrint(&abuf, ", sent alert {s}", .{tls.alertName(a)}) catch ""
+        else
+            "";
+        const hint: []const u8 = if (diag.received_alert) |a| switch (a) {
+            .bad_certificate, .unknown_ca, .certificate_unknown, .access_denied => " - that device does not trust the Portal CA yet (see `portal ca export`)",
+            else => "",
+        } else "";
+        srv.log.print("TLS handshake with {s} failed: {t}{s}{s} ({d} more since last report)", .{
+            conn.peer(), err, alert, hint, suppressed,
+        });
     }
 
     fn readSome(conn: *Conn, io: Io, dest: []u8) !usize {
         if (dest.len == 0) return error.NoBufferSpace;
+        if (conn.tls) |t| return t.readSome(dest);
         var iov = [_][]u8{dest};
         const r = try conn.stream.readWithControl(io, &iov, &.{});
         return r.data_len;
     }
 
-    fn serveHttp(srv: *Server, conn: *Conn) !void {
+    fn serveHttp(srv: *Server, conn: *Conn, w: *Io.Writer) !void {
         const io = srv.io;
         // Head (up to max_head_bytes) plus a login body.
         var buf: [http1.max_head_bytes + max_body]u8 = undefined;
         var len: usize = 0;
-        var send_buf: [16 * 1024]u8 = undefined;
-        var sw = conn.stream.writer(io, &send_buf);
-        const w = &sw.interface;
 
         var n: u32 = 0;
         while (n < max_requests_per_connection) : (n += 1) {
@@ -556,6 +658,7 @@ pub const Server = struct {
             return srv.fail(conn, w, .misdirected_request, "unknown host\n");
         }
         if (http1.framingError(req, max_body)) |r| return srv.fail(conn, w, r.status, r.msg);
+        if (srv.cfg.ca_download) |d| return srv.caDownload(conn, w, req, d);
 
         if (!conn.authed) {
             if (h.cookie) |c| {
@@ -705,6 +808,53 @@ pub const Server = struct {
         });
         defer srv.gpa.free(page);
         return srv.asset(conn, w, req, page, "text/html; charset=utf-8");
+    }
+
+    /// The pairing-time download listener (plain HTTP on port+1): the CA
+    /// certificate as an Apple profile and as DER, plus a page linking them.
+    fn caDownload(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, d: *const CaDownload) !bool {
+        if (req.method != .GET) return srv.fail(conn, w, .method_not_allowed, "method not allowed\n");
+        const path = req.path;
+        if (std.mem.eql(u8, path, "/ca.mobileconfig") or std.mem.eql(u8, path, "/ca.cer")) {
+            const profile = path[4] == 'm';
+            srv.log.print("CA certificate downloaded by {s}: {s}", .{ conn.peer(), path });
+            const extra = [_]http1.Header{.{
+                .name = "content-disposition",
+                .value = if (profile) "attachment; filename=\"portal-ca.mobileconfig\"" else "attachment; filename=\"portal-ca.cer\"",
+            }};
+            try srv.respond(conn, w, .ok, if (profile) d.mobileconfig else d.cer, if (profile) "application/x-apple-aspen-config" else "application/pkix-cert", &extra, false);
+            return false;
+        }
+        if (!std.mem.eql(u8, path, "/")) return srv.fail(conn, w, .not_found, "not found\n");
+        // Host passed the allowlist; keep only safe characters for the link.
+        const host_full = req.host orelse "";
+        const host = blk: {
+            var end = host_full.len;
+            if (std.mem.lastIndexOfScalar(u8, host_full, ':')) |c| {
+                if (std.mem.indexOfScalar(u8, host_full[c..], ']') == null) end = c;
+            }
+            const h = host_full[0..end];
+            for (h) |ch| switch (ch) {
+                'a'...'z', 'A'...'Z', '0'...'9', '.', '-', ':', '[', ']' => {},
+                else => break :blk "",
+            };
+            break :blk h;
+        };
+        var page_buf: [3072]u8 = undefined;
+        const page = std.fmt.bufPrint(&page_buf,
+            \\<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+            \\<title>Portal certificate</title><style>body{{font-family:system-ui,sans-serif;max-width:36em;margin:2em auto;padding:0 1em;line-height:1.5}}a.b{{display:block;margin:1em 0;padding:.8em;border:1px solid #888;border-radius:.5em;text-align:center;text-decoration:none}}code{{word-break:break-all}}</style></head><body>
+            \\<h1>Trust this desktop's Portal</h1>
+            \\<p>Install the Portal certificate once per device, then continue to pairing over HTTPS.</p>
+            \\<a class="b" href="/ca.mobileconfig">iPhone / iPad / Mac: install profile</a>
+            \\<a class="b" href="/ca.cer">Other devices: certificate (.cer)</a>
+            \\<p><b>iPhone / iPad:</b> after downloading, open Settings &gt; General &gt; VPN &amp; Device Management, install the "Portal Local CA" profile, then Settings &gt; General &gt; About &gt; Certificate Trust Settings and enable full trust for it.</p>
+            \\<p>Check the fingerprint (SHA-256) matches what <code>portal ca export</code> prints on the desktop:<br><code>{s}</code></p>
+            \\<a class="b" href="https://{s}:{d}/pair">Continue to pairing (HTTPS)</a>
+            \\</body></html>
+        , .{ d.fingerprint, host, d.https_port }) catch return srv.fail(conn, w, .internal_server_error, "page too large\n");
+        try srv.respond(conn, w, .ok, page, "text/html; charset=utf-8", &.{}, false);
+        return false;
     }
 
     fn newSecret(srv: *Server, out: *[auth.encoded_len]u8) !void {

@@ -2,11 +2,16 @@
 
 Used by every client: the browser viewer, and the native Zig + Vulkan clients
 for Windows, Linux and macOS. Transport is HTTP/1.1 + WebSocket (RFC 6455)
-over the WireGuard tunnel, plain HTTP inside the tunnel.
+over the WireGuard tunnel, inside TLS 1.3 (HTTPS / WSS on the same port).
+The server certificate is issued by the desktop's private Portal CA; clients
+must trust that CA (`portal ca export`) or pin it, and must offer TLS 1.3
+with x25519 and ecdsa_secp256r1_sha256 (ALPN, if sent, must include
+`http/1.1`). `portal run --no-tls` serves plain HTTP for tests; replace
+`https`/`wss` with `http`/`ws` and drop the `__Host-` cookie names below.
 
 ## 1. Pairing and sign-in (no passwords)
 
-Every POST needs `Host` on the server's allowlist and `Origin: http://<that
+Every POST needs `Host` on the server's allowlist and `Origin: https://<that
 host>`, sent exactly; native clients must send both. POST bodies are empty
 (`Content-Length: 0`).
 
@@ -16,22 +21,22 @@ desktop, which opens a 2-minute, single-use window. The client then sends:
 ```
 POST /pair HTTP/1.1
 Host: 10.8.0.1:8420
-Origin: http://10.8.0.1:8420
+Origin: https://10.8.0.1:8420
 Content-Length: 0
 ```
 
 * Success: `303`, `Location: /`, with two `Set-Cookie` headers:
-  * `portal_device=<name>.<43 chars>; Path=/; HttpOnly; SameSite=Strict; Max-Age=7776000`
+  * `__Host-portal_device=<name>.<43 chars>; Path=/; HttpOnly; SameSite=Strict; Max-Age=7776000; Secure`
     is the device credential;
-  * `portal_session=<43 chars>; ...` is a session.
+  * `__Host-portal=<43 chars>; ...; Secure` is a session.
 * No window open: `303` to `/pair?e=closed`.
-* With `--https` the names are `__Host-portal_device` / `__Host-portal`, with `Secure`.
+* With `--no-tls` the names are `portal_device` / `portal_session`, without `Secure`.
 
 **Sign in (every launch or reconnect).** Present the device credential:
 
-* Browsers: `GET /` with the `portal_device` cookie. Returns `303 /` with a
-  rotated `portal_device` and a new session.
-* Native clients: `POST /auth/refresh` with the `portal_device` cookie.
+* Browsers: `GET /` with the device cookie. Returns `303 /` with a
+  rotated device cookie and a new session.
+* Native clients: `POST /auth/refresh` with the device cookie.
   Returns `204` with the same two `Set-Cookie` headers, or `401` if the
   device is unknown or revoked.
 
@@ -51,8 +56,8 @@ sessions.
 ```
 GET /ws HTTP/1.1
 Host: 10.8.0.1:8420
-Origin: http://10.8.0.1:8420
-Cookie: portal_session=<value>
+Origin: https://10.8.0.1:8420
+Cookie: __Host-portal=<value>
 Upgrade: websocket
 Connection: Upgrade
 Sec-WebSocket-Key: <base64 of 16 random bytes>

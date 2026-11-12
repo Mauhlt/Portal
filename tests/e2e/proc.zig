@@ -256,7 +256,8 @@ pub const Instance = struct {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(h.gpa);
         // --console: the e2e suite tests the server, not the GUI window.
-        try argv.appendSlice(h.gpa, &.{ "run", "--console", "--listen", inst.host });
+        // --no-tls: the harness speaks plain HTTP (TLS has its own tests).
+        try argv.appendSlice(h.gpa, &.{ "run", "--console", "--no-tls", "--listen", inst.host });
         try argv.appendSlice(h.gpa, run_args);
         const pi = try spawn(h, argv.items, data_dir, .console);
         inst.process = pi.hProcess;

@@ -84,7 +84,7 @@ rest of your laptop's browsing is unaffected.
    ```
 4. Add the phone to the firewall rule in step 4 (`-RemoteAddress 10.8.0.2,10.8.0.3`).
 5. Turn the tunnel on in the WireGuard app, open Safari, and go to
-   `http://10.8.0.1:8420/`. Optional: Share, then **Add to Home Screen**, for a
+   `https://10.8.0.1:8420/` (trust the Portal CA first: see the README, "HTTPS certificates"). Optional: Share, then **Add to Home Screen**, for a
    full-screen icon.
 
 On the phone, Portal shows a row of large answer buttons (1–4, Yes, No, Enter,
@@ -108,9 +108,12 @@ Allow Portal's port only from the laptop's tunnel address:
 
 ```powershell
 New-NetFirewallRule -DisplayName "Portal (WireGuard only)" -Direction Inbound `
-  -Protocol TCP -LocalPort 8420 -LocalAddress 10.8.0.1 -RemoteAddress 10.8.0.2 `
+  -Protocol TCP -LocalPort 8420,8421 -LocalAddress 10.8.0.1 -RemoteAddress 10.8.0.2 `
   -InterfaceAlias "<your tunnel name>" -Action Allow
 ```
+
+8420 is Portal (HTTPS). 8421 is the certificate download page, which is open only
+while a `portal pair` window is.
 
 With an iPhone too, use `-RemoteAddress 10.8.0.2,10.8.0.3`.
 
@@ -135,7 +138,7 @@ does **not** connect.
 
 1. Turn the laptop's Wi-Fi off and tether to your phone, so you are genuinely
    outside the home network.
-2. Activate the tunnel and open `http://10.8.0.1:8420/`.
+2. Activate the tunnel and open `https://10.8.0.1:8420/` (trust the Portal CA first: see the README, "HTTPS certificates").
 3. Pair the device (`portal pair <name>` at the desk first; see the README).
    The desktop console title should change to
    `Portal - 1 REMOTE VIEWER CONNECTED`.
