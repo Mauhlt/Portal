@@ -321,6 +321,7 @@ test {
     _ = @import("guard.zig");
     _ = @import("cmdline.zig");
     _ = @import("console.zig");
+    _ = @import("vt.zig");
 }
 
 test "parseListen" {
