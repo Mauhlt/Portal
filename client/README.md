@@ -80,7 +80,7 @@ branch `portal-client`). After that branch is merged, change it to
 
 | Path | What |
 |---|---|
-| `src/view/` | **Module `view`**: reusable, no networking. `TermView` (window, Instanced2D drawing, fit/zoom, cursor, answer bar, status line), `grid.zig` (cell snapshot model mirroring `src/vt.zig`), `input.zig` (Key/Mods/Event, `InputSink`), `platform/` (Win32, X11, Cocoa), `font` / `wcwidth` (re-exports of the Renderer's `Font` module: TrueType parser, rasteriser, system fonts, atlas, cell widths). Imports only `std`, the Renderer's `Renderer` and `Font` modules, and `imgdec`. |
+| `src/view/` | **Module `view`**: reusable, no networking. `TermView` (window, Instanced2D drawing, fit/zoom, cursor, answer bar, status line), `grid.zig` (cell snapshot model mirroring `src/vt.zig`), `input.zig` (`InputSink`; Key/Mods/Event re-exported from the Renderer's `Window` module, which provides the native window on Win32, Wayland and macOS), `font` / `wcwidth` (re-exports of the Renderer's `Font` module: TrueType parser, rasteriser, system fonts, atlas, cell widths). Imports only `std`, the Renderer's `Renderer`, `Window` and `Font` modules, and `imgdec`. |
 | `src/connect.zig` | The viewer's main loop; module "client" in Portal's root build (`portal connect`), wrapped by `src/main.zig` here. |
 | `src/gframe.zig` | Writes decoded 'G'/'I'/'P' frames into `view.grid.Grid` (remote grid source). |
 | `src/keys.zig` | Protocol key names per `hello.input` mode. |
@@ -131,11 +131,13 @@ server refused without --insecure-plain-http, 80 s idle kept alive by pings).
 
 Not yet tested:
 
-* Linux (X11) and macOS (Cocoa/MoltenVK) backends, Keychain and libsecret:
-  compile-checked by cross-compilation only, never run.
+* Linux (Wayland) and macOS (AppKit/MoltenVK) window backends (the
+  Renderer's `Window` module), Keychain and libsecret: compile-checked by
+  cross-compilation only (`zig build test` does it), never run.
 * Zoom keys (Ctrl+= / Ctrl+- / Ctrl+0) and HiDPI scaling > 100% were not
   exercised by the automated run.
-* No IME/compose input on X11; no Wayland backend; macOS needs arm64.
+* No IME/compose input; no X11 (Wayland only, by choice); integer Wayland
+  scales only.
 * std's TLS client changes its write keys from the reading thread when a
   server sends KeyUpdate(update_requested) (Portal's server never does);
   a malicious, already-authenticated server could only break its own
