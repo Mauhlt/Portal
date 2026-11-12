@@ -9,8 +9,15 @@
 //!
 //! Module layout (for merging into Portal's root build later):
 //!   "view"   src/view/root.zig   window, Vulkan drawing, fonts, input types.
-//!                                No networking; imports only "Renderer".
+//!                                No networking; imports the Renderer's
+//!                                "Renderer" and "Font" modules and imgdec.
 //!   client   src/main.zig        pairing, refresh, WebSocket, 'G' decoding.
+//!   "inputrules"  ../src/inputrules/root.zig   the input policy, key names
+//!                                and input line, shared with Portal's server
+//!                                and browser client (Portal's own source
+//!                                tree: this build lives inside it).
+//!   "datafeed"    ../src/datafeed/root.zig     the Data slice's model,
+//!                                shared with the browser client.
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -31,7 +38,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "view", .module = view }},
+        .imports = &.{
+            .{ .name = "view", .module = view },
+            .{ .name = "inputrules", .module = inputrulesModule(b, target, optimize) },
+            .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
+        },
     }) });
     const test_step = b.step("test", "Run unit tests and compile-check the executables");
     test_step.dependOn(&b.addRunArtifact(view_tests).step);
@@ -43,16 +54,23 @@ pub fn build(b: *std.Build) void {
 /// The reusable view module (src/view), wired to the Renderer package.
 pub fn viewModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     const renderer = b.dependency("Renderer", .{ .target = target, .optimize = optimize, .demo = false });
-    // Inline images: pngcheck + imgdec (src/image) on the owner's pinned
-    // Image package (see build.zig.zon), as in Portal's root build.
-    const pngcheck = b.createModule(.{ .root_source_file = b.path("src/image/pngcheck.zig"), .target = target, .optimize = optimize });
+    // Inline images: imgcheck + imgdec (src/image) on the owner's Image
+    // package (see build.zig.zon), as in Portal's root build.
+    // Same args as Renderer's, so both share Image's and Renderer's ../Vulkan module.
+    const image = b.dependency("Image", .{ .target = target, .optimize = optimize });
+    const imgcheck = b.createModule(.{
+        .root_source_file = b.path("src/image/imgcheck.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "ImageCheck", .module = image.module("ImageCheck") }},
+    });
     const imgdec = b.createModule(.{
         .root_source_file = b.path("src/image/imgdec.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "Image", .module = b.dependency("Image", .{ .target = target }).module("Image") },
-            .{ .name = "pngcheck", .module = pngcheck },
+            .{ .name = "Image", .module = image.module("Image") },
+            .{ .name = "imgcheck", .module = imgcheck },
         },
     });
     return b.createModule(.{
@@ -64,9 +82,25 @@ pub fn viewModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
         .link_libc = target.result.os.tag != .windows,
         .imports = &.{
             .{ .name = "Renderer", .module = renderer.module("Renderer") },
+            // Fonts and cell widths: the Renderer's Font module.
+            .{ .name = "Font", .module = renderer.module("Font") },
             .{ .name = "imgdec", .module = imgdec },
         },
     });
+}
+
+/// The input policy and input line, shared with Portal's server and
+/// browser client: Portal's src/inputrules (one directory up; Zig allows a
+/// module root outside the build root, and this build only ever runs from
+/// inside the Portal checkout).
+pub fn inputrulesModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("../src/inputrules/root.zig"), .target = target, .optimize = optimize });
+}
+
+/// The Data slice's model, shared with Portal's browser client:
+/// Portal's src/datafeed (one directory up, as inputrules).
+pub fn datafeedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("../src/datafeed/root.zig"), .target = target, .optimize = optimize });
 }
 
 fn addClient(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
@@ -75,6 +109,10 @@ fn addClient(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, 
         .target = target,
         .optimize = optimize,
         .link_libc = target.result.os.tag != .windows, // libsecret / Security.framework via dlopen
-        .imports = &.{.{ .name = "view", .module = viewModule(b, target, optimize) }},
+        .imports = &.{
+            .{ .name = "view", .module = viewModule(b, target, optimize) },
+            .{ .name = "inputrules", .module = inputrulesModule(b, target, optimize) },
+            .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
+        },
     }) });
 }

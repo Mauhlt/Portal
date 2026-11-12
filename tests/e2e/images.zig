@@ -10,7 +10,7 @@ const net = @import("net.zig");
 const proc = @import("proc.zig");
 const client = @import("client.zig");
 const ws = @import("ws.zig");
-const pngcheck = @import("pngcheck");
+const imgcheck = @import("imgcheck");
 const Runner = @import("runner.zig").Runner;
 
 /// 80 x 40 px at `--cols 8`: 8 columns, and rows from the aspect ratio at
@@ -26,7 +26,7 @@ fn hasPlacement(_: void, v: *client.Viewer) bool {
 
 pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const dir = try h.dataDir("images");
-    const png = try pngcheck.testImage(h.gpa, png_w, png_h);
+    const png = try imgcheck.testImage(h.gpa, png_w, png_h);
     defer h.gpa.free(png);
     const png_path = try std.fmt.allocPrint(h.gpa, "{s}\\test.png", .{dir});
     try Io.Dir.cwd().writeFile(h.io, .{ .sub_path = png_path, .data = png });

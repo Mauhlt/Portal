@@ -2,9 +2,10 @@
 //! in every client (the local window and `portal connect` via the view
 //! module, the browser client in wasm).
 //!
-//! The decoder is the owner's Image package (module "Image", pinned; see
+//! The decoder is the owner's Image package (module "Image"; see
 //! build.zig.zon), used read-only. It is wrapped defensively:
-//!   1. `pngcheck.validate` first: signature, IHDR limits (8192 per side,
+//!   1. `imgcheck.validate` first (Image.check with Portal's limits):
+//!      signature, IHDR limits (8192 per side,
 //!      32 Mpx), every chunk's bounds and CRC, chunk order, IEND.
 //!   2. The decode's memory cost is computed from the IHDR and checked
 //!      against the caller's budget before anything is allocated.
@@ -19,7 +20,7 @@
 const std = @import("std");
 const Image = @import("Image");
 /// The checks imgdec runs first, for callers that want header info.
-pub const pngcheck = @import("pngcheck");
+pub const imgcheck = @import("imgcheck");
 
 pub const Error = error{ Invalid, TooLarge, OutOfMemory };
 
@@ -107,24 +108,21 @@ pub fn fitted(w: u32, h: u32, max_side: u32) [2]u32 {
     return .{ @intCast(@max(1, (@as(u64, w) * m + h / 2) / h)), m };
 }
 
-/// Upper bound of what `decode` allocates for an image with this header.
-pub fn cost(info: pngcheck.Info, png_len: usize, max_side: u32) u64 {
+/// Upper bound of what `decode` allocates for an image `info` describes.
+pub fn cost(info: imgcheck.Info, max_side: u32) u64 {
     const out_wh = fitted(info.width, info.height, max_side);
-    const decoded = info.pixels() * 4; // the decoder's output, at most 4 bytes/pixel for PNG tags
     const rgba = @as(u64, out_wh[0]) * out_wh[1] * 4;
     const sums = @as(u64, out_wh[0]) * 4 * 8; // one row of box-filter accumulators
-    // raw (inflated) data + concatenated IDATs (<= file) + a zero row + slack
-    return info.rawBytes() + png_len + (@as(u64, info.width) * 8 + 8) + decoded + rgba + sums + (64 << 10);
+    // The decoder's own (Image.check's bound: inflated rows, concatenated
+    // IDATs, a zero row, its output) + our RGBA + accumulators + slack.
+    return info.decode_bytes + rgba + sums + (64 << 10);
 }
 
 /// Decodes `png` to RGBA8 (caller frees `px` with `gpa`). Never panics on
 /// any input; returns Invalid for anything the checker or decoder rejects.
 pub fn decode(gpa: std.mem.Allocator, png: []const u8, opts: Options) Error!Rgba {
-    const info = pngcheck.validate(png) catch |e| return switch (e) {
-        error.TooLarge => error.TooLarge,
-        else => error.Invalid,
-    };
-    if (cost(info, png.len, opts.max_side) > opts.budget) return error.TooLarge;
+    const info = imgcheck.validate(png) catch |e| return if (imgcheck.tooLarge(e)) error.TooLarge else error.Invalid;
+    if (cost(info, opts.max_side) > opts.budget) return error.TooLarge;
     var bounded: Bounded = .{ .child = gpa, .limit = opts.budget };
     const ba = bounded.allocator();
 
@@ -242,7 +240,7 @@ const testing = std.testing;
 
 test "decode a stored PNG exactly" {
     const gpa = testing.allocator;
-    const png = try pngcheck.testImage(gpa, 31, 17);
+    const png = try imgcheck.testImage(gpa, 31, 17);
     defer gpa.free(png);
     var img = try decode(gpa, png, .{});
     defer img.deinit(gpa);
@@ -256,7 +254,7 @@ test "decode a stored PNG exactly" {
 
 test "downscale to max_side and scale()" {
     const gpa = testing.allocator;
-    const png = try pngcheck.testImage(gpa, 300, 100);
+    const png = try imgcheck.testImage(gpa, 300, 100);
     defer gpa.free(png);
     var img = try decode(gpa, png, .{ .max_side = 60 });
     defer img.deinit(gpa);
@@ -290,21 +288,21 @@ test "decoder output matches the Image package's own encoder" {
 
 test "budget and limits refuse before decoding" {
     const gpa = testing.allocator;
-    const png = try pngcheck.testImage(gpa, 64, 64);
+    const png = try imgcheck.testImage(gpa, 64, 64);
     defer gpa.free(png);
     try testing.expectError(error.TooLarge, decode(gpa, png, .{ .budget = 1000 }));
-    // Huge IHDR with fixed CRC: refused by pngcheck's limits.
+    // Huge IHDR with fixed CRC: refused by imgcheck's limits.
     const m = try gpa.dupe(u8, png);
     defer gpa.free(m);
     std.mem.writeInt(u32, m[16..20], 8192, .big);
     std.mem.writeInt(u32, m[20..24], 8192, .big);
-    pngcheck.fixCrcs(m);
+    imgcheck.fixCrcs(m);
     try testing.expectError(error.TooLarge, decode(gpa, m, .{}));
     // Large-but-legal IHDR (4096 x 4096) with a tiny IDAT: the cost check
     // refuses it under a small budget without allocating.
     std.mem.writeInt(u32, m[16..20], 4096, .big);
     std.mem.writeInt(u32, m[20..24], 4096, .big);
-    pngcheck.fixCrcs(m);
+    imgcheck.fixCrcs(m);
     try testing.expectError(error.TooLarge, decode(gpa, m, .{ .budget = 64 << 20 }));
 }
 
@@ -331,7 +329,7 @@ fn zlibZeros(gpa: std.mem.Allocator, n: usize) ![]u8 {
 fn pngWith(gpa: std.mem.Allocator, w: u32, h: u32, depth: u8, ctype: u8, interlace: u8, idat: []const u8, plte: ?[]const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    try out.appendSlice(gpa, &pngcheck.signature);
+    try out.appendSlice(gpa, &imgcheck.signature);
     var ihdr: [13]u8 = undefined;
     std.mem.writeInt(u32, ihdr[0..4], w, .big);
     std.mem.writeInt(u32, ihdr[4..8], h, .big);
@@ -349,7 +347,7 @@ fn pngWith(gpa: std.mem.Allocator, w: u32, h: u32, depth: u8, ctype: u8, interla
         try out.appendSlice(gpa, &[4]u8{ 0, 0, 0, 0 });
     }
     const s = try out.toOwnedSlice(gpa);
-    pngcheck.fixCrcs(s);
+    imgcheck.fixCrcs(s);
     return s;
 }
 
@@ -364,7 +362,7 @@ test "zlib bomb: output bounded by the IHDR, decode stays in budget" {
     defer gpa.free(z);
     const png = try pngWith(gpa, w, h, 8, 6, 0, z, null);
     defer gpa.free(png);
-    const budget: usize = @intCast(cost(try pngcheck.validate(png), png.len, 2048));
+    const budget: usize = @intCast(cost(try imgcheck.validate(png), 2048));
     var img = decode(gpa, png, .{ .budget = budget }) catch |e| {
         // Either outcome is fine as long as it is bounded and clean.
         try testing.expect(e == error.Invalid or e == error.TooLarge);
@@ -386,7 +384,7 @@ test "fuzz: mutated, truncated, split and odd-format PNGs never panic" {
         for (seeds.items) |s| gpa.free(s);
         seeds.deinit(gpa);
     }
-    try seeds.append(gpa, try pngcheck.testImage(gpa, 17, 9));
+    try seeds.append(gpa, try imgcheck.testImage(gpa, 17, 9));
     {
         var px: [40 * 20 * 4]u8 = undefined;
         rand.bytes(&px);
@@ -458,7 +456,7 @@ test "fuzz: mutated, truncated, split and odd-format PNGs never panic" {
                 }
             },
         }
-        if (rand.uintLessThan(u8, 4) != 0) pngcheck.fixCrcs(buf.items);
+        if (rand.uintLessThan(u8, 4) != 0) imgcheck.fixCrcs(buf.items);
         var img = decode(gpa, buf.items, .{ .budget = 8 << 20, .max_side = 64 }) catch continue;
         decoded_ok += 1;
         try testing.expect(img.w <= 64 and img.h <= 64);
@@ -498,7 +496,7 @@ fn splitIdat(gpa: std.mem.Allocator, png: []const u8, n: usize) !?[]u8 {
         i += 12 + len;
     }
     const s = try out.toOwnedSlice(gpa);
-    pngcheck.fixCrcs(s);
+    imgcheck.fixCrcs(s);
     return s;
 }
 

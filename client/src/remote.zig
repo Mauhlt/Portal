@@ -1,17 +1,32 @@
 //! Remote host for TermView (`portal connect`): turns view input into
 //! protocol frames for the connection thread, and the connection status
 //! into TermView's overlay (pairing screens with the request code, trust
-//! errors, status line, answer bar).
+//! errors, status line, answer bar, the instruction line).
+//!
+//! Per input mode (hello's `input`, rules shared with the browser client
+//! and the server: module "inputrules"):
+//!   none      view only: no answer bar, keys do nothing.
+//!   keys      answer bar; digits, y, n, Enter, Esc at the terminal.
+//!   instruct  (the default) answer bar plus the instruction line under it,
+//!             which has the keyboard (inputline.zig).
+//!   text      answer bar; typing and the editing keys go to the terminal.
+//! In every mode the Data column (dataview.zig) shows what the session
+//! pushed; F2 shows or hides it.
 
 const std = @import("std");
 const view = @import("view");
 const TermView = view.TermView;
 const input = view.input;
 const keys = @import("keys.zig");
+const inputline = @import("inputline.zig");
+const dataview = @import("dataview.zig");
+const rules = @import("inputrules");
 const client_mod = @import("net/client.zig");
 
 pub const pair_button_id = 1;
 pub const cancel_button_id = 2;
+/// The instruction line (a click on it reports this id).
+pub const line_field_id = 3;
 
 /// InputSink that sends protocol key names / text per the server's
 /// `hello.input` mode.
@@ -21,8 +36,12 @@ pub const RemoteSink = struct {
     /// active it gets the keyboard and its buttons.
     modal: ?Modal = null,
     /// Snapshot of the mode/status, refreshed each frame by the main loop.
-    mode: keys.Mode = .unknown,
+    mode: ?keys.Policy = null,
     status: client_mod.Status = .starting,
+    /// The instruction line (instruct mode). UI thread only.
+    line: inputline.Line = .{},
+    /// The Data column. UI thread only (fed under the shared lock).
+    data: dataview.DataView = .{},
 
     pub fn sink(r: *RemoteSink) input.InputSink {
         return .{ .ctx = r, .vtable = &vtable };
@@ -45,14 +64,34 @@ pub const RemoteSink = struct {
     }
 
     /// Who gets the keyboard: decided here only. The pairing screens
-    /// take it while shown; otherwise the remote terminal. A bottom-region
-    /// input pane (TermView.Layout) would be one more target here.
-    pub const Focus = enum { pair_screen, wait_screen, terminal };
+    /// take it while shown; in instruct mode the instruction line;
+    /// otherwise the remote terminal.
+    pub const Focus = enum { pair_screen, wait_screen, line, terminal };
 
     pub fn focus(r: *const RemoteSink) Focus {
         if (r.canPair()) return .pair_screen;
         if (r.waiting()) return .wait_screen;
+        if (r.status == .connected and r.mode == .instruct) return .line;
         return .terminal;
+    }
+
+    /// The instruction line's sender: frames go out on the connection.
+    const LineSender = struct {
+        client: *client_mod.Client,
+        pub fn send(s: LineSender, f: []const u8) bool {
+            return s.client.sendInput(f);
+        }
+    };
+
+    /// A local edit or note: ask the main loop for a frame (it redraws
+    /// when the shared version moves; no polling).
+    fn redraw(r: *RemoteSink) void {
+        _ = r.client.shared.version.fetchAdd(1, .release);
+    }
+
+    /// The server refused an instruction line ({"t":"rejected"}).
+    pub fn rejected(r: *RemoteSink, reason: []const u8) void {
+        r.line.rejected(reason);
     }
 
     pub const Modal = struct {
@@ -74,11 +113,18 @@ pub const RemoteSink = struct {
     fn onKey(ctx: *anyopaque, key: input.Key, mods: input.Mods) void {
         const r: *RemoteSink = @ptrCast(@alignCast(ctx));
         if (r.modalActive()) |m| return m.key(m.ctx, key, mods);
+        // F2 (not a protocol key): show / hide the Data column.
+        if (key == .f2 and !mods.ctrl and !mods.alt and !mods.super) {
+            r.data.toggle();
+            return r.redraw();
+        }
         switch (r.focus()) {
             .pair_screen => if (key == .enter) r.client.requestPairing(),
             .wait_screen => if (key == .escape) r.client.cancelPairing(),
-            .terminal => if (keys.keyFrame(r.mode, key, mods)) |f| {
-                _ = r.client.sendInput(f);
+            .line => if (r.line.onKey(key, mods, LineSender{ .client = r.client })) r.redraw(),
+            .terminal => {
+                var buf: [16]u8 = undefined;
+                if (keys.keyFrame(r.mode, key, mods, &buf)) |f| _ = r.client.sendInput(f);
             },
         }
     }
@@ -90,6 +136,7 @@ pub const RemoteSink = struct {
         switch (r.focus()) {
             .pair_screen => if (!mods.ctrl and (cp == 'p' or cp == 'P')) r.client.requestPairing(),
             .wait_screen => {},
+            .line => if (r.line.onChar(cp, mods)) r.redraw(),
             .terminal => {
                 var buf: [8]u8 = undefined;
                 if (keys.charFrame(r.mode, cp, mods, &buf)) |f| _ = r.client.sendInput(f);
@@ -99,7 +146,8 @@ pub const RemoteSink = struct {
 
     fn onAnswer(ctx: *anyopaque, key: []const u8) void {
         const r: *RemoteSink = @ptrCast(@alignCast(ctx));
-        if (keys.answerFrame(r.mode, key)) |f| _ = r.client.sendInput(f);
+        var buf: [16]u8 = undefined;
+        if (keys.answerFrame(r.mode, key, &buf)) |f| _ = r.client.sendInput(f);
     }
 
     fn onButton(ctx: *anyopaque, id: u32) void {
@@ -157,9 +205,14 @@ const pair_lines = [_][]const u8{
 /// What the overlay is built from (a snapshot taken under the lock).
 pub const View = struct {
     status: client_mod.Status,
-    mode: keys.Mode,
+    mode: ?keys.Policy,
     /// Must outlive TermView.build.
     detail: []const u8,
+    /// The instruction line (shown in instruct mode).
+    line: inputline.View = .{},
+    /// The Data column (null: hidden) and the status note while hidden.
+    data: ?TermView.DataColumn = null,
+    data_badge: []const u8 = "",
     host: []const u8,
     has_grid: bool,
     /// The request code while waiting for the desk.
@@ -175,6 +228,9 @@ pub const Bufs = struct {
     txt: [4][200]u8 = undefined,
     lines: [4][]const u8 = undefined,
     title: [48]u8 = undefined,
+    extra: [256]u8 = undefined,
+    right: [128]u8 = undefined,
+    panes: [1]TermView.Pane = undefined,
 };
 
 /// Builds the overlay from a status snapshot.
@@ -225,11 +281,27 @@ pub fn overlay(v: View, b: *Bufs) TermView.Overlay {
             o.screen = .{ .message = .{ .title = "Cannot store the device credential", .title_tone = .bad, .detail = v.detail } };
             return o;
         },
-        .connected => {
-            o.show_answers = v.mode.acceptsAnswers();
-            if (v.mode != .unknown) {
-                o.status.extra = v.mode.label();
-                o.status.extra_tone = if (v.mode == .text) .warn else .normal;
+        .connected => if (v.mode) |mode| {
+            o.show_answers = mode.acceptsAnswers();
+            o.status.extra = mode.label();
+            o.status.extra_tone = if (mode == .text) .warn else .normal;
+            if (mode == .instruct) {
+                b.panes[0] = .{ .content = .{ .field = .{
+                    .label = "",
+                    .value = v.line.text,
+                    .hint = rules.placeholder(.instruct),
+                    .id = line_field_id,
+                    .focused = true,
+                } } };
+                o.bottom = b.panes[0..1];
+                if (v.line.note.len > 0) {
+                    o.status.extra = std.fmt.bufPrint(&b.extra, "{s}: {s}", .{ mode.label(), v.line.note }) catch mode.label();
+                    o.status.extra_tone = switch (v.line.note_tone) {
+                        .neutral => .normal,
+                        .ok => .good,
+                        .bad => .bad,
+                    };
+                }
             }
         },
         else => o.status.extra = v.detail,
@@ -256,22 +328,85 @@ pub fn overlay(v: View, b: *Bufs) TermView.Overlay {
         o.status.tone = .bad;
         return o;
     };
-    if (!v.has_grid) o.screen = .{ .message = .{ .title = statusWord(st), .title_tone = .muted, .detail = v.detail } };
+    if (!v.has_grid) {
+        o.screen = .{ .message = .{ .title = statusWord(st), .title_tone = .muted, .detail = v.detail } };
+        return o;
+    }
+    o.data = v.data;
+    if (v.data_badge.len > 0) o.status.right = std.fmt.bufPrint(&b.right, "{s}  \u{00B7}  {s}", .{ v.data_badge, v.host }) catch v.host;
     return o;
 }
 
 test "overlay: waiting shows the request code; trust errors are explained" {
     var b: Bufs = .{};
-    const w = overlay(.{ .status = .pair_waiting, .mode = .unknown, .detail = "", .host = "10.8.0.1:8420", .has_grid = false, .code = "7f3a".* }, &b);
+    const w = overlay(.{ .status = .pair_waiting, .mode = null, .detail = "", .host = "10.8.0.1:8420", .has_grid = false, .code = "7f3a".* }, &b);
     try std.testing.expectEqualStrings("Request code 7f3a", w.screen.message.title);
     try std.testing.expectEqual(@as(u32, cancel_button_id), w.screen.message.button.?.id);
-    const t = overlay(.{ .status = .retrying, .mode = .unknown, .detail = "retrying in 2 s", .host = "10.8.0.1:8420", .has_grid = true, .err = error.NotIssuedByPinnedCa, .pin_fp = "AB:CD" }, &b);
+    const t = overlay(.{ .status = .retrying, .mode = null, .detail = "retrying in 2 s", .host = "10.8.0.1:8420", .has_grid = true, .err = error.NotIssuedByPinnedCa, .pin_fp = "AB:CD" }, &b);
     try std.testing.expectEqualStrings("Cannot verify this Portal", t.screen.message.title);
     try std.testing.expect(std.mem.indexOf(u8, t.screen.message.lines[0], "pinned Portal CA") != null);
     // A plain network error keeps the picture and says it in the status line.
-    const n = overlay(.{ .status = .retrying, .mode = .unknown, .detail = "refused", .host = "h", .has_grid = true, .err = error.ConnectionRefused }, &b);
+    const n = overlay(.{ .status = .retrying, .mode = null, .detail = "refused", .host = "h", .has_grid = true, .err = error.ConnectionRefused }, &b);
     try std.testing.expect(n.screen == .grid);
     try std.testing.expectEqualStrings("refused", n.status.extra);
     try std.testing.expect(isTrustError(error.HostMismatch));
     try std.testing.expect(!isTrustError(error.TimedOut));
+}
+
+test "overlay per input mode: the same features as the browser" {
+    var b: Bufs = .{};
+    const base: View = .{ .status = .connected, .mode = null, .detail = "", .host = "h", .has_grid = true };
+    // view only: no answer bar, no line.
+    var v = base;
+    v.mode = .none;
+    var o = overlay(v, &b);
+    try std.testing.expect(!o.show_answers);
+    try std.testing.expectEqual(@as(usize, 0), o.bottom.len);
+    try std.testing.expectEqualStrings("view only", o.status.extra);
+    // keys and text: the answer bar, no line.
+    for ([_]keys.Policy{ .keys, .text }) |p| {
+        v.mode = p;
+        o = overlay(v, &b);
+        try std.testing.expect(o.show_answers);
+        try std.testing.expectEqual(@as(usize, 0), o.bottom.len);
+    }
+    // instruct (the default): answer bar plus the instruction line, which
+    // has the keyboard; its note shows in the status line.
+    v.mode = .instruct;
+    v.line = .{ .text = "fix it", .note = "Sent.", .note_tone = .ok };
+    o = overlay(v, &b);
+    try std.testing.expect(o.show_answers);
+    try std.testing.expectEqual(@as(usize, 1), o.bottom.len);
+    try std.testing.expectEqualStrings("fix it", o.bottom[0].content.field.value);
+    try std.testing.expect(o.bottom[0].content.field.focused);
+    try std.testing.expectEqualStrings("instructions: Sent.", o.status.extra);
+    try std.testing.expectEqual(TermView.Tone.good, o.status.extra_tone);
+}
+
+test "overlay: the data column beside the terminal, its badge while hidden" {
+    var b: Bufs = .{};
+    const col: TermView.DataColumn = .{};
+    var v: View = .{ .status = .connected, .mode = .instruct, .detail = "", .host = "h", .has_grid = true, .data = col };
+    try std.testing.expect(overlay(v, &b).data != null);
+    v.data = null;
+    v.data_badge = "2 new in Data (F2)";
+    const o = overlay(v, &b);
+    try std.testing.expect(o.data == null);
+    try std.testing.expectEqualStrings("2 new in Data (F2)  \u{00B7}  h", o.status.right);
+    // Pairing screens have no data column.
+    v.status = .need_pairing;
+    v.data = col;
+    try std.testing.expect(overlay(v, &b).data == null);
+}
+
+test "keyboard focus: the instruction line in instruct mode only" {
+    var r: RemoteSink = .{ .client = undefined, .status = .connected, .mode = .instruct };
+    try std.testing.expectEqual(RemoteSink.Focus.line, r.focus());
+    r.mode = .keys;
+    try std.testing.expectEqual(RemoteSink.Focus.terminal, r.focus());
+    r.mode = .instruct;
+    r.status = .retrying;
+    try std.testing.expectEqual(RemoteSink.Focus.terminal, r.focus());
+    r.status = .need_pairing;
+    try std.testing.expectEqual(RemoteSink.Focus.pair_screen, r.focus());
 }

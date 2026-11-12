@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const width = @import("vt_width.zig");
+const width = @import("Font").wcwidth; // the Renderer's Font module
 /// Inline images (kitty graphics subset): store, placements, wire frames.
 pub const gfx = @import("vt_gfx.zig");
 /// Cell width of a code point (0, 1 or 2). Public so the browser client

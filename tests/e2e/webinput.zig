@@ -1,6 +1,6 @@
 //! The browser's input box against a real server in its DEFAULT input
-//! mode (no --input): what Send produces is decided by the browser
-//! client's own logic (src/wasm/inputbox.zig, imported as "inputbox"), then
+//! mode (no --input): what Send produces is decided by the clients'
+//! own input-line logic (src/inputrules/send.zig, module "inputrules"), then
 //! sent over the socket exactly as the page would. The child is `cmd.exe
 //! /k` (prompt "E2E>"), so what reaches it shows on the prompt line.
 
@@ -9,7 +9,36 @@ const net = @import("net.zig");
 const proc = @import("proc.zig");
 const client = @import("client.zig");
 const Runner = @import("runner.zig").Runner;
-const inputbox = @import("inputbox");
+const inputbox = @import("inputrules");
+/// The native client's instruction line (client/src/inputline.zig).
+const inputline = @import("inputline");
+
+/// The native line's sender: frames go out on the test socket.
+const LineSender = struct {
+    v: *client.Viewer,
+    pub fn send(s: LineSender, f: []const u8) bool {
+        s.v.send(f);
+        return true;
+    }
+};
+
+/// Types `s` into the native line as the window delivers characters.
+fn typeLine(l: *inputline.Line, s: []const u8) void {
+    var it = std.unicode.Utf8View.initUnchecked(s).iterator();
+    while (it.nextCodepoint()) |cp| _ = l.onChar(cp, .{});
+}
+
+/// The `reason` of the last {"t":"rejected"} the viewer got.
+fn rejectedReason(v: *const client.Viewer, buf: []u8) []const u8 {
+    const msg = v.rejected[0..v.rejected_len];
+    const key = "\"reason\":\"";
+    const i = std.mem.indexOf(u8, msg, key) orelse return "";
+    const rest = msg[i + key.len ..];
+    const j = std.mem.indexOfScalar(u8, rest, '"') orelse return "";
+    const n = @min(j, buf.len);
+    @memcpy(buf[0..n], rest[0..n]);
+    return buf[0..n];
+}
 
 fn waitLine(v: *client.Viewer, want: []const u8, ms: u32) bool {
     const ok = v.pumpUntil(ms, want, struct {
@@ -117,6 +146,46 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = waitLine(v, "E2E>5", 5000);
         _ = box(v, policy, "OK.", &scratch);
         _ = r.check("\"OK.\" presses Enter", v.waitFor("'5' is not recognized", 5000), "{s}", .{v.dump(&dump_buf)});
+        _ = waitLine(v, "E2E>", 5000);
+
+        // The native client's instruction line, fed keystrokes the way its
+        // window does: the same features as the box.
+        {
+            const line = try std.heap.page_allocator.create(inputline.Line);
+            defer std.heap.page_allocator.destroy(line);
+            line.* = .{};
+            const sender: LineSender = .{ .v = v };
+            typeLine(line, "echo NATIVE-%OS%");
+            _ = line.onKey(.enter, .{}, sender);
+            _ = r.check("native line: Enter sends an instruction line", v.waitFor("NATIVE-Windows_NT", 5000) and line.text().len == 0, "{s}", .{v.dump(&dump_buf)});
+            _ = waitLine(v, "E2E>", 5000);
+            typeLine(line, "!echo NATIVE-ESCAPE");
+            _ = line.onKey(.enter, .{}, sender);
+            _ = r.check("native line: a leading ! is refused locally, the text kept", std.mem.eql(u8, line.text(), "!echo NATIVE-ESCAPE") and std.mem.eql(u8, line.note(), inputbox.refusalText(.shell_escape)), "'{s}' '{s}'", .{ line.text(), line.note() });
+            net.sleep(1100); // one Esc per second
+            _ = line.onKey(.escape, .{}, sender); // clears the line, sends nothing
+            _ = r.check("native line: Esc clears a non-empty line", line.text().len == 0, "'{s}'", .{line.text()});
+            // A server refusal puts the last line back (the server is sent
+            // a raw line the client would have refused).
+            const before = v.rejected_count;
+            v.send("l:#NATIVE-ESCAPE");
+            const got = v.pumpUntil(3000, before, struct {
+                fn f(n: usize, vv: *client.Viewer) bool {
+                    return vv.rejected_count > n;
+                }
+            }.f);
+            var why_buf: [32]u8 = undefined;
+            if (got) line.rejected(rejectedReason(v, &why_buf));
+            _ = r.check("native line: a rejection is explained and the line restored", got and std.mem.eql(u8, line.text(), "echo NATIVE-%OS%") and std.mem.eql(u8, line.note(), inputbox.refusalText(.memory_shortcut)), "got={} '{s}' '{s}'", .{ got, line.text(), line.note() });
+            line.field.clear();
+            // Answer words press keys; Enter on an empty line presses Enter.
+            typeLine(line, "Three.");
+            _ = line.onKey(.enter, .{}, sender);
+            _ = r.check("native line: an answer word presses its key", waitLine(v, "E2E>3", 5000), "'{s}'", .{v.cursorLine()});
+            _ = line.onKey(.enter, .{}, sender);
+            _ = r.check("native line: Enter on an empty line presses Enter", v.waitFor("'3' is not recognized", 5000), "{s}", .{v.dump(&dump_buf)});
+            _ = r.check("native line: nothing refused reached the child", v.g.find("NATIVE-ESCAPE") == null, "{s}", .{v.dump(&dump_buf)});
+        }
         _ = r.check("every frame decoded strictly", v.bad == null, "{?t}", .{v.bad});
         _ = r.ok("portal still running", inst.alive() and client.alive(inst));
     }

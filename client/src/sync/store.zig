@@ -1,6 +1,9 @@
 //! The device side of Portal sync: where verified packages are installed.
+//! One Store per paired desktop: `<root>` is that desktop's own folder
+//! (keypin.desktopRoot), so two desktops can never overwrite or block
+//! each other's packages.
 //!
-//!   <root>\                               %LOCALAPPDATA%\Portal\sync
+//!   <root>\         %LOCALAPPDATA%\Portal\sync\desktops\<host>-<key fp>
 //!     staging\<random>\<n>                one download being verified, file
 //!                                         n of its manifest (by index, never
 //!                                         by a path from the network);
@@ -9,10 +12,18 @@
 //!     packages\<pkg>\<version>\...        verified, read-only, immutable
 //!     packages\<pkg>\.manifests\<ver>.txt the signed manifest it came from
 //!     packages\<pkg>\.manifests\<ver>.sig  (and its signature, hex)
-//!     current\<pkg>.txt                   atomic pointer (temp + MoveFileEx
-//!                                         REPLACE_EXISTING | WRITE_THROUGH)
-//!     previous\<pkg>.txt                  the last good version (rollback)
+//!     state\<pkg>.txt                     ONE record per package: signer,
+//!                                         current, previous and the highest
+//!                                         sequence ever installed; replaced
+//!                                         atomically as a whole (flushed
+//!                                         temp + MoveFileEx REPLACE_EXISTING
+//!                                         | WRITE_THROUGH), so install,
+//!                                         rollback and revoke never leave a
+//!                                         half-updated pair of pointers
 //!     data\<pkg>\                         the package's own writable state
+//!
+//! Only one thread may change a Store (in `portal connect`, the sync
+//! worker); nothing here locks.
 //!
 //! Rules (docs/sync-design.md):
 //!   * files are verified (size and SHA-256 against the signed manifest)
@@ -23,7 +34,11 @@
 //!     version is always a new folder;
 //!   * sequence numbers only go up: a manifest whose sequence is not above
 //!     the highest ever installed for that package is refused (downgrade or
-//!     replay), except for an explicit local `rollback`;
+//!     replay), except for an explicit local `rollback`; a `revoke` keeps
+//!     the highest sequence too, so a revoked version never comes back;
+//!   * every record names the release key (its SHA-256) that signed what
+//!     it points at; a record signed by another key is refused, never
+//!     overwritten;
 //!   * pruning keeps current, previous and any version still in use
 //!     (a file in it cannot be opened exclusively);
 //!   * quotas: the manifest caps one package version, `quota` caps the
@@ -43,8 +58,8 @@ const sep = std.fs.path.sep_str;
 
 /// Everything installed together (all packages, all kept versions).
 pub const default_quota: u64 = 32 << 30;
-const pointer_header = "portal-sync-pointer-v1";
-const max_pointer_bytes = 512;
+const record_header = "portal-sync-state-v2";
+const max_record_bytes = 512;
 
 pub const Error = error{
     SizeMismatch,
@@ -56,9 +71,12 @@ pub const Error = error{
     NothingToRollBack,
     NotInstalled,
     Downgrade,
+    /// The package's record was written for another release key.
+    SignerMismatch,
 } || Allocator.Error;
 
-/// What current\<pkg>.txt and previous\<pkg>.txt hold.
+/// One version a record points at (current or previous), with the
+/// record's highest sequence: what `current()` / `previous()` return.
 pub const Pointer = struct {
     version_buf: [manifest.max_version]u8 = undefined,
     version_len: u8 = 0,
@@ -78,21 +96,93 @@ pub const Pointer = struct {
     pub fn version(p: *const Pointer) []const u8 {
         return p.version_buf[0..p.version_len];
     }
+};
 
-    fn format(p: *const Pointer, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, pointer_header ++ "\nversion {s}\nsequence {d}\nhighest {d}\n", .{ p.version(), p.sequence, p.highest }) catch buf[0..0];
+/// state\<pkg>.txt: everything about one package, in one file.
+///
+///   portal-sync-state-v2
+///   signer <64 hex: SHA-256 of the release key>
+///   current <version> <sequence>      or  current -
+///   previous <version> <sequence>     or  previous -
+///   highest <sequence>
+pub const Record = struct {
+    signer: [32]u8,
+    cur: ?Slot = null,
+    prev: ?Slot = null,
+    /// The highest sequence ever installed: replay protection that
+    /// survives a rollback and a revoke.
+    highest: u64 = 0,
+
+    pub const Slot = struct {
+        version_buf: [manifest.max_version]u8 = undefined,
+        version_len: u8 = 0,
+        sequence: u64 = 0,
+
+        pub fn init(v: []const u8, sequence: u64) Slot {
+            var s: Slot = .{ .sequence = sequence };
+            const n = @min(v.len, s.version_buf.len);
+            @memcpy(s.version_buf[0..n], v[0..n]);
+            s.version_len = @intCast(n);
+            return s;
+        }
+        pub fn version(s: *const Slot) []const u8 {
+            return s.version_buf[0..s.version_len];
+        }
+    };
+
+    fn pointer(r: *const Record, s: ?Slot) ?Pointer {
+        const x = s orelse return null;
+        return Pointer.init(x.version(), x.sequence, r.highest);
     }
 
-    pub fn parse(text: []const u8) Error!Pointer {
+    pub fn format(r: *const Record, buf: []u8) []const u8 {
+        var w: Io.Writer = .fixed(buf);
+        var hex: [64]u8 = undefined;
+        w.print(record_header ++ "\nsigner {s}\n", .{manifest.hexLower(&r.signer, &hex)}) catch return buf[0..0];
+        inline for (.{ "current", "previous" }, .{ r.cur, r.prev }) |name, slot| {
+            if (slot) |s| {
+                w.print(name ++ " {s} {d}\n", .{ s.version(), s.sequence }) catch return buf[0..0];
+            } else {
+                w.writeAll(name ++ " -\n") catch return buf[0..0];
+            }
+        }
+        w.print("highest {d}\n", .{r.highest}) catch return buf[0..0];
+        return w.buffered();
+    }
+
+    pub fn parse(text: []const u8) Error!Record {
         var it = std.mem.splitScalar(u8, text, '\n');
-        if (!std.mem.eql(u8, it.next() orelse "", pointer_header)) return error.BadPointer;
-        const v = field(it.next(), "version ") orelse return error.BadPointer;
-        if (!manifest.validVersion(v)) return error.BadPointer;
-        const s = std.fmt.parseInt(u64, field(it.next(), "sequence ") orelse return error.BadPointer, 10) catch return error.BadPointer;
-        const h = std.fmt.parseInt(u64, field(it.next(), "highest ") orelse return error.BadPointer, 10) catch return error.BadPointer;
+        if (!std.mem.eql(u8, it.next() orelse "", record_header)) return error.BadPointer;
+        const sh = field(it.next(), "signer ") orelse return error.BadPointer;
+        if (sh.len != 64) return error.BadPointer;
+        for (sh) |c| switch (c) {
+            '0'...'9', 'a'...'f' => {},
+            else => return error.BadPointer,
+        };
+        var r: Record = .{ .signer = manifest.parseHex(32, sh) orelse return error.BadPointer };
+        r.cur = try parseSlot(field(it.next(), "current ") orelse return error.BadPointer);
+        r.prev = try parseSlot(field(it.next(), "previous ") orelse return error.BadPointer);
+        r.highest = try parseSeq(field(it.next(), "highest ") orelse return error.BadPointer);
         if (!std.mem.eql(u8, it.next() orelse "x", "") or it.next() != null) return error.BadPointer;
-        if (s == 0 or h < s) return error.BadPointer;
-        return init(v, s, h);
+        if (r.cur) |c| if (c.sequence > r.highest) return error.BadPointer;
+        if (r.prev) |p| if (p.sequence > r.highest) return error.BadPointer;
+        if (r.cur != null and r.prev != null and std.mem.eql(u8, r.cur.?.version(), r.prev.?.version())) return error.BadPointer;
+        return r;
+    }
+
+    fn parseSlot(text: []const u8) Error!?Slot {
+        if (std.mem.eql(u8, text, "-")) return null;
+        const sp = std.mem.indexOfScalar(u8, text, ' ') orelse return error.BadPointer;
+        const v = text[0..sp];
+        if (!manifest.validVersion(v)) return error.BadPointer;
+        return Slot.init(v, try parseSeq(text[sp + 1 ..]));
+    }
+
+    /// Decimal, 1..2^64-1, no sign, no leading zeros.
+    fn parseSeq(text: []const u8) Error!u64 {
+        if (text.len == 0 or text.len > 20 or text[0] == '0') return error.BadPointer;
+        for (text) |c| if (c < '0' or c > '9') return error.BadPointer;
+        return std.fmt.parseInt(u64, text, 10) catch error.BadPointer;
     }
 
     fn field(line: ?[]const u8, comptime key: []const u8) ?[]const u8 {
@@ -120,14 +210,18 @@ pub const Offer = enum {
 pub const Store = struct {
     gpa: Allocator,
     io: Io,
-    /// Absolute path of the sync folder (…\Portal\sync).
+    /// Absolute path of this desktop's sync folder
+    /// (…\Portal\sync\desktops\<host>-<key fp>).
     root: []const u8,
+    /// SHA-256 of the release key pinned for this desktop: every record
+    /// must name it.
+    signer: [32]u8,
     quota: u64 = default_quota,
 
     /// Creates the layout's folders if needed.
-    pub fn open(gpa: Allocator, io: Io, root: []const u8) !Store {
-        const s: Store = .{ .gpa = gpa, .io = io, .root = root };
-        for ([_][]const u8{ "staging", "packages", "current", "previous", "data" }) |d| {
+    pub fn open(gpa: Allocator, io: Io, root: []const u8, signer: [32]u8) !Store {
+        const s: Store = .{ .gpa = gpa, .io = io, .root = root, .signer = signer };
+        for ([_][]const u8{ "staging", "packages", "state", "data" }) |d| {
             var b: [1024]u8 = undefined;
             try Io.Dir.cwd().createDirPath(io, try s.path(&b, &.{d}));
         }
@@ -145,59 +239,57 @@ pub const Store = struct {
         return w.buffered();
     }
 
-    fn pointerPath(s: *const Store, buf: []u8, which: []const u8, pkg: []const u8) ![]const u8 {
+    fn recordPath(s: *const Store, buf: []u8, pkg: []const u8) ![]const u8 {
+        if (!manifest.validPackageId(pkg)) return error.BadPointer;
         var nb: [64]u8 = undefined;
-        return s.path(buf, &.{ which, try std.fmt.bufPrint(&nb, "{s}.txt", .{pkg}) });
+        return s.path(buf, &.{ "state", try std.fmt.bufPrint(&nb, "{s}.txt", .{pkg}) });
     }
 
-    fn readPointer(s: *const Store, which: []const u8, pkg: []const u8) !?Pointer {
+    /// The package's record, or null if it was never installed here.
+    /// A record for another release key is an error, never reinterpreted.
+    pub fn record(s: *const Store, pkg: []const u8) !?Record {
         var pb: [1024]u8 = undefined;
-        var fb: [max_pointer_bytes]u8 = undefined;
-        const text = Io.Dir.cwd().readFile(s.io, try s.pointerPath(&pb, which, pkg), &fb) catch |err| switch (err) {
+        var fb: [max_record_bytes]u8 = undefined;
+        const text = Io.Dir.cwd().readFile(s.io, try s.recordPath(&pb, pkg), &fb) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
-        return try Pointer.parse(text);
+        const r = try Record.parse(text);
+        if (!std.crypto.timing_safe.eql([32]u8, r.signer, s.signer)) return error.SignerMismatch;
+        return r;
     }
 
     pub fn current(s: *const Store, pkg: []const u8) !?Pointer {
-        return s.readPointer("current", pkg);
+        const r = (try s.record(pkg)) orelse return null;
+        return r.pointer(r.cur);
     }
 
     pub fn previous(s: *const Store, pkg: []const u8) !?Pointer {
-        return s.readPointer("previous", pkg);
+        const r = (try s.record(pkg)) orelse return null;
+        return r.pointer(r.prev);
     }
 
-    /// Writes a pointer: temp file, flushed, then an atomic replace that
-    /// is itself written through to disk.
-    fn writePointer(s: *const Store, which: []const u8, pkg: []const u8, p: Pointer) !void {
+    /// Replaces the whole record at once: temp file, flushed, then an
+    /// atomic replace that is itself written through to disk. A crash
+    /// leaves either the old record or the new one.
+    fn writeRecord(s: *const Store, pkg: []const u8, r: Record) !void {
         var pb: [1024]u8 = undefined;
-        const final = try s.pointerPath(&pb, which, pkg);
-        var tb: [1100]u8 = undefined;
-        var rnd: [8]u8 = undefined;
-        s.io.random(&rnd);
-        const tmp = try std.fmt.bufPrint(&tb, "{s}.{x}.tmp", .{ final, &rnd });
-        var buf: [max_pointer_bytes]u8 = undefined;
-        try writeFlushed(s.io, tmp, p.format(&buf), true);
-        errdefer Io.Dir.cwd().deleteFile(s.io, tmp) catch {};
-        try replaceFile(s.gpa, s.io, tmp, final);
-    }
-
-    fn deletePointer(s: *const Store, which: []const u8, pkg: []const u8) !void {
-        var pb: [1024]u8 = undefined;
-        Io.Dir.cwd().deleteFile(s.io, try s.pointerPath(&pb, which, pkg)) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
+        var rec = r;
+        rec.signer = s.signer;
+        var buf: [max_record_bytes]u8 = undefined;
+        try writeAtomic(s.gpa, s.io, try s.recordPath(&pb, pkg), rec.format(&buf));
     }
 
     // ------------------------------------------------------------ policy
 
     pub fn checkOffer(s: *const Store, m: *const Manifest, client_version: []const u8) !Offer {
         if (manifest.compareClientVersions(client_version, m.min_client) < 0) return .needs_newer_client;
-        if (try s.current(m.package)) |cur| {
-            if (cur.sequence == m.sequence and std.mem.eql(u8, cur.version(), m.version)) return .up_to_date;
-            if (m.sequence <= cur.highest) return if (m.sequence < cur.sequence) .downgrade else .replay;
+        if (try s.record(m.package)) |rec| {
+            if (rec.cur) |cur| if (cur.sequence == m.sequence and std.mem.eql(u8, cur.version(), m.version)) return .up_to_date;
+            if (m.sequence <= rec.highest) {
+                const below = if (rec.cur) |cur| m.sequence < cur.sequence else false;
+                return if (below) .downgrade else .replay;
+            }
         }
         if ((try s.usage()) +| m.totalSize() > s.quota) return .over_quota;
         return .install;
@@ -291,9 +383,10 @@ pub const Store = struct {
     pub fn install(s: *Store, m: *const Manifest, manifest_bytes: []const u8, sig: [manifest.signature_len]u8, source: anytype) !Installed {
         if (m.totalSize() > manifest.max_package_bytes) return error.TooLarge;
         // Again here, whatever the caller checked: sequences only go up.
-        if (try s.current(m.package)) |cur| {
-            const same = cur.sequence == m.sequence and std.mem.eql(u8, cur.version(), m.version);
-            if (!same and m.sequence <= cur.highest) return error.Downgrade;
+        const old = try s.record(m.package);
+        if (old) |o| {
+            const same = if (o.cur) |cur| cur.sequence == m.sequence and std.mem.eql(u8, cur.version(), m.version) else false;
+            if (!same and m.sequence <= o.highest) return error.Downgrade;
         }
         if ((try s.usage()) +| m.totalSize() > s.quota) return error.OverQuota;
         var result: Installed = .{};
@@ -311,14 +404,19 @@ pub const Store = struct {
             try s.stageAndPlace(m, manifest_bytes, sig, source);
         }
 
-        // Pointers: the old current becomes previous, then the new current.
-        const old = try s.current(m.package);
-        var highest = m.sequence;
+        // One record: the old current becomes previous, the new current.
+        var rec: Record = .{ .signer = s.signer, .cur = .init(m.version, m.sequence), .highest = m.sequence };
         if (old) |o| {
-            highest = @max(highest, o.highest);
-            if (!std.mem.eql(u8, o.version(), m.version)) try s.writePointer("previous", m.package, o);
+            rec.highest = @max(rec.highest, o.highest);
+            rec.prev = o.prev;
+            if (o.cur) |c| if (!std.mem.eql(u8, c.version(), m.version)) {
+                rec.prev = c;
+            };
+            if (rec.prev) |p| if (std.mem.eql(u8, p.version(), m.version)) {
+                rec.prev = null;
+            };
         }
-        try s.writePointer("current", m.package, Pointer.init(m.version, m.sequence, highest));
+        try s.writeRecord(m.package, rec);
 
         var db: [1024]u8 = undefined;
         try Io.Dir.cwd().createDirPath(s.io, try s.path(&db, &.{ "data", m.package }));
@@ -394,15 +492,40 @@ pub const Store = struct {
     /// seen is kept, so the version rolled back from is not re-installed
     /// automatically.
     pub fn rollback(s: *Store, pkg: []const u8) !Pointer {
-        const cur = (try s.current(pkg)) orelse return error.NotInstalled;
-        const prev = (try s.previous(pkg)) orelse return error.NothingToRollBack;
+        const rec = (try s.record(pkg)) orelse return error.NotInstalled;
+        const cur = rec.cur orelse return error.NotInstalled;
+        const prev = rec.prev orelse return error.NothingToRollBack;
         var vb: [1024]u8 = undefined;
         if (!exists(s.io, try s.path(&vb, &.{ "packages", pkg, prev.version() }))) return error.NothingToRollBack;
-        const highest = @max(cur.highest, prev.highest);
-        try s.writePointer("previous", pkg, Pointer.init(cur.version(), cur.sequence, highest));
-        const now = Pointer.init(prev.version(), prev.sequence, highest);
-        try s.writePointer("current", pkg, now);
-        return now;
+        // One atomic write swaps both: a crash cannot leave current and
+        // previous naming the same version, or neither.
+        const now: Record = .{ .signer = s.signer, .cur = prev, .prev = cur, .highest = rec.highest };
+        try s.writeRecord(pkg, now);
+        return now.pointer(now.cur).?;
+    }
+
+    pub const Revoked = struct {
+        /// The version now current (the previous one), or null: uninstalled.
+        now: ?Pointer,
+        pruned: Pruned,
+    };
+
+    /// Withdraws the current version (the owner revoking an executable's
+    /// approval): the previous version becomes current, or, without one,
+    /// the package is uninstalled. The highest sequence is kept, so the
+    /// revoked version is never installed again (only a newer one, after a
+    /// new approval). Its folder is pruned unless something still runs
+    /// from it. data\<pkg>\ is left alone.
+    pub fn revoke(s: *Store, pkg: []const u8) !Revoked {
+        const rec = (try s.record(pkg)) orelse return error.NotInstalled;
+        _ = rec.cur orelse return error.NotInstalled;
+        var now: Record = .{ .signer = s.signer, .highest = rec.highest };
+        if (rec.prev) |p| {
+            var vb: [1024]u8 = undefined;
+            if (exists(s.io, try s.path(&vb, &.{ "packages", pkg, p.version() }))) now.cur = p;
+        }
+        try s.writeRecord(pkg, now);
+        return .{ .now = now.pointer(now.cur), .pruned = try s.prune(pkg) };
     }
 
     // -------------------------------------------------------------- prune
@@ -414,8 +537,9 @@ pub const Store = struct {
     pub fn prune(s: *Store, pkg: []const u8) !Pruned {
         const io = s.io;
         var r: Pruned = .{};
-        const cur = try s.current(pkg);
-        const prev = try s.previous(pkg);
+        const rec = try s.record(pkg);
+        const cur = if (rec) |x| x.cur else null;
+        const prev = if (rec) |x| x.prev else null;
         var pb: [1024]u8 = undefined;
         const pkg_dir = try s.path(&pb, &.{ "packages", pkg });
         var names: std.ArrayList([]u8) = .empty;
@@ -485,25 +609,49 @@ pub const Store = struct {
         return n;
     }
 
-    /// Packages with a current pointer.
+    /// Packages with a current version.
     pub fn installedPackages(s: *const Store, out: [][manifest.max_package_id]u8, lens: []u8) !usize {
         var pb: [1024]u8 = undefined;
-        var dir = Io.Dir.cwd().openDir(s.io, try s.path(&pb, &.{"current"}), .{ .iterate = true }) catch return 0;
+        var dir = Io.Dir.cwd().openDir(s.io, try s.path(&pb, &.{"state"}), .{ .iterate = true }) catch return 0;
         defer dir.close(s.io);
         var n: usize = 0;
         var it = dir.iterate();
         while (try it.next(s.io)) |e| {
             if (n == out.len) break;
-            if (!std.mem.endsWith(u8, e.name, ".txt")) continue;
+            if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".txt")) continue;
             const id = e.name[0 .. e.name.len - 4];
             if (!manifest.validPackageId(id)) continue;
+            const cur = s.current(id) catch continue;
+            if (cur == null) continue;
             @memcpy(out[n][0..id.len], id);
             lens[n] = @intCast(id.len);
             n += 1;
         }
         return n;
     }
+
+    /// The kind of an installed version (from its signed manifest).
+    pub fn kindOf(s: *const Store, pkg: []const u8, ver: []const u8) !manifest.Kind {
+        const im = try s.readInstalledManifest(pkg, ver);
+        defer s.gpa.free(im.text);
+        var m = try manifest.parse(s.gpa, im.text);
+        defer m.deinit(s.gpa);
+        return m.kind;
+    }
 };
+
+/// Writes `data` to `final` atomically: a flushed temp file next to it,
+/// then MoveFileEx REPLACE_EXISTING | WRITE_THROUGH (rename elsewhere).
+/// Readers see the old file or the new one, never a torn one.
+pub fn writeAtomic(gpa: Allocator, io: Io, final: []const u8, data: []const u8) !void {
+    var tb: [1100]u8 = undefined;
+    var rnd: [8]u8 = undefined;
+    io.random(&rnd);
+    const tmp = try std.fmt.bufPrint(&tb, "{s}.{x}.tmp", .{ final, &rnd });
+    try writeFlushed(io, tmp, data, true);
+    errdefer Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    try replaceFile(gpa, io, tmp, final);
+}
 
 // ------------------------------------------------------------ file sinks
 
@@ -724,24 +872,148 @@ fn testStore(tmp: *testing.TmpDir, buf: []u8) !Store {
     var abs_buf: [1024]u8 = undefined;
     const n = try Io.Dir.cwd().realPath(io, &abs_buf);
     const abs = try std.fmt.allocPrint(testing.allocator, "{s}" ++ sep ++ "{s}", .{ abs_buf[0..n], rel });
-    return Store.open(testing.allocator, io, abs);
+    return Store.open(testing.allocator, io, abs, test_signer);
 }
+
+const test_signer: [32]u8 = @splat(0x5a);
 
 fn readAll(s: *const Store, parts: []const []const u8, buf: []u8) ![]u8 {
     var pb: [1024]u8 = undefined;
     return Io.Dir.cwd().readFile(s.io, try s.path(&pb, parts), buf);
 }
 
-test "pointer format is strict" {
-    const p = Pointer.init("1.2", 5, 7);
-    var b: [256]u8 = undefined;
-    const t = p.format(&b);
-    const q = try Pointer.parse(t);
-    try testing.expectEqualStrings("1.2", q.version());
+test "record format is strict" {
+    const r: Record = .{ .signer = @splat(0xab), .cur = .init("1.2", 5), .prev = .init("1.1", 4), .highest = 7 };
+    var b: [512]u8 = undefined;
+    const t = r.format(&b);
+    try testing.expect(std.mem.startsWith(u8, t, "portal-sync-state-v2\nsigner abab"));
+    try testing.expect(std.mem.endsWith(u8, t, "\ncurrent 1.2 5\nprevious 1.1 4\nhighest 7\n"));
+    const q = try Record.parse(t);
+    try testing.expectEqualStrings("1.2", q.cur.?.version());
+    try testing.expectEqualStrings("1.1", q.prev.?.version());
     try testing.expectEqual(@as(u64, 7), q.highest);
-    try testing.expectError(error.BadPointer, Pointer.parse("portal-sync-pointer-v1\nversion ../x\nsequence 1\nhighest 1\n"));
-    try testing.expectError(error.BadPointer, Pointer.parse("portal-sync-pointer-v1\nversion 1\nsequence 3\nhighest 2\n"));
-    try testing.expectError(error.BadPointer, Pointer.parse("portal-sync-pointer-v1\nversion 1\nsequence 1\nhighest 1\nx"));
+    const none: Record = .{ .signer = @splat(1), .highest = 3 };
+    const q2 = try Record.parse(none.format(&b));
+    try testing.expect(q2.cur == null and q2.prev == null and q2.highest == 3);
+    const sig = "portal-sync-state-v2\nsigner " ++ "0101010101010101010101010101010101010101010101010101010101010101" ++ "\n";
+    for ([_][]const u8{
+        sig ++ "current ../x 1\nprevious -\nhighest 1\n", // bad version
+        sig ++ "current 1 3\nprevious -\nhighest 2\n", // above highest
+        sig ++ "current 1 1\nprevious -\nhighest 1\nx", // trailing
+        sig ++ "current 1 01\nprevious -\nhighest 1\n", // leading zero
+        sig ++ "current 1 +1\nprevious -\nhighest 1\n",
+        sig ++ "current 1 1\nprevious 1 1\nhighest 1\n", // same version twice
+        sig ++ "previous -\ncurrent 1 1\nhighest 1\n", // order
+        "portal-sync-state-v2\nsigner " ++ "0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A" ++ "\ncurrent -\nprevious -\nhighest 1\n", // uppercase hex
+        "portal-sync-pointer-v1\nversion 1\nsequence 1\nhighest 1\n", // the old format
+    }) |bad| try testing.expectError(error.BadPointer, Record.parse(bad));
+}
+
+test "a record for another release key is refused, not overwritten" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rb: [256]u8 = undefined;
+    var s = try testStore(&tmp, &rb);
+    defer gpa.free(s.root);
+    const kp = try manifest.Ed25519.KeyPair.generateDeterministic(@splat(9));
+    const v1 = try TestPkg.make(gpa, kp, "stt-model", "1", 1, &.{"one"}, &.{"m"});
+    defer v1.destroy(gpa);
+    var src: MemSource = .{ .contents = &.{"one"} };
+    _ = try s.install(&v1.m, v1.bytes, v1.sig, &src);
+    var fb: [512]u8 = undefined;
+    const before = try readAll(&s, &.{ "state", "stt-model.txt" }, &fb);
+    var keep: [512]u8 = undefined;
+    @memcpy(keep[0..before.len], before);
+    // The same folder opened for another signer.
+    var other = s;
+    other.signer = @splat(0x77);
+    try testing.expectError(error.SignerMismatch, other.current("stt-model"));
+    try testing.expectError(error.SignerMismatch, other.checkOffer(&v1.m, "0.1.0"));
+    const v2 = try TestPkg.make(gpa, kp, "stt-model", "2", 2, &.{"two"}, &.{"m"});
+    defer v2.destroy(gpa);
+    var src2: MemSource = .{ .contents = &.{"two"} };
+    try testing.expectError(error.SignerMismatch, other.install(&v2.m, v2.bytes, v2.sig, &src2));
+    try testing.expectError(error.SignerMismatch, other.rollback("stt-model"));
+    try testing.expectError(error.SignerMismatch, other.revoke("stt-model"));
+    try testing.expectEqualStrings(keep[0..before.len], try readAll(&s, &.{ "state", "stt-model.txt" }, &fb));
+}
+
+test "revoke: back to the previous version, then uninstalled; the revoked version never returns" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rb: [256]u8 = undefined;
+    var s = try testStore(&tmp, &rb);
+    defer gpa.free(s.root);
+    const kp = try manifest.Ed25519.KeyPair.generateDeterministic(@splat(8));
+    const v1 = try TestPkg.make(gpa, kp, "npu-probe", "1", 1, &.{"MZ-1"}, &.{"npu-probe.exe"});
+    defer v1.destroy(gpa);
+    const v2 = try TestPkg.make(gpa, kp, "npu-probe", "2", 2, &.{"MZ-2"}, &.{"npu-probe.exe"});
+    defer v2.destroy(gpa);
+    var s1: MemSource = .{ .contents = &.{"MZ-1"} };
+    _ = try s.install(&v1.m, v1.bytes, v1.sig, &s1);
+    var s2: MemSource = .{ .contents = &.{"MZ-2"} };
+    _ = try s.install(&v2.m, v2.bytes, v2.sig, &s2);
+
+    const r1 = try s.revoke("npu-probe");
+    try testing.expectEqualStrings("1", r1.now.?.version());
+    try testing.expectEqual(@as(usize, 1), r1.pruned.removed); // 2's folder is gone
+    try testing.expect((try s.previous("npu-probe")) == null);
+    var pb: [1024]u8 = undefined;
+    try testing.expect(!exists(s.io, try s.path(&pb, &.{ "packages", "npu-probe", "2" })));
+    try testing.expectEqual(Offer.replay, try s.checkOffer(&v2.m, "0.1.0"));
+    try testing.expectError(error.NothingToRollBack, s.rollback("npu-probe"));
+
+    const r2 = try s.revoke("npu-probe");
+    try testing.expect(r2.now == null);
+    try testing.expect((try s.current("npu-probe")) == null);
+    try testing.expectError(error.NotInstalled, s.revoke("npu-probe"));
+    var ids: [4][manifest.max_package_id]u8 = undefined;
+    var lens: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try s.installedPackages(&ids, &lens));
+    // Neither revoked version comes back; a newer one may (after approval).
+    try testing.expectEqual(Offer.replay, try s.checkOffer(&v1.m, "0.1.0"));
+    try testing.expectEqual(Offer.replay, try s.checkOffer(&v2.m, "0.1.0"));
+    const v3 = try TestPkg.make(gpa, kp, "npu-probe", "3", 3, &.{"MZ-3"}, &.{"npu-probe.exe"});
+    defer v3.destroy(gpa);
+    try testing.expectEqual(Offer.install, try s.checkOffer(&v3.m, "0.1.0"));
+    var s3: MemSource = .{ .contents = &.{"MZ-3"} };
+    _ = try s.install(&v3.m, v3.bytes, v3.sig, &s3);
+    try testing.expectEqualStrings("3", (try s.current("npu-probe")).?.version());
+    try testing.expect((try s.previous("npu-probe")) == null);
+}
+
+test "rollback is one atomic record write; no temp files are left" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rb: [256]u8 = undefined;
+    var s = try testStore(&tmp, &rb);
+    defer gpa.free(s.root);
+    const kp = try manifest.Ed25519.KeyPair.generateDeterministic(@splat(10));
+    const v1 = try TestPkg.make(gpa, kp, "stt-model", "1", 1, &.{"a"}, &.{"m"});
+    defer v1.destroy(gpa);
+    const v2 = try TestPkg.make(gpa, kp, "stt-model", "2", 2, &.{"b"}, &.{"m"});
+    defer v2.destroy(gpa);
+    var s1: MemSource = .{ .contents = &.{"a"} };
+    _ = try s.install(&v1.m, v1.bytes, v1.sig, &s1);
+    var s2: MemSource = .{ .contents = &.{"b"} };
+    _ = try s.install(&v2.m, v2.bytes, v2.sig, &s2);
+    _ = try s.rollback("stt-model");
+    var fb: [512]u8 = undefined;
+    const text = try readAll(&s, &.{ "state", "stt-model.txt" }, &fb);
+    try testing.expect(std.mem.endsWith(u8, text, "\ncurrent 1 1\nprevious 2 2\nhighest 2\n"));
+    var pb: [1024]u8 = undefined;
+    var dir = try Io.Dir.cwd().openDir(s.io, try s.path(&pb, &.{"state"}), .{ .iterate = true });
+    defer dir.close(s.io);
+    var it = dir.iterate();
+    var n: usize = 0;
+    while (try it.next(s.io)) |e| {
+        try testing.expect(std.mem.endsWith(u8, e.name, ".txt") and !std.mem.endsWith(u8, e.name, ".tmp"));
+        n += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n);
 }
 
 test "atomic install, read-only files, upgrade, downgrade/replay refused, rollback" {
