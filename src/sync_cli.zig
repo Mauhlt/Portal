@@ -237,6 +237,13 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
         return;
     }
 
+    {
+        // The shared store of earlier builds is never used: delete it.
+        const r = keypin.removeLegacyStore(io) catch keypin.Dropped{};
+        if (r.removed > 0 or r.kept > 0)
+            std.debug.print("sync-device: removed the shared store of earlier versions ({d} removed, {d} still in use: retried next time)\n", .{ r.removed, r.kept });
+    }
+
     // This desktop's own store, named after the pinned host and key.
     const pinned_now = keypin.load(io, host) catch |err| fatal("the pinned release key is unreadable: {t}", .{err});
     var root_buf: [client.pin.max_path]u8 = undefined;

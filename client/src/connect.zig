@@ -392,14 +392,19 @@ const SyncState = struct {
             return null;
         };
         s.store_key = pinned;
-        if (!s.legacy_noted and sync.keypin.legacyStorePresent(s.io())) {
+        if (!s.legacy_noted) {
+            // The shared store of earlier builds is never used: delete it.
             s.legacy_noted = true;
+            const r = sync.keypin.removeLegacyStore(s.io()) catch sync.keypin.Dropped{};
             var rb: [pin_mod.max_path]u8 = undefined;
             const old = sync.keypin.syncRoot(&rb) catch "";
-            std.debug.print("portal connect: sync: the shared folder of earlier versions ({s}\\packages, \\current, \\previous) is no longer used; each desktop now has its own folder under {s}\\desktops. Delete the old folders once nothing runs from them.\n", .{ old, old });
-            s.mutex.lockUncancelable(s.io());
-            s.ui.setNote("Packages from before per-desktop folders (in {s}) are no longer used; delete them once nothing runs from them.", .{old});
-            s.mutex.unlock(s.io());
+            if (r.removed > 0 or r.kept > 0)
+                std.debug.print("portal connect: sync: removed the shared store of earlier versions in {s} ({d} removed, {d} still in use: retried on a later start)\n", .{ old, r.removed, r.kept });
+            if (r.kept > 0) {
+                s.mutex.lockUncancelable(s.io());
+                s.ui.setNote("Some packages from before per-desktop folders (in {s}) are still in use; they are removed on a later start.", .{old});
+                s.mutex.unlock(s.io());
+            }
         }
         return &s.store.?;
     }
