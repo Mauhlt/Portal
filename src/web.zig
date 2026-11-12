@@ -53,6 +53,7 @@ const auth = @import("auth.zig");
 const guard = @import("guard.zig");
 const http1 = @import("http1.zig");
 const websocket = @import("shared").ws;
+const http_names = @import("shared").http;
 const Session = @import("session.zig").Session;
 const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
@@ -425,15 +426,15 @@ pub const Server = struct {
     stop: std.atomic.Value(bool) = .init(false),
 
     fn cookieName(srv: *const Server) []const u8 {
-        return if (srv.cfg.secure_cookie) "__Host-portal" else "portal_session";
+        return http_names.cookieName(.session, srv.cfg.secure_cookie);
     }
 
     fn deviceCookieName(srv: *const Server) []const u8 {
-        return if (srv.cfg.secure_cookie) "__Host-portal_device" else "portal_device";
+        return http_names.cookieName(.device, srv.cfg.secure_cookie);
     }
 
     fn pairReqCookieName(srv: *const Server) []const u8 {
-        return if (srv.cfg.secure_cookie) "__Host-portal_pairreq" else "portal_pairreq";
+        return http_names.cookieName(.pairreq, srv.cfg.secure_cookie);
     }
 
     fn nowUnix(srv: *const Server) i64 {

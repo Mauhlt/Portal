@@ -8,6 +8,7 @@
 //! asserts on peer input, and rejects anything unusual instead of guessing.
 
 const std = @import("std");
+const syntax = @import("shared").http;
 
 pub const max_head_bytes = 8 * 1024;
 pub const max_headers = 64;
@@ -67,25 +68,9 @@ pub const CookieIterator = struct {
 
 /// Returns the length of the head including the terminating CRLFCRLF, or
 /// null if not yet complete.
-pub fn findHeadEnd(buf: []const u8) ?usize {
-    const i = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
-    return i + 4;
-}
-
-fn isTokenChar(c: u8) bool {
-    return switch (c) {
-        'a'...'z', 'A'...'Z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
-        else => false,
-    };
-}
-
-fn validValue(v: []const u8) bool {
-    for (v) |c| {
-        if (c == '\t') continue;
-        if (c < 0x20 or c == 0x7f) return false;
-    }
-    return true;
-}
+pub const findHeadEnd = syntax.findHeadEnd;
+const isToken = syntax.isToken;
+const validValue = syntax.validValue;
 
 fn listContainsToken(value: []const u8, token: []const u8) bool {
     var it = std.mem.splitScalar(u8, value, ',');
@@ -109,8 +94,7 @@ pub fn parseHead(head: []const u8) ParseError!Request {
     const target = parts.next() orelse return error.BadRequestLine;
     const version = parts.next() orelse return error.BadRequestLine;
     if (parts.next() != null) return error.BadRequestLine;
-    if (m.len == 0) return error.BadRequestLine;
-    for (m) |c| if (!isTokenChar(c)) return error.BadRequestLine;
+    if (!isToken(m)) return error.BadRequestLine;
     if (!std.mem.eql(u8, version, "HTTP/1.1")) return error.UnsupportedVersion;
     if (target.len == 0 or target.len > max_target_bytes or target[0] != '/') return error.BadTarget;
     for (target) |c| if (c <= 0x20 or c >= 0x7f) return error.BadTarget;
@@ -128,8 +112,7 @@ pub fn parseHead(head: []const u8) ParseError!Request {
         if (std.mem.indexOfAny(u8, hl, "\r\n") != null) return error.BadHeader; // bare CR / LF
         const colon = std.mem.indexOfScalar(u8, hl, ':') orelse return error.BadHeader;
         const name = hl[0..colon];
-        if (name.len == 0) return error.BadHeader;
-        for (name) |c| if (!isTokenChar(c)) return error.BadHeader;
+        if (!isToken(name)) return error.BadHeader;
         const value = std.mem.trim(u8, hl[colon + 1 ..], " \t");
         if (!validValue(value)) return error.BadHeader;
         if (req.header_count >= max_headers) return error.TooManyHeaders;
@@ -215,9 +198,7 @@ pub const Status = enum(u16) {
 /// Header values written by Portal are constants or base64url; this guards
 /// against a future caller accidentally passing CR/LF (response splitting).
 pub fn headerSafe(h: Header) bool {
-    if (h.name.len == 0) return false;
-    for (h.name) |c| if (!isTokenChar(c)) return false;
-    return validValue(h.value);
+    return isToken(h.name) and validValue(h.value);
 }
 
 pub fn writeResponse(

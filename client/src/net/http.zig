@@ -6,26 +6,19 @@
 //! untrusted and never cause a panic.
 
 const std = @import("std");
+/// Header syntax and cookie names, shared with the server (shared/http.zig).
+const syntax = @import("shared").http;
 
 pub const max_head_bytes = 8 * 1024;
 pub const max_headers = 64;
 /// Device cookie values are "<name>.<43-char secret>"; session values are 43.
 pub const max_cookie_value = 200;
 
-pub const CookieKind = enum { session, device, pairreq };
-
-const CookieName = struct { name: []const u8, kind: CookieKind };
+pub const CookieKind = syntax.CookieKind;
 /// `__Host-` variants are what the server uses over HTTPS (its default);
-/// the plain names only with `portal run --no-tls`.
-pub const cookie_names = [_]CookieName{
-    .{ .name = "portal_session", .kind = .session },
-    .{ .name = "__Host-portal", .kind = .session },
-    .{ .name = "portal_device", .kind = .device },
-    .{ .name = "__Host-portal_device", .kind = .device },
-    // The pairing request token (HttpOnly for browsers; memory only here).
-    .{ .name = "portal_pairreq", .kind = .pairreq },
-    .{ .name = "__Host-portal_pairreq", .kind = .pairreq },
-};
+/// the plain names only with `portal run --no-tls`. The pairing request
+/// token is HttpOnly for browsers and kept in memory only here.
+pub const cookie_names = syntax.cookie_names;
 
 /// A cookie value. The session cookie lives in memory only; the device
 /// cookie is persisted only through the OS credential store (credstore.zig).
@@ -57,20 +50,12 @@ pub const Cookie = struct {
     }
 };
 
-fn nameIndex(k: CookieKind, secure: bool) u8 {
-    return switch (k) {
-        .session => if (secure) 1 else 0,
-        .device => if (secure) 3 else 2,
-        .pairreq => if (secure) 5 else 4,
-    };
-}
+const nameIndex = syntax.cookieIndex;
 
 /// The name the server expects for `k`: `__Host-portal` /
 /// `__Host-portal_device` over HTTPS, `portal_session` / `portal_device`
 /// over plain HTTP.
-pub fn cookieName(k: CookieKind, secure: bool) []const u8 {
-    return cookie_names[nameIndex(k, secure)].name;
-}
+pub const cookieName = syntax.cookieName;
 
 fn scheme(secure: bool) []const u8 {
     return if (secure) "https" else "http";
@@ -125,10 +110,7 @@ pub fn canonicalHost(text: []const u8, out: []u8) ![]const u8 {
     return std.fmt.bufPrint(out, "{f}", .{addr}) catch error.BadServerAddress;
 }
 
-pub fn findHeadEnd(buf: []const u8) ?usize {
-    const i = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
-    return i + 4;
-}
+pub const findHeadEnd = syntax.findHeadEnd;
 
 pub const Response = struct {
     status: u16,
@@ -167,9 +149,9 @@ pub fn parseResponseHead(head: []const u8) ParseError!Response {
         if (count > max_headers) return error.TooManyHeaders;
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadHeader;
         const name = line[0..colon];
-        if (name.len == 0 or std.mem.indexOfAny(u8, name, " \t") != null) return error.BadHeader;
+        if (!syntax.isToken(name)) return error.BadHeader;
         const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        for (val) |c| if ((c < 0x20 and c != '\t') or c == 0x7f) return error.BadHeader;
+        if (!syntax.validValue(val)) return error.BadHeader;
         if (std.ascii.eqlIgnoreCase(name, "location")) {
             resp.location = val;
         } else if (std.ascii.eqlIgnoreCase(name, "set-cookie")) {
@@ -220,11 +202,7 @@ pub fn parseSetCookie(header: []const u8) SetCookieResult {
     const name = std.mem.trim(u8, pair[0..eq], " \t");
     var v = std.mem.trim(u8, pair[eq + 1 ..], " \t");
     if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v = v[1 .. v.len - 1];
-    var idx: ?u8 = null;
-    for (cookie_names, 0..) |n, i| {
-        if (std.mem.eql(u8, name, n.name)) idx = @intCast(i);
-    }
-    const name_index = idx orelse return .other;
+    const name_index = syntax.findCookie(name) orelse return .other;
     while (parts.next()) |attr_raw| {
         const attr = std.mem.trim(u8, attr_raw, " \t");
         if (std.ascii.startsWithIgnoreCase(attr, "max-age=")) {
