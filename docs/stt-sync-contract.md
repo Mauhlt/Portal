@@ -1,102 +1,130 @@
-# Speech-to-text integration: contract on file (not implemented)
+# Speech-to-text: how Portal and stt fit together
 
-**Status:** parked. The owner will say when to integrate their `stt` module
-(SpeechToText repo). Nothing in Portal implements this yet.
+**Status (2026-11-12):** the stt side exists (SpeechToText repo: `stt.Home`,
+`stt.Local`, the `stt-local` program, proto 1). Portal's side is not built
+yet; this is the contract it will implement. The owner says when.
 
-## Owner decisions
+## Who does what
 
-* **stt is GPU-only, on the home desktop**, for both transcription and
-  training. There is no CPU path.
-* **stt's own transport is gone.** Portal is the only way in: no stt TCP
-  server, no `stt.Client`, no stt mic capture or voice detection.
-* **Devices are thin clients** (iPhone, laptops). They record audio and
-  upload it through Portal; the desktop transcribes and learns.
-* **Unpairing never deletes samples** ("those will be used for training").
-  Pending bundles from an unpaired device are imported, not deleted.
-* **Portal must show training status.** While training runs, warn that
-  other GPU work, including transcription, may be slower.
+Each project has one job, and no job is done twice:
 
-## stt API: `stt.Home` (src/home.zig in SpeechToText; thread-safe)
+| Piece | Owns | Never does |
+|---|---|---|
+| **Portal** | transport (HTTPS/WSS over WireGuard), pairing and auth, signed package sync, the window/UI on every device, mic capture (WASAPI), starting `stt-local` | speech recognition, training, audio file formats |
+| **stt** (SpeechToText) | transcription, feedback, learning, training, bundles/updates as opaque blobs | sockets, servers, mic capture, UI, child processes |
+| **Audio** (`../Audio`) | WAV / QOA / MP3 decode and encode, PCM sample handling | capture, playback |
+| **TranslateNPU** (`../TranslateNPU`) | QNN bindings for the Snapdragon NPU (used by stt) | anything Portal-facing |
+
+Portal has no audio-format code of its own: anything it needs to encode or
+decode (e.g. a WAV for the "Test" button in the audio panel) comes from
+`../Audio`. If something is missing there (resampling, for instance), it is
+added to Audio, not to Portal.
+
+## Per device
+
+| Device | Speech | Runs where | Audio leaves the device? |
+|---|---|---|---|
+| **Desktop** (Portal's own window) | `stt.Home` linked into Portal, NVIDIA GPU; also trains | in-process | no |
+| **Laptop** (Snapdragon X) | `stt-local` child process wrapping `stt.Local`, on the NPU (QNN) | delivered by signed sync, approved on the laptop | no; only training bundles go home |
+| **iPhone** | Apple keyboard dictation into the input box | iOS | no; only the resulting text |
+
+So no device uploads audio for transcription, and Portal has no
+`/stt/transcribe` endpoint.
+
+## Desktop: `stt.Home` (SpeechToText src/home.zig; thread-safe)
 
 ```zig
 const home = try stt.Home.open(gpa, io, .{ .model_path = ..., .profile_dir = ... });
 defer home.close();
-const r = try home.transcribe(gpa, audio_bytes, device_name); // WAV, MP3 or QOA, any rate/channels -> { id, text }; caller frees text
-home.feedback(id, text, success);       // fix = (corrected, true); discard = (_, false); silence = no call (auto-confirmed after 60 s)
-home.setLearning(enabled);              // "nothing": learning off
-home.importBundle(gpa, bytes);          // device bundles (formats and caps unchanged)
-home.exportUpdate(gpa, device_version); // null = device current
-home.tick();                            // confirms silence, starts scheduled training, adopts a finished adapter
-home.trainingStatus();                  // stt.schedule.Status
-home.trainNow(); home.cancelTraining(); home.setSchedule(cfg); home.setListener(listener);
+const r = try home.transcribe(gpa, audio_bytes, "desk");   // WAV/MP3/QOA, any rate/channels -> Result{ id, text }; caller frees text
+const o = try home.feedback(r.id, corrected_text, true);    // !Outcome; discard = (id, _, false); silence = no call
+try home.setLearning(enabled);                              // !void
+const rep = try home.importBundle(gpa, bundle_bytes);       // !sync.ImportReport (bundles from laptops)
+const up = try home.exportUpdate(gpa, device_version);      // !?[]u8; null = device is current
+const next: ?i64 = home.tick();                             // unix ms of the next timed work, null = none
+const st = home.trainingStatus();                           // stt.schedule.Status
+try home.trainNow(); home.cancelTraining(); home.setSchedule(cfg); home.setListener(listener);
+home.setWakeup(.{ .ctx = portal, .onWakeup = onWakeup });   // fn (ctx, deadline_unix_ms: ?i64) void
 ```
 
-* **Build:** stt depends on `../Audio` (path dependency). The Audio repo must
-  be checked out next to SpeechToText.
-* **Event-driven (agreed, implemented in stt):**
-  * `home.tick()` returns `?i64`: the unix-ms deadline of its next timed
-    work, or null when nothing is pending. Timed work means auto-confirming
-    a transcript after 60 s of silence, or starting training when the window
-    opens. Calling it early is harmless.
-  * `home.setWakeup(.{ .ctx, .onWakeup = fn (ctx, deadline_unix_ms: ?i64) void })`
-    fires on set and whenever the deadline can move: transcribe, feedback,
-    setLearning, importBundle, setSchedule, or a training run finishing. It
-    may fire on the training thread, so Portal only re-arms its wait in it
-    and never calls into Home from inside it.
-  * Training completes on its own thread. That thread commits the version,
-    merges the adapter, and fires finished/failed/canceled, then onWakeup.
-  * **Portal's loop:** one waiter sleeps until the latest deadline (from
-    onWakeup or tick's return), calls tick() at that deadline, and sleeps
-    until tick's return value; null means wait for the next event. Nothing
-    wakes on a fixed interval.
+* **Build:** stt depends on `../Audio` and `../TranslateNPU` (path
+  dependencies, checked out next to SpeechToText).
+* **Event-driven:** the only timed work is auto-confirming a transcript after
+  60 s of silence and starting training when its window opens.
+  * `onWakeup` fires whenever the deadline can move (transcribe, feedback,
+    setLearning, importBundle, setSchedule, a run finishing). It may fire on
+    the training thread: Portal only re-arms its wait there and never calls
+    into Home from inside it.
+  * Portal's loop: one waiter sleeps until the latest deadline, calls
+    `tick()`, then sleeps until tick's return value (null = until the next
+    event). Nothing wakes on a fixed interval.
+* **Unpairing never deletes samples** (owner decision): pending bundles from
+  an unpaired laptop are still imported.
 
-## Training schedule and status
+## Laptop: `stt-local`, proto 1 (SpeechToText src/local_main.zig)
 
-* **Schedule:** training starts automatically only inside a daily local-time
-  window (default 02:00–06:00), once 20 new samples have arrived since the
-  last adapter version. `trainNow()` ignores the window. A run takes seconds
-  to minutes.
-* **Status fields:**
-  * `state`: idle | waiting_for_window | running;
-  * `pending_samples` / `min_new_samples`;
-  * `next_start_unix` (when waiting);
-  * `started_unix`, `progress` (0–1), `eta_seconds`, `epoch`/`epochs` (while
-    running);
-  * `version` (the adapter in use);
-  * `last_finished_unix`, `last_loss`, `last_samples`, `last_error`.
-* **Events:** started, progress, finished, failed and canceled, each with a
-  Status.
-  * `started` and `progress` fire on the training thread. Keep the handler
-    quick and don't call back into Home from it.
-  * `started` fires from whichever call started the run (tick or trainNow).
-  * `finished`, `failed` and `canceled` fire from the training thread when
-    the run ends, with no tick needed.
-* **Portal UI:**
-  * a top-bar banner on every viewer while running: "Training on GPU —
-    other GPU work may be slower (ETA …)";
-  * cleared on finished, failed or canceled;
-  * when waiting, the next start time.
-  * Train now / Cancel controls are **desk-only**.
+`stt-local` is a package delivered by signed sync (executable, approval
+required), with `stt-model` and `stt-adapter` as data packages. Portal starts
+it as a child process; see "Running delivered programs" in
+`docs/sync-design.md`.
 
-## Proposed Portal endpoints
+* **Framing:** JSON lines on stdin/stdout, at most 8 MiB per line; logs on
+  stderr. The first line is
+  `{"event":"ready","proto":1,"version":"…","backend":"htp|cpu|cuda","model":"…","adapter_version":N}`.
+  Every request carries `rid` and its reply echoes it.
+* **Requests:**
+  * `transcribe` with `pcm_s16le_b64` (16 kHz mono, preferred) or `wav_b64`
+    → `{"rid","id","text"}`. At most 120 s of audio (else `too_long`).
+    `id 0` = nothing heard, so no feedback is possible.
+  * `feedback` `{"id","text","ok"}` → `outcome` learned / discarded.
+  * `export_bundle` `{"max_bytes"}` → `{"b64","through","count","version"}`
+    (`b64` null when nothing is pending). stt-local caps a bundle at 5 MiB.
+  * `commit_export` `{"through"}` — only after the desktop stored the bundle.
+  * `import_update` `{"b64"}` → `{"version"}`.
+  * `set_learning` `{"on"}`, `status`.
+* **Errors:** `{"rid","error","message"}` with codes `bad_request`,
+  `bad_audio`, `too_long`, `busy`, `backend_lost` (restart the process),
+  `unknown_id`, `not_found`, `internal`.
+* **Events:** `{"event":"wakeup","deadline_unix_ms":N|null}`; stt-local runs
+  its own tick at that deadline. Portal stops it by closing stdin.
+* **Sandbox:** no network, sockets or child processes; writes only under its
+  `--profile` dir (`sync\data\stt-local\` in the per-desktop sync folder).
+* **Capture:** Portal records 16 kHz mono s16le from WASAPI (event-driven,
+  `AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, with `AUTOCONVERTPCM` to get 16 kHz;
+  any conversion Windows can't do goes into `../Audio`) and sends
+  `pcm_s16le_b64`.
 
-All endpoints require a live session from a paired device. `device_name`
-comes from the session's device tag, never from the client. Payloads are
-opaque, with explicit body limits.
+## Laptop → desktop: training data (proposed endpoints, not built)
+
+All require a live session from a paired device; the device name comes from
+the session, never from the request. Payloads are opaque to Portal.
 
 | Endpoint | Body / reply |
 |---|---|
-| `POST /stt/transcribe` | audio (WAV/MP3/QOA, ≤ ~4 MB, ≤ 120 s) → `{"id", "text"}`; 400 bad audio, 413 too long |
-| `POST /stt/feedback` | `{"id", "text", "success"}` |
-| `POST /sync/bundle?device_version=N` | opaque bundle ≤ 8 MB; 200 only after a durable write; 400 on bad bundle |
-| `GET /sync/update?version=N` | 200 + update ≤ 16 MB, or 204 if current |
+| `POST /sync/bundle?device_version=N` | a bundle from `export_bundle`, ≤ 5 MiB; 200 only after `home.importBundle` returned and the data is durable, then the laptop sends `commit_export`; 400 bad bundle |
+| `GET /sync/update?version=N` | 200 + update from `home.exportUpdate`, or 204 if current; the laptop passes it to `import_update` |
 
-Training status travels as a new text message on the existing WebSocket,
-`{"t":"training", ...}`, sent only on change (event-driven).
+* **Order:** `export_bundle` → POST → `commit_export` (repeat while more is
+  pending), then GET update → `import_update`. Event-driven: run on connect,
+  after feedback, and when the desk signals a new adapter version; no timers.
+* **Open item for the stt session:** updates travel as one base64 line, so
+  an update above ~6 MiB raw can't fit `import_update`'s 8 MiB line. Either
+  stt-local raises `max_line` or splits updates; until then Portal refuses
+  updates over 6 MiB.
 
-## Audio capture on the iPhone
+## Training status
 
-Safari records only AAC/Opus/WebM through MediaRecorder, and stt accepts WAV,
-MP3 or QOA. So the wasm client captures raw PCM through the JS bridge's audio
-callback and encodes WAV (or QOA) in Zig. The mic needs HTTPS, which Portal
-now serves.
+* **Schedule:** training starts only inside a daily local-time window
+  (default 02:00–06:00), once 20 new samples arrived since the last adapter.
+  `trainNow()` ignores the window.
+* **Status fields:** `state` idle | waiting_for_window | running;
+  `pending_samples` / `min_new_samples`; `next_start_unix`; `started_unix`,
+  `progress`, `eta_seconds`, `epoch`/`epochs`; `version`;
+  `last_finished_unix`, `last_loss`, `last_samples`, `last_error`.
+* **Events:** started, progress, finished, failed, canceled (each with a
+  Status). started/progress fire on the training thread: keep handlers quick.
+* **Portal UI:** a top-bar banner on every device while running ("Training on
+  GPU — other GPU work may be slower (ETA …)"), cleared when it ends; the next
+  start time while waiting. Train now / Cancel are desk-only. The status
+  travels to devices as `{"t":"training",…}` on the WebSocket, sent only on
+  change.
