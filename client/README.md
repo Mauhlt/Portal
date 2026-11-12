@@ -80,7 +80,7 @@ branch `portal-client`). After that branch is merged, change it to
 
 | Path | What |
 |---|---|
-| `src/view/` | **Module `view`**: reusable, no networking. `TermView` (window, Instanced2D drawing, fit/zoom, cursor, answer bar, status line), `grid.zig` (cell snapshot model mirroring `src/vt.zig`), `input.zig` (Key/Mods/Event, `InputSink`), `platform/` (Win32, X11, Cocoa), `font/` (TrueType parser, rasteriser, system fonts, atlas), `wcwidth.zig` (copy of `src/vt_width.zig`). Imports only `std` and `Renderer`. |
+| `src/view/` | **Module `view`**: reusable, no networking. `TermView` (window, Instanced2D drawing, fit/zoom, cursor, answer bar, status line), `grid.zig` (cell snapshot model mirroring `src/vt.zig`), `input.zig` (Key/Mods/Event, `InputSink`), `platform/` (Win32, X11, Cocoa), `font` / `wcwidth` (re-exports of the Renderer's `Font` module: TrueType parser, rasteriser, system fonts, atlas, cell widths). Imports only `std`, the Renderer's `Renderer` and `Font` modules, and `imgdec`. |
 | `src/connect.zig` | The viewer's main loop; module "client" in Portal's root build (`portal connect`), wrapped by `src/main.zig` here. |
 | `src/gframe.zig` | Writes decoded 'G'/'I'/'P' frames into `view.grid.Grid` (remote grid source). |
 | `src/keys.zig` | Protocol key names per `hello.input` mode. |

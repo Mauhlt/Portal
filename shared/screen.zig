@@ -45,7 +45,7 @@ pub const attr_underline: u8 = 8;
 pub const attr_strike: u8 = 16;
 
 /// Largest blob ('I' frame) a client stores: the server's limit too
-/// (client/src/image/pngcheck.zig `max_file_bytes`).
+/// (client/src/image/imgcheck.zig `max_file_bytes`).
 pub const max_blob_bytes: usize = 6 << 20;
 /// Most blobs, and most bytes in all, a client keeps: what the server holds
 /// (src/vt_gfx.zig `max_images`, `max_total_bytes`).

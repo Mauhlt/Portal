@@ -12,6 +12,4 @@ test {
     _ = @import("inputbox.zig");
     _ = @import("glyphs.zig");
     _ = @import("render.zig");
-    _ = @import("font/ttf.zig");
-    _ = @import("font/raster.zig");
 }

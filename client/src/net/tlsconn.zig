@@ -85,6 +85,11 @@ const Gate = struct {
     stream: net.Stream,
     read_err: ?anyerror = null,
     gate_err: ?GateError = null,
+    /// The watchdog's stop flag (Conn.openWatched) and this connection's
+    /// own (Conn.halt): once either is set no read or write blocks again,
+    /// so a swallowed cancelation cannot leave a task stuck.
+    stop: ?*const std.atomic.Value(bool) = null,
+    halted: std.atomic.Value(bool) = .init(false),
     /// Sticky: once failed, every later read fails too.
     failed: bool = false,
     buf: [tls.max_ciphertext_record_len]u8 = undefined,
@@ -170,7 +175,17 @@ const Gate = struct {
         }
     }
 
+    fn stopped(g: *const Gate) bool {
+        if (g.halted.load(.seq_cst)) return true;
+        if (g.stop) |s| return s.load(.seq_cst);
+        return false;
+    }
+
     fn sockRead(g: *Gate, dest: []u8) Io.Reader.Error!usize {
+        if (g.stopped()) {
+            g.read_err = error.Canceled;
+            return error.ReadFailed;
+        }
         var vec = [_][]u8{dest};
         const res = g.stream.readWithControl(g.io, &vec, &.{}) catch |err| {
             g.read_err = err;
@@ -388,6 +403,13 @@ pub const Conn = struct {
     /// Connects and, unless `security` is `.plain`, completes the TLS
     /// handshake. On error, `why` (if given) gets a short reason.
     pub fn open(gpa: std.mem.Allocator, io: Io, addr: net.IpAddress, security: Security) OpenError!*Conn {
+        return openWatched(gpa, io, addr, security, null);
+    }
+
+    /// `open` for a task under a watchdog: `stop` is its `stopped` flag
+    /// (watchdog.zig); once set, every read and write of the connection
+    /// fails with error.Canceled instead of blocking.
+    pub fn openWatched(gpa: std.mem.Allocator, io: Io, addr: net.IpAddress, security: Security, stop: ?*const std.atomic.Value(bool)) OpenError!*Conn {
         const stream = try addr.connect(io, .{ .mode = .stream });
         errdefer stream.close(io);
         const c = try gpa.create(Conn);
@@ -398,6 +420,7 @@ pub const Conn = struct {
         c.bundle = .empty;
         c.bundle_lock = .init;
         c.gate.init(io, stream, security == .tls);
+        c.gate.stop = stop;
         c.sock_writer = stream.writer(io, &c.out_buf);
         const pin = switch (security) {
             .plain => return c,
@@ -456,6 +479,7 @@ pub const Conn = struct {
 
     /// Writes and flushes all of `bytes`.
     pub fn writeAll(c: *Conn, bytes: []const u8) error{ WriteFailed, Canceled }!void {
+        if (c.gate.stopped()) return error.Canceled;
         c.writeAllInner(bytes) catch {
             if (c.sock_writer.err) |e| if (e == error.Canceled) return error.Canceled;
             return error.WriteFailed;
@@ -475,6 +499,7 @@ pub const Conn = struct {
     /// Reads what is available (at least one byte); 0 at end of stream.
     pub fn read(c: *Conn, buf: []u8) error{ ReadFailed, Canceled }!usize {
         if (buf.len == 0) return 0;
+        if (c.gate.stopped()) return error.Canceled;
         const r: *Io.Reader = if (c.client) |*cl| &cl.reader else &c.gate.interface;
         while (r.bufferedLen() == 0) {
             r.fillMore() catch |err| switch (err) {
@@ -491,14 +516,25 @@ pub const Conn = struct {
         return n;
     }
 
+    /// Makes every later read and write fail with error.Canceled instead
+    /// of blocking (any thread); used with a cancel of the task doing them.
+    pub fn halt(c: *Conn) void {
+        c.gate.halted.store(true, .seq_cst);
+    }
+
+    pub fn stopped(c: *const Conn) bool {
+        return c.gate.stopped();
+    }
+
     /// Closes the socket and frees the connection (not thread-safe with
     /// concurrent reads/writes: the caller stops those first).
     pub fn close(c: *Conn, gpa: std.mem.Allocator) void {
         // No close_notify: a send to a stalled server could block here.
         c.stream.close(c.io);
         c.bundle.deinit(gpa);
-        std.crypto.secureZero(u8, &c.tls_read_buf);
-        std.crypto.secureZero(u8, &c.tls_write_buf);
+        // Everything: the buffers, and std's TlsClient state with the
+        // application traffic keys.
+        std.crypto.secureZero(u8, std.mem.asBytes(c));
         gpa.destroy(c);
     }
 };

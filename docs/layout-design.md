@@ -72,3 +72,13 @@ segmented control (and swipe), with a badge on Data when new data arrives.
   slices.
 * Data frames reuse the image path ('I'/'P'), plus later typed data frames
   with explicit size limits.
+* Status (2026-11-12): both clients have the Data slice, on one shared
+  model (`src/datafeed`: bounded history, the "new" badge). The native
+  client draws it as a right-hand column (`TermView.DataColumn`,
+  `client/src/dataview.zig`), shown when the window is at least 640
+  logical px wide; F2 shows/hides it; while hidden, the status line counts
+  new items. Not yet: a draggable splitter, scrolling the history, keyboard
+  focus moving between slices.
+* Interaction is one manner on every device: the input policy, the key
+  names, the answer buttons and what Send does are defined once
+  (`src/inputrules`) and used by the server and both clients.

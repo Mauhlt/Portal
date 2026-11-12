@@ -3,8 +3,11 @@
 //!
 //!   no stored device credential -> wait for the user to press "Pair"
 //!       -> POST /pair (registers a request, returns its token)
-//!       -> GET /pair/wait every 2 s, showing the request code, until the
-//!          desk approves (device + session cookies) or denies
+//!       -> GET /pair/wait, showing the request code, until the desk
+//!          approves (device + session cookies) or denies. The server
+//!          holds each wait until the request changes (or ~25 s), and the
+//!          next one goes out as soon as it answers: a long poll, no
+//!          fixed sleep (only errors back off)
 //!       -> store the device cookie in the OS credential store
 //!   stored credential -> POST /auth/refresh -> store the rotated value
 //!       immediately (before anything else), keep the session in memory
@@ -19,9 +22,18 @@
 //! authenticated the server.
 //!
 //! Liveness: each step runs under a watchdog (watchdog.zig): 15 s for
-//! connect + TLS handshake, 15 s for each request/response, and on the
-//! stream 60 s without any data from the server. A ping goes out after
-//! 20 s of silence, so a live server always answers in time.
+//! connect + TLS handshake, 15 s for each request/response (40 s for a
+//! held /pair/wait), and on the stream 60 s without any data from the
+//! server. A ping goes out after 20 s of silence, so a live server always
+//! answers in time.
+//!
+//! On the stream one writer task owns every socket write: input frames
+//! (queued by the UI thread, which never touches the socket), pings
+//! (flagged by the watchdog, which never does I/O) and pongs. A server
+//! that stops reading can block the writer, but never the UI thread or the
+//! watchdog, so the idle timeout always fires; the watchdog then sets its
+//! stop flag and cancels reader and writer, and a stopped connection never
+//! blocks again even if a cancelation was swallowed.
 //!
 //! Everything read from the network is bounded and parsed defensively.
 
@@ -48,6 +60,8 @@ pub const connect_timeout_ms = 15_000;
 pub const request_timeout_ms = 15_000;
 pub const idle_timeout_ms = 60_000;
 pub const ping_interval_ms = 20_000;
+/// One held `GET /pair/wait` (the server answers within ~25 s).
+pub const pair_wait_timeout_ms = 40_000;
 /// The server keeps a pairing request (its token cookie) for 10 minutes.
 pub const pair_request_lifetime_ms = 600_000;
 
@@ -70,7 +84,13 @@ pub const Status = enum {
 pub const Shared = struct {
     mutex: Io.Mutex = .init,
     grid: Grid = .{},
-    mode: keys.Mode = .unknown,
+    /// hello's `input` (null before hello and while disconnected).
+    mode: ?keys.Policy = null,
+    /// The last {"t":"rejected"} reason (a LineError name) and a counter
+    /// bumped with each one, for the UI thread's instruction field.
+    rejected_buf: [32]u8 = undefined,
+    rejected_len: usize = 0,
+    rejected_gen: u64 = 0,
     status: Status = .starting,
     detail_buf: [160]u8 = undefined,
     detail_len: usize = 0,
@@ -152,16 +172,30 @@ pub const Client = struct {
     ca_len: usize = 0,
 
     wd: watchdog.Watchdog,
-    /// The open WebSocket connection; guarded by write_mutex.
-    write_mutex: Io.Mutex = .init,
-    conn: ?*tlsconn.Conn = null,
+    /// Frames for the stream's writer task (input from the UI thread,
+    /// pongs from the reader).
+    out: OutQueue = .{},
+    /// Wakes the writer task: a frame was queued or a ping is due.
+    write_wake: Io.Event = .unset,
+    /// Set by the watchdog's tick (which never writes itself).
+    ping_due: std.atomic.Value(bool) = .init(false),
     last_rx_ms: std.atomic.Value(i64) = .init(0),
     last_ping_ms: std.atomic.Value(i64) = .init(0),
+    /// Stream liveness (tests shorten them).
+    idle_ms: i64 = idle_timeout_ms,
+    ping_ms: i64 = ping_interval_ms,
     /// Last connection error printed to stderr (printed once per change).
     last_logged: ?anyerror = null,
-    /// Delay between `GET /pair/wait` polls (tests shorten it).
-    pair_poll_ms: i64 = 2000,
+    /// First retry delay after a failed `GET /pair/wait` (doubles, up to
+    /// 15 s). Successful waits are re-issued at once.
+    pair_retry_ms: i64 = 1000,
+    /// A /pair/wait that answers faster than this (a server that does not
+    /// hold the request) is re-issued only this long after it was sent,
+    /// so such a server is not hammered; a held one goes again at once.
+    pair_min_interval_ms: i64 = 1000,
     reason_buf: [160]u8 = undefined,
+    /// Tests: no connection errors on stderr.
+    quiet: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, shared: *Shared, server: []const u8, transport: Transport) !Client {
         var c: Client = .{
@@ -217,7 +251,7 @@ pub const Client = struct {
         s.detail_len = d.len;
         if (status != .pair_waiting) s.pair_code = null;
         if (status == .connected) s.last_error = null;
-        if (status != .connected) s.mode = if (status == .session_ended) s.mode else .unknown;
+        if (status != .connected) s.mode = if (status == .session_ended) s.mode else null;
         s.mutex.unlock(c.io);
         c.notify();
     }
@@ -227,6 +261,9 @@ pub const Client = struct {
         if (c.shared.wake_fn) |f| f(c.shared.wake_ctx.?);
     }
 
+    /// Only on the long-lived network thread (never inside a watchdog
+    /// task): nothing cancels that thread, so there is no cancelation to
+    /// swallow here.
     fn sleepMs(c: *Client, ms: i64) void {
         c.io.sleep(.fromMilliseconds(ms), .awake) catch {};
     }
@@ -238,6 +275,7 @@ pub const Client = struct {
         c.shared.mutex.unlock(c.io);
         if (c.last_logged) |l| if (l == err) return;
         c.last_logged = err;
+        if (c.quiet) return;
         std.debug.print("portal connect: {s}: {s} ({t})\n", .{ c.host(), describe(err), err });
     }
 
@@ -321,8 +359,8 @@ pub const Client = struct {
         defer std.crypto.secureZero(u8, &req_buf);
         var w: Io.Writer = .fixed(&req_buf);
         try http.writeRefreshRequest(&w, c.host(), c.secure(), &device);
-        var r = try c.roundTrip(w.buffered(), &resp_buf);
-        defer if (r.device) |*d| d.wipe();
+        var r = try c.roundTrip(w.buffered(), &resp_buf, request_timeout_ms);
+        defer r.wipe();
         switch (http.refreshOutcome(&r)) {
             .ok => {
                 try credstore.save(c.target(), r.device.?.value());
@@ -368,6 +406,7 @@ pub const Client = struct {
         c.shared.mutex.unlock(c.io);
         if (!already) c.setStatus(.need_pairing, "", .{}); // keep any "no longer paired" note
         while (!c.shared.pair_requested.swap(false, .acq_rel)) {
+            // Network thread, not a watchdog task: nothing cancels it.
             c.shared.wake.wait(c.io) catch {};
             c.shared.wake.reset();
         }
@@ -408,9 +447,14 @@ pub const Client = struct {
     /// The desk-approved pairing (docs/protocol.md section 1): `POST /pair`
     /// registers a request and returns its token; then `GET /pair/wait`
     /// until the desk answers. While waiting the request code is shown
-    /// (Shared.pair_code) so the user can match it with the desk's. Waits
-    /// between polls are real deadlines (`pair_poll_ms`, the browsers'
-    /// 2 s refresh), cut short by cancelPairing; the whole wait ends when
+    /// (Shared.pair_code) so the user can match it with the desk's.
+    ///
+    /// Long poll: the server holds each wait until the request changes or
+    /// about 25 s pass, and the next wait is sent as soon as one returns
+    /// (no sleep between successful waits; see `pair_min_interval_ms` for
+    /// servers that answer at once). A held wait is interrupted at once by
+    /// cancelPairing (the watchdog's abort flag). Only failed waits back
+    /// off, with real deadlines on Shared.wake. The whole wait ends when
     /// the request's 10-minute lifetime is over. Nothing is stored here.
     pub fn pairFlow(c: *Client) PairFlowResult {
         var resp_buf: [http.max_head_bytes]u8 = undefined;
@@ -420,11 +464,11 @@ pub const Client = struct {
         var w: Io.Writer = .fixed(&req_buf);
         http.writePairRequest(&w, c.host(), c.secure()) catch return .{ .failed = "request too long" };
         var token: http.Cookie = blk: {
-            var r = c.roundTrip(w.buffered(), &resp_buf) catch |err| {
+            var r = c.roundTrip(w.buffered(), &resp_buf, request_timeout_ms) catch |err| {
                 c.logError(err);
                 return .{ .failed = c.reason("could not reach the server: {s}", .{describe(err)}) };
             };
-            defer if (r.pairreq) |*t| t.wipe();
+            defer r.wipe();
             switch (http.pairStartOutcome(&r)) {
                 .requested => break :blk r.pairreq.?,
                 .closed => return .{ .failed = "no pairing window is open at the desk (Pair a device in the Portal window, or portalctl pair <name>)" },
@@ -441,10 +485,15 @@ pub const Client = struct {
             if (c.shared.pair_cancel.swap(false, .acq_rel)) return .cancelled;
             w = .fixed(&req_buf);
             http.writePairWaitRequest(&w, c.host(), c.secure(), &token) catch return .{ .failed = "request too long" };
-            var delay = c.pair_poll_ms;
-            if (c.roundTrip(w.buffered(), &resp_buf)) |resp| {
+            const sent = watchdog.nowMs(c.io);
+            // The held request: cancelPairing aborts it through the watchdog.
+            c.wd.abort = &c.shared.pair_cancel;
+            const result = c.roundTrip(w.buffered(), &resp_buf, pair_wait_timeout_ms);
+            c.wd.abort = null;
+            var next_at: i64 = sent +| c.pair_min_interval_ms;
+            if (result) |resp| {
                 var r = resp;
-                defer if (r.device) |*d| d.wipe();
+                defer r.wipe();
                 failures = 0;
                 switch (http.pairWaitOutcome(&r)) {
                     .waiting => {
@@ -453,24 +502,30 @@ pub const Client = struct {
                         c.shared.mutex.unlock(c.io);
                         c.setStatus(.pair_waiting, "approve this device at the desk", .{});
                     },
-                    .paired => return .{ .paired = .{ .device = r.device.?, .session = r.session.? } },
+                    .paired => {
+                        const p: PairFlowResult = .{ .paired = .{ .device = r.device.?, .session = r.session.? } };
+                        return p;
+                    },
                     .denied => return .{ .failed = "the desk denied this request" },
                     .expired => return .{ .failed = "the request expired or the pairing window closed; pair again" },
                     .unexpected => return .{ .failed = c.reason("unexpected answer while waiting (HTTP {d})", .{r.status}) },
                 }
             } else |err| {
-                // A lost poll is retried (with backoff) until the deadline.
+                if (c.shared.pair_cancel.swap(false, .acq_rel)) return .cancelled;
+                // A lost wait is retried (with backoff) until the deadline.
                 c.logError(err);
                 failures += 1;
-                delay = @min(c.pair_poll_ms * (@as(i64, 1) << @intCast(@min(failures, 3))), 15_000);
+                next_at = watchdog.nowMs(c.io) +| @min(c.pair_retry_ms * (@as(i64, 1) << @intCast(@min(failures - 1, 4))), 15_000);
                 c.setStatus(.pair_waiting, "{s}; trying again", .{describe(err)});
             }
             const now = watchdog.nowMs(c.io);
             if (now >= deadline) return .{ .failed = "the pairing request expired; pair again" };
-            // Sleep until the next poll, or until the user cancels.
+            if (now >= next_at) continue;
+            // Until the retry (or the floor for a non-holding server), or
+            // until the user cancels. Network thread: nothing cancels it.
             c.shared.wake.reset();
             if (c.shared.pair_cancel.load(.acquire)) continue;
-            c.shared.wake.waitTimeout(c.io, .{ .duration = .{ .raw = .fromMilliseconds(@min(delay, deadline - now)), .clock = .awake } }) catch {};
+            c.shared.wake.waitTimeout(c.io, .{ .duration = .{ .raw = .fromMilliseconds(@min(next_at, deadline) - now), .clock = .awake } }) catch {};
         }
     }
 
@@ -486,12 +541,12 @@ pub const Client = struct {
         defer std.crypto.secureZero(u8, &req_buf);
         var w: Io.Writer = .fixed(&req_buf);
         http.writeRefreshRequest(&w, c.host(), c.secure(), device) catch return null;
-        var r = c.roundTrip(w.buffered(), &resp_buf) catch |err| {
+        var r = c.roundTrip(w.buffered(), &resp_buf, request_timeout_ms) catch |err| {
             c.logError(err);
             c.retryWait(backoff, describe(err));
             return null;
         };
-        defer if (r.device) |*d| d.wipe();
+        defer r.wipe();
         switch (http.refreshOutcome(&r)) {
             .ok => {
                 // Rotate first: the old value is only valid for 10 minutes.
@@ -516,19 +571,20 @@ pub const Client = struct {
         }
     }
 
-    /// Sends a request on a fresh connection and parses the response head.
-    /// Returned slices point into `buf`.
-    fn roundTrip(c: *Client, request: []const u8, buf: *[http.max_head_bytes]u8) anyerror!http.Response {
+    /// Sends a request on a fresh connection and parses the response head
+    /// (the server must answer within `answer_ms`). Returned slices point
+    /// into `buf`.
+    fn roundTrip(c: *Client, request: []const u8, buf: *[http.max_head_bytes]u8, answer_ms: i64) anyerror!http.Response {
         c.wd.extend(connect_timeout_ms);
-        const r = c.wd.run(roundTripTask, .{ c, request, buf }, null);
+        const r = c.wd.run(roundTripTask, .{ c, request, buf, answer_ms }, null);
         if (c.wd.expired.load(.acquire)) return error.TimedOut;
         return r;
     }
 
-    fn roundTripTask(c: *Client, request: []const u8, buf: *[http.max_head_bytes]u8) anyerror!http.Response {
-        const conn = try tlsconn.Conn.open(c.gpa, c.io, c.addr, c.security());
+    fn roundTripTask(c: *Client, request: []const u8, buf: *[http.max_head_bytes]u8, answer_ms: i64) anyerror!http.Response {
+        const conn = try tlsconn.Conn.openWatched(c.gpa, c.io, c.addr, c.security(), &c.wd.stopped);
         defer conn.close(c.gpa);
-        c.wd.extend(request_timeout_ms);
+        c.wd.extend(answer_ms);
         try conn.writeAll(request);
         var len: usize = 0;
         while (true) {
@@ -559,21 +615,23 @@ pub const Client = struct {
         return r;
     }
 
-    /// Runs on the network thread while the stream task runs: keeps an idle
-    /// stream alive (the server answers pings with pongs). Returns when it
-    /// next needs to run (awake-clock ms), so the watchdog sleeps until then.
+    /// Runs on the watchdog's thread while the stream task runs. It never
+    /// writes (a blocked write would keep the watchdog from its deadline):
+    /// it only flags a ping for the writer task after `ping_ms` of
+    /// silence. Returns when it next needs to run (awake-clock ms).
     fn pingTick(ctx: *anyopaque) i64 {
         const c: *Client = @ptrCast(@alignCast(ctx));
         const now = watchdog.nowMs(c.io);
-        const due = @max(c.last_rx_ms.load(.acquire), c.last_ping_ms.load(.acquire)) +| ping_interval_ms;
+        const due = @max(c.last_rx_ms.load(.acquire), c.last_ping_ms.load(.acquire)) +| c.ping_ms;
         if (now < due) return due;
         c.last_ping_ms.store(now, .release);
-        c.sendFrame(.ping, "") catch {};
-        return now +| ping_interval_ms;
+        c.ping_due.store(true, .release);
+        c.write_wake.set(c.io);
+        return now +| c.ping_ms;
     }
 
     fn streamTask(c: *Client, session: *const http.Cookie, backoff: *i64) StreamResult {
-        const conn = tlsconn.Conn.open(c.gpa, c.io, c.addr, c.security()) catch |err| {
+        const conn = tlsconn.Conn.openWatched(c.gpa, c.io, c.addr, c.security(), &c.wd.stopped) catch |err| {
             c.logError(err);
             return .{ .failed = describe(err) };
         };
@@ -581,7 +639,10 @@ pub const Client = struct {
         c.wd.extend(request_timeout_ms);
 
         var rnd: [16]u8 = undefined;
-        c.io.randomSecure(&rnd) catch return .{ .failed = "no secure randomness" };
+        c.io.randomSecure(&rnd) catch |err| {
+            if (err == error.Canceled) c.io.recancel();
+            return .{ .failed = "no secure randomness" };
+        };
         const key = ws.makeKey(rnd);
         {
             var req_buf: [768]u8 = undefined;
@@ -619,14 +680,23 @@ pub const Client = struct {
 
         c.last_rx_ms.store(watchdog.nowMs(c.io), .release);
         c.last_ping_ms.store(0, .release);
-        c.wd.extend(idle_timeout_ms);
-        c.write_mutex.lockUncancelable(c.io);
-        c.conn = conn;
-        c.write_mutex.unlock(c.io);
+        c.ping_due.store(false, .release);
+        c.wd.extend(c.idle_ms);
+
+        // The writer task owns every write from here on.
+        c.write_wake.reset();
+        c.out.open(c.io);
+        var writer = c.io.concurrent(writerTask, .{ c, conn }) catch {
+            c.out.close(c.io);
+            return .{ .failed = "cannot start the writer" };
+        };
         defer {
-            c.write_mutex.lockUncancelable(c.io);
-            c.conn = null;
-            c.write_mutex.unlock(c.io);
+            // No more frames; the writer must not block again (a write
+            // stuck on a server that stopped reading is canceled).
+            c.out.close(c.io);
+            conn.halt();
+            c.write_wake.set(c.io);
+            writer.cancel(c.io);
         }
         c.last_logged = null;
         c.setStatus(.connected, "", .{});
@@ -650,6 +720,37 @@ pub const Client = struct {
         }
     }
 
+    /// The stream's only writer: due pings and queued frames, until the
+    /// stream ends (halted connection, closed queue) or it is canceled.
+    /// A failed write ends it and halts the connection, so the reader's
+    /// next read fails too and the stream reconnects.
+    fn writerTask(c: *Client, conn: *tlsconn.Conn) void {
+        var item: OutQueue.Item = .{};
+        defer std.crypto.secureZero(u8, &item.buf);
+        var out: [ws.max_client_payload + 16]u8 = undefined;
+        defer std.crypto.secureZero(u8, &out);
+        while (!conn.stopped()) {
+            if (c.ping_due.swap(false, .acq_rel)) {
+                c.writeFrame(conn, .ping, "", &out) catch return conn.halt();
+                continue;
+            }
+            if (c.out.take(c.io, &item)) {
+                c.writeFrame(conn, item.opcode, item.buf[0..item.len], &out) catch return conn.halt();
+                continue;
+            }
+            if (!c.out.isOpen(c.io)) return;
+            c.write_wake.wait(c.io) catch return; // canceled: the stream is ending
+            c.write_wake.reset(); // then look again: nothing queued before this is missed
+        }
+    }
+
+    fn writeFrame(c: *Client, conn: *tlsconn.Conn, opcode: ws.Opcode, payload: []const u8, out: []u8) !void {
+        var mask: [4]u8 = undefined;
+        try c.io.randomSecure(&mask);
+        const frame = try ws.encodeClientFrame(out, opcode, payload, mask);
+        try conn.writeAll(frame);
+    }
+
     /// Reads into `buf`; any data from the server moves the idle deadline.
     fn readMore(c: *Client, conn: *tlsconn.Conn, buf: *std.ArrayList(u8)) bool {
         buf.ensureUnusedCapacity(c.gpa, 32 * 1024) catch return false;
@@ -658,7 +759,7 @@ pub const Client = struct {
         if (n == 0) return false;
         buf.items.len += n;
         c.last_rx_ms.store(watchdog.nowMs(c.io), .release);
-        c.wd.extend(idle_timeout_ms);
+        c.wd.extend(c.idle_ms);
         return true;
     }
 
@@ -666,6 +767,7 @@ pub const Client = struct {
         t: []const u8 = "",
         input: ?[]const u8 = null,
         code: ?i64 = null,
+        reason: ?[]const u8 = null,
     };
 
     fn handleFrame(c: *Client, frame: ws.Frame, backoff: *i64) ?StreamResult {
@@ -700,11 +802,21 @@ pub const Client = struct {
                 const m = parsed.value;
                 if (std.mem.eql(u8, m.t, "hello")) {
                     c.shared.mutex.lockUncancelable(c.io);
-                    c.shared.mode = keys.Mode.parse(m.input orelse "none");
+                    c.shared.mode = keys.parsePolicy(m.input orelse "none");
                     c.shared.mutex.unlock(c.io);
                     backoff.* = 1000;
                     c.notify();
                     c.signalSync(); // look for updates on every (re)connect
+                } else if (std.mem.eql(u8, m.t, "rejected")) {
+                    // An instruction line was refused (docs/protocol.md §4).
+                    const why = m.reason orelse "";
+                    c.shared.mutex.lockUncancelable(c.io);
+                    const n = @min(why.len, c.shared.rejected_buf.len);
+                    @memcpy(c.shared.rejected_buf[0..n], why[0..n]);
+                    c.shared.rejected_len = n;
+                    c.shared.rejected_gen +%= 1;
+                    c.shared.mutex.unlock(c.io);
+                    c.notify();
                 } else if (std.mem.eql(u8, m.t, "updates")) {
                     c.signalSync();
                 } else if (std.mem.eql(u8, m.t, "exit")) {
@@ -713,39 +825,24 @@ pub const Client = struct {
                     return .logout;
                 }
             },
-            .ping => c.sendFrame(.pong, frame.payload) catch {},
-            .close => {
-                c.sendFrame(.close, "") catch {};
-                return .{ .failed = "server closed the stream" };
-            },
+            // Queued for the writer (dropped if its queue is full: the
+            // server's next ping gets the next pong).
+            .ping => _ = c.out.put(c.io, .pong, frame.payload),
+            // The stream ends now; the closing handshake reply is not
+            // waited for (the writer is stopped with the reader).
+            .close => return .{ .failed = "server closed the stream" },
             else => {},
         }
         return null;
     }
 
-    /// Callable from any thread. Inside the watchdog's task, a cancelation
-    /// that lands here is re-armed so that the next read sees it.
-    fn sendFrame(c: *Client, opcode: ws.Opcode, payload: []const u8) !void {
-        if (payload.len > ws.max_client_payload) return error.TooLarge;
-        var mask: [4]u8 = undefined;
-        c.io.randomSecure(&mask) catch |err| {
-            if (err == error.Canceled) c.io.recancel();
-            return err;
-        };
-        var out: [ws.max_client_payload + 16]u8 = undefined;
-        const frame = try ws.encodeClientFrame(&out, opcode, payload, mask);
-        c.write_mutex.lockUncancelable(c.io);
-        defer c.write_mutex.unlock(c.io);
-        const conn = c.conn orelse return error.NotConnected;
-        conn.writeAll(frame) catch |err| {
-            if (err == error.Canceled) c.io.recancel();
-            return err;
-        };
-    }
-
-    /// Sends an input frame ("k:..." or "t:..."); callable from the UI thread.
+    /// Queues an input frame ("k:...", "t:..." or "l:...") for the stream's writer;
+    /// callable from the UI thread and never blocks on the socket. False
+    /// when not connected, too long, or the queue is full (a server that
+    /// stopped reading: the idle timeout will reconnect).
     pub fn sendInput(c: *Client, text: []const u8) bool {
-        c.sendFrame(.text, text) catch return false;
+        if (!c.out.put(c.io, .text, text)) return false;
+        c.write_wake.set(c.io);
         return true;
     }
 
@@ -759,8 +856,79 @@ pub const Client = struct {
     pub fn cancelPairing(c: *Client) void {
         c.shared.pair_cancel.store(true, .release);
         c.shared.wake.set(c.io);
+        c.wd.poke(); // ends a held /pair/wait (the watchdog's abort flag)
     }
 };
+
+/// Frames waiting for the stream's writer task. Bounded: when the socket
+/// is stuck, input is refused rather than piling up or blocking.
+pub const OutQueue = struct {
+    pub const cap = 16;
+    pub const Item = struct {
+        opcode: ws.Opcode = .text,
+        len: u16 = 0,
+        buf: [ws.max_client_payload]u8 = undefined,
+    };
+
+    mutex: Io.Mutex = .init,
+    items: [cap]Item = undefined,
+    head: usize = 0,
+    len: usize = 0,
+    /// True while a stream is connected (frames are accepted).
+    is_open: bool = false,
+
+    pub fn open(q: *OutQueue, io: Io) void {
+        q.mutex.lockUncancelable(io);
+        defer q.mutex.unlock(io);
+        q.is_open = true;
+        q.head = 0;
+        q.len = 0;
+    }
+
+    /// Stops accepting and drops what is queued (wiped: it may be typed text).
+    pub fn close(q: *OutQueue, io: Io) void {
+        q.mutex.lockUncancelable(io);
+        defer q.mutex.unlock(io);
+        q.is_open = false;
+        q.len = 0;
+        q.head = 0;
+        for (&q.items) |*it| std.crypto.secureZero(u8, &it.buf);
+    }
+
+    pub fn isOpen(q: *OutQueue, io: Io) bool {
+        q.mutex.lockUncancelable(io);
+        defer q.mutex.unlock(io);
+        return q.is_open;
+    }
+
+    pub fn put(q: *OutQueue, io: Io, opcode: ws.Opcode, payload: []const u8) bool {
+        if (payload.len > ws.max_client_payload) return false;
+        q.mutex.lockUncancelable(io);
+        defer q.mutex.unlock(io);
+        if (!q.is_open or q.len == cap) return false;
+        const it = &q.items[(q.head + q.len) % cap];
+        it.opcode = opcode;
+        it.len = @intCast(payload.len);
+        @memcpy(it.buf[0..payload.len], payload);
+        q.len += 1;
+        return true;
+    }
+
+    pub fn take(q: *OutQueue, io: Io, out: *Item) bool {
+        q.mutex.lockUncancelable(io);
+        defer q.mutex.unlock(io);
+        if (q.len == 0) return false;
+        const it = &q.items[q.head];
+        out.opcode = it.opcode;
+        out.len = it.len;
+        @memcpy(out.buf[0..it.len], it.buf[0..it.len]);
+        std.crypto.secureZero(u8, it.buf[0..it.len]);
+        q.head = (q.head + 1) % cap;
+        q.len -= 1;
+        return true;
+    }
+};
+
 
 /// "10.8.0.1:8420" -> "10.8.0.1", "[fd00::1]:8420" -> "fd00::1".
 pub fn bareIp(canonical_host: []const u8) []const u8 {
@@ -792,7 +960,7 @@ pub fn fetchCaCertificate(gpa: std.mem.Allocator, io: Io, server: []const u8, ou
 }
 
 fn fetchTask(gpa: std.mem.Allocator, io: Io, addr: net.IpAddress, host_: []const u8, wd: *watchdog.Watchdog, out: *[x509check.max_cert_len]u8) anyerror![]const u8 {
-    const conn = try tlsconn.Conn.open(gpa, io, addr, .plain);
+    const conn = try tlsconn.Conn.openWatched(gpa, io, addr, .plain, &wd.stopped);
     defer conn.close(gpa);
     wd.extend(request_timeout_ms);
     var req_buf: [256]u8 = undefined;
@@ -854,6 +1022,11 @@ const ScriptServer = struct {
             }
             s.seen_len[s.n] = len;
             s.n += 1;
+            if (reply.len == 0) {
+                // Hold the request unanswered, as a long poll does.
+                io.sleep(.fromSeconds(60), .awake) catch {};
+                return;
+            }
             var wb: [1024]u8 = undefined;
             var w = conn.writer(io, &wb);
             w.interface.writeAll(reply) catch return;
@@ -886,7 +1059,8 @@ fn runScript(replies: []const []const u8, srv: *ScriptServer) !Client.PairFlowRe
     }
     var shared: Shared = .{};
     var c = try Client.init(gpa, io, &shared, host_text, .insecure_plain_http);
-    c.pair_poll_ms = 5;
+    c.pair_min_interval_ms = 5;
+    c.pair_retry_ms = 5;
     const r = c.pairFlow();
     if (r == .paired) {
         // The request code was shown while waiting (cleared on later
@@ -947,7 +1121,8 @@ test "pairing: denied, expired, refused, and the code is published" {
     }
     var shared: Shared = .{};
     var c = try Client.init(std.testing.allocator, io, &shared, host_text, .insecure_plain_http);
-    c.pair_poll_ms = 5;
+    c.pair_min_interval_ms = 5;
+    c.pair_retry_ms = 5;
     var seen_code = false;
     // Watch the shared state from the UI side: wake_fn runs on every change.
     const Watch = struct {
@@ -982,7 +1157,7 @@ test "pairing: cancel stops the wait" {
     }
     var shared: Shared = .{};
     var c = try Client.init(std.testing.allocator, io, &shared, host_text, .insecure_plain_http);
-    c.pair_poll_ms = 60_000; // only a cancel can end the wait in time
+    c.pair_min_interval_ms = 60_000; // only a cancel can end the wait in time
     const Cancel = struct {
         var client: *Client = undefined;
         fn f(_: *anyopaque) void {
@@ -995,4 +1170,128 @@ test "pairing: cancel stops the wait" {
     const t0 = watchdog.nowMs(io);
     try std.testing.expect(c.pairFlow() == .cancelled);
     try std.testing.expect(watchdog.nowMs(io) - t0 < 10_000);
+}
+
+test "pairing: waits are re-issued at once (long poll), and cancel ends a held wait" {
+    var srv: ScriptServer = undefined;
+    const io = std.testing.io;
+    var addr: net.IpAddress = try .parseLiteral("127.0.0.1:0");
+    // "" = hold the request without answering (the server's long poll).
+    srv = .{ .server = try addr.listen(io, .{}), .replies = &.{ reply_requested, reply_waiting, reply_waiting, "" } };
+    addr = srv.server.socket.address;
+    var host_buf: [32]u8 = undefined;
+    const host_text = try std.fmt.bufPrint(&host_buf, "{f}", .{addr});
+    var fut = try io.concurrent(ScriptServer.serve, .{ &srv, io });
+    defer {
+        fut.cancel(io);
+        srv.server.deinit(io);
+    }
+    var shared: Shared = .{};
+    var c = try Client.init(std.testing.allocator, io, &shared, host_text, .insecure_plain_http);
+    c.pair_min_interval_ms = 0; // a holding server: no floor
+    const T = struct {
+        fn cancelWhenHeld(cl: *Client, s: *ScriptServer, i: Io) void {
+            // The fourth request (index 3) is the held one.
+            while (s.n < 4) i.sleep(.fromMilliseconds(10), .awake) catch return;
+            i.sleep(.fromMilliseconds(100), .awake) catch return;
+            cl.cancelPairing();
+        }
+    };
+    const t0 = watchdog.nowMs(io);
+    var canceller = try io.concurrent(T.cancelWhenHeld, .{ &c, &srv, io });
+    defer canceller.cancel(io);
+    try std.testing.expect(c.pairFlow() == .cancelled);
+    // Well before the 40 s request timeout: the cancel interrupted the held wait.
+    try std.testing.expect(watchdog.nowMs(io) - t0 < 10_000);
+    try std.testing.expectEqual(@as(usize, 4), srv.n);
+}
+
+/// A WebSocket server that completes the upgrade, then never reads or
+/// writes again: the client's writes back up until the socket blocks.
+const DeafServer = struct {
+    server: net.Server,
+    upgraded: Io.Event = .unset,
+
+    fn serve(s: *DeafServer, io: Io) void {
+        const conn = s.server.accept(io) catch return;
+        defer conn.close(io);
+        var buf: [2048]u8 = undefined;
+        var len: usize = 0;
+        while (std.mem.indexOf(u8, buf[0..len], "\r\n\r\n") == null) {
+            if (len == buf.len) return;
+            var vec = [_][]u8{buf[len..]};
+            const got = conn.readWithControl(io, &vec, &.{}) catch return;
+            if (got.data_len == 0) return;
+            len += got.data_len;
+        }
+        const head = buf[0..len];
+        const name = "Sec-WebSocket-Key: ";
+        const at = std.mem.indexOf(u8, head, name) orelse return;
+        const rest = head[at + name.len ..];
+        const key = rest[0 .. std.mem.indexOf(u8, rest, "\r\n") orelse return];
+        const accept = ws.accept(key) catch return;
+        var rb: [256]u8 = undefined;
+        const reply = std.fmt.bufPrint(&rb, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{&accept}) catch return;
+        var wb: [512]u8 = undefined;
+        var w = conn.writer(io, &wb);
+        w.interface.writeAll(reply) catch return;
+        w.interface.flush() catch return;
+        s.upgraded.set(io);
+        io.sleep(.fromSeconds(60), .awake) catch {}; // deaf until the test ends
+    }
+};
+
+test "stream: the idle timeout fires while a write is blocked, and input never blocks the caller" {
+    const io = std.testing.io;
+    var addr: net.IpAddress = try .parseLiteral("127.0.0.1:0");
+    var srv: DeafServer = .{ .server = try addr.listen(io, .{}) };
+    addr = srv.server.socket.address;
+    var host_buf: [32]u8 = undefined;
+    const host_text = try std.fmt.bufPrint(&host_buf, "{f}", .{addr});
+    var fut = try io.concurrent(DeafServer.serve, .{ &srv, io });
+    defer {
+        fut.cancel(io);
+        srv.server.deinit(io);
+    }
+    var shared: Shared = .{};
+    const c = try std.testing.allocator.create(Client);
+    defer std.testing.allocator.destroy(c);
+    c.* = try Client.init(std.testing.allocator, io, &shared, host_text, .insecure_plain_http);
+    c.idle_ms = 1500;
+    c.ping_ms = 100; // pings fall due while the writer is stuck
+    c.quiet = true; // the expected timeout stays off stderr
+    var session = http.Cookie.fromValue(.session, tok43, false).?;
+    const T = struct {
+        fn stream(cl: *Client, sess: *const http.Cookie, done: *Io.Event, out: *Client.StreamResult) void {
+            var backoff: i64 = 1000;
+            out.* = cl.runStream(sess, &backoff);
+            done.set(cl.io);
+        }
+    };
+    var done: Io.Event = .unset;
+    var result: Client.StreamResult = .unauthorized;
+    const t0 = watchdog.nowMs(io);
+    var st = try io.concurrent(T.stream, .{ c, &session, &done, &result });
+    defer st.cancel(io);
+    try srv.upgraded.wait(io);
+    // Flood input from "the UI thread" until the stream gives up. Each
+    // call must return at once (queued or refused), never wait on the socket.
+    var payload: [ws.max_client_payload]u8 = undefined;
+    @memset(&payload, 'x');
+    var slowest: i64 = 0;
+    var refused: usize = 0;
+    while (!done.isSet()) {
+        const a = watchdog.nowMs(io);
+        if (!c.sendInput(&payload)) refused += 1;
+        slowest = @max(slowest, watchdog.nowMs(io) - a);
+        if (refused > 0) io.sleep(.fromMilliseconds(1), .awake) catch {};
+        if (watchdog.nowMs(io) - t0 > 20_000) break;
+    }
+    try std.testing.expect(done.isSet());
+    try std.testing.expect(result == .failed);
+    try std.testing.expectEqualStrings(describe(error.TimedOut), result.failed);
+    try std.testing.expect(watchdog.nowMs(io) - t0 < 10_000);
+    try std.testing.expect(slowest < 500);
+    try std.testing.expect(refused > 0); // the writer was stuck: the queue filled
+    try std.testing.expect(!c.sendInput("k:enter")); // not connected any more
 }

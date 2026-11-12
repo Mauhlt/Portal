@@ -56,14 +56,37 @@ after that, new adapter versions arrive whenever training produces one.
 
 ## Directory layout on the device
 
+**One folder per paired desktop (owner decision, 2026-11-12):** "paired
+desktops on the laptop go to their own folder to prevent
+overlapping/overwriting".
+
 ```
-%LOCALAPPDATA%\Portal\sync\
+%LOCALAPPDATA%\Portal\sync\desktops\<host>-<key>\
+                                   one per paired desktop: <host> is the
+                                   pinned IP_PORT (10.8.0.1_8420), <key> the
+                                   first 16 hex digits of the SHA-256 of the
+                                   release key pinned for it
   staging\<random>\                download + verify area (deleted after)
   packages\<package>\<version>\    verified, read-only, immutable
-  current\<package>.txt            atomic pointer (temp + MoveFileEx)
-  previous\<package>.txt           last good version, for rollback
+  state\<package>.txt              one record: signer, current, previous,
+                                   highest sequence (temp + MoveFileEx)
   data\<package>\                  the package's own writable state
 ```
+(macOS `~/Library/Application Support/Portal/sync/desktops/...`, Linux
+`$XDG_DATA_HOME/portal/sync/desktops/...`.)
+
+* **Desktops never share anything.** Every pointer, highest sequence,
+  install and approval belongs to one desktop's folder; desktop B
+  publishing `foo` at a huge sequence cannot replace desktop A's `foo` or
+  block A's updates. The same address paired with another release key is
+  a different folder (pairing again starts clean).
+* Every record names the release key (SHA-256) that signed what it points
+  at; a record naming another key is refused, never overwritten.
+* **Earlier builds** used one shared store (`sync\packages`, `sync\current`,
+  `sync\previous`, ...). It is never read or written any more (its
+  pointers could have come from any desktop); `portal connect` notes it
+  once, and it can be deleted by hand once nothing runs from it. Packages
+  are fetched again into the desktop's own folder.
 
 * **Package ids** are a fixed namespace: `portal-client`, `stt-local`,
   `stt-model`, `stt-adapter`, `npu-probe`, … (`[a-z0-9-]{1,32}`).
@@ -75,7 +98,7 @@ after that, new adapter versions arrive whenever training produces one.
 * **Running programs are never overwritten.** A new version is a new
   folder. Pruning keeps current, previous and any version still in use.
 * **Quotas:** per-package size caps and total sync cap (8 GiB per
-  package version, 32 GiB for the whole store by default).
+  package version, 32 GiB per desktop's store by default).
 
 ## Desktop side
 
@@ -245,26 +268,63 @@ sync-device` (headless, for tests):
    `packages\<pkg>\.manifests\<ver>.{txt,sig}`; the folder is renamed to
    `packages\<pkg>\<ver>` (an existing version folder is never written: the
    same version must come back with the identical manifest, else refused);
-7. `previous\<pkg>.txt` := the old current, then `current\<pkg>.txt` :=
-   the new one (each a flushed temp file + MoveFileEx REPLACE_EXISTING |
-   WRITE_THROUGH; the pointer also keeps the highest sequence installed);
+7. `state\<pkg>.txt` := one record (old current becomes previous, the new
+   version current, the highest sequence installed, the signer), written
+   as a flushed temp file + one MoveFileEx REPLACE_EXISTING |
+   WRITE_THROUGH: a crash leaves the old record or the new one, never a
+   half-moved pair;
 8. `data\<pkg>\` is created; versions other than current and previous are
    pruned unless a file in them can't be opened exclusively (a running
    program), in which case they stay.
 
 Leftover staging, `.incoming-*` and `.trash-*` folders are removed at the
-start of every pass. Rollback (`sync-device --rollback <pkg>`, Roll back in
-Packages) swaps current and previous and keeps the highest sequence, so the
-version rolled back from is not taken again.
+start of every pass. Rollback (`sync-device --server S --rollback <pkg>`,
+Roll back in Packages) swaps current and previous in one record write and
+keeps the highest sequence, so the version rolled back from is not taken
+again.
+
+**Revoke** (`sync-device --server S --revoke <pkg>`, Revoke in Packages,
+after a confirmation): withdraws an executable's approval. The previous
+version becomes current, or, without one, the package is uninstalled; the
+highest sequence is kept, so the revoked version is never installed again
+(only a newer one, which asks for approval again). Its folder is pruned
+unless something still runs from it. `data\<pkg>\` is kept.
+
+**Forget this desktop** (Packages, after a confirmation; `portal connect
+--server S --forget`; `sync-device --server S --forget`): deletes the
+device's credentials for it, the pinned CA and release key, every
+`desktops\<host>-*` folder (renamed to `desktops\.trash-*` first, then
+deleted; folders a running program holds stay and are reported) and the
+remembered last server if it was this one. The desktop keeps listing the
+device until it is unpaired there. `portal connect` exits afterwards.
+
+**One writer.** In `portal connect` only the sync worker thread touches
+the store. The UI posts Roll back / Revoke / Forget as an atomic pending
+op (the package name written first, under the panel mutex) and sets the
+worker's wake event; the worker performs it before its next pass or
+between two packages of a pass (Forget only between passes). The UI never
+mutates the store, so a rollback can't race an install or prune.
 
 ### UI
 
 * `portal connect`: "Install <pkg> <ver> from <desktop>?" with the
-  publisher key SHA-256 and size, Reject focused, `y`/`n`; "Install voice
-  model?" after pairing when voice packages are subscribed (Install also
-  approves stt-local; Not now holds them for this run); Packages
-  (Ctrl+Shift+K): installed versions with Roll back, versions waiting for
-  approval with Approve, rejected ones with the reason.
+  publisher key SHA-256 and size; "Install voice model?" after pairing
+  when voice packages are subscribed (Install also approves stt-local; Not
+  now holds them for this run); Packages (Ctrl+Shift+K): installed data
+  with Roll back, installed programs with Revoke, versions waiting for
+  approval with Approve, rejected ones with the reason, and Forget this
+  desktop. Revoke and Forget ask for confirmation (Cancel focused).
+* **No accidental approval (owner decision, 2026-11-12).** The approval
+  panel can open by itself after a background pass, while the user is
+  typing into the remote terminal, and takes the keyboard. So there are no
+  letter shortcuts (the old `y`/`n` are gone; typed characters are
+  swallowed while a panel is open); the focus starts on the safe button
+  (Reject / Not now / Close / Cancel); and every key and click is ignored
+  until the panel has been on screen for 600 ms, measured from the frame
+  that really presented it (no timer: each input compares its own time).
+  Only Approve activated as a button (a click, or Tab to it and Enter)
+  approves. A later pass asking the same question keeps the panel, its
+  focus and the guard already served.
 * The desk: Devices shows each device's package count; P on a row opens
   its packages (known ids and everything published) with
   Subscribe / Unsubscribe.
@@ -289,7 +349,12 @@ version rolled back from is not taken again.
   nothing runs packages yet.
 * Self-update of `portal-client` through sync, and publishing from the
   desk window (publishing is `portalctl publish` only).
-* Quotas are fixed (8 GiB per version, 32 GiB in total); no setting yet.
+* Quotas are fixed (8 GiB per version, 32 GiB per desktop); no setting yet.
+* Approvals given in the app are kept in memory for the run (an
+  approved manifest installs at once, so nothing more is needed); a
+  revoke is recorded on disk through the highest sequence.
+* The old shared store of earlier builds is not migrated or deleted
+  automatically.
 * A device-side end-to-end test of a *signed* path-traversal manifest:
   the server never offers one, and device-side rejection is covered by
   unit tests.

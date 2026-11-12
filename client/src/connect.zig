@@ -7,7 +7,8 @@
 //!                                                       the first-run screen
 //!   connect --server 10.8.0.1:8420 --ca portal-ca.pem   pin the CA, connect
 //!   connect --server 10.8.0.1:8420                      connect (CA pinned)
-//!   connect --server ADDR --forget     delete this device's credential + pin
+//!   connect --server ADDR --forget     forget that desktop: credential, pins,
+//!                                      its sync folder
 //!
 //! Everything happens in the window: with no server or no trusted CA yet,
 //! a first-run screen (setup.zig) asks for the address and the certificate
@@ -63,8 +64,9 @@ const usage =
     \\                     desktop while a pairing window is open
     \\                     (http://IP:PORT+1/ca.cer), check it against HEX,
     \\                     and remember it
-    \\  --forget           delete this device's stored credentials and the
-    \\                     remembered CA for this server, and exit
+    \\  --forget           forget this server: delete this device's stored
+    \\                     credentials, the remembered CA and release key,
+    \\                     and its sync folder (packages), and exit
     \\  --insecure-plain-http
     \\                     talk plain HTTP to a server run with --no-tls
     \\                     (tests only: keystrokes and credentials are not
@@ -107,6 +109,8 @@ const Host = struct {
     client: *client_mod.Client,
     sink: remote.RemoteSink,
     drawn_version: u64 = std.math.maxInt(u64),
+    /// The last {"t":"rejected"} handed to the instruction line.
+    seen_rejected: u64 = 0,
     title_status: ?client_mod.Status = null,
     bufs: remote.Bufs = .{},
     pin_fp_buf: [95]u8 = undefined,
@@ -124,10 +128,21 @@ const Host = struct {
         const mode = s.mode;
         const detail = detail_buf[0..s.detail_len];
         @memcpy(detail, s.detail());
+        if (s.rejected_gen != h.seen_rejected) {
+            h.seen_rejected = s.rejected_gen;
+            h.sink.rejected(s.rejected_buf[0..s.rejected_len]);
+        }
+        // The Data column: new blobs from the terminal; whether it fits.
+        _ = h.sink.data.sync(h.client.gpa, &s.grid.images);
+        const fb = h.tv.window.framebufferSize();
+        h.sink.data.setFits(TermView.dataWidth(@floatFromInt(fb[0]), h.tv.window.scale(), (TermView.DataColumn{}).frac) > 0);
         const o = remote.overlay(.{
             .status = st,
             .mode = mode,
             .detail = detail,
+            .line = h.sink.line.snapshot(),
+            .data = h.sink.data.column(),
+            .data_badge = h.sink.data.badge(),
             .host = h.client.host(),
             .has_grid = s.grid.cols > 0,
             .code = s.pair_code,
@@ -138,9 +153,14 @@ const Host = struct {
         h.sync.mutex.lockUncancelable(h.client.io);
         defer h.sync.mutex.unlock(h.client.io);
         if (h.sync.ui.panel(&h.sync_bufs)) |p| oo.panel = p;
+        const panel_shown = oo.panel != null;
         h.tv.build(&s.grid, oo);
         s.mutex.unlock(h.client.io);
         h.tv.present();
+        // The panels ignore input until they have really been on screen
+        // for a moment (sync/ui.zig, "No accidental approvals").
+        // (h.sync.mutex is still held here: the defer above.)
+        if (panel_shown) h.sync.ui.presented(watchdog.nowMs(h.client.io));
         h.sink.mode = mode;
         h.sink.status = st;
         h.drawn_version = version;
@@ -200,16 +220,12 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
         const s = server orelse fatal(prog, "--forget needs --server IP:PORT", .{});
         var hb: [64]u8 = undefined;
         const host = http.canonicalHost(s, &hb) catch fatal(prog, "bad --server '{s}' (want a literal IP:PORT such as 10.8.0.1:8420)", .{s});
-        var tbuf: [credstore.max_target]u8 = undefined;
-        for ([_]bool{ false, true }) |plain| {
-            credstore.delete(credstore.targetName(host, plain, &tbuf)) catch |err|
-                fatal(prog, "could not delete the credential: {t}", .{err});
-        }
-        if (pin_mod.Pin.forHost(host)) |p| {
-            p.delete(io) catch |err| fatal(prog, "could not delete {s}: {t}", .{ p.path(), err });
-        } else |_| {}
-        report("{s}: forgot the credentials and the pinned CA for {s}", .{ prog, host });
-        std.process.exit(0);
+        const r = forgetDesktop(io, host);
+        var mb: [400]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&mb);
+        r.describe(&w, host) catch {};
+        report("{s}: {s}", .{ prog, w.buffered() });
+        std.process.exit(if (r.first_error == null) 0 else 1);
     }
     if (insecure) {
         if (ca_file != null or ca_sha256 != null) fatal(prog, "--insecure-plain-http cannot be combined with --ca / --ca-sha256", .{});
@@ -315,6 +331,11 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     thread.detach();
 
     while (tv.pollEvents(host_ui.sink.sink())) {
+        if (sync_state.dropped.load(.acquire)) {
+            tv.deinit();
+            report("{s}: {s}", .{ prog, sync_state.dropped_msg_buf[0..sync_state.dropped_msg_len] });
+            std.process.exit(0);
+        }
         if (tv.needsRedraw() or shared.version.load(.acquire) != host_ui.drawn_version) host_ui.frame();
         // Event-driven: the network thread wakes us on every Shared change
         // (Client.notify), input wakes us too; no idle polling.
@@ -326,35 +347,80 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
 
 /// The device side of Portal sync inside the viewer: a worker thread for
 /// the passes and the panels' state (approval, voice offer, Packages).
+///
+/// The worker is the only thread that touches the store (this desktop's
+/// own folder, keypin.desktopRoot). The UI thread never does: a Roll back,
+/// Revoke or Forget is posted as `pending` (an atomic op code; its package
+/// in `pending_pkg`, written under `mutex` before the op is published)
+/// plus the worker's wake event, and the worker performs it between
+/// operations: before a pass, or between two packages of one
+/// (engine.Options.between). Forget waits for the pass to end.
 const SyncState = struct {
     client: *client_mod.Client,
     shared: *client_mod.Shared,
     mutex: std.Io.Mutex = .init,
     ui: sync.ui.Ui = .{},
+    /// Worker only.
     store: ?sync.store.Store = null,
+    store_key: sync.keypin.Key = undefined,
     root_buf: [pin_mod.max_path]u8 = undefined,
     seen: u64 = 0,
+    legacy_noted: bool = false,
+    /// A request from the UI thread (Op), 0 = none.
+    pending: std.atomic.Value(u8) = .init(0),
+    /// Guarded by `mutex`.
+    pending_pkg: sync.ui.Pkg = .{},
+    /// Set by the worker once Forget this desktop has run: the main loop
+    /// tells the user and exits.
+    dropped: std.atomic.Value(bool) = .init(false),
+    dropped_msg_buf: [400]u8 = undefined,
+    dropped_msg_len: usize = 0,
+
+    const Op = enum(u8) { none = 0, rollback = 1, revoke = 2, forget = 3 };
 
     fn io(s: *const SyncState) std.Io {
         return s.client.io;
     }
 
-    fn openStore(s: *SyncState) ?*sync.store.Store {
-        if (s.store == null) {
-            const root = sync.keypin.syncRoot(&s.root_buf) catch return null;
-            s.store = sync.store.Store.open(s.client.gpa, s.io(), root) catch return null;
+    /// This desktop's store for `pinned` (worker only).
+    fn openStore(s: *SyncState, pinned: sync.keypin.Key) ?*sync.store.Store {
+        if (s.store != null and std.mem.eql(u8, &s.store_key, &pinned)) return &s.store.?;
+        s.store = null;
+        const root = sync.keypin.desktopRoot(s.client.host(), pinned, &s.root_buf) catch return null;
+        s.store = sync.store.Store.open(s.client.gpa, s.io(), root, sync.manifest.fingerprint(pinned)) catch |err| {
+            std.debug.print("portal connect: sync: cannot open {s}: {t}\n", .{ root, err });
+            return null;
+        };
+        s.store_key = pinned;
+        if (!s.legacy_noted and sync.keypin.legacyStorePresent(s.io())) {
+            s.legacy_noted = true;
+            var rb: [pin_mod.max_path]u8 = undefined;
+            const old = sync.keypin.syncRoot(&rb) catch "";
+            std.debug.print("portal connect: sync: the shared folder of earlier versions ({s}\\packages, \\current, \\previous) is no longer used; each desktop now has its own folder under {s}\\desktops. Delete the old folders once nothing runs from them.\n", .{ old, old });
+            s.mutex.lockUncancelable(s.io());
+            s.ui.setNote("Packages from before per-desktop folders (in {s}) are no longer used; delete them once nothing runs from them.", .{old});
+            s.mutex.unlock(s.io());
         }
         return &s.store.?;
     }
 
+    fn loadPin(s: *SyncState) ?sync.keypin.Key {
+        return sync.keypin.load(s.io(), s.client.host()) catch null;
+    }
+
     /// Event-driven: sleeps until the network thread bumps sync_gen (a
-    /// stream connected, or the desktop said {"t":"updates"}) or the user
-    /// approved something.
+    /// stream connected, or the desktop said {"t":"updates"}), the user
+    /// approved something, or the UI posted an action.
     fn run(s: *SyncState) void {
-        while (true) {
+        while (!s.dropped.load(.acquire)) {
             s.shared.sync_wake.reset();
+            if (s.pending.load(.acquire) != 0) {
+                s.performPending(true);
+                continue;
+            }
             const gen = s.shared.sync_gen.load(.acquire);
             if (gen == s.seen) {
+                // A long-lived thread, never canceled: nothing to re-arm.
                 s.shared.sync_wake.wait(s.io()) catch {};
                 continue;
             }
@@ -369,7 +435,6 @@ const SyncState = struct {
     }
 
     fn pass(s: *SyncState) void {
-        const st = s.openStore() orelse return;
         var session: ?client_mod.http_Cookie = null;
         s.shared.mutex.lockUncancelable(s.io());
         session = s.shared.session;
@@ -377,15 +442,16 @@ const SyncState = struct {
         var sess = session orelse return;
         defer sess.wipe();
         const host = s.client.host();
-        const pinned = (sync.keypin.load(s.io(), host) catch null) orelse {
+        const pinned = s.loadPin() orelse {
             s.mutex.lockUncancelable(s.io());
             s.ui.setNote("Sync is off for {s}: pair this device again to pin the desktop's release key.", .{host});
             s.mutex.unlock(s.io());
             return;
         };
+        const st = s.openStore(pinned) orelse return;
         var approvals: [sync.ui.max_marks]sync.engine.Approval = undefined;
         var marks: [sync.ui.max_marks]sync.ui.Mark = undefined;
-        var opts: sync.engine.Options = .{ .client_version = client_version };
+        var opts: sync.engine.Options = .{ .client_version = client_version, .between = .{ .ctx = s, .f = between } };
         s.mutex.lockUncancelable(s.io());
         if (s.shared.just_paired.swap(false, .acq_rel)) s.ui.startVoiceOffer();
         s.ui.setDesktop(host, pinned);
@@ -402,17 +468,31 @@ const SyncState = struct {
             std.debug.print("portal connect: sync: {s}\n", .{sync.engine.describe(err)});
             return;
         };
-        var rows: [32]sync.ui.Installed = undefined;
-        const n = installedRows(st, &rows);
         s.mutex.lockUncancelable(s.io());
         s.ui.setReport(rep);
-        s.ui.setInstalled(rows[0..n]);
         s.mutex.unlock(s.io());
-        s.redraw();
+        s.refreshRows(st);
+    }
+
+    /// Between two packages of a pass: a posted rollback / revoke runs now
+    /// (Forget waits for the pass to finish).
+    fn between(ctx: *anyopaque) void {
+        const s: *SyncState = @ptrCast(@alignCast(ctx));
+        if (s.pending.load(.acquire) != 0) s.performPending(false);
     }
 
     fn logLine(_: ?*anyopaque, line: []const u8) void {
         std.debug.print("portal connect: sync: {s}\n", .{line});
+    }
+
+    /// Re-reads the installed list from the store (worker only).
+    fn refreshRows(s: *SyncState, st: *sync.store.Store) void {
+        var rows: [32]sync.ui.Installed = undefined;
+        const n = installedRows(st, &rows);
+        s.mutex.lockUncancelable(s.io());
+        s.ui.setInstalled(rows[0..n]);
+        s.mutex.unlock(s.io());
+        s.redraw();
     }
 
     fn installedRows(st: *sync.store.Store, rows: []sync.ui.Installed) usize {
@@ -424,34 +504,95 @@ const SyncState = struct {
             const id = ids[i][0..lens[i]];
             const cur = (st.current(id) catch continue) orelse continue;
             const prev = st.previous(id) catch null;
-            rows[k] = sync.ui.Installed.init(id, cur.version(), if (prev) |p| p.version() else null);
+            // Unknown kind: treat it as a program (Revoke, the safe offer).
+            const kind = st.kindOf(id, cur.version()) catch .executable;
+            rows[k] = sync.ui.Installed.init(id, cur.version(), if (prev) |p| p.version() else null, kind);
             k += 1;
         }
         return k;
     }
 
+    /// Runs the UI's posted action (worker only).
+    fn performPending(s: *SyncState, allow_forget: bool) void {
+        s.mutex.lockUncancelable(s.io());
+        const raw = s.pending.load(.acquire);
+        if (raw == @intFromEnum(Op.forget) and !allow_forget) {
+            s.mutex.unlock(s.io());
+            return;
+        }
+        _ = s.pending.swap(0, .acq_rel);
+        const pkg = s.pending_pkg;
+        s.mutex.unlock(s.io());
+        const op: Op = if (raw <= 3) @enumFromInt(raw) else return;
+        switch (op) {
+            .none => return,
+            .forget => {
+                const host = s.client.host();
+                const r = forgetDesktop(s.io(), host);
+                s.store = null;
+                var w: std.Io.Writer = .fixed(&s.dropped_msg_buf);
+                r.describe(&w, host) catch {};
+                s.dropped_msg_len = w.buffered().len;
+                s.dropped.store(true, .release);
+                s.redraw();
+                return;
+            },
+            .rollback, .revoke => {},
+        }
+        const pinned = s.loadPin() orelse return;
+        const st = s.openStore(pinned) orelse return;
+        const name = pkg.slice();
+        var nb: [200]u8 = undefined;
+        const note: []const u8 = switch (op) {
+            .rollback => if (st.rollback(name)) |p|
+                std.fmt.bufPrint(&nb, "{s} rolled back to {s}.", .{ name, p.version() }) catch ""
+            else |err|
+                std.fmt.bufPrint(&nb, "Roll back of {s} failed: {s}.", .{ name, sync.engine.describe(err) }) catch "",
+            .revoke => if (st.revoke(name)) |r| blk: {
+                const kept = if (r.pruned.in_use > 0) " (its folder stays until it stops running)" else "";
+                break :blk if (r.now) |p|
+                    std.fmt.bufPrint(&nb, "Approval revoked: {s} is back at {s}{s}.", .{ name, p.version(), kept }) catch ""
+                else
+                    std.fmt.bufPrint(&nb, "Approval revoked: {s} is uninstalled{s}.", .{ name, kept }) catch "";
+            } else |err| std.fmt.bufPrint(&nb, "Revoke of {s} failed: {s}.", .{ name, sync.engine.describe(err) }) catch "",
+            else => "",
+        };
+        std.debug.print("portal connect: sync: {s}\n", .{note});
+        s.mutex.lockUncancelable(s.io());
+        s.ui.setNote("{s}", .{note});
+        s.mutex.unlock(s.io());
+        s.refreshRows(st);
+    }
+
+    /// UI thread: hands an action to the worker (never touches the store).
     fn perform(s: *SyncState, a: sync.ui.Action) void {
-        switch (a) {
-            .none => {},
+        const op: Op, const pkg: sync.ui.Pkg = switch (a) {
+            .none => return,
             .rerun => {
                 _ = s.shared.sync_gen.fetchAdd(1, .release);
                 s.shared.sync_wake.set(s.io());
+                s.redraw();
+                return;
             },
-            .rollback => |i| {
-                const st = s.openStore() orelse return;
-                s.mutex.lockUncancelable(s.io());
-                const pkg_row = if (i < s.ui.n_installed) s.ui.installed[i] else null;
-                s.mutex.unlock(s.io());
-                const row = pkg_row orelse return;
-                const r = st.rollback(row.package());
-                var rows: [32]sync.ui.Installed = undefined;
-                const n = installedRows(st, &rows);
-                s.mutex.lockUncancelable(s.io());
-                s.ui.setInstalled(rows[0..n]);
-                if (r) |p| s.ui.setNote("{s} rolled back to {s}.", .{ row.package(), p.version() }) else |err| s.ui.setNote("Roll back failed: {t}", .{err});
-                s.mutex.unlock(s.io());
-            },
+            .rollback => |p| .{ .rollback, p },
+            .revoke => |p| .{ .revoke, p },
+            .forget_desktop => .{ .forget, .{} },
+        };
+        s.mutex.lockUncancelable(s.io());
+        if (s.pending.load(.acquire) != 0) {
+            s.ui.setNote("Still busy with the last request; try again in a moment.", .{});
+        } else {
+            s.pending_pkg = pkg;
+            s.pending.store(@intFromEnum(op), .release);
+            switch (op) {
+                .rollback => s.ui.setNote("Rolling back {s}...", .{pkg.slice()}),
+                .revoke => s.ui.setNote("Revoking {s}...", .{pkg.slice()}),
+                .forget => s.ui.setNote("Forgetting this desktop...", .{}),
+                .none => {},
+            }
         }
+        s.mutex.unlock(s.io());
+        s.shared.sync_wake.set(s.io());
         s.redraw();
     }
 
@@ -461,6 +602,9 @@ const SyncState = struct {
     fn self(p: *anyopaque) *SyncState {
         return @ptrCast(@alignCast(p));
     }
+    fn now(s: *const SyncState) i64 {
+        return watchdog.nowMs(s.io());
+    }
     fn active(p: *anyopaque) bool {
         const s = self(p);
         s.mutex.lockUncancelable(s.io());
@@ -469,25 +613,26 @@ const SyncState = struct {
     }
     fn key(p: *anyopaque, k: view.input.Key, m: view.input.Mods) void {
         const s = self(p);
+        const t = s.now();
         s.mutex.lockUncancelable(s.io());
-        const a = s.ui.key(k, m);
+        const a = s.ui.key(k, m, t);
         s.mutex.unlock(s.io());
         s.perform(a);
+        s.redraw(); // focus moves
     }
-    fn char(p: *anyopaque, cp: u21, m: view.input.Mods) void {
-        const s = self(p);
-        s.mutex.lockUncancelable(s.io());
-        const a = s.ui.char(cp, m);
-        s.mutex.unlock(s.io());
-        s.perform(a);
-    }
+    /// Characters never act on the panels (no letter shortcuts): while
+    /// one is open they are swallowed, so they can't reach the terminal
+    /// either.
+    fn char(_: *anyopaque, _: u21, _: view.input.Mods) void {}
     fn button(p: *anyopaque, b: u32) bool {
         if (b < sync.ui.id.approve) return false;
         const s = self(p);
+        const t = s.now();
         s.mutex.lockUncancelable(s.io());
-        const a = s.ui.button(b);
+        const a = s.ui.button(b, t);
         s.mutex.unlock(s.io());
         s.perform(a);
+        s.redraw();
         return true;
     }
     /// Ctrl+Shift+K opens Packages.
@@ -501,6 +646,51 @@ const SyncState = struct {
         return true;
     }
 };
+
+/// What forgetting a desktop removed.
+pub const Forgotten = struct {
+    first_error: ?anyerror = null,
+    folders: sync.keypin.Dropped = .{},
+
+    pub fn describe(r: *const Forgotten, w: *std.Io.Writer, host: []const u8) !void {
+        try w.print("Forgot {s}: its certificate pin, release-key pin, this device's credential and its sync folder", .{host});
+        if (r.folders.kept > 0) try w.print(" (except {d} folder(s) still in use: close the programs running from them, then delete them)", .{r.folders.kept});
+        try w.writeAll(".");
+        if (r.first_error) |e| try w.print(" Some items could not be removed: {t}.", .{e});
+        try w.writeAll(" The desktop still lists this device until you unpair it there.");
+    }
+};
+
+/// Forgets a paired desktop on this device: both credentials (TLS and
+/// plain), the pinned CA, the pinned release key, every sync folder of
+/// that host, and the "last server" if it was this one. Shared by
+/// `connect --forget`, Forget this desktop (Packages) and
+/// `portalctl sync-device --forget`.
+pub fn forgetDesktop(io: std.Io, host: []const u8) Forgotten {
+    var r: Forgotten = .{};
+    var tbuf: [credstore.max_target]u8 = undefined;
+    for ([_]bool{ false, true }) |plain| {
+        credstore.delete(credstore.targetName(host, plain, &tbuf)) catch |err| {
+            if (r.first_error == null) r.first_error = err;
+        };
+    }
+    if (pin_mod.Pin.forHost(host)) |p| p.delete(io) catch |err| {
+        if (r.first_error == null) r.first_error = err;
+    } else |_| {}
+    sync.keypin.delete(io, host) catch |err| {
+        if (r.first_error == null) r.first_error = err;
+    };
+    r.folders = sync.keypin.deleteDesktopFolders(io, host) catch |err| blk: {
+        if (r.first_error == null) r.first_error = err;
+        break :blk .{};
+    };
+    var lb: [64]u8 = undefined;
+    if (pin_mod.loadLastServer(io, &lb)) |last| if (std.mem.eql(u8, last, host)) {
+        var pb: [pin_mod.max_path]u8 = undefined;
+        if (pin_mod.lastServerPath(&pb)) |p| std.Io.Dir.cwd().deleteFile(io, p) catch {} else |_| {}
+    };
+    return r;
+}
 
 /// The version manifests' min-client is compared with (Portal's version).
 pub const client_version = "0.1.0";

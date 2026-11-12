@@ -19,8 +19,12 @@
 ## Flow (laptop and desktop)
 
 1. **Capture:** Windows WASAPI from Zig, event-driven
-   (`AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, no polling).
-2. **Encode in Zig:** 16 kHz mono PCM.
+   (`AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, no polling). Capture is Portal's
+   job; nothing else captures audio.
+2. **16 kHz mono PCM:** ask WASAPI for it (`AUTOCONVERTPCM`). Any audio
+   format work (resampling, WAV/QOA for the Test button) comes from the
+   owner's `../Audio` library, never from code inside Portal; anything Audio
+   lacks is added there. See `docs/stt-sync-contract.md` for who owns what.
 3. **Transcribe locally:** `stt.Local.transcribe` on the laptop NPU, or
    `stt.Home.transcribe` on the desktop GPU.
 4. The text fills the input box. The user edits and sends; edits become

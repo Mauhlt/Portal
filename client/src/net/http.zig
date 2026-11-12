@@ -128,6 +128,17 @@ pub const Response = struct {
     connection_upgrade: bool = false,
     accept: ?[]const u8 = null,
     content_length: ?usize = null,
+
+    /// Wipes the cookie copies (device, session, pairing token) this
+    /// response holds. Copy out what is kept first.
+    pub fn wipe(r: *Response) void {
+        if (r.session) |*c| c.wipe();
+        if (r.device) |*c| c.wipe();
+        if (r.pairreq) |*c| c.wipe();
+        r.session = null;
+        r.device = null;
+        r.pairreq = null;
+    }
 };
 
 pub const ParseError = error{ BadStatusLine, BadHeader, TooManyHeaders };
