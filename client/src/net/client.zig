@@ -484,14 +484,16 @@ pub const Client = struct {
     }
 
     /// Runs on the network thread while the stream task runs: keeps an idle
-    /// stream alive (the server answers pings with pongs).
-    fn pingTick(ctx: *anyopaque) void {
+    /// stream alive (the server answers pings with pongs). Returns when it
+    /// next needs to run (awake-clock ms), so the watchdog sleeps until then.
+    fn pingTick(ctx: *anyopaque) i64 {
         const c: *Client = @ptrCast(@alignCast(ctx));
         const now = watchdog.nowMs(c.io);
-        if (now - c.last_rx_ms.load(.acquire) < ping_interval_ms) return;
-        if (now - c.last_ping_ms.load(.acquire) < ping_interval_ms) return;
+        const due = @max(c.last_rx_ms.load(.acquire), c.last_ping_ms.load(.acquire)) +| ping_interval_ms;
+        if (now < due) return due;
         c.last_ping_ms.store(now, .release);
         c.sendFrame(.ping, "") catch {};
+        return now +| ping_interval_ms;
     }
 
     fn streamTask(c: *Client, session: *const http.Cookie, backoff: *i64) StreamResult {

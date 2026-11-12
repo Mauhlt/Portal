@@ -25,7 +25,8 @@ pub const Watchdog = struct {
 
     pub const Tick = struct {
         ctx: *anyopaque,
-        f: *const fn (*anyopaque) void,
+        /// Returns when it next needs to run (awake-clock ms).
+        f: *const fn (*anyopaque) i64,
     };
 
     /// Moves the deadline to `ms` from now (callable from the task).
@@ -38,8 +39,9 @@ pub const Watchdog = struct {
     }
 
     /// Runs `func(args)` and returns its result. `extend` must have been
-    /// called first. `tick` (if any) runs on this thread about every 250 ms
-    /// while the task runs (WebSocket pings).
+    /// called first. `tick` (if any) runs on this thread whenever it said it
+    /// is next due (WebSocket pings). Event-driven: this thread sleeps until
+    /// the task finishes, the deadline passes or the tick is due.
     pub fn run(w: *Watchdog, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func)), tick: ?Tick) Ret(func) {
         const R = Ret(func);
         const Args = @TypeOf(args);
@@ -54,14 +56,22 @@ pub const Watchdog = struct {
         // Without concurrency (should not happen with std.Io.Threaded) run
         // inline: the OS limits still apply.
         var fut = w.io.concurrent(Wrap.task, .{ w, args }) catch return @call(.auto, func, args);
+        var tick_due: i64 = if (tick) |t| t.f(t.ctx) else std.math.maxInt(i64);
         while (true) {
-            w.done.waitTimeout(w.io, .{ .duration = .{ .raw = .fromMilliseconds(250), .clock = .awake } }) catch {};
+            // The task may have moved the deadline while this thread slept;
+            // waking at the old one just re-reads it.
+            const wake_at = @min(w.deadline_ms.load(.acquire), tick_due);
+            const left = wake_at -| nowMs(w.io);
+            if (left > 0) w.done.waitTimeout(w.io, .{ .duration = .{ .raw = .fromMilliseconds(left), .clock = .awake } }) catch {};
             if (w.done.isSet()) return fut.await(w.io);
-            if (tick) |t| t.f(t.ctx);
-            if (nowMs(w.io) > w.deadline_ms.load(.acquire)) {
+            const now = nowMs(w.io);
+            if (now > w.deadline_ms.load(.acquire)) {
                 w.expired.store(true, .release);
                 return fut.cancel(w.io);
             }
+            if (tick) |t| if (now >= tick_due) {
+                tick_due = t.f(t.ctx);
+            };
         }
     }
 };
@@ -86,4 +96,28 @@ test "watchdog cancels a stalled task and returns a finished one" {
     try std.testing.expectError(error.Canceled, w.run(T.stall, .{io}, null));
     try std.testing.expect(w.expired.load(.acquire));
     try std.testing.expect(nowMs(io) - t0 < 5000);
+}
+
+test "watchdog wakes only when the tick is due, not on a fixed period" {
+    const io = std.testing.io;
+    var w: Watchdog = .{ .io = io };
+    const T = struct {
+        var calls: u32 = 0;
+        var tio: Io = undefined;
+        fn tick(_: *anyopaque) i64 {
+            calls += 1;
+            return nowMs(tio) + 200;
+        }
+        fn work(i: Io) Io.Cancelable!u32 {
+            try i.sleep(.fromMilliseconds(700), .awake);
+            return 1;
+        }
+    };
+    T.tio = io;
+    var dummy: u8 = 0;
+    w.extend(5000);
+    try std.testing.expectEqual(@as(u32, 1), try w.run(T.work, .{io}, .{ .ctx = &dummy, .f = T.tick }));
+    // About 700/200 + 1 calls; a fixed 250 ms period would also be close,
+    // but a busy or 10 ms loop would be far above.
+    try std.testing.expect(T.calls >= 3 and T.calls <= 6);
 }

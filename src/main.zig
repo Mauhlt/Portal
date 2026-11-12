@@ -34,6 +34,7 @@ const Allocator = std.mem.Allocator;
 const auth = @import("auth.zig");
 const guard = @import("guard.zig");
 const cmdline = @import("cmdline.zig");
+const netlisten = @import("netlisten.zig");
 const keymap = @import("keymap.zig");
 const vt = @import("vt.zig");
 const conpty = @import("conpty.zig");
@@ -1058,7 +1059,7 @@ const PairWatch = struct {
             if (pw.ca_srv) |cs| {
                 if (open) |p| {
                     if (active == null and failed_nonce != p.nonce) {
-                        if (pw.ca_addr.listen(io, .{ .reuse_address = false })) |l| {
+                        if (netlisten.listenExclusive(pw.ca_addr)) |l| {
                             cs.listener = l;
                             cs.stop.store(false, .release);
                             if (io.concurrent(web.Server.run, .{cs})) |f| {
@@ -1066,7 +1067,7 @@ const PairWatch = struct {
                                 pw.srv.log.print("pairing window open: certificate download on http://{s}/", .{where});
                             } else |_| {
                                 var ll = l;
-                                ll.deinit(io);
+                                netlisten.close(&ll);
                             }
                         } else |err| {
                             pw.srv.log.print("PAIRING WARNING: cannot open the certificate download listener on {s}: {t}. " ++
@@ -1080,7 +1081,7 @@ const PairWatch = struct {
                     cs.stop.store(true, .release);
                     f.cancel(io); // interrupts the blocked accept, waits for run() to return
                     active = null;
-                    cs.listener.deinit(io);
+                    netlisten.close(&cs.listener);
                     pw.srv.log.print("pairing window closed: certificate download on http://{s}/ stopped", .{where});
                 }
             } else if (open) |p| pw.report(p.nonce, .off, "");
@@ -1293,10 +1294,10 @@ fn prepare(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, cfg: *co
         error.PublicAddress => fail_(err_buf, "Refusing to listen on a public address ({s}). Use loopback or your WireGuard address.", .{cfg.listen}),
     };
     // Listen before starting the child so a port conflict fails fast.
-    var listener = addr.listen(io, .{ .reuse_address = false }) catch |err|
+    var listener = netlisten.listenExclusive(addr) catch |err|
         return fail_(err_buf, "Cannot listen on {s}: {t}. Is another Portal running there?", .{ cfg.listen, err });
     const resolved = cmdline.resolve(gpa, io, command, env.get("PATH"), env.get("SystemRoot")) catch |err| {
-        listener.deinit(io);
+        netlisten.close(&listener);
         return fail_(err_buf, "Cannot find program '{s}': {t}.", .{ command[0], err });
     };
     return .{ .ok = .{ .addr = addr, .listener = listener, .resolved = resolved } };
@@ -1382,9 +1383,36 @@ const max_read_failures = 1000;
 /// before exiting anyway (process exit closes the job, which kills the child).
 const shutdown_timeout_ms = 10_000;
 
+/// Set by each shutdown step as it finishes (output drained, pseudo console
+/// closed, child exited), so the main thread sleeps until one finishes or
+/// the shutdown deadline passes instead of polling.
+var shutdown_wake: Io.Event = .unset;
+
+fn shutdownStepDone(io: Io, flag: *std.atomic.Value(bool)) void {
+    flag.store(true, .release);
+    shutdown_wake.set(io);
+}
+
+/// Waits until every flag is set or `deadline_ms` (awake clock) passes.
+/// Returns true if all were set.
+fn waitShutdown(io: Io, flags: []const *std.atomic.Value(bool), deadline_ms: i64) bool {
+    while (true) {
+        // Reset before checking: a step finishing after the check sets the
+        // event again, so no wake-up is lost.
+        shutdown_wake.reset();
+        var all = true;
+        for (flags) |f| all = all and f.load(.acquire);
+        if (all) return true;
+        const left = deadline_ms - Io.Clock.awake.now(io).toMilliseconds();
+        if (left <= 0) return false;
+        shutdown_wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(left), .clock = .awake } }) catch {};
+    }
+}
+
+
 const Threads = struct {
     fn ptyOutput(session: *Session, console: *Console, pty: *conpty.Pty, io: Io, done: *std.atomic.Value(bool)) void {
-        defer done.store(true, .release);
+        defer shutdownStepDone(io, done);
         var buf: [32 * 1024]u8 = undefined;
         var failures: u32 = 0;
         while (true) {
@@ -1431,14 +1459,14 @@ const Threads = struct {
 
     fn closePty(session: *Session, done: *std.atomic.Value(bool)) void {
         session.shutdownPty();
-        done.store(true, .release);
+        shutdownStepDone(session.io, done);
     }
 
     /// GUI mode: the main thread runs the window, so the child is waited
     /// for here.
-    fn waitChild(pty: *conpty.Pty, code: *std.atomic.Value(u32), done: *std.atomic.Value(bool), host: *gui.LocalHost) void {
+    fn waitChild(io: Io, pty: *conpty.Pty, code: *std.atomic.Value(u32), done: *std.atomic.Value(bool), host: *gui.LocalHost) void {
         code.store(pty.wait(), .release);
-        done.store(true, .release);
+        shutdownStepDone(io, done);
         host.wakeChildExited(); // the GUI loop sleeps until woken
     }
 };
@@ -1791,7 +1819,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         // GUI: the window owns the main thread; a waiter thread watches
         // the child. Closing the window ends the session the same way the
         // child exiting does (below): ClosePseudoConsole ends the child.
-        const waiter = std.Thread.spawn(.{}, Threads.waitChild, .{ &pty, &child_code, &child_done, h }) catch |err|
+        const waiter = std.Thread.spawn(.{}, Threads.waitChild, .{ io, &pty, &child_code, &child_done, h }) catch |err|
             fatal("cannot start child waiter thread: {t}", .{err});
         waiter.detach();
         switch (h.run()) {
@@ -1820,18 +1848,13 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     } else |_| {
         Threads.closePty(&session, &close_done);
     }
-    var waited: u32 = 0;
-    while (!(close_done.load(.acquire) and out_done.load(.acquire)) and waited < shutdown_timeout_ms) : (waited += 20) {
-        io.sleep(.fromMilliseconds(20), .awake) catch {};
-    }
-    const clean = close_done.load(.acquire) and out_done.load(.acquire);
+    // One deadline for the whole shutdown; each step wakes this thread.
+    const shutdown_deadline = Io.Clock.awake.now(io).toMilliseconds() + shutdown_timeout_ms;
+    const clean = waitShutdown(io, &.{ &close_done, &out_done }, shutdown_deadline);
     if (window_closed) {
         // The child was ended by closing its pseudo console; report its
         // own exit code if it has gone within the remaining time.
-        while (!child_done.load(.acquire) and waited < shutdown_timeout_ms) : (waited += 20) {
-            io.sleep(.fromMilliseconds(20), .awake) catch {};
-        }
-        code = if (child_done.load(.acquire)) child_code.load(.acquire) else 1;
+        code = if (waitShutdown(io, &.{&child_done}, shutdown_deadline)) child_code.load(.acquire) else 1;
     }
 
     session.markClosed(code);
@@ -1858,6 +1881,7 @@ test {
     _ = @import("keymap.zig");
     _ = @import("auth.zig");
     _ = @import("guard.zig");
+    _ = @import("netlisten.zig");
     _ = @import("cmdline.zig");
     _ = @import("console.zig");
     _ = @import("session.zig");
