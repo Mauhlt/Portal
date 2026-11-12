@@ -21,6 +21,12 @@
 //!  * Presenting any other secret for a known device revokes the device:
 //!    either the credential was copied and used elsewhere, or it is garbage.
 //!    Either way, re-pairing at the desk is required.
+//!  * Every device record has a random id, issued when it is paired.
+//!    Sessions are tagged with it (auth.Sessions), not with the name. A
+//!    re-pair under a name (or from an address) already in use removes the
+//!    old record outright and the server ends every session of it before
+//!    the new credential is issued; nothing of the old record is kept or
+//!    merged, so a misidentified device never inherits anything.
 //!
 //! The store is a small text file shared by the running server and the
 //! `portal pair/devices/unpair` commands; every change is a locked
@@ -55,7 +61,9 @@ pub const max_requests_per_ip = 2;
 pub const code_len = 4;
 
 const header_v1 = "portal-devices-v1";
-const header = "portal-devices-v2";
+const header_v2 = "portal-devices-v2";
+/// v3: `dev` lines carry the record id.
+const header = "portal-devices-v3";
 
 pub fn validName(name: []const u8) bool {
     if (name.len == 0 or name.len > max_name) return false;
@@ -126,12 +134,31 @@ pub const Grace = struct {
 pub const Device = struct {
     name: Text = .{},
     ip: Text = .{},
+    /// Random, issued at pairing; what sessions are tagged with.
+    id: auth.DeviceId,
     cur: auth.Hash,
     /// Recently superseded secrets, each valid until its own `until`.
     ring: [ring_len]?Grace = @splat(null),
     created: i64,
     last_seen: i64,
+
+    /// The record's identity, as sessions are tagged with it.
+    pub fn ref(d: *const Device) auth.Device {
+        return .init(d.id, d.name.get());
+    }
 };
+
+/// Id for a record from a file older than v3 (which had none): derived
+/// from its current secret hash, so it is stable until the file is
+/// rewritten as v3. Sessions are memory-only, so none predate it.
+fn legacyId(cur: auth.Hash) auth.DeviceId {
+    var h: auth.Hash = undefined;
+    var s = std.crypto.hash.sha2.Sha256.init(.{});
+    s.update("portal-device-id-v2:");
+    s.update(&cur);
+    s.final(&h);
+    return h[0..auth.device_id_len].*;
+}
 
 pub const ReqState = enum {
     pending,
@@ -206,8 +233,9 @@ pub const AuthResult = union(enum) {
     ok: usize,
     /// Known device, but presented from a different address. Not revoked.
     wrong_address,
-    /// Wrong or stale secret for a known device: the device was revoked.
-    revoked: []const u8,
+    /// Wrong or stale secret for a known device: that record was removed;
+    /// the caller ends its sessions.
+    revoked: auth.Device,
     unknown,
 };
 
@@ -225,13 +253,30 @@ pub const RequestError = error{
 
 pub const AnswerResult = enum { approved, denied, not_pending, no_such_request, window_gone };
 
+/// Device records a pairing removed (same name or same address as the new
+/// one). The caller ends all their sessions before issuing the new
+/// credential.
+pub const Replaced = struct {
+    list: [max_devices]auth.Device = undefined,
+    n: usize = 0,
+
+    pub fn items(r: *const Replaced) []const auth.Device {
+        return r.list[0..r.n];
+    }
+};
+
+pub const Paired = struct {
+    /// The new record.
+    device: auth.Device,
+    replaced: Replaced = .{},
+};
+
 pub const ClaimResult = union(enum) {
     pending,
     denied,
     /// No such request (expired, window closed, wrong address).
     unknown,
-    /// Paired: the device's name.
-    paired: []const u8,
+    paired: Paired,
 };
 
 pub const Store = struct {
@@ -241,6 +286,14 @@ pub const Store = struct {
     pub fn find(s: *const Store, name: []const u8) ?usize {
         for (s.devices, 0..) |d, i| {
             if (d) |dev| if (std.mem.eql(u8, dev.name.get(), name)) return i;
+        }
+        return null;
+    }
+
+    /// The record with id `id` (a re-paired name has a different one).
+    pub fn findId(s: *const Store, id: auth.DeviceId) ?usize {
+        for (s.devices, 0..) |d, i| {
+            if (d) |dev| if (std.mem.eql(u8, &dev.id, &id)) return i;
         }
         return null;
     }
@@ -294,8 +347,9 @@ pub const Store = struct {
             if (std.crypto.timing_safe.eql(auth.Hash, h, g.hash) and now <= g.until) valid = true;
         }
         if (valid) return .{ .ok = idx };
+        const gone = dev.ref();
         s.devices[idx] = null;
-        return .{ .revoked = name };
+        return .{ .revoked = gone };
     }
 
     /// Issues `new_hash` as the device's current secret. The secret it
@@ -410,9 +464,11 @@ pub const Store = struct {
     }
 
     /// The device behind request `token` asks for its outcome from `ip`.
-    /// If approved, registers the device with secret hash `new_hash` (a
-    /// device already using that name, or that address, is replaced).
-    pub fn claim(s: *Store, token: auth.Hash, ip: []const u8, new_hash: auth.Hash, now: i64) !ClaimResult {
+    /// If approved, registers a new device record with id `new_id` and
+    /// secret hash `new_hash`. Any record already using that name, or that
+    /// address, is removed (never updated or merged) and reported in
+    /// `replaced`, so the caller can end its sessions.
+    pub fn claim(s: *Store, token: auth.Hash, ip: []const u8, new_id: auth.DeviceId, new_hash: auth.Hash, now: i64) !ClaimResult {
         const p = &(s.pairing orelse return .unknown);
         if (now > p.expires) return .unknown;
         const i = p.findToken(token) orelse return .unknown;
@@ -424,11 +480,16 @@ pub const Store = struct {
             .done => return .unknown, // single use
             .approved => {},
         }
-        var dev: Device = .{ .cur = new_hash, .created = now, .last_seen = now };
+        // An id collision (2^-128) would let sessions cross records.
+        if (s.findId(new_id) != null) return error.DuplicateDeviceId;
+        var dev: Device = .{ .id = new_id, .cur = new_hash, .created = now, .last_seen = now };
         dev.name = p.name;
         dev.ip.set(ip);
+        var out: Paired = .{ .device = dev.ref() };
         for (&s.devices) |*slot| {
-            if (slot.*) |d| if (std.mem.eql(u8, d.name.get(), dev.name.get()) or std.mem.eql(u8, d.ip.get(), ip)) {
+            if (slot.*) |*d| if (std.mem.eql(u8, d.name.get(), dev.name.get()) or std.mem.eql(u8, d.ip.get(), ip)) {
+                out.replaced.list[out.replaced.n] = d.ref();
+                out.replaced.n += 1;
                 slot.* = null;
             };
         }
@@ -436,7 +497,7 @@ pub const Store = struct {
             if (slot.* == null) {
                 slot.* = dev;
                 r.state = .done;
-                return .{ .paired = slot.*.?.name.get() };
+                return .{ .paired = out };
             }
         }
         return error.TooManyDevices;
@@ -448,6 +509,13 @@ pub const Store = struct {
         return true;
     }
 
+    /// Removes record `id` only: a newer record under the same name stays.
+    pub fn removeId(s: *Store, id: auth.DeviceId) bool {
+        const idx = s.findId(id) orelse return false;
+        s.devices[idx] = null;
+        return true;
+    }
+
     // ----------------------------------------------------------- file format
 
     pub fn parse(text: []const u8) !Store {
@@ -455,7 +523,8 @@ pub const Store = struct {
         var lines = std.mem.tokenizeAny(u8, text, "\r\n");
         const first = lines.next() orelse return error.BadDeviceFile;
         const v1 = std.mem.eql(u8, first, header_v1);
-        if (!v1 and !std.mem.eql(u8, first, header)) return error.BadDeviceFile;
+        const v2 = std.mem.eql(u8, first, header_v2);
+        if (!v1 and !v2 and !std.mem.eql(u8, first, header)) return error.BadDeviceFile;
         var n: usize = 0;
         var n_req: usize = 0;
         while (lines.next()) |line| {
@@ -500,7 +569,10 @@ pub const Store = struct {
                 const name = f.next() orelse return error.BadDeviceFile;
                 const ip = f.next() orelse return error.BadDeviceFile;
                 if (!validName(name) or !validIp(ip)) return error.BadDeviceFile;
-                var d: Device = .{ .cur = try parseHash(f.next()), .created = 0, .last_seen = 0 };
+                const id: ?auth.DeviceId = if (v1 or v2) null else try parseId(f.next());
+                const cur = try parseHash(f.next());
+                var d: Device = .{ .id = id orelse legacyId(cur), .cur = cur, .created = 0, .last_seen = 0 };
+                for (s.devices[0..n]) |o| if (std.mem.eql(u8, &o.?.id, &d.id)) return error.BadDeviceFile;
                 if (v1) {
                     const prev = f.next() orelse return error.BadDeviceFile;
                     const prev_until = try parseInt(f.next());
@@ -544,8 +616,8 @@ pub const Store = struct {
         }
         for (s.devices) |slot| {
             const d = slot orelse continue;
-            try out.appendSlice(gpa, try std.fmt.bufPrint(&buf, "dev {s} {s} {x} {d} {d}", .{
-                d.name.get(), d.ip.get(), &d.cur, d.created, d.last_seen,
+            try out.appendSlice(gpa, try std.fmt.bufPrint(&buf, "dev {s} {s} {x} {x} {d} {d}", .{
+                d.name.get(), d.ip.get(), &d.id, &d.cur, d.created, d.last_seen,
             }));
             for (d.ring) |gs| {
                 const g = gs orelse continue;
@@ -558,6 +630,14 @@ pub const Store = struct {
 
 fn parseInt(s: ?[]const u8) !i64 {
     return std.fmt.parseInt(i64, s orelse return error.BadDeviceFile, 10) catch error.BadDeviceFile;
+}
+
+fn parseId(s: ?[]const u8) !auth.DeviceId {
+    const hex = s orelse return error.BadDeviceFile;
+    if (hex.len != 2 * auth.device_id_len) return error.BadDeviceFile;
+    var id: auth.DeviceId = undefined;
+    _ = std.fmt.hexToBytes(&id, hex) catch return error.BadDeviceFile;
+    return id;
 }
 
 fn parseHash(s: ?[]const u8) !auth.Hash {
@@ -824,15 +904,25 @@ fn hashOf(cookie: []const u8) auth.Hash {
     return auth.hashSecret(cookie[std.mem.indexOfScalar(u8, cookie, '.').? + 1 ..]);
 }
 
+/// A test record id (real ones are random).
+fn idOf(h: auth.Hash) auth.DeviceId {
+    return h[0..auth.device_id_len].*;
+}
+
 /// Pairs `name` at `ip` through the request/approve/claim flow.
 fn testPair(s: *Store, name: []const u8, ip: []const u8, secret_hash: auth.Hash, now: i64) !void {
+    _ = try testPairReplacing(s, name, ip, secret_hash, now);
+}
+
+fn testPairReplacing(s: *Store, name: []const u8, ip: []const u8, secret_hash: auth.Hash, now: i64) !Paired {
     try s.beginPair(name, now, 120, 0x1234, 1);
     const tok = auth.hashSecret("token");
     try s.addRequest(ip, tok, "ab12".*, now);
     try testing.expectEqual(AnswerResult.approved, s.answer(0x1234, "ab12", true));
-    const r = try s.claim(tok, ip, secret_hash, now);
-    try testing.expectEqualStrings(name, r.paired);
+    const r = try s.claim(tok, ip, idOf(secret_hash), secret_hash, now);
+    try testing.expectEqualStrings(name, r.paired.device.name());
     _ = s.endPair(0x1234);
+    return r.paired;
 }
 
 test "names and addresses" {
@@ -860,12 +950,12 @@ test "desk approval: only the approved request gets a credential" {
     try testing.expectError(error.DuplicateCode, s.addRequest("10.8.0.4", auth.hashSecret("C"), "aaaa".*, 2));
 
     // Nothing is issued before the owner answers.
-    try testing.expect((try s.claim(tok_b, "10.8.0.9", auth.hashSecret("x"), 3)) == .pending);
+    try testing.expect((try s.claim(tok_b, "10.8.0.9", idOf(auth.hashSecret("x")), auth.hashSecret("x"), 3)) == .pending);
     try testing.expectEqual(@as(usize, 0), s.count());
 
     // Deny the wrong-looking one: the window stays open.
     try testing.expectEqual(AnswerResult.denied, s.answer(7, "bbbb", false));
-    try testing.expect((try s.claim(tok_b, "10.8.0.9", auth.hashSecret("x"), 4)) == .denied);
+    try testing.expect((try s.claim(tok_b, "10.8.0.9", idOf(auth.hashSecret("x")), auth.hashSecret("x"), 4)) == .denied);
     try testing.expectError(error.AddressDenied, s.addRequest("10.8.0.9", auth.hashSecret("D"), "dddd".*, 4));
     try testing.expectEqual(AnswerResult.not_pending, s.answer(7, "bbbb", true));
     try testing.expectEqual(AnswerResult.window_gone, s.answer(8, "aaaa", true));
@@ -873,15 +963,16 @@ test "desk approval: only the approved request gets a credential" {
 
     // Approve the phone; the token is bound to its address.
     try testing.expectEqual(AnswerResult.approved, s.answer(7, "aaaa", true));
-    try testing.expect((try s.claim(tok_a, "10.8.0.9", auth.hashSecret("x"), 5)) == .unknown);
-    try testing.expect((try s.claim(auth.hashSecret("guess"), "10.8.0.3", auth.hashSecret("x"), 5)) == .unknown);
+    try testing.expect((try s.claim(tok_a, "10.8.0.9", idOf(auth.hashSecret("x")), auth.hashSecret("x"), 5)) == .unknown);
+    try testing.expect((try s.claim(auth.hashSecret("guess"), "10.8.0.3", idOf(auth.hashSecret("x")), auth.hashSecret("x"), 5)) == .unknown);
     try testing.expectError(error.WindowDecided, s.addRequest("10.8.0.5", auth.hashSecret("E"), "eeee".*, 5));
-    const r = try s.claim(tok_a, "10.8.0.3", auth.hashSecret("secret"), 6);
-    try testing.expectEqualStrings("iphone", r.paired);
+    const r = try s.claim(tok_a, "10.8.0.3", idOf(auth.hashSecret("secret")), auth.hashSecret("secret"), 6);
+    try testing.expectEqualStrings("iphone", r.paired.device.name());
+    try testing.expectEqual(@as(usize, 0), r.paired.replaced.n);
     try testing.expectEqual(@as(usize, 1), s.count());
     try testing.expectEqualStrings("10.8.0.3", s.devices[s.find("iphone").?].?.ip.get());
     // Single use.
-    try testing.expect((try s.claim(tok_a, "10.8.0.3", auth.hashSecret("again"), 7)) == .unknown);
+    try testing.expect((try s.claim(tok_a, "10.8.0.3", idOf(auth.hashSecret("again")), auth.hashSecret("again"), 7)) == .unknown);
 }
 
 test "approving one request denies the other pending ones" {
@@ -890,7 +981,7 @@ test "approving one request denies the other pending ones" {
     try s.addRequest("10.8.0.2", auth.hashSecret("1"), "0001".*, 1);
     try s.addRequest("10.8.0.3", auth.hashSecret("2"), "0002".*, 1);
     try testing.expectEqual(AnswerResult.approved, s.answer(1, "0002", true));
-    try testing.expect((try s.claim(auth.hashSecret("1"), "10.8.0.2", auth.hashSecret("x"), 2)) == .denied);
+    try testing.expect((try s.claim(auth.hashSecret("1"), "10.8.0.2", idOf(auth.hashSecret("x")), auth.hashSecret("x"), 2)) == .denied);
 }
 
 test "pairing request bounds" {
@@ -1038,10 +1129,62 @@ test "malformed cookies are unknown, not revocations" {
 test "re-pairing replaces same name or same address" {
     var s: Store = .{};
     try testPair(&s, "laptop", "10.8.0.2", auth.hashSecret("a"), 1);
-    try testPair(&s, "laptop2", "10.8.0.2", auth.hashSecret("b"), 3);
+    const p = try testPairReplacing(&s, "laptop2", "10.8.0.2", auth.hashSecret("b"), 3);
     try testing.expect(s.find("laptop") == null);
     try testing.expect(s.find("laptop2") != null);
     try testing.expectEqual(@as(usize, 1), s.count());
+    try testing.expectEqual(@as(usize, 1), p.replaced.n);
+    try testing.expectEqualStrings("laptop", p.replaced.items()[0].name());
+    try testing.expectEqual(idOf(auth.hashSecret("a")), p.replaced.items()[0].id);
+}
+
+test "re-pairing a name: the old record is removed outright, never updated" {
+    var s: Store = .{};
+    var b1: [80]u8 = undefined;
+    const old = cookieFor(&b1, "laptop", 1);
+    try testPair(&s, "laptop", "10.8.0.2", hashOf(old), 1);
+    s.rotate(s.find("laptop").?, auth.hashSecret("rotated"), 2); // grace ring has `old`
+    // The same name re-paired from another address (another machine).
+    var b2: [80]u8 = undefined;
+    const new = cookieFor(&b2, "laptop", 2);
+    const p = try testPairReplacing(&s, "laptop", "10.8.0.7", hashOf(new), 3);
+    try testing.expectEqual(@as(usize, 1), p.replaced.n);
+    try testing.expectEqual(idOf(hashOf(old)), p.replaced.items()[0].id);
+    try testing.expect(!std.mem.eql(u8, &p.device.id, &p.replaced.items()[0].id));
+    try testing.expectEqual(@as(usize, 1), s.count());
+    const d = s.devices[s.find("laptop").?].?;
+    // Nothing carried over: new id, address, secret, empty grace ring, new created.
+    try testing.expectEqual(p.device.id, d.id);
+    try testing.expectEqualStrings("10.8.0.7", d.ip.get());
+    try testing.expectEqual(@as(i64, 3), d.created);
+    for (d.ring) |g| try testing.expect(g == null);
+    try testing.expect(s.findId(idOf(hashOf(old))) == null);
+    // The old credential (current or in its grace ring) is just unknown
+    // now from the old address, and never works for the new record.
+    try testing.expect(s.authenticate(old, "10.8.0.2", 4) == .wrong_address);
+    try testing.expect(s.authenticate(old, "10.8.0.7", 4) == .revoked);
+}
+
+test "removeId spares a newer record under the same name" {
+    var s: Store = .{};
+    try testPair(&s, "laptop", "10.8.0.2", auth.hashSecret("a"), 1);
+    const old_id = s.devices[s.find("laptop").?].?.id;
+    try testPair(&s, "laptop", "10.8.0.2", auth.hashSecret("b"), 2);
+    try testing.expect(!s.removeId(old_id));
+    try testing.expect(s.find("laptop") != null);
+    try testing.expect(s.removeId(idOf(auth.hashSecret("b"))));
+    try testing.expectEqual(@as(usize, 0), s.count());
+}
+
+test "authenticate reports which record it revoked" {
+    var s: Store = .{};
+    var b: [80]u8 = undefined;
+    const c = cookieFor(&b, "phone", 5);
+    try testPair(&s, "phone", "10.8.0.3", hashOf(c), 1);
+    var bad: [80]u8 = undefined;
+    const r = s.authenticate(cookieFor(&bad, "phone", 9), "10.8.0.3", 2);
+    try testing.expectEqualStrings("phone", r.revoked.name());
+    try testing.expectEqual(idOf(hashOf(c)), r.revoked.id);
 }
 
 test "pairing window expires and ends" {
@@ -1060,7 +1203,7 @@ test "pairing window expires and ends" {
     try s.beginPair("laptop", 0, 60, 9, 1);
     try s.addRequest("10.8.0.2", auth.hashSecret("t"), "0a0a".*, 1);
     _ = s.answer(9, "0a0a", true);
-    try testing.expect((try s.claim(auth.hashSecret("t"), "10.8.0.2", auth.hashSecret("x"), 61)) == .unknown);
+    try testing.expect((try s.claim(auth.hashSecret("t"), "10.8.0.2", idOf(auth.hashSecret("x")), auth.hashSecret("x"), 61)) == .unknown);
 }
 
 test "unused devices are forgotten" {
@@ -1112,13 +1255,31 @@ test "file round trip and strict parsing" {
     try testing.expectEqual(auth.hashSecret("new"), d.cur);
     try testing.expectEqual(hashOf(c), d.ring[0].?.hash);
     try testing.expectEqual(@as(i64, 8 + grace_s), d.ring[0].?.until);
+    try testing.expectEqual(idOf(hashOf(c)), d.id);
 
     try testing.expectError(error.BadDeviceFile, Store.parse(""));
-    try testing.expectError(error.BadDeviceFile, Store.parse("portal-devices-v3\n"));
+    try testing.expectError(error.BadDeviceFile, Store.parse("portal-devices-v4\n"));
     try testing.expectError(error.BadDeviceFile, Store.parse(header ++ "\ndev x\n"));
     try testing.expectError(error.BadDeviceFile, Store.parse(header ++ "\nhack\n"));
     try testing.expectError(error.BadDeviceFile, Store.parse(header ++ "\npair Bad 5\n"));
     try testing.expectError(error.BadDeviceFile, Store.parse(header ++ "\nreq 7f3a " ++ &zeros64 ++ " 10.8.0.3 1 pending\n"));
+    // Two records with one id would let sessions cross between them.
+    const dup = "dev a 10.8.0.2 " ++ zeros64[0..32] ++ " " ++ &zeros64 ++ " 1 1\n";
+    try testing.expectError(error.BadDeviceFile, Store.parse(header ++ "\n" ++ dup ++ "dev b 10.8.0.3 " ++ zeros64[0..32] ++ " " ++ &zeros64 ++ " 1 1\n"));
+    _ = try Store.parse(header ++ "\n" ++ dup);
+}
+
+test "v2 files still load (ids derived, stable)" {
+    const h1: [64]u8 = @splat('1');
+    const v2 = header_v2 ++ "\ndev laptop 10.8.0.2 " ++ &h1 ++ " 5 6\n";
+    const a = try Store.parse(v2);
+    const b = try Store.parse(v2);
+    try testing.expectEqual(a.devices[0].?.id, b.devices[0].?.id);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try a.format(testing.allocator, &out);
+    try testing.expect(std.mem.startsWith(u8, out.items, header ++ "\n"));
+    try testing.expectEqual(a.devices[0].?.id, (try Store.parse(out.items)).devices[0].?.id);
 }
 
 test "v1 files still load (prev secret becomes the ring; v1 windows are dropped)" {
@@ -1157,7 +1318,7 @@ test "Desk: begin, see a request, approve, collect, cancel (on a real store file
     try testing.expectEqual(AnswerResult.not_pending, try desk.answer(43, "7f3a", false));
     try withStore(testing.allocator, io, desk.paths, now, Ctx{ .now = now }, struct {
         fn op(c: Ctx, st: *Store) !bool {
-            _ = try st.claim(auth.hashSecret("tok"), "10.8.0.3", auth.hashSecret("secret"), c.now);
+            _ = try st.claim(auth.hashSecret("tok"), "10.8.0.3", idOf(auth.hashSecret("secret")), auth.hashSecret("secret"), c.now);
             return true;
         }
     }.op);
