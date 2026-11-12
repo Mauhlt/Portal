@@ -21,7 +21,11 @@ fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     root.addAnonymousImport("app_wasm", .{ .root_source_file = wasm_bin });
     // src/vt.zig (a file of the root module) takes its cell widths from it.
     root.addImport("Font", fontModule(b, target, optimize));
-    const gui_mods = addGuiModules(b, root, target, optimize);
+    // One instance per compilation: src/keymap.zig and the client module
+    // (portal connect) share it.
+    const rules = inputrulesModule(b, target, optimize);
+    root.addImport("inputrules", rules);
+    const gui_mods = addGuiModules(b, root, target, optimize, rules);
     return .{ .root = root, .gui = gui_mods };
 }
 
@@ -154,6 +158,10 @@ pub fn build(b: *std.Build) void {
     // The Renderer's Font module (parser, rasteriser, widths, atlas): its
     // own tests, run here too so vetting a compiler covers them.
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fontModule(b, target, .Debug) })).step);
+    // The input policy and input line shared by server and both clients,
+    // and the Data slice's model shared by both clients.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.inputrules })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = datafeedModule(b, target, optimize) })).step);
     // Inline images: PNG checks and the bounded decoder (fuzzed).
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.pngcheck })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.imgdec })).step);
@@ -165,7 +173,22 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&launcher_exe.step);
     test_step.dependOn(&launcher_con.step);
 
-    addE2e(b, target, optimize, gui_mods.pngcheck, ctl_exe, show_exe);
+    addE2e(b, target, optimize, gui_mods, ctl_exe, show_exe);
+}
+
+/// "inputrules" (src/inputrules): the input policy, the allowed key names
+/// and the input line (answer words, what Send does, refusal texts), shared
+/// by the server (src/keymap.zig), the native client (client/src) and the
+/// browser client (src/wasm). std only.
+fn inputrulesModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("src/inputrules/root.zig"), .target = target, .optimize = optimize });
+}
+
+/// "datafeed" (src/datafeed): the Data slice's model (bounded history of
+/// what the session pushed, the "new" badge), shared by the browser client
+/// (src/wasm/data.zig) and the native one (client/src/dataview.zig).
+fn datafeedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("src/datafeed/root.zig"), .target = target, .optimize = optimize });
 }
 
 /// `zig build e2e [-- group...]`: end-to-end tests (tests/e2e) that launch
@@ -173,7 +196,7 @@ pub fn build(b: *std.Build) void {
 /// them over sockets. portalctl.exe and portal-show.exe are copied into one
 /// folder, as in a release, so sessions find portal-show next to Portal.
 /// Deliberately not part of `test`: it spawns processes and takes minutes.
-fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, pngcheck: *std.Build.Module, ctl: *std.Build.Step.Compile, show: *std.Build.Step.Compile) void {
+fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, gui: GuiModules, ctl: *std.Build.Step.Compile, show: *std.Build.Step.Compile) void {
     const e2e_exe = b.addExecutable(.{
         .name = "portal-e2e",
         .root_module = b.createModule(.{
@@ -181,15 +204,20 @@ fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
             .target = target,
             .optimize = optimize,
             // The images group writes its test PNG with pngcheck's encoder;
-            // the webinput group decides what to send with the browser
-            // client's own input-box logic.
+            // the webinput group decides what to send with the clients'
+            // own input-line logic, and drives the native client's
+            // instruction line (client/src/inputline.zig).
             .imports = &.{
-                .{ .name = "pngcheck", .module = pngcheck },
-                .{ .name = "inputbox", .module = b.createModule(.{
-                    .root_source_file = b.path("src/wasm/inputbox.zig"),
+                .{ .name = "pngcheck", .module = gui.pngcheck },
+                .{ .name = "inputrules", .module = gui.inputrules },
+                .{ .name = "inputline", .module = b.createModule(.{
+                    .root_source_file = b.path("client/src/inputline.zig"),
                     .target = target,
                     .optimize = optimize,
-                    .imports = &.{.{ .name = "keymap", .module = keymapModule(b, target, optimize) }},
+                    .imports = &.{
+                        .{ .name = "view", .module = gui.view },
+                        .{ .name = "inputrules", .module = gui.inputrules },
+                    },
                 }) },
             },
         }),
@@ -209,14 +237,11 @@ fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
 }
 
 /// The browser client's module graph: `vt` (src/vt.zig, for the colour
-/// sentinels, cell widths and, in tests, real server frames), `keymap`
-/// (src/keymap.zig, instruction-line rules), the Renderer's `Font` module
-/// (TrueType parser + rasteriser) and the bundled fonts as `font_regular` /
-/// `font_bold`.
-fn keymapModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    return b.createModule(.{ .root_source_file = b.path("src/keymap.zig"), .target = target, .optimize = optimize });
-}
-
+/// sentinels, cell widths and, in tests, real server frames), `inputrules`
+/// (src/inputrules: the input policy, key names and input line, shared
+/// with the server and the native client), `datafeed`, the Renderer's
+/// `Font` module (TrueType parser + rasteriser) and the bundled fonts as
+/// `font_regular` / `font_bold`.
 fn clientModule(b: *std.Build, root_src: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     const img = imageModules(b, target, optimize);
     const m = b.createModule(.{ .root_source_file = b.path(root_src), .target = target, .optimize = optimize });
@@ -226,8 +251,9 @@ fn clientModule(b: *std.Build, root_src: []const u8, target: std.Build.ResolvedT
     vt_mod.addImport("Font", font);
     m.addImport("vt", vt_mod);
     m.addImport("Font", font);
-    // The input box checks instruction lines with the server's own rules.
-    m.addImport("keymap", keymapModule(b, target, optimize));
+    // Keys and the input box follow the server's own rules.
+    m.addImport("inputrules", inputrulesModule(b, target, optimize));
+    m.addImport("datafeed", datafeedModule(b, target, optimize));
     m.addImport("imgdec", img.imgdec);
     m.addImport("pngcheck", img.pngcheck);
     m.addAnonymousImport("font_regular", .{ .root_source_file = b.path("src/web/fonts/DejaVuSansMono.ttf") });
@@ -301,12 +327,12 @@ fn imageModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
 
 // ---- GUI modules (shared with client/, which still builds on its own) ----
 
-const GuiModules = struct { view: *std.Build.Module, client: *std.Build.Module, imgdec: *std.Build.Module, pngcheck: *std.Build.Module };
+const GuiModules = struct { view: *std.Build.Module, client: *std.Build.Module, imgdec: *std.Build.Module, pngcheck: *std.Build.Module, inputrules: *std.Build.Module };
 
 /// Adds "view" (client/src/view: window, Vulkan drawing via the owner's
 /// Renderer, fonts via its Font module; used by `portal run`'s window) and "client"
 /// (client/src: the remote viewer behind `portal connect`) to `mod`.
-fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) GuiModules {
+fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inputrules: *std.Build.Module) GuiModules {
     const renderer = rendererDep(b, target, optimize);
     const link_libc = target.result.os.tag != .windows; // dlopen off Windows
     const img = imageModules(b, target, optimize);
@@ -326,11 +352,15 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
-        .imports = &.{.{ .name = "view", .module = view }},
+        .imports = &.{
+            .{ .name = "view", .module = view },
+            .{ .name = "inputrules", .module = inputrules },
+            .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
+        },
     });
     mod.addImport("view", view);
     mod.addImport("client", client);
     // src/vt.zig (a file of the root module) validates transmitted images.
     mod.addImport("pngcheck", img.pngcheck);
-    return .{ .view = view, .client = client, .imgdec = img.imgdec, .pngcheck = img.pngcheck };
+    return .{ .view = view, .client = client, .imgdec = img.imgdec, .pngcheck = img.pngcheck, .inputrules = inputrules };
 }

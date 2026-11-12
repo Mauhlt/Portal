@@ -161,6 +161,9 @@ pub const Layout = struct {
     terminal: Rect = .{},
     bottom: Rect = .{},
     status: Rect = .{},
+    /// The data column (Overlay.data), right of everything above the
+    /// status line; zero-sized when hidden.
+    data: Rect = .{},
     /// Each bottom pane's rectangle (same order as Overlay.bottom).
     panes: [max_panes]Rect = @splat(.{}),
     n_panes: usize = 0,
@@ -186,9 +189,39 @@ pub const Pane = struct {
     },
 };
 
+/// One entry of the data column, newest first.
+pub const DataItem = struct {
+    caption: []const u8,
+    /// Image id in `DataColumn.images` (null: caption only).
+    image: ?u32 = null,
+    /// The image's pixel size (0 if unknown), for fitting.
+    w: u32 = 0,
+    h: u32 = 0,
+};
+
+/// The data slice on the desktop (docs/layout-design.md ③): a column at
+/// the right, from the top down to the status line. The host owns the
+/// feed; images are looked up by id in `images` (a store separate from the
+/// grid's, so its ids never collide with the terminal's images).
+pub const DataColumn = struct {
+    title: []const u8 = "Data",
+    /// Muted text right of the title (e.g. how to hide the column).
+    hint: []const u8 = "",
+    items: []const DataItem = &.{},
+    images: ?*const grid_mod.Images = null,
+    empty_text: []const u8 = "No data yet",
+    /// Share of the window's width.
+    frac: f32 = 0.34,
+};
+
+/// Below this window width (logical px) the data column is not drawn.
+pub const data_min_window_w: f32 = 640;
+
 pub const Overlay = struct {
     /// `.grid` draws the grid (if it has cells); `.message` a centred notice.
     screen: union(enum) { grid, message: Message } = .grid,
+    /// The data column (shown when the window is wide enough).
+    data: ?DataColumn = null,
     top_bar: ?TopBar = null,
     selection: ?Selection = null,
     /// Shorthand for one `.answers` pane at the top of the bottom region.
@@ -574,13 +607,18 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
     tv.instances.clearRetainingCapacity();
     tv.n_buttons = 0;
     const size = tv.window.framebufferSize();
-    const W: f32 = @floatFromInt(size[0]);
+    const full_w: f32 = @floatFromInt(size[0]);
     const H: f32 = @floatFromInt(size[1]);
-    if (W < 1 or H < 1) return;
+    if (full_w < 1 or H < 1) return;
     const s = tv.window.scale();
     const ui = tv.fonts.metrics(@round(13 * s));
     const status_h: f32 = @round(@as(f32, @floatFromInt(ui.cell_h)) * 1.6);
     const top_h: f32 = if (overlay.top_bar != null) topBarHeight(ui) else 0;
+    // The data column takes the right part; the top bar, the terminal and
+    // the bottom region keep the rest (W); the status line and a modal
+    // panel span the window.
+    const data_w: f32 = if (overlay.data) |d| dataWidth(full_w, s, d.frac) else 0;
+    const W = full_w - data_w;
     // The bottom region: its panes' heights, but never more than half the
     // window (the terminal keeps the rest).
     var panes: [max_panes]Pane = undefined;
@@ -613,7 +651,8 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
         .top = .{ .w = W, .h = top_h },
         .terminal = .{ .y = top_h, .w = W, .h = grid_h },
         .bottom = .{ .y = top_h + grid_h, .w = W, .h = bar_h },
-        .status = .{ .y = H - status_h, .w = W, .h = status_h },
+        .status = .{ .y = H - status_h, .w = full_w, .h = status_h },
+        .data = .{ .x = W, .y = 0, .w = data_w, .h = if (data_w > 0) H - status_h else 0 },
         .n_panes = n_panes,
     };
     var py = top_h + grid_h;
@@ -624,6 +663,9 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
 
     tv.layout.cols = 0;
     tv.layout.rows = 0;
+    // Image entries live while the grid or the data column draws them.
+    tv.img.begin();
+    defer tv.img.end();
     switch (overlay.screen) {
         .grid => {
             const m = tv.cellMetrics(grid, W, grid_h, s);
@@ -634,11 +676,73 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
     }
     if (overlay.top_bar) |tb| tv.drawTopBar(ui, tb, W, top_h, s);
     for (panes[0..n_panes], 0..) |p, i| tv.drawPane(ui, p, tv.regions.panes[i], s);
-    tv.drawStatus(ui, overlay.status, H - status_h, W, status_h, s);
+    if (overlay.data) |d| if (data_w > 0) tv.drawData(ui, d, tv.regions.data, s);
+    tv.drawStatus(ui, overlay.status, H - status_h, full_w, status_h, s);
     if (overlay.panel) |p| {
         // Modal: buttons under the panel stop reacting.
         tv.n_buttons = 0;
-        tv.drawPanel(ui, p, W, H, s);
+        tv.drawPanel(ui, p, full_w, H, s);
+    }
+}
+
+/// The data column's width in pixels for a window `W` wide (0: too
+/// narrow, not shown).
+pub fn dataWidth(W: f32, s: f32, frac: f32) f32 {
+    if (W < data_min_window_w * s) return 0;
+    const f = std.math.clamp(frac, 0.2, 0.5);
+    return @round(std.math.clamp(W * f, 220 * s, W * 0.5));
+}
+
+/// Fits a `w x h` image into `box_w x box_h` keeping its aspect ratio,
+/// never more than 2 pixels per image pixel. Unknown size: a 4:3 box.
+pub fn fitImage(w: u32, h: u32, box_w: f32, box_h: f32) [2]f32 {
+    if (box_w < 1 or box_h < 1) return .{ 0, 0 };
+    if (w == 0 or h == 0) return .{ @round(@min(box_w, box_h * 4 / 3)), @round(@min(box_h, box_w * 3 / 4)) };
+    const fw: f32 = @floatFromInt(w);
+    const fh: f32 = @floatFromInt(h);
+    const k = @min(@min(box_w / fw, box_h / fh), 2);
+    return .{ @max(1, @round(fw * k)), @max(1, @round(fh * k)) };
+}
+
+/// The data column: title, then each item's caption and image, newest
+/// first, clipped to the column.
+fn drawData(tv: *TermView, ui: fontset.Metrics, d: DataColumn, r: Rect, s: f32) void {
+    tv.rect(r.x, r.y, r.w, r.h, ui_bg);
+    tv.rect(r.x, r.y, @max(1, @round(s)), r.h, panel_edge); // the edge to the terminal
+    const pad = @round(10 * s);
+    const lh: f32 = @floatFromInt(ui.cell_h);
+    const x0 = r.x + pad;
+    const inner = @max(1, r.w - 2 * pad);
+    const bottom = r.y + r.h;
+    var y = r.y + pad;
+    const tx = tv.text(ui, x0, y, clipText(ui, d.title, inner, false), button_fg, true);
+    if (d.hint.len > 0) {
+        const room = x0 + inner - tx - lh;
+        if (room > 0) _ = tv.text(ui, tx + lh, y, clipText(ui, d.hint, room, false), toneColor(.muted), false);
+    }
+    y += lh * 1.8;
+    if (d.items.len == 0) {
+        const w = textWidth(ui, d.empty_text);
+        _ = tv.text(ui, x0 + @max(0, @round((inner - w) / 2)), r.y + @round(r.h / 2), clipText(ui, d.empty_text, inner, false), toneColor(.muted), false);
+        return;
+    }
+    const tex = [2]u32{ tex_w, tex_h };
+    for (d.items) |it| {
+        if (y + lh > bottom) break;
+        _ = tv.text(ui, x0, y, clipText(ui, it.caption, inner, false), toneColor(.muted), false);
+        y += lh * 1.3;
+        const id = it.image orelse continue;
+        const store = d.images orelse continue;
+        const fit = fitImage(it.w, it.h, inner, @max(lh * 3, r.h * 0.55));
+        if (fit[0] < 1 or fit[1] < 1) continue;
+        switch (tv.img.prepare(store, id, @intFromFloat(fit[0]), @intFromFloat(fit[1]), tex[0], tex[1])) {
+            .image => |uv| if (images.clip(x0, y, fit[0], fit[1], uv, r.x, r.y, r.x + r.w, bottom)) |c| {
+                tv.pushA(c.rect[0], c.rect[1], c.rect[2], c.rect[3], c.uv, .{ 255, 255, 255 }, 255);
+            },
+            .placeholder => |dims| tv.placeholder(ui, x0, y, fit[0], fit[1], dims, r.x, r.y, r.x + r.w, bottom),
+            .none => {},
+        }
+        y += fit[1] + pad * 1.5;
     }
 }
 
@@ -797,8 +901,6 @@ fn drawGrid(tv: *TermView, g: *const Grid, sel: ?Selection, m: fontset.Metrics, 
 
 /// Pushes the grid's image placements (above backgrounds, below text).
 fn drawImages(tv: *TermView, g: *const Grid, m: fontset.Metrics, ox: f32, oy: f32, clip_x1: f32, clip_y1: f32) void {
-    tv.img.begin();
-    defer tv.img.end();
     const cw: f32 = @floatFromInt(m.cell_w);
     const ch: f32 = @floatFromInt(m.cell_h);
     for (g.images.placements.items) |p| {
@@ -1137,8 +1239,11 @@ fn drawPane(tv: *TermView, ui: fontset.Metrics, p: Pane, r: Rect, s: f32) void {
             const tx = box.x + cw;
             const ty = box.y + @round(@min(cw, (box.h - lh) / 2));
             const inner = box.w - 2 * cw;
-            if (f.value.len == 0 and !f.focused) {
-                _ = tv.text(ui, tx, ty, clipText(ui, f.hint, inner, false), toneColor(.muted), false);
+            if (f.value.len == 0) {
+                // The hint stays visible in an empty focused box, after the cursor.
+                const cur = if (f.focused) @max(2, @round(2 * s)) else 0;
+                if (f.focused) tv.rect(tx, ty, cur, lh, focus_edge);
+                _ = tv.text(ui, tx + cur * 2, ty, clipText(ui, f.hint, inner - cur * 2, false), toneColor(.muted), false);
             } else {
                 const end = tv.text(ui, tx, ty, clipText(ui, f.value, inner - cw, true), button_fg, false);
                 if (f.focused) tv.rect(end, ty, @max(2, @round(2 * s)), lh, focus_edge);
@@ -1146,6 +1251,20 @@ fn drawPane(tv: *TermView, ui: fontset.Metrics, p: Pane, r: Rect, s: f32) void {
             tv.registerButton(box.x, box.y, box.w, box.h, f.id);
         },
     }
+}
+
+test "data column sizing and image fitting" {
+    try std.testing.expectEqual(@as(f32, 0), dataWidth(500, 1, 0.34)); // too narrow
+    try std.testing.expectEqual(@as(f32, 340), dataWidth(1000, 1, 0.34));
+    try std.testing.expectEqual(@as(f32, 440), dataWidth(1290, 2, 0.34)); // at least 220 logical px
+    try std.testing.expectEqual(@as(f32, 600), dataWidth(1200, 1, 0.9)); // at most half
+    // Aspect kept, at most 2x, fits the box.
+    try std.testing.expectEqual([2]f32{ 8, 4 }, fitImage(4, 2, 300, 300));
+    try std.testing.expectEqual([2]f32{ 300, 150 }, fitImage(640, 320, 300, 300));
+    try std.testing.expectEqual([2]f32{ 100, 200 }, fitImage(320, 640, 300, 200));
+    const unknown = fitImage(0, 0, 300, 300);
+    try std.testing.expect(unknown[0] <= 300 and unknown[1] <= 300 and unknown[0] > 0);
+    try std.testing.expectEqual([2]f32{ 0, 0 }, fitImage(4, 4, 0, 10));
 }
 
 test "Rect contains" {

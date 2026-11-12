@@ -216,20 +216,24 @@ passed, so the program can't read the pair as Alt+key.
 | frame | meaning |
 |---|---|
 | `k:<name>` | press a key |
-| `t:<utf8>` | type text (only when `input` is `"text"`; a `!` typed at the start of a line is dropped) |
+| `t:<utf8>` | type text (only when `input` is `"text"`; a `!` typed at the start of a line is dropped, where "start of a line" means after any key other than the character keys `0`…`9`, `y`, `n`: Enter, Esc, Ctrl+C, Backspace, the arrows, Home, End…) |
 | `l:<line>` | an instruction line (`"instruct"` and `"text"`): Portal rejects a leading `!` (shell), `/` (slash command) or `#` (memory), control characters, line breaks and bidi controls, max 2000 bytes; otherwise it types the line (as a bracketed paste when the program enabled it) and presses Enter |
 
-Key names. `keys` mode accepts only the first row; `text` mode accepts all:
+Key names. `keys` and `instruct` mode accept only the first row; `text`
+mode accepts all (`none` accepts nothing):
 
 | mode | names |
 |---|---|
-| `keys` | `0` … `9`, `y`, `n`, `enter`, `esc` |
+| `keys`, `instruct` | `0` … `9`, `y`, `n`, `enter`, `esc` |
 | `text` additionally | `backspace`, `tab`, `shift-tab`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `ctrl-c` |
 
 The server maps names to the exact bytes the terminal expects, applies the
 session's input policy, and silently drops anything not allowed. Clients
 should still hide controls the current mode doesn't accept. Unknown frames
-are ignored.
+are ignored. The tables are defined once, in `src/inputrules/keys.zig`,
+which the server and both Portal clients use; so is the clients' key rule:
+Ctrl, Alt and Meta combinations send nothing (Ctrl+Enter is not Enter),
+except Ctrl+C in `text` mode; Shift+Tab is `shift-tab`.
 
 ## 5. Behaviour clients should implement
 
@@ -239,11 +243,14 @@ are ignored.
   or pan, to fit `cols × rows`.
 * Show the input mode clearly ("view only", "answer keys", "instructions",
   "typing allowed").
-* The browser client sends instruction lines from a text box (so phone
-  dictation works) and maps answer words to keys before sending ("Yes." →
-  `k:y`, "two" → `k:2`, "OK" → `k:enter`; table in `src/wasm/inputbox.zig`).
-  It checks lines with the server's rules first, so a refusal is shown
-  without a round trip; `rejected` still covers anything it missed.
+* Both Portal clients send instruction lines from an input line (the
+  browser's text box, so phone dictation works; the native client's field
+  under the answer bar) and map answer words to keys before sending
+  ("Yes." → `k:y`, "two" → `k:2`, "OK" → `k:enter`; one shared table and
+  `decide` in `src/inputrules/send.zig`). They check lines with the
+  server's rules first, so a refusal is shown without a round trip;
+  `rejected` still covers anything they missed, and the line comes back.
+  The answer buttons are the same on both: Yes, No, 1, 2, 3, Esc, Enter.
 
 ## 7. Portal sync (signed packages for paired devices)
 
