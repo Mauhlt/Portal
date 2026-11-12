@@ -69,6 +69,8 @@ pub const Slices = struct {
     /// The drag handle between the left column and the data column.
     split: Rect = .{},
     head_pad: i32 = 0,
+    /// The project tabs row at the top of the header.
+    tabs_h: i32 = 0,
     ctl_h: i32 = 0,
     status_h: i32 = 0,
     /// Interaction slice internals: textarea, note line, button grid.
@@ -112,6 +114,9 @@ pub const box_line: i32 = 22;
 pub const box_chrome: i32 = 14; // padding + border
 pub const note_line: i32 = 18;
 pub const status_line: i32 = 20;
+/// The project tabs row (touch: a finger-sized target).
+pub const tabs_row_touch: i32 = 36;
+pub const tabs_row: i32 = 30;
 
 fn px(v: f64) i32 {
     return @intFromFloat(@round(v));
@@ -147,6 +152,7 @@ pub fn compute(in: Input) Slices {
     s.pad_bottom = if (s.keyboard) 0 else px(sane(in.safe_bottom, 0, 200));
     s.head_pad = px(sane(in.safe_top, 0, 200));
     s.ctl_h = if (in.touch) 44 else 36;
+    s.tabs_h = if (in.touch) tabs_row_touch else tabs_row;
     s.status_h = status_line;
 
     // Columns: the data column on the right, everything else on the left.
@@ -187,7 +193,7 @@ pub fn compute(in: Input) Slices {
             const bar_h = rows * s.btn_h + (rows - 1) * gap + 2 * pane_pad;
             inter_h = pane_pad + s.box_h + s.note_h + 2 + bar_h + s.pad_bottom;
         } else inter_h = s.pad_bottom;
-        head_h = if (s.no_head) 0 else s.head_pad + s.ctl_h + s.status_h;
+        head_h = if (s.no_head) 0 else s.head_pad + s.tabs_h + s.ctl_h + s.status_h;
         term_h = H - head_h - inter_h;
         if (term_h >= min_term or !in.input) break;
         // Too tight (keyboard open, landscape, tiny window): shed the
@@ -212,9 +218,9 @@ pub fn compute(in: Input) Slices {
 /// CSS custom properties for the page (index.html / app.css read them).
 pub fn css(s: Slices, buf: []u8) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
-    w.print("--app-h:{d}px;--app-top:{d}px;--head-pad:{d}px;--ctl-h:{d}px;--status-h:{d}px;" ++
+    w.print("--app-h:{d}px;--app-top:{d}px;--head-pad:{d}px;--tabs-h:{d}px;--ctl-h:{d}px;--status-h:{d}px;" ++
         "--box-h:{d}px;--note-h:{d}px;--btn-h:{d}px;--cols:{d};--pad-b:{d}px", .{
-        s.app_h, s.app_top, s.head_pad, s.ctl_h, s.status_h, s.box_h, s.note_h, s.btn_h, s.cols, s.pad_bottom,
+        s.app_h, s.app_top, s.head_pad, s.tabs_h, s.ctl_h, s.status_h, s.box_h, s.note_h, s.btn_h, s.cols, s.pad_bottom,
     }) catch return "";
     const named = [_]struct { []const u8, Rect }{
         .{ "head", s.head }, .{ "term", s.term }, .{ "data", s.data }, .{ "inter", s.inter }, .{ "split", s.split },
@@ -286,8 +292,8 @@ test "iPhones, portrait, keyboard closed: tabs, interaction pinned at the bottom
         try testing.expectEqual(@as(i32, @intFromFloat(ph.h)), s.app_h);
         try testing.expectEqual(@as(i32, 0), s.app_top);
         try testing.expectEqual(@as(i32, @intFromFloat(ph.safe_bottom)), s.pad_bottom);
-        // Header: safe area + controls + status line.
-        try testing.expectEqual(@as(i32, @intFromFloat(ph.safe_top)) + 44 + status_line, s.head.h);
+        // Header: safe area + project tabs + controls + status line.
+        try testing.expectEqual(@as(i32, @intFromFloat(ph.safe_top)) + tabs_row_touch + 44 + status_line, s.head.h);
         // One row of 8 buttons of 44 px; 3-line box.
         try testing.expectEqual(@as(u32, 1), s.rows);
         try testing.expectEqual(@as(i32, 44), s.btn_h);
@@ -392,7 +398,7 @@ test "view only: no interaction slice" {
     const s = compute(.{ .inner_w = 390, .inner_h = 664, .vv_w = 390, .vv_h = 664, .vv_top = 0, .safe_top = 47, .safe_bottom = 34, .touch = true, .input = false });
     try expectTiles(s);
     try testing.expectEqual(@as(i32, 34), s.inter.h); // only the home-indicator pad
-    try testing.expectEqual(@as(i32, 664 - (47 + 44 + status_line) - 34), s.term.h);
+    try testing.expectEqual(@as(i32, 664 - (47 + tabs_row_touch + 44 + status_line) - 34), s.term.h);
 }
 
 test "pinch zoom is not a keyboard" {
@@ -418,6 +424,7 @@ test "css variables" {
     const c = css(s, &buf);
     try testing.expect(std.mem.startsWith(u8, c, "--app-h:664px;--app-top:0px;"));
     try testing.expect(std.mem.indexOf(u8, c, "--cols:8;") != null);
-    try testing.expect(std.mem.indexOf(u8, c, ";--term-x:0px;--term-y:111px;--term-w:390px;") != null);
+    try testing.expect(std.mem.indexOf(u8, c, "--tabs-h:36px;") != null);
+    try testing.expect(std.mem.indexOf(u8, c, ";--term-x:0px;--term-y:147px;--term-w:390px;") != null);
     try testing.expect(std.mem.endsWith(u8, c, "--split-h:0px"));
 }

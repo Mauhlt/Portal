@@ -20,6 +20,11 @@
      fill it, plus the button row). Narrow screens show Terminal or Data
      via the segmented control; wide ones put Data in a right column. -->
 <header id="head">
+  <!-- Project tabs (filled by wasm): switch between the desktop's open
+       projects. Opening and closing projects is the desk's only. -->
+  <nav class="ptabs" aria-label="Projects">
+    <button type="button" class="ptab off" data-ptab="0"></button><button type="button" class="ptab off" data-ptab="1"></button><button type="button" class="ptab off" data-ptab="2"></button><button type="button" class="ptab off" data-ptab="3"></button><button type="button" class="ptab off" data-ptab="4"></button><button type="button" class="ptab off" data-ptab="5"></button><button type="button" class="ptab off" data-ptab="6"></button><button type="button" class="ptab off" data-ptab="7"></button><button type="button" class="ptab off" data-ptab="8"></button><button type="button" class="ptab off" data-ptab="9"></button><button type="button" class="ptab off" data-ptab="10"></button><button type="button" class="ptab off" data-ptab="11"></button>
+  </nav>
   <div class="ctl">
     <div class="tabs" role="tablist" aria-label="View">
       <button type="button" role="tab" data-tab="0">Terminal</button>

@@ -112,6 +112,12 @@ const Host = struct {
     /// The last {"t":"rejected"} handed to the instruction line.
     seen_rejected: u64 = 0,
     title_status: ?client_mod.Status = null,
+    /// The title as last set ("Portal — <project> — <status>").
+    title_buf: [160]u8 = undefined,
+    title_len: usize = 0,
+    /// Copies of the tab list for this frame (built outside the lock's
+    /// writers: the network thread replaces Shared.tabs).
+    tabs: client_mod.TabList = .{},
     bufs: remote.Bufs = .{},
     pin_fp_buf: [95]u8 = undefined,
     pin_fp_len: usize = 0,
@@ -136,6 +142,20 @@ const Host = struct {
         _ = h.sink.data.sync(h.client.gpa, &s.grid.images);
         const fb = h.tv.window.framebufferSize();
         h.sink.data.setFits(TermView.dataWidth(@floatFromInt(fb[0]), h.tv.window.scale(), (TermView.DataColumn{}).frac) > 0);
+        // The tabs: what the top bar draws and what its clicks mean.
+        h.tabs = s.tabs;
+        const current = s.current;
+        h.sink.n_tabs = h.tabs.len;
+        h.sink.shown = null;
+        for (h.tabs.slice(), 0..) |e, i| {
+            h.sink.tab_ids[i] = e.id;
+            if (current) |id| if (std.mem.eql(u8, &id, &e.id)) {
+                h.sink.shown = i;
+            };
+        }
+        var pbuf: [64]u8 = undefined;
+        const project: ?[]const u8 = if (s.project()) |p| pbuf[0..p.len] else null;
+        if (s.project()) |p| @memcpy(pbuf[0..p.len], p);
         const o = remote.overlay(.{
             .status = st,
             .mode = mode,
@@ -148,6 +168,8 @@ const Host = struct {
             .code = s.pair_code,
             .err = s.last_error,
             .pin_fp = h.pin_fp_buf[0..h.pin_fp_len],
+            .tabs = if (st == .connected) h.tabs.slice() else &.{},
+            .current = current,
         }, &h.bufs);
         var oo = o;
         h.sync.mutex.lockUncancelable(h.client.io);
@@ -164,10 +186,13 @@ const Host = struct {
         h.sink.mode = mode;
         h.sink.status = st;
         h.drawn_version = version;
-        if (h.title_status != st) {
+        var tbuf: [160]u8 = undefined;
+        const t = remote.title(st, project, &tbuf);
+        if (!std.mem.eql(u8, t, h.title_buf[0..h.title_len])) {
             h.title_status = st;
-            var tbuf: [128]u8 = undefined;
-            h.tv.setTitle(remote.title(st, h.client.host(), &tbuf));
+            @memcpy(h.title_buf[0..t.len], t);
+            h.title_len = t.len;
+            h.tv.setTitle(t);
         }
     }
 

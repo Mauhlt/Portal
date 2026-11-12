@@ -22,11 +22,14 @@ const inputline = @import("inputline.zig");
 const dataview = @import("dataview.zig");
 const rules = @import("inputrules");
 const client_mod = @import("net/client.zig");
+const tabs_wire = @import("shared").tabs;
 
 pub const pair_button_id = 1;
 pub const cancel_button_id = 2;
 /// The instruction line (a click on it reports this id).
 pub const line_field_id = 3;
+/// The top bar's project tabs: tab_id0 + position switches to that tab.
+pub const tab_id0: u32 = 700;
 
 /// InputSink that sends protocol key names / text per the server's
 /// `hello.input` mode.
@@ -42,6 +45,11 @@ pub const RemoteSink = struct {
     line: inputline.Line = .{},
     /// The Data column. UI thread only (fed under the shared lock).
     data: dataview.DataView = .{},
+    /// The tabs as last drawn (button position -> id) and the one shown.
+    /// UI thread only, refreshed each frame by the main loop.
+    tab_ids: [tabs_wire.max_tabs]tabs_wire.Id = undefined,
+    n_tabs: usize = 0,
+    shown: ?usize = null,
 
     pub fn sink(r: *RemoteSink) input.InputSink {
         return .{ .ctx = r, .vtable = &vtable };
@@ -110,9 +118,19 @@ pub const RemoteSink = struct {
         return if (m.active(m.ctx)) m else null;
     }
 
+    /// Switches to the tab `step` places on (Ctrl+Tab / Ctrl+Shift+Tab).
+    fn cycleTab(r: *RemoteSink, step: i32) void {
+        if (r.n_tabs < 2) return;
+        const at: i64 = @intCast(r.shown orelse 0);
+        const next = @mod(at + step, @as(i64, @intCast(r.n_tabs)));
+        r.client.selectTab(r.tab_ids[@intCast(next)]);
+    }
+
     fn onKey(ctx: *anyopaque, key: input.Key, mods: input.Mods) void {
         const r: *RemoteSink = @ptrCast(@alignCast(ctx));
         if (r.modalActive()) |m| return m.key(m.ctx, key, mods);
+        // Ctrl+Tab (never a protocol key: Ctrl combinations send nothing).
+        if (key == .tab and mods.ctrl and !mods.alt and r.status == .connected) return r.cycleTab(if (mods.shift) -1 else 1);
         // F2 (not a protocol key): show / hide the Data column.
         if (key == .f2 and !mods.ctrl and !mods.alt and !mods.super) {
             r.data.toggle();
@@ -155,6 +173,7 @@ pub const RemoteSink = struct {
         if (r.modal) |m| if (m.button(m.ctx, id)) return;
         if (id == pair_button_id) r.client.requestPairing();
         if (id == cancel_button_id) r.client.cancelPairing();
+        if (id >= tab_id0 and id < tab_id0 + r.n_tabs) r.client.selectTab(r.tab_ids[id - tab_id0]);
     }
 
     fn onResized(_: *anyopaque, _: u32, _: u32, _: u16, _: u16) void {
@@ -177,8 +196,12 @@ fn statusWord(st: client_mod.Status) []const u8 {
     };
 }
 
-pub fn title(st: client_mod.Status, host: []const u8, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Portal - {s} - {s}", .{ host, statusWord(st) }) catch "Portal";
+/// The window title: "Portal — <project> — <status>" (the tab shown), or
+/// "Portal — <status>" before the desktop has said. No addresses: the
+/// status line shows the host.
+pub fn title(st: client_mod.Status, project: ?[]const u8, buf: []u8) []const u8 {
+    if (project) |p| return std.fmt.bufPrint(buf, "Portal \u{2014} {s} \u{2014} {s}", .{ p, statusWord(st) }) catch "Portal";
+    return std.fmt.bufPrint(buf, "Portal \u{2014} {s}", .{statusWord(st)}) catch "Portal";
 }
 
 /// Errors that mean "this is not the Portal we trust" (or not Portal's
@@ -221,6 +244,9 @@ pub const View = struct {
     err: ?anyerror = null,
     /// "AB:CD:..." of the pinned Portal CA ("" without TLS).
     pin_fp: []const u8 = "",
+    /// The desktop's open tabs and the one shown (protocol v2).
+    tabs: []const tabs_wire.Entry = &.{},
+    current: ?tabs_wire.Id = null,
 };
 
 /// Text storage for overlay(); must outlive TermView.build.
@@ -231,7 +257,27 @@ pub const Bufs = struct {
     extra: [256]u8 = undefined,
     right: [128]u8 = undefined,
     panes: [1]TermView.Pane = undefined,
+    top_tabs: [tabs_wire.max_tabs]TermView.TopTab = undefined,
 };
+
+/// The top bar: one tab per open project (name, colour, amber while its
+/// program waits for an answer), the one shown highlighted. A device can
+/// switch between them (a click, Ctrl+Tab) but has no + and no close box:
+/// only the desk opens and closes projects.
+fn topBar(v: View, b: *Bufs) ?TermView.TopBar {
+    if (v.tabs.len == 0) return null;
+    for (v.tabs, 0..) |*e, i| {
+        const c = e.color;
+        b.top_tabs[i] = .{
+            .label = e.name(),
+            .color = .{ @truncate(c >> 16), @truncate(c >> 8), @truncate(c) },
+            .active = if (v.current) |id| std.mem.eql(u8, &id, &e.id) else false,
+            .attention = e.state.attention(),
+            .id = tab_id0 + @as(u32, @intCast(i)),
+        };
+    }
+    return .{ .tabs = b.top_tabs[0..v.tabs.len] };
+}
 
 /// Builds the overlay from a status snapshot.
 pub fn overlay(v: View, b: *Bufs) TermView.Overlay {
@@ -328,6 +374,7 @@ pub fn overlay(v: View, b: *Bufs) TermView.Overlay {
         o.status.tone = .bad;
         return o;
     };
+    o.top_bar = topBar(v, b);
     if (!v.has_grid) {
         o.screen = .{ .message = .{ .title = statusWord(st), .title_tone = .muted, .detail = v.detail } };
         return o;
@@ -397,6 +444,29 @@ test "overlay: the data column beside the terminal, its badge while hidden" {
     v.status = .need_pairing;
     v.data = col;
     try std.testing.expect(overlay(v, &b).data == null);
+}
+
+test "top bar: the desktop's tabs, the one shown active, no open or close" {
+    var b: Bufs = .{};
+    var list: [2]tabs_wire.Entry = .{ .{ .id = @splat(1), .color = 0x3366CC }, .{ .id = @splat(2), .color = 0x10B981, .state = .waiting } };
+    list[0].setName("Alpha");
+    list[1].setName("Beta");
+    const v: View = .{ .status = .connected, .mode = .keys, .detail = "", .host = "h", .has_grid = true, .tabs = &list, .current = @splat(2) };
+    const tb = overlay(v, &b).top_bar.?;
+    try std.testing.expectEqual(@as(usize, 2), tb.tabs.len);
+    try std.testing.expectEqualStrings("Alpha", tb.tabs[0].label);
+    try std.testing.expect(!tb.tabs[0].active and tb.tabs[1].active);
+    try std.testing.expect(tb.tabs[1].attention and !tb.tabs[0].attention);
+    try std.testing.expect(tb.tabs[0].close_id == null and tb.add_id == null);
+    try std.testing.expectEqual(@as(u32, tab_id0 + 1), tb.tabs[1].id);
+    // Even one tab shows its name; none (an old desktop): no bar.
+    const one: View = .{ .status = .connected, .mode = .keys, .detail = "", .host = "h", .has_grid = true, .tabs = list[0..1] };
+    try std.testing.expectEqual(@as(usize, 1), overlay(one, &b).top_bar.?.tabs.len);
+    const none: View = .{ .status = .connected, .mode = .keys, .detail = "", .host = "h", .has_grid = true };
+    try std.testing.expect(overlay(none, &b).top_bar == null);
+    var tbuf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("Portal \u{2014} Beta \u{2014} connected", title(.connected, "Beta", &tbuf));
+    try std.testing.expectEqualStrings("Portal \u{2014} reconnecting", title(.retrying, null, &tbuf));
 }
 
 test "keyboard focus: the instruction line in instruct mode only" {

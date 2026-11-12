@@ -293,8 +293,14 @@ pub const Policy = @import("inputbox.zig").Policy;
 /// Longest project name the server sends (gui.max_project_bytes).
 pub const max_project = 64;
 
+pub const tabs = @import("shared").tabs;
+
 pub const Hello = struct {
     policy: Policy,
+    /// Protocol v2: the open tabs and the one shown (empty / null from a
+    /// desktop that predates tabs).
+    list: tabs.List = .{},
+    session: ?tabs.Id = null,
     /// `portal run --project NAME`, if given.
     project_buf: [max_project]u8 = undefined,
     project_len: u8 = 0,
@@ -310,6 +316,14 @@ pub const SessionState = enum { unknown, working, waiting, done };
 
 pub const Control = union(enum) {
     hello: Hello,
+    /// The open tabs changed.
+    tabs: tabs.List,
+    /// The server now shows this tab (its full screen follows).
+    session: tabs.Id,
+    /// The tab asked for is not open.
+    nosession,
+    /// The tab shown ended while others go on.
+    ended: tabs.Id,
     exit: i64,
     logout,
     /// An `l:` line was refused; the reason (a keymap.LineError name)
@@ -328,8 +342,14 @@ pub fn parseControl(text: []const u8) Control {
         const input = stringField(text, "input") orelse "none";
         var h: Hello = .{ .policy = std.meta.stringToEnum(Policy, input) orelse .none };
         if (escapedField(text, "project", &h.project_buf)) |p| h.project_len = @intCast(p.len);
+        if (tabs.parseList(text)) |l| h.list = l;
+        h.session = tabs.idField(text, "session");
         return .{ .hello = h };
     }
+    if (std.mem.eql(u8, t, "tabs")) return .{ .tabs = tabs.parseList(text) orelse return .unknown };
+    if (std.mem.eql(u8, t, "session")) return .{ .session = tabs.idField(text, "id") orelse return .unknown };
+    if (std.mem.eql(u8, t, "nosession")) return .nosession;
+    if (std.mem.eql(u8, t, "ended")) return .{ .ended = tabs.idField(text, "id") orelse return .unknown };
     if (std.mem.eql(u8, t, "exit")) return .{ .exit = intField(text, "code") orelse 0 };
     if (std.mem.eql(u8, t, "logout")) return .logout;
     if (std.mem.eql(u8, t, "rejected")) return .{ .rejected = stringField(text, "reason") orelse "" };
@@ -807,6 +827,16 @@ test "control messages" {
     try testing.expectEqual(Control.unknown, parseControl(""));
     // A key that merely ends in "t" is not "t".
     try testing.expectEqual(Control.unknown, parseControl("{\"input\":\"keys\",\"at\":\"hello\"}"));
+    // Protocol v2: tabs.
+    const h2 = parseControl("{\"t\":\"hello\",\"v\":2,\"input\":\"keys\",\"project\":\"A\",\"session\":\"000102030405060708090a0b0c0d0eff\"," ++
+        "\"sessions\":[{\"id\":\"000102030405060708090a0b0c0d0eff\",\"name\":\"A\",\"color\":\"#3366cc\",\"state\":\"waiting\"}]}").hello;
+    try testing.expectEqual(@as(usize, 1), h2.list.len);
+    try testing.expect(h2.session != null);
+    try testing.expectEqual(@as(usize, 0), parseControl("{\"t\":\"tabs\",\"sessions\":[]}").tabs.len);
+    try testing.expectEqual(Control.unknown, parseControl("{\"t\":\"tabs\",\"sessions\":[{}]}"));
+    try testing.expectEqual(@as(u8, 0xff), parseControl("{\"t\":\"session\",\"id\":\"000102030405060708090a0b0c0d0eff\"}").session[15]);
+    try testing.expectEqual(Control.nosession, parseControl("{\"t\":\"nosession\"}"));
+    try testing.expectEqual(Control.unknown, parseControl("{\"t\":\"ended\",\"id\":\"zz\"}"));
 }
 
 test "utf8 single" {
