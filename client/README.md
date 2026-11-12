@@ -82,10 +82,11 @@ branch `portal-client`). After that branch is merged, change it to
 |---|---|
 | `src/view/` | **Module `view`**: reusable, no networking. `TermView` (window, Instanced2D drawing, fit/zoom, cursor, answer bar, status line), `grid.zig` (cell snapshot model mirroring `src/vt.zig`), `input.zig` (Key/Mods/Event, `InputSink`), `platform/` (Win32, X11, Cocoa), `font/` (TrueType parser, rasteriser, system fonts, atlas), `wcwidth.zig` (copy of `src/vt_width.zig`). Imports only `std` and `Renderer`. |
 | `src/connect.zig` | The viewer's main loop; module "client" in Portal's root build (`portal connect`), wrapped by `src/main.zig` here. |
-| `src/gframe.zig` | 'G' frame decoder into `view.grid.Grid` (remote grid source). |
+| `src/gframe.zig` | Writes decoded 'G'/'I'/'P' frames into `view.grid.Grid` (remote grid source). |
 | `src/keys.zig` | Protocol key names per `hello.input` mode. |
 | `src/remote.zig` | `RemoteSink` (InputSink → protocol frames) and the overlay (pairing screen, status). |
-| `src/net/` | `http.zig` (requests, strict response/Set-Cookie parsing), `ws.zig` (masked client frames, server frame parser), `client.zig` (connection thread), `tlsconn.zig` (TCP/TLS connection, certificate gate), `x509check.zig` (bounds-checked certificate checks, PEM, fingerprints), `pin.zig` (per-server pinned CA files), `watchdog.zig` (deadlines). |
+| `src/net/` | `http.zig` (requests, strict response/Set-Cookie parsing), `client.zig` (connection thread), `tlsconn.zig` (TCP/TLS connection, certificate gate), `x509check.zig` (bounds-checked certificate checks, PEM, fingerprints), `pin.zig` (per-server pinned CA files), `watchdog.zig` (deadlines). |
+| `../shared/` | **Module `shared`** (a path dependency, also used by Portal's server and browser client): `screen.zig` (the 'G'/'I'/'P' frame decoder), `ws.zig` (WebSocket framing), `http.zig` (header syntax, cookie names), `pki/` (DER, certificate reading, PEM, fingerprints), `tls13.zig` (TLS 1.3 record protection). |
 | `src/credstore.zig` | OS credential store: Windows Credential Manager; macOS Keychain and Linux Secret Service (libsecret) via dlopen. |
 
 `portal run`'s local window (Portal's `src/gui.zig`) uses `view` too: it
