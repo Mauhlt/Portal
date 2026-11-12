@@ -14,6 +14,7 @@
 //! or the Windows folder, a terminal leaves it where the user is.
 
 const std = @import("std");
+const w = @import("win32.zig");
 
 /// Set by the release launcher (src/tools/launcher.zig) in its child's
 /// environment, to the launcher's own process id (decimal): the launcher
@@ -40,7 +41,7 @@ pub fn viaLauncher(value: ?[]const u8, parent_pid: ?u32) bool {
 /// the child.
 pub fn takeLauncherFlag(value: ?[]const u8) bool {
     const ok = viaLauncher(value, parentPid());
-    _ = SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral(launcher_env), null);
+    _ = w.SetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral(launcher_env), null);
     return ok;
 }
 
@@ -61,7 +62,6 @@ const PROCESS_BASIC_INFORMATION = extern struct {
     InheritedFromUniqueProcessId: usize,
 };
 extern "ntdll" fn NtQueryInformationProcess(process: *anyopaque, class: u32, info: *anyopaque, len: u32, ret_len: ?*u32) callconv(.winapi) i32;
-extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) i32;
 
 /// The default when --cwd is absent. Null means "inherit Portal's current
 /// directory". A pure function, so the policy is unit-tested.
@@ -171,15 +171,14 @@ test "launcher variable is only trusted from the parent process" {
 
 test "takeLauncherFlag removes the variable from the environment" {
     const name = std.unicode.utf8ToUtf16LeStringLiteral(launcher_env);
-    try testing.expect(SetEnvironmentVariableW(name, std.unicode.utf8ToUtf16LeStringLiteral("1")) != 0);
+    try testing.expect(w.SetEnvironmentVariableW(name, std.unicode.utf8ToUtf16LeStringLiteral("1")) != 0);
     // The test runner's parent is not a launcher with pid 1.
     try testing.expect(!takeLauncherFlag("1"));
     var buf: [16]u16 = undefined;
-    try testing.expectEqual(@as(u32, 0), GetEnvironmentVariableW(name, &buf, buf.len));
+    try testing.expectEqual(@as(u32, 0), w.GetEnvironmentVariableW(name, &buf, buf.len));
     try testing.expect(parentPid() != null);
 }
 
-extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buf: [*]u16, size: u32) callconv(.winapi) u32;
 
 test "pathInside" {
     try testing.expect(pathInside("C:\\a\\b", "C:\\a"));

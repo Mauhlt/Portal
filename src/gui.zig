@@ -89,6 +89,7 @@ pub const Desk = struct {
 pub const Ended = enum { window_closed, child_exited };
 
 const title = @import("title.zig");
+const win32 = @import("win32.zig");
 const windowLabel = title.windowLabel;
 const windowTitle = title.windowTitle;
 const max_project_bytes = title.max_project_bytes;
@@ -316,7 +317,7 @@ pub const LocalHost = struct {
     /// Hides the window (shutdown can take a moment; the user already
     /// asked to close, or the program ended).
     pub fn hide(h: *LocalHost) void {
-        _ = ShowWindow(@ptrCast(h.tv.window.hwnd), 0);
+        _ = win32.ShowWindow(@ptrCast(h.tv.window.hwnd), 0);
     }
 
     fn liveRedraw(ctx: *anyopaque) void {
@@ -795,23 +796,18 @@ pub fn checkListen(text: []const u8) ?[]const u8 {
     return null;
 }
 
-const FILETIME = extern struct { lo: u32, hi: u32 };
-const SYSTEMTIME = extern struct { year: u16, month: u16, dow: u16, day: u16, hour: u16, minute: u16, second: u16, ms: u16 };
-extern "kernel32" fn FileTimeToLocalFileTime(ft: *const FILETIME, local: *FILETIME) callconv(.winapi) i32;
-extern "kernel32" fn FileTimeToSystemTime(ft: *const FILETIME, st: *SYSTEMTIME) callconv(.winapi) i32;
 
 /// Unix time `t` as local "HH:MM" (empty if it can't be converted).
 fn localClock(t: i64, buf: []u8) []const u8 {
     if (t <= 0) return buf[0..0];
     const ticks: u64 = (@as(u64, @intCast(t)) + 11644473600) * 10_000_000;
-    const ft: FILETIME = .{ .lo = @truncate(ticks), .hi = @truncate(ticks >> 32) };
-    var local: FILETIME = undefined;
-    var st: SYSTEMTIME = undefined;
-    if (FileTimeToLocalFileTime(&ft, &local) == 0 or FileTimeToSystemTime(&local, &st) == 0) return buf[0..0];
-    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ st.hour, st.minute }) catch buf[0..0];
+    const ft: win32.FILETIME = .fromU64(ticks);
+    var local: win32.FILETIME = undefined;
+    var st: win32.SYSTEMTIME = undefined;
+    if (win32.FileTimeToLocalFileTime(&ft, &local) == 0 or win32.FileTimeToSystemTime(&local, &st) == 0) return buf[0..0];
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ st.wHour, st.wMinute }) catch buf[0..0];
 }
 
-extern "user32" fn ShowWindow(hwnd: *anyopaque, cmd: i32) callconv(.winapi) i32;
 
 test "selection range normalises drag direction" {
     var s: Select = .{ .anchor = .{ 5, 3 }, .head = .{ 2, 1 }, .active = true };

@@ -149,7 +149,8 @@ pub extern "kernel32" fn CreateProcessW(
     flags: DWORD,
     env: ?*anyopaque,
     cwd: ?[*:0]const u16,
-    si: *STARTUPINFOEXW,
+    /// *STARTUPINFOEXW (with EXTENDED_STARTUPINFO_PRESENT) or *STARTUPINFOW.
+    si: *anyopaque,
     pi: *PROCESS_INFORMATION,
 ) callconv(.winapi) BOOL;
 pub extern "kernel32" fn ResumeThread(h: HANDLE) callconv(.winapi) DWORD;
@@ -206,7 +207,7 @@ pub extern "kernel32" fn FindNextChangeNotification(h: HANDLE) callconv(.winapi)
 pub extern "kernel32" fn FindCloseChangeNotification(h: HANDLE) callconv(.winapi) BOOL;
 
 pub extern "kernel32" fn GetFileSizeEx(h: HANDLE, size: *i64) callconv(.winapi) BOOL;
-pub extern "kernel32" fn MoveFileExW(from: [*:0]const u16, to: [*:0]const u16, flags: DWORD) callconv(.winapi) BOOL;
+pub extern "kernel32" fn MoveFileExW(from: [*:0]const u16, to: ?[*:0]const u16, flags: DWORD) callconv(.winapi) BOOL;
 
 pub const GENERIC_WRITE: DWORD = 0x40000000;
 pub const MOVEFILE_WRITE_THROUGH: DWORD = 0x8;
@@ -245,3 +246,64 @@ comptime {
 }
 
 pub extern "kernel32" fn ReadConsoleInputW(h: HANDLE, buf: [*]INPUT_RECORD, len: DWORD, read: *DWORD) callconv(.winapi) BOOL;
+
+// ------------------------------------------------- process, environment, UI
+// (shared with the panic handler, which must not fail or allocate: these
+// are plain externs) and the release tools (src/tools, via the "win32"
+// module).
+
+pub const GENERIC_READ: DWORD = 0x80000000;
+pub const FILE_FLAG_DELETE_ON_CLOSE: DWORD = 0x04000000;
+pub const SYNCHRONIZE: DWORD = 0x00100000;
+pub const CTRL_C_EVENT: DWORD = 0;
+pub const CTRL_BREAK_EVENT: DWORD = 1;
+pub const ATTACH_PARENT_PROCESS: DWORD = 0xFFFFFFFF;
+
+pub const SYSTEMTIME = extern struct {
+    wYear: u16,
+    wMonth: u16,
+    wDayOfWeek: u16,
+    wDay: u16,
+    wHour: u16,
+    wMinute: u16,
+    wSecond: u16,
+    wMilliseconds: u16,
+};
+
+pub const FILETIME = extern struct {
+    dwLowDateTime: DWORD,
+    dwHighDateTime: DWORD,
+
+    pub fn fromU64(v: u64) FILETIME {
+        return .{ .dwLowDateTime = @truncate(v), .dwHighDateTime = @truncate(v >> 32) };
+    }
+
+    pub fn toU64(ft: FILETIME) u64 {
+        return (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    }
+};
+
+pub const HandlerRoutine = *const fn (ctrl_type: DWORD) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) DWORD;
+pub extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) DWORD;
+pub extern "kernel32" fn OpenProcess(access: DWORD, inherit: BOOL, pid: DWORD) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+pub extern "kernel32" fn GetModuleFileNameW(module: ?*anyopaque, buf: [*]u16, size: DWORD) callconv(.winapi) DWORD;
+pub extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]u16;
+pub extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buf: ?[*]u16, size: DWORD) callconv(.winapi) DWORD;
+pub extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) BOOL;
+pub extern "kernel32" fn AttachConsole(pid: DWORD) callconv(.winapi) BOOL;
+pub extern "kernel32" fn SetConsoleCtrlHandler(handler: ?HandlerRoutine, add: BOOL) callconv(.winapi) BOOL;
+pub extern "kernel32" fn CreateEventW(sa: ?*anyopaque, manual: BOOL, initial: BOOL, name: ?[*:0]const u16) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn SetEvent(h: HANDLE) callconv(.winapi) BOOL;
+pub extern "kernel32" fn ResetEvent(h: HANDLE) callconv(.winapi) BOOL;
+/// Only the panic handler (parking other panicking threads) and
+/// portal-show use it; Portal's loops wait on events instead.
+pub extern "kernel32" fn Sleep(ms: DWORD) callconv(.winapi) void;
+pub extern "kernel32" fn GetSystemTime(t: *SYSTEMTIME) callconv(.winapi) void;
+pub extern "kernel32" fn GetSystemTimeAsFileTime(ft: *FILETIME) callconv(.winapi) void;
+pub extern "kernel32" fn FileTimeToLocalFileTime(ft: *const FILETIME, local: *FILETIME) callconv(.winapi) BOOL;
+pub extern "kernel32" fn FileTimeToSystemTime(ft: *const FILETIME, st: *SYSTEMTIME) callconv(.winapi) BOOL;
+pub extern "user32" fn MessageBoxW(hwnd: ?*anyopaque, text: [*:0]const u16, caption: [*:0]const u16, flags: u32) callconv(.winapi) i32;
+pub extern "user32" fn ShowWindow(hwnd: *anyopaque, cmd: i32) callconv(.winapi) i32;

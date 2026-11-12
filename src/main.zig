@@ -265,7 +265,7 @@ fn guiMain(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     }
     if (std.mem.eql(u8, cmd, "show")) {
         // Old habit inside a session: run it on the session's console.
-        if (AttachConsole(ATTACH_PARENT_PROCESS) != 0) std.process.exit(@import("show.zig").main(gpa, io, args[1..]));
+        if (w.AttachConsole(w.ATTACH_PARENT_PROCESS) != 0) std.process.exit(@import("show.zig").main(gpa, io, args[1..]));
         fatal("`show` runs inside a session: use portal-show <file.png>.", .{});
     }
     if (std.mem.eql(u8, cmd, "version")) {
@@ -285,8 +285,6 @@ fn guiMain(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     w.ExitProcess(2);
 }
 
-const ATTACH_PARENT_PROCESS: w.DWORD = 0xFFFFFFFF;
-extern "kernel32" fn AttachConsole(pid: w.DWORD) callconv(.winapi) w.BOOL;
 
 /// An information box (the GUI program's stdout).
 fn messageBox(text: []const u8) void {
@@ -297,7 +295,7 @@ fn showBox(text: []const u8, flags: u32) void {
     var wbuf: [2049:0]u16 = undefined;
     const n = std.unicode.utf8ToUtf16Le(wbuf[0..2048], text[0..@min(text.len, 2048)]) catch 0;
     wbuf[n] = 0;
-    _ = MessageBoxW(null, &wbuf, std.unicode.utf8ToUtf16LeStringLiteral("Portal"), flags);
+    _ = w.MessageBoxW(null, &wbuf, std.unicode.utf8ToUtf16LeStringLiteral("Portal"), flags);
 }
 
 fn printUsage() void {
@@ -325,7 +323,6 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     w.ExitProcess(1);
 }
 
-extern "user32" fn MessageBoxW(hwnd: ?*anyopaque, text: [*:0]const u16, caption: [*:0]const u16, flags: u32) callconv(.winapi) i32;
 
 // ------------------------------------------------------------- data paths
 
@@ -352,13 +349,6 @@ fn openLog(gpa: Allocator, paths: devices.Paths, io: Io) ?Log {
 
 // ---------------------------------------------------------------- devices
 
-const SYNCHRONIZE: w.DWORD = 0x00100000;
-extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) w.DWORD;
-extern "kernel32" fn OpenProcess(access: w.DWORD, inherit: w.BOOL, pid: w.DWORD) callconv(.winapi) ?w.HANDLE;
-extern "kernel32" fn CreateEventW(sa: ?*anyopaque, manual: w.BOOL, initial: w.BOOL, name: ?[*:0]const u16) callconv(.winapi) ?w.HANDLE;
-extern "kernel32" fn SetEvent(h: w.HANDLE) callconv(.winapi) w.BOOL;
-extern "kernel32" fn ResetEvent(h: w.HANDLE) callconv(.winapi) w.BOOL;
-extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (w.DWORD) callconv(.winapi) w.BOOL, add: w.BOOL) callconv(.winapi) w.BOOL;
 
 /// SHA-256 of the Portal CA, if one exists yet (never creates one).
 fn caFingerprint(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, out: *[95]u8) ?[]const u8 {
@@ -404,14 +394,14 @@ const ConsoleLines = struct {
             c.len = len;
             n = 0;
             c.ready.store(true, .release);
-            _ = SetEvent(c.ready_ev);
+            _ = w.SetEvent(c.ready_ev);
             _ = w.WaitForSingleObject(c.taken_ev, w.INFINITE);
         }
     }
 
     fn finish(c: *ConsoleLines) void {
         c.eof.store(true, .release);
-        _ = SetEvent(c.ready_ev);
+        _ = w.SetEvent(c.ready_ev);
     }
 
     /// The next typed line, if one is waiting (copied into `out`).
@@ -420,8 +410,8 @@ const ConsoleLines = struct {
         const n = @min(c.len, out.len);
         @memcpy(out[0..n], c.buf[0..n]);
         c.ready.store(false, .release);
-        _ = ResetEvent(c.ready_ev);
-        _ = SetEvent(c.taken_ev);
+        _ = w.ResetEvent(c.ready_ev);
+        _ = w.SetEvent(c.taken_ev);
         return out[0..n];
     }
 };
@@ -487,7 +477,7 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     var nonce_bytes: [8]u8 = undefined;
     io.randomSecure(&nonce_bytes) catch fatal("no entropy", .{});
     const nonce = std.mem.readInt(u64, &nonce_bytes, .little) | 1;
-    const pid = GetCurrentProcessId();
+    const pid = w.GetCurrentProcessId();
 
     // Watch before opening the window, so no change is missed.
     var dw = devices.watchStore(gpa, paths) catch |err|
@@ -507,7 +497,7 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
         @memcpy(replaced_buf[0..t.len], t.get());
     }
     pair_cleanup = .{ .gpa = gpa, .io = io, .paths = paths, .nonce = nonce };
-    _ = SetConsoleCtrlHandler(&pairCtrlHandler, 1);
+    _ = w.SetConsoleCtrlHandler(&pairCtrlHandler, 1);
     pairLog(gpa, paths, io, "pairing window opened for '{s}' ({d} min); requests need approval at the desk", .{ name, minutes });
 
     if (replaced_len > 0) std.debug.print("(Replaced the open pairing window for '{s}'.)\n", .{replaced_buf[0..replaced_len]});
@@ -540,8 +530,8 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     , .{});
 
     var lines: ConsoleLines = .{
-        .ready_ev = CreateEventW(null, 1, 0, null) orelse fatal("cannot create an event", .{}),
-        .taken_ev = CreateEventW(null, 0, 0, null) orelse fatal("cannot create an event", .{}),
+        .ready_ev = w.CreateEventW(null, 1, 0, null) orelse fatal("cannot create an event", .{}),
+        .taken_ev = w.CreateEventW(null, 0, 0, null) orelse fatal("cannot create an event", .{}),
     };
     const reader = std.Thread.spawn(.{}, ConsoleLines.reader, .{&lines}) catch fatal("cannot start the input thread", .{});
     reader.detach();
@@ -1089,7 +1079,7 @@ const PairWatch = struct {
                 if (p.nonce != proc_nonce) {
                     if (proc_h) |h| _ = w.CloseHandle(h);
                     proc_nonce = p.nonce;
-                    proc_h = OpenProcess(SYNCHRONIZE, 0, p.pid);
+                    proc_h = w.OpenProcess(w.SYNCHRONIZE, 0, p.pid);
                     if (proc_h == null) {
                         gone_nonce = p.nonce;
                         pw.srv.pairingProcessGone(p.nonce);
@@ -1619,7 +1609,7 @@ fn childCwd(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, data_di
             // launcher, the current directory is Portal's own folder (or
             // System32); from a terminal it is the terminal's.
             var exe_buf: [32768]u16 = undefined;
-            const n = GetModuleFileNameW(null, &exe_buf, exe_buf.len);
+            const n = w.GetModuleFileNameW(null, &exe_buf, exe_buf.len);
             const exe_path: ?[]u8 = if (n > 0 and n < exe_buf.len) std.unicode.wtf16LeToWtf8Alloc(gpa, exe_buf[0..n]) catch null else null;
             defer if (exe_path) |p| gpa.free(p);
             const exe_dir: ?[]const u8 = if (exe_path) |p| std.fs.path.dirname(p) else null;
@@ -1637,9 +1627,6 @@ fn childCwd(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, data_di
     return std.unicode.wtf8ToWtf16LeAllocZ(gpa, chosen) catch fatal("bad directory name '{s}'", .{chosen});
 }
 
-extern "kernel32" fn GetModuleFileNameW(module: ?*anyopaque, buf: [*]u16, size: w.DWORD) callconv(.winapi) w.DWORD;
-extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buf: ?[*]u16, size: w.DWORD) callconv(.winapi) w.DWORD;
-extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) w.BOOL;
 
 /// Puts the folder of this exe first on PATH in Portal's own environment,
 /// which the session inherits (conpty.zig passes no environment block), so
@@ -1647,20 +1634,20 @@ extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]
 /// inside the session. Only this process and its children see the change.
 fn prependOwnDirToPath(gpa: Allocator) void {
     var exe_buf: [32768]u16 = undefined;
-    const n = GetModuleFileNameW(null, &exe_buf, exe_buf.len);
+    const n = w.GetModuleFileNameW(null, &exe_buf, exe_buf.len);
     if (n == 0 or n >= exe_buf.len) return;
     var end: usize = n;
     while (end > 0 and exe_buf[end - 1] != '\\' and exe_buf[end - 1] != '/') end -= 1;
     if (end <= 1) return;
     const dir = exe_buf[0 .. end - 1];
     const name = std.unicode.utf8ToUtf16LeStringLiteral("PATH");
-    const old_len = GetEnvironmentVariableW(name, null, 0);
+    const old_len = w.GetEnvironmentVariableW(name, null, 0);
     const old = gpa.alloc(u16, old_len + 1) catch return;
     defer gpa.free(old);
-    const got: usize = if (old_len == 0) 0 else GetEnvironmentVariableW(name, old.ptr, @intCast(old.len));
+    const got: usize = if (old_len == 0) 0 else w.GetEnvironmentVariableW(name, old.ptr, @intCast(old.len));
     const new = std.mem.concatWithSentinel(gpa, u16, &.{ dir, &[_]u16{';'}, old[0..@min(got, old.len)] }, 0) catch return;
     defer gpa.free(new);
-    _ = SetEnvironmentVariableW(name, new.ptr);
+    _ = w.SetEnvironmentVariableW(name, new.ptr);
 }
 
 fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {

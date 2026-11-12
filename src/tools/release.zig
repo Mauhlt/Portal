@@ -38,7 +38,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const lib = @import("releases_lib.zig");
-const w = @import("win32_tools.zig");
+const w = @import("win32");
 
 const usage =
     \\portal-release - build, test and promote Portal releases
@@ -186,18 +186,20 @@ fn readPointerRaw(ctx: Ctx, name: []const u8) lib.PointerRead {
 }
 
 /// Holds `<releases>\release.lock` open with no sharing (and delete-on-
-/// close) until the process exits, so two `release` runs cannot share
-/// _staging or race on the pointers. Fails the release if another holds it.
-fn lockReleases(ctx: Ctx) void {
-    const p = ctx.path(lib.lock_file) catch failRelease("out of memory", .{});
+/// close) until the process exits, so two commands that change the
+/// pointers (`release`, `mark-good`, `rollback`) cannot share _staging or
+/// race on current.txt / known-good.txt. Fails command `cmd` if another
+/// holds it; nothing has been changed then.
+fn lockReleases(ctx: Ctx, cmd: []const u8) void {
+    const p = ctx.path(lib.lock_file) catch fatal(cmd, "out of memory", .{});
     defer ctx.gpa.free(p);
-    const p_w = std.unicode.wtf8ToWtf16LeAllocZ(ctx.gpa, p) catch failRelease("out of memory", .{});
+    const p_w = std.unicode.wtf8ToWtf16LeAllocZ(ctx.gpa, p) catch fatal(cmd, "out of memory", .{});
     defer ctx.gpa.free(p_w);
-    const h = w.CreateFileW(p_w.ptr, w.GENERIC_READ | w.GENERIC_WRITE, 0, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL | w.FILE_FLAG_DELETE_ON_CLOSE, null);
-    if (@intFromPtr(h) == w.INVALID_HANDLE_VALUE) {
+    const h = w.validHandle(w.CreateFileW(p_w.ptr, w.GENERIC_READ | w.GENERIC_WRITE, 0, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL | w.FILE_FLAG_DELETE_ON_CLOSE, null));
+    if (h == null) {
         const e = w.GetLastError();
-        if (e == 32) failRelease("another `portal-release release` is running ({s} is in use)", .{p});
-        failRelease("cannot create lock file {s} (error {d})", .{ p, e });
+        if (e == 32) fatal(cmd, "another portal-release command (release, mark-good or rollback) is running ({s} is in use); nothing was changed", .{p});
+        fatal(cmd, "cannot create lock file {s} (error {d}); nothing was changed", .{ p, e });
     }
     // Never closed: the handle (and lock) lasts until the process exits.
 }
@@ -369,7 +371,7 @@ const Now = struct {
 fn cmdRelease(ctx: Ctx, zig_arg: ?[]const u8, repo_arg: ?[]const u8) !void {
     const gpa = ctx.gpa;
     const io = ctx.io;
-    lockReleases(ctx);
+    lockReleases(ctx, "release");
 
     const repo = Io.Dir.cwd().realPathFileAlloc(io, repo_arg orelse ".", gpa) catch |err|
         failRelease("cannot resolve repo directory '{s}': {t}", .{ repo_arg orelse ".", err });
@@ -731,6 +733,7 @@ fn pruneInner(ctx: Ctx, current: []const u8, known_good: ?[]const u8) !void {
 }
 
 fn cmdMarkGood(ctx: Ctx) !void {
+    lockReleases(ctx, "mark-good");
     const cur = readPointer(ctx, lib.current_file) orelse fatal("mark-good", "no valid current release.", .{});
     defer ctx.gpa.free(cur);
     const exe = try releaseExe(ctx, cur);
@@ -742,6 +745,7 @@ fn cmdMarkGood(ctx: Ctx) !void {
 }
 
 fn cmdRollback(ctx: Ctx) !void {
+    lockReleases(ctx, "rollback");
     const kg = readPointer(ctx, lib.known_good_file) orelse
         fatal("rollback", "no known-good release recorded (run `zig build mark-good` on a working release).", .{});
     defer ctx.gpa.free(kg);

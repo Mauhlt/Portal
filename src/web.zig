@@ -62,8 +62,8 @@ const sync_manifest = @import("client").sync.manifest;
 const sync_keypin = @import("client").sync.keypin;
 const keymap = @import("keymap.zig");
 const title = @import("title.zig");
+const win32 = @import("win32.zig");
 
-extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 
 const index_html = @embedFile("web/index.html");
 const pair_html = @embedFile("web/pair.html");
@@ -589,7 +589,7 @@ pub const Server = struct {
         var b: [8]u8 = undefined;
         try srv.io.randomSecure(&b);
         const nonce = std.mem.readInt(u64, &b, .little) | 1;
-        _ = try srv.desk().begin(name, window_s, nonce, GetCurrentProcessId());
+        _ = try srv.desk().begin(name, window_s, nonce, win32.GetCurrentProcessId());
         srv.log.print("pairing window opened for '{s}' ({d} s) from the Portal window", .{ name, window_s });
         srv.refreshPairing();
         return nonce;
