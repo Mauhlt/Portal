@@ -1,0 +1,77 @@
+# Portal sync: signed package delivery from the desktop to devices
+
+**Owner decision (2026-11-12):** test builds and updates (e.g. the speech
+model's NPU backend for the Snapdragon laptop) reach devices through Portal
+sync, with directories laid out so nothing clashes.
+
+This channel delivers code to the laptop, so it is security-critical.
+Treat every rule below as a hard requirement.
+
+## Trust
+
+* **A dedicated release-signing key** (Ed25519) lives on the desktop. It is
+  separate from the TLS CA key and DPAPI-protected like it.
+* **Pinned at pairing.** The device learns the release public key once,
+  through the already-authenticated paired TLS channel, and pins it per
+  server.
+* **Signed manifest.** Every package version has one, covering: package id,
+  version, a list of files {relative path, size, SHA-256}, the kind
+  (`data` | `executable`), the minimum client version and the creation
+  time. Devices verify the signature, then every file's hash and size,
+  before anything is installed.
+* **Unsigned or mismatched → rejected and logged.** A compromised web layer
+  or network can't push code without the release key.
+* **Approval on the device:**
+  * `data` packages (model weights, trained adapter) install automatically;
+  * `executable` packages require approval in the device's Portal app
+    (package, version, publisher-key fingerprint, size), every new version.
+  * Nothing is ever executed automatically, and nothing ever runs from
+    staging.
+
+## Directory layout on the device
+
+```
+%LOCALAPPDATA%\Portal\sync\
+  staging\<random>\                download + verify area (deleted after)
+  packages\<package>\<version>\    verified, read-only, immutable
+  current\<package>.txt            atomic pointer (temp + MoveFileEx)
+  previous\<package>.txt           last good version, for rollback
+  data\<package>\                  the package's own writable state
+```
+
+* **Package ids** are a fixed namespace: `portal-client`, `stt-local`,
+  `stt-model`, `stt-adapter`, `stt-npu-test`, … (`[a-z0-9-]{1,32}`).
+* **No shared folders.** A package can write only to `data\<package>\`, and
+  nothing writes into `packages\`.
+* **Versions** are validated (`[0-9A-Za-z.+-]{1,64}`, no `..`). Paths inside
+  a manifest are relative, normalised, and must stay inside the version
+  folder: no `..`, no drive letters, no ADS (`:`), no reserved device names.
+* **Running programs are never overwritten.** A new version is a new
+  folder. Pruning keeps current, previous and any version still in use.
+* **Quotas:** per-package size caps and total sync cap.
+
+## Desktop side
+
+* `portalctl publish <package> <folder> [--kind data|executable]` hashes the
+  files, signs the manifest and stores the version under
+  `%LOCALAPPDATA%\Portal\publish\<package>\<version>\`.
+* **Device subscription:** the owner chooses per device which packages it
+  receives (e.g. `stt-npu-test` only to the laptop).
+* **Event-driven delivery:** an `{"t":"updates", ...}` message on the
+  existing WebSocket announces new versions to subscribed devices. Devices
+  fetch `GET /sync/pkg/<package>/<version>/manifest` and files over HTTPS
+  with the session, with explicit size limits. Nothing polls.
+
+## The other direction
+
+Device → desktop data (speech samples and corrections) uses the bundle
+endpoints in `docs/stt-sync-contract.md`.
+
+## Tests required
+
+* Signature and hash verification, plus every rejection path: bad signature,
+  wrong key, hash mismatch, path traversal, oversize, downgrade.
+* Atomic install and rollback.
+* Executable approval.
+* Never overwriting a running exe.
+* Privacy scan.
