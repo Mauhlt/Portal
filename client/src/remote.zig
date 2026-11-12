@@ -170,10 +170,15 @@ pub const RemoteSink = struct {
 
     fn onButton(ctx: *anyopaque, id: u32) void {
         const r: *RemoteSink = @ptrCast(@alignCast(ctx));
+        // The top bar's tabs first: the sync panels claim every id from
+        // theirs up (connect.zig), and a tab click is never theirs.
+        if (id >= tab_id0 and id < tab_id0 + r.n_tabs) {
+            if (r.modalActive() == null) r.client.selectTab(r.tab_ids[id - tab_id0]);
+            return;
+        }
         if (r.modal) |m| if (m.button(m.ctx, id)) return;
         if (id == pair_button_id) r.client.requestPairing();
         if (id == cancel_button_id) r.client.cancelPairing();
-        if (id >= tab_id0 and id < tab_id0 + r.n_tabs) r.client.selectTab(r.tab_ids[id - tab_id0]);
     }
 
     fn onResized(_: *anyopaque, _: u32, _: u32, _: u16, _: u16) void {
