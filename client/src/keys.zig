@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const rules = @import("inputrules");
-const input = @import("view").input;
+const input = @import("portal_ui").input;
 pub const Policy = rules.Policy;
 pub const Key = input.Key;
 pub const Mods = input.Mods;
@@ -126,7 +126,7 @@ test "answer buttons: the shared list, accepted in every mode with input" {
     try testing.expectEqualStrings("k:enter", answerFrame(.text, "enter", &b).?);
     try testing.expect(answerFrame(.keys, "rm -rf", &b) == null);
     try testing.expect(answerFrame(.text, "backspace", &b) == null);
-    // TermView draws view.input.answers: the same buttons as the browser.
+    // The UI draws input.answers: the same buttons as the browser.
     try testing.expectEqual(rules.answer_buttons.len, input.answers.len);
     for (rules.answer_buttons, input.answers) |r, v| {
         try testing.expectEqualStrings(r.label, v.label);

@@ -1,24 +1,32 @@
 //! portal-client build.
 //!
 //!   zig build                         debug build of portal-client
-//!   zig build test                    unit tests (view module + client), plus
+//!   zig build test                    unit tests (portal_ui, view, client), plus
 //!                                     compile checks of the exe in Debug and
 //!                                     ReleaseSafe
 //!   zig build -Dtarget=x86_64-linux-gnu   cross-compile (no SDK needed: Wayland,
 //!   zig build -Dtarget=aarch64-macos      AppKit, Vulkan are loaded at runtime;
 //!                                         `test` compile-checks both too)
 //!
-//! Module layout (for merging into Portal's root build later):
-//!   "view"   src/view/root.zig   window, Vulkan drawing, fonts, input types.
-//!                                No networking; imports the Renderer's
-//!                                "Renderer" and "Font" modules and imgdec.
+//! Module layout (as in Portal's root build):
+//!   "portal_ui"   ../ui/root.zig  the shared Portal UI (layout, draw list,
+//!                                shell, panels; colours from the theme in
+//!                                ../shared/theme.zig). A plain module made
+//!                                here from Portal's tree (like inputrules),
+//!                                so it shares this compilation's "Font",
+//!                                "shared", "inputrules" and "datafeed".
+//!   "view"   src/view/root.zig   the window and Vulkan drawing of the UI's
+//!                                draw list. No networking; imports the
+//!                                Renderer's "Renderer", "Window" and "Font"
+//!                                modules, imgdec and portal_ui.
 //!   client   src/main.zig        pairing, refresh, WebSocket, 'G' decoding.
 //!   "inputrules"  ../src/inputrules/root.zig   the input policy, key names
 //!                                and input line, shared with Portal's server
 //!                                and browser client (Portal's own source
 //!                                tree: this build lives inside it).
 //!   "datafeed"    ../src/datafeed/root.zig     the Data slice's model,
-//!                                shared with the browser client.
+//!                                shared with the browser client (used by
+//!                                portal_ui).
 //!   "shared" ../shared/root.zig  protocol code shared with Portal's server
 //!                                and browser client (a path dependency).
 const std = @import("std");
@@ -35,20 +43,16 @@ pub fn build(b: *std.Build) void {
     run.addPassthruArgs();
     b.step("run", "Run portal-client").dependOn(&run.step);
 
-    const view = viewModule(b, target, optimize);
-    const view_tests = b.addTest(.{ .root_module = view });
+    const mods = modules(b, target, optimize);
+    const view_tests = b.addTest(.{ .root_module = mods.view });
     const client_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "view", .module = view },
-            .{ .name = "shared", .module = sharedModule(b, target, optimize) },
-            .{ .name = "inputrules", .module = inputrulesModule(b, target, optimize) },
-            .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
-        },
+        .imports = mods.clientImports(),
     }) });
     const test_step = b.step("test", "Run unit tests and compile-check the executables");
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.ui })).step);
     test_step.dependOn(&b.addRunArtifact(view_tests).step);
     test_step.dependOn(&b.addRunArtifact(client_tests).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sharedModule(b, target, optimize) })).step);
@@ -74,9 +78,44 @@ pub fn sharedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     return b.dependency("shared", .{ .target = target, .optimize = optimize }).module("shared");
 }
 
-/// The reusable view module (src/view), wired to the Renderer package.
-pub fn viewModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+/// One compilation's modules: each created once, so every user shares the
+/// same instance (a source file may belong to only one module).
+pub const Modules = struct {
+    view: *std.Build.Module,
+    ui: *std.Build.Module,
+    shared: *std.Build.Module,
+    inputrules: *std.Build.Module,
+    imports: [4]std.Build.Module.Import = undefined,
+
+    /// The client's imports (src/main.zig, src/tests.zig).
+    pub fn clientImports(m: *Modules) []const std.Build.Module.Import {
+        m.imports = .{
+            .{ .name = "view", .module = m.view },
+            .{ .name = "portal_ui", .module = m.ui },
+            .{ .name = "shared", .module = m.shared },
+            .{ .name = "inputrules", .module = m.inputrules },
+        };
+        return &m.imports;
+    }
+};
+
+/// The view module (src/view) and the shared UI (../ui), wired to the
+/// Renderer package.
+pub fn modules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *Modules {
     const renderer = b.dependency("Renderer", .{ .target = target, .optimize = optimize, .demo = false });
+    const shared = sharedModule(b, target, optimize);
+    const inputrules = inputrulesModule(b, target, optimize);
+    const ui = b.createModule(.{
+        .root_source_file = b.path("../ui/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "Font", .module = renderer.module("Font") },
+            .{ .name = "shared", .module = shared },
+            .{ .name = "inputrules", .module = inputrules },
+            .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
+        },
+    });
     // Inline images: imgcheck + imgdec (src/image) on the owner's Image
     // package (see build.zig.zon), as in Portal's root build.
     // Same args as Renderer's, so both share Image's and Renderer's ../Vulkan module.
@@ -96,7 +135,7 @@ pub fn viewModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
             .{ .name = "imgcheck", .module = imgcheck },
         },
     });
-    return b.createModule(.{
+    const view = b.createModule(.{
         .root_source_file = b.path("src/view/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -111,9 +150,12 @@ pub fn viewModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
             // Fonts and cell widths: the Renderer's Font module.
             .{ .name = "Font", .module = renderer.module("Font") },
             .{ .name = "imgdec", .module = imgdec },
-            .{ .name = "shared", .module = sharedModule(b, target, optimize) },
+            .{ .name = "portal_ui", .module = ui },
         },
     });
+    const m = b.allocator.create(Modules) catch @panic("OOM");
+    m.* = .{ .view = view, .ui = ui, .shared = shared, .inputrules = inputrules };
+    return m;
 }
 
 /// The input policy and input line, shared with Portal's server and
@@ -131,16 +173,12 @@ pub fn datafeedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize:
 }
 
 fn addClient(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const mods = modules(b, target, optimize);
     return b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = target.result.os.tag != .windows, // libsecret / Security.framework via dlopen
-        .imports = &.{
-            .{ .name = "view", .module = viewModule(b, target, optimize) },
-            .{ .name = "shared", .module = sharedModule(b, target, optimize) },
-            .{ .name = "inputrules", .module = inputrulesModule(b, target, optimize) },
-            .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
-        },
+        .imports = mods.clientImports(),
     }) });
 }

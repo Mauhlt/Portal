@@ -49,7 +49,8 @@ const tabs_wire = @import("shared").tabs;
 const tlsconn = @import("tlsconn.zig");
 const x509check = @import("x509check.zig");
 const watchdog = @import("watchdog.zig");
-const Grid = @import("view").grid.Grid;
+const ui = @import("portal_ui");
+const Grid = ui.grid.Grid;
 const gframe = @import("../gframe.zig");
 const keys = @import("../keys.zig");
 const credstore = @import("../credstore.zig");
@@ -109,11 +110,30 @@ pub fn classify(err: anyerror) Reach {
     };
 }
 
-/// The user-facing sentences for the session-ended and offline states.
-pub fn endedText(code: i64, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Session ended on the desktop (exit code {d})", .{code}) catch "Session ended on the desktop";
+/// The user-facing sentences for the session-ended and offline states
+/// (the shared UI's, which shows them too).
+pub const endedText = ui.shell.endedText;
+pub const offline_text = ui.shell.offline_text;
+
+/// Errors that mean "this is not the Portal we trust" (or not Portal's
+/// TLS at all), as opposed to the network being down.
+pub fn isTrustError(err: anyerror) bool {
+    const list = [_]anyerror{
+        error.NotIssuedByPinnedCa,    error.HostMismatch,          error.CertificateExpired,
+        error.CertificateNotYetValid, error.CaExpired,             error.BadCertificate,
+        error.UnsupportedCertificate, error.NotTls13,              error.UnsupportedCipherSuite,
+        error.HelloRetryRequest,      error.TlsHandshakeMalformed, error.TlsUnexpectedMessage,
+        error.TlsDecodeError,         error.TlsAlert,              error.TlsConnectionTruncated,
+        error.NoServerCertificate,
+    };
+    for (list) |e| if (e == err) return true;
+    return false;
 }
-pub const offline_text = "Desktop offline \u{2014} reconnects automatically";
+
+test "trust errors" {
+    try std.testing.expect(isTrustError(error.HostMismatch));
+    try std.testing.expect(!isTrustError(error.TimedOut));
+}
 
 pub const Shared = struct {
     mutex: Io.Mutex = .init,

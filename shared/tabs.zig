@@ -19,6 +19,7 @@
 //! more than `max_tabs` entries is rejected as a whole.
 
 const std = @import("std");
+const theme = @import("theme.zig");
 
 pub const id_len = 16;
 pub const Id = [id_len]u8;
@@ -90,31 +91,13 @@ fn hexDigit(c: u8) ?u8 {
 
 // --------------------------------------------------------------- colours
 
-/// The palette names are hashed into: distinct, readable on a dark bar
-/// and under white text.
-pub const palette = [_]u32{
-    0x3B82F6, // blue
-    0x10B981, // green
-    0xF59E0B, // amber
-    0xEF4444, // red
-    0x8B5CF6, // violet
-    0x06B6D4, // cyan
-    0xEC4899, // pink
-    0x84CC16, // lime
-    0xF97316, // orange
-    0x14B8A6, // teal
-};
+/// The colours project names are hashed into: the theme's accent set (theme.zig,
+/// the one place Portal's colours are defined).
+pub const palette = theme.accents;
 
 /// A stable colour for a project name (FNV-1a over the bytes, ignoring
 /// ASCII case, into `palette`).
-pub fn colorFromName(name: []const u8) u32 {
-    var h: u32 = 0x811C9DC5;
-    for (name) |c| {
-        h ^= std.ascii.toLower(c);
-        h *%= 0x01000193;
-    }
-    return palette[h % palette.len];
-}
+pub const colorFromName = theme.tabColor;
 
 /// "#rrggbb" (either case) as 0xRRGGBB, or null.
 pub fn parseColor(text: []const u8) ?u32 {

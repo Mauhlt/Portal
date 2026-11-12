@@ -4,13 +4,13 @@
 //! Decoding is shared/screen.zig, the same decoder the browser uses: it
 //! validates a whole frame before anything here touches the grid, so a
 //! malformed frame changes nothing and returns an error. This file only
-//! writes what the decoder yields into view's Grid.
+//! writes what the decoder yields into the UI's Grid.
 
 const std = @import("std");
-const view = @import("view");
+const ui = @import("portal_ui");
 const screen = @import("shared").screen;
-const wcwidth = view.wcwidth;
-const grid_mod = view.grid;
+const wcwidth = @import("view").wcwidth;
+const grid_mod = ui.grid;
 const Grid = grid_mod.Grid;
 const Cell = grid_mod.Cell;
 const Attrs = grid_mod.Attrs;

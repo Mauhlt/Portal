@@ -8,7 +8,7 @@
 //! Session.writeInput.
 
 const std = @import("std");
-const input = @import("view").input;
+const input = @import("portal_ui").input;
 const Key = input.Key;
 const Mods = input.Mods;
 

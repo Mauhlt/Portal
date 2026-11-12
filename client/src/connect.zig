@@ -1,7 +1,14 @@
 //! The remote viewer: `portal connect` (in the Portal window's executable,
 //! a GUI program with no console) and the standalone `portal-client` both
-//! run `main` below. Module "client" in Portal's root build; imports only
-//! std and "view".
+//! run `main` below. Module "client" in Portal's root build; imports std,
+//! "view" (the window), "portal_ui" (the shared UI), "shared" and
+//! "inputrules".
+//!
+//! This file is the device glue: it binds the shared UI's shell
+//! (portal_ui.Shell, device `.viewer`) to the network client (net/) and the
+//! sync worker: each frame it hands the shell the connection's state and the
+//! sync panels; what the shell's input means comes back through `Host`
+//! (keys.zig turns keys into protocol frames per the desktop's input mode).
 //!
 //!   connect                                             the last server, or
 //!                                                       the first-run screen
@@ -24,19 +31,21 @@
 
 const std = @import("std");
 const view = @import("view");
-const TermView = view.TermView;
+const Presenter = view.Presenter;
+const ui = @import("portal_ui");
+const shell_mod = ui.shell;
+const keys = @import("keys.zig");
 const client_mod = @import("net/client.zig");
 const credstore = @import("credstore.zig");
-const remote = @import("remote.zig");
 const http = @import("net/http.zig");
 const pin_mod = @import("net/pin.zig");
 const x509check = @import("net/x509check.zig");
-const setup_mod = @import("setup.zig");
+const setup_mod = ui.panels.setup;
 /// Portal sync (device side, and the manifest format the desktop shares).
 pub const sync = @import("sync/root.zig");
 /// The input line and the Data slice, shared with the desk's window.
-pub const inputline = @import("inputline.zig");
-pub const dataview = @import("dataview.zig");
+pub const inputline = ui.inputline;
+pub const dataview = ui.dataview;
 // For portalctl's headless sync-device (src/sync_cli.zig).
 pub const net_client = client_mod;
 pub const net_http = http;
@@ -107,25 +116,29 @@ fn fatal(prog: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 const Host = struct {
-    tv: *TermView,
+    p: *Presenter,
     shared: *client_mod.Shared,
     client: *client_mod.Client,
-    sink: remote.RemoteSink,
+    shell: ui.Shell = undefined,
     drawn_version: u64 = std.math.maxInt(u64),
     /// The last {"t":"rejected"} handed to the instruction line.
     seen_rejected: u64 = 0,
-    title_status: ?client_mod.Status = null,
     /// The title as last set ("Portal — <project> — <status>").
     title_buf: [160]u8 = undefined,
     title_len: usize = 0,
     /// Copies of the tab list for this frame (built outside the lock's
     /// writers: the network thread replaces Shared.tabs).
     tabs: client_mod.TabList = .{},
-    bufs: remote.Bufs = .{},
     pin_fp_buf: [95]u8 = undefined,
     pin_fp_len: usize = 0,
     sync: *SyncState,
     sync_bufs: sync.ui.Ui.Bufs = .{},
+
+    fn uiStatus(st: client_mod.Status) shell_mod.Status {
+        return switch (st) {
+            inline else => |t| @field(shell_mod.Status, @tagName(t)),
+        };
+    }
 
     /// Snapshot status under the lock, build the frame, then present.
     fn frame(h: *Host) void {
@@ -134,74 +147,129 @@ const Host = struct {
         var detail_buf: [160]u8 = undefined;
         s.mutex.lockUncancelable(h.client.io);
         const st = s.status;
-        const mode = s.mode;
         const detail = detail_buf[0..s.detail_len];
         @memcpy(detail, s.detail());
         if (s.rejected_gen != h.seen_rejected) {
             h.seen_rejected = s.rejected_gen;
-            h.sink.rejected(s.rejected_buf[0..s.rejected_len]);
+            h.shell.rejected(s.rejected_buf[0..s.rejected_len]);
         }
         // The Data slice: new blobs from the terminal.
-        _ = h.sink.data.sync(h.client.gpa, &s.grid.images);
+        _ = h.shell.data.sync(h.client.gpa, &s.grid.images);
         // The tabs: what the top bar draws and what its clicks mean.
         h.tabs = s.tabs;
-        const current = s.current;
-        h.sink.n_tabs = h.tabs.len;
-        h.sink.shown = null;
-        for (h.tabs.slice(), 0..) |e, i| {
-            h.sink.tab_ids[i] = e.id;
-            if (current) |id| if (std.mem.eql(u8, &id, &e.id)) {
-                h.sink.shown = i;
-            };
-        }
         var pbuf: [64]u8 = undefined;
-        const project: ?[]const u8 = if (s.project()) |p| blk: {
-            @memcpy(pbuf[0..p.len], p);
-            break :blk pbuf[0..p.len];
+        const project: ?[]const u8 = if (s.project()) |pj| blk: {
+            @memcpy(pbuf[0..pj.len], pj);
+            break :blk pbuf[0..pj.len];
         } else null;
-        const o = remote.overlay(.{
-            .status = st,
-            .mode = mode,
-            .detail = detail,
-            .line = h.sink.line.snapshot(),
-            .data = h.sink.data.slice(remote.data_toggle_id, remote.data_clear_id),
-            .host = h.client.host(),
-            .has_grid = s.grid.cols > 0,
-            .code = s.pair_code,
-            .err = s.last_error,
-            .pin_fp = h.pin_fp_buf[0..h.pin_fp_len],
-            .tabs = if (st == .connected) h.tabs.slice() else &.{},
-            .current = current,
-            .exit_code = s.exit_code,
-        }, &h.bufs);
-        var oo = o;
+        const trust: ?[]const u8 = if (s.last_error) |err| (if (client_mod.isTrustError(err)) client_mod.describe(err) else null) else null;
         h.sync.mutex.lockUncancelable(h.client.io);
         defer h.sync.mutex.unlock(h.client.io);
-        if (h.sync.ui.panel(&h.sync_bufs)) |p| oo.panel = p;
-        const panel_shown = oo.panel != null;
-        h.tv.build(&s.grid, oo);
+        const panel = h.sync.ui.panel(&h.sync_bufs);
+        const o = h.shell.overlay(.{
+            .tabs = if (st == .connected) h.tabs.slice() else &.{},
+            .current = s.current,
+            .panel = panel,
+            .viewer = .{
+                .status = uiStatus(st),
+                .mode = s.mode,
+                .detail = detail,
+                .host = h.client.host(),
+                .has_grid = s.grid.cols > 0,
+                .code = s.pair_code,
+                .trust_error = trust,
+                .exit_code = s.exit_code,
+                .pin_fp = h.pin_fp_buf[0..h.pin_fp_len],
+            },
+        });
+        h.p.build(&s.grid, o);
         s.mutex.unlock(h.client.io);
-        h.tv.present();
+        h.p.present();
         // The panels ignore input until they have really been on screen
         // for a moment (sync/ui.zig, "No accidental approvals").
         // (h.sync.mutex is still held here: the defer above.)
-        if (panel_shown) h.sync.ui.presented(watchdog.nowMs(h.client.io));
-        h.sink.mode = mode;
-        h.sink.status = st;
+        if (panel != null) h.sync.ui.presented(watchdog.nowMs(h.client.io));
         h.drawn_version = version;
         var tbuf: [160]u8 = undefined;
-        const t = remote.title(st, project, &tbuf);
+        const t = shell_mod.title(uiStatus(st), project, &tbuf);
         if (!std.mem.eql(u8, t, h.title_buf[0..h.title_len])) {
-            h.title_status = st;
             @memcpy(h.title_buf[0..t.len], t);
             h.title_len = t.len;
-            h.tv.setTitle(t);
+            h.p.setTitle(t);
         }
     }
 
     fn liveRedraw(ctx: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(ctx));
         h.frame();
+    }
+
+    // ------------------------------------------------ shell.Host: input
+
+    fn self(ctx: *anyopaque) *Host {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn uiHost(h: *Host) shell_mod.Host {
+        return .{ .ctx = h, .vtable = &host_vtable };
+    }
+
+    const host_vtable: shell_mod.Host.VTable = .{
+        .key = onKey,
+        .char = onChar,
+        .answer = onAnswer,
+        .send = onSend,
+        .command = onCommand,
+        .shortcut = onShortcut,
+    };
+
+    /// A key at the terminal: a protocol frame if the desktop's input mode
+    /// allows it (the server filters again).
+    fn onKey(ctx: *anyopaque, k: ui.input.Key, m: ui.input.Mods) void {
+        const h = self(ctx);
+        var buf: [16]u8 = undefined;
+        if (keys.keyFrame(h.shell.mode, k, m, &buf)) |f| _ = h.client.sendInput(f);
+    }
+
+    fn onChar(ctx: *anyopaque, cp: u21, m: ui.input.Mods) void {
+        const h = self(ctx);
+        var buf: [8]u8 = undefined;
+        if (keys.charFrame(h.shell.mode, cp, m, &buf)) |f| _ = h.client.sendInput(f);
+    }
+
+    fn onAnswer(ctx: *anyopaque, key: []const u8) void {
+        const h = self(ctx);
+        var buf: [16]u8 = undefined;
+        if (keys.answerFrame(h.shell.mode, key, &buf)) |f| _ = h.client.sendInput(f);
+    }
+
+    /// The instruction line's frames go out on the connection.
+    fn onSend(ctx: *anyopaque, f: []const u8) bool {
+        return self(ctx).client.sendInput(f);
+    }
+
+    fn onCommand(ctx: *anyopaque, c: shell_mod.Command) void {
+        const h = self(ctx);
+        switch (c) {
+            .select_tab => |i| if (i < h.tabs.len) h.client.selectTab(h.tabs.items[i].id),
+            .pair => h.client.requestPairing(),
+            .cancel_pair => h.client.cancelPairing(),
+            // A device opens and closes no tabs, has no selection yet, and
+            // the remote grid size is the server's (the view scales to fit).
+            .close_tab, .open_tab, .copy, .paste, .button, .resized => {},
+        }
+    }
+
+    /// Ctrl+Shift+K opens Packages (not over another panel).
+    fn onShortcut(ctx: *anyopaque, cp: u21, m: ui.input.Mods, f: shell_mod.Focus) bool {
+        if (f == .panel) return false;
+        if (!(m.ctrl and m.shift and (cp == 'k' or cp == 'K'))) return false;
+        const s = self(ctx).sync;
+        s.mutex.lockUncancelable(s.io());
+        s.ui.openPackages();
+        s.mutex.unlock(s.io());
+        s.redraw();
+        return true;
     }
 };
 
@@ -263,7 +331,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
 
     // The window comes first: a first run, or a server that can't be
     // trusted yet, is answered inside it.
-    const tv = TermView.init(gpa, io, .{ .title = "Portal" }) catch |err| fatal(prog, "cannot open the window: {t}", .{err});
+    const tv = Presenter.init(gpa, io, .{ .title = "Portal" }) catch |err| fatal(prog, "cannot open the window: {t}", .{err});
 
     const ca_buf = gpa.create([x509check.max_cert_len]u8) catch fatal(prog, "out of memory", .{});
     const host_store = gpa.create([64]u8) catch fatal(prog, "out of memory", .{});
@@ -300,7 +368,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
                     st.setNote("Enter the desktop's address as a literal IP:PORT, e.g. 10.8.0.1:8420.", .{});
                     continue;
                 };
-                const cert = setup_mod.classify(st.cert.text());
+                const cert = classify(st.cert.text());
                 const file: ?[]const u8 = if (cert == .file) cert.file else null;
                 const sha: ?[]const u8 = if (cert == .sha256) cert.sha256 else null;
                 if (cert == .pinned and !hasPin(io, s_in)) {
@@ -331,7 +399,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     const host_ui = gpa.create(Host) catch fatal(prog, "out of memory", .{});
     const sync_state = gpa.create(SyncState) catch fatal(prog, "out of memory", .{});
     sync_state.* = .{ .client = client, .shared = shared };
-    host_ui.* = .{ .tv = tv, .shared = shared, .client = client, .sink = .{ .client = client, .modal = sync_state.modal() }, .sync = sync_state };
+    host_ui.* = .{ .p = tv, .shared = shared, .client = client, .sync = sync_state };
+    host_ui.shell = ui.Shell.init(gpa, .viewer, host_ui.uiHost());
+    host_ui.shell.modal = sync_state.modal();
     // Portal sync (docs/sync-design.md): a worker that runs a pass on
     // every (re)connect and {"t":"updates"}; only over TLS, where the
     // release key was pinned at pairing.
@@ -346,7 +416,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     shared.wake_ctx = tv;
     shared.wake_fn = struct {
         fn f(ctx: *anyopaque) void {
-            const v: *TermView = @ptrCast(@alignCast(ctx));
+            const v: *Presenter = @ptrCast(@alignCast(ctx));
             v.wake();
         }
     }.f;
@@ -359,7 +429,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     thread.detach();
 
     var gone_handled = false;
-    while (tv.pollEvents(host_ui.sink.sink())) {
+    while (tv.pollEvents(host_ui.shell.sink())) {
         // The desktop no longer has this device: forget it here too (the
         // sync worker does it between operations; without TLS there is no
         // worker and no sync store, so here).
@@ -386,7 +456,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
         if (tv.needsRedraw() or shared.version.load(.acquire) != host_ui.drawn_version) host_ui.frame();
         // Event-driven: the network thread wakes us on every Shared change
         // (Client.notify), input wakes us too; no idle polling.
-        tv.waitEvents(TermView.forever);
+        tv.waitEvents(Presenter.forever);
     }
     tv.deinit();
     std.process.exit(0);
@@ -662,8 +732,9 @@ const SyncState = struct {
         s.redraw();
     }
 
-    fn modal(s: *SyncState) remote.RemoteSink.Modal {
-        return .{ .ctx = s, .active = active, .key = key, .char = char, .button = button, .shortcut = shortcut };
+    /// The sync panels as the shell's modal layer.
+    fn modal(s: *SyncState) shell_mod.Modal {
+        return .{ .ctx = s, .active = active, .key = key, .char = char, .button = button };
     }
     fn self(p: *anyopaque) *SyncState {
         return @ptrCast(@alignCast(p));
@@ -677,7 +748,7 @@ const SyncState = struct {
         defer s.mutex.unlock(s.io());
         return s.ui.open();
     }
-    fn key(p: *anyopaque, k: view.input.Key, m: view.input.Mods) void {
+    fn key(p: *anyopaque, k: ui.input.Key, m: ui.input.Mods) void {
         const s = self(p);
         const t = s.now();
         s.mutex.lockUncancelable(s.io());
@@ -689,9 +760,8 @@ const SyncState = struct {
     /// Characters never act on the panels (no letter shortcuts): while
     /// one is open they are swallowed, so they can't reach the terminal
     /// either.
-    fn char(_: *anyopaque, _: u21, _: view.input.Mods) void {}
-    fn button(p: *anyopaque, b: u32) bool {
-        if (b < sync.ui.id.approve) return false;
+    fn char(_: *anyopaque, _: u21, _: ui.input.Mods) void {}
+    fn button(p: *anyopaque, b: u32) void {
         const s = self(p);
         const t = s.now();
         s.mutex.lockUncancelable(s.io());
@@ -699,17 +769,6 @@ const SyncState = struct {
         s.mutex.unlock(s.io());
         s.perform(a);
         s.redraw();
-        return true;
-    }
-    /// Ctrl+Shift+K opens Packages.
-    fn shortcut(p: *anyopaque, cp: u21, m: view.input.Mods) bool {
-        if (!(m.ctrl and m.shift and (cp == 'k' or cp == 'K'))) return false;
-        const s = self(p);
-        s.mutex.lockUncancelable(s.io());
-        s.ui.openPackages();
-        s.mutex.unlock(s.io());
-        s.redraw();
-        return true;
     }
 };
 
@@ -830,12 +889,29 @@ fn hasPin(io: std.Io, server: []const u8) bool {
     return got != null;
 }
 
+/// How the certificate field reads.
+pub const Cert = union(enum) {
+    /// Nothing entered: use the CA pinned earlier for this server.
+    pinned,
+    /// A fingerprint: download the CA and check it against this.
+    sha256: []const u8,
+    /// A file path (.pem or .cer).
+    file: []const u8,
+};
+
+pub fn classify(text: []const u8) Cert {
+    const t = std.mem.trim(u8, text, " \"");
+    if (t.len == 0) return .pinned;
+    if (x509check.parseFingerprint(t)) |_| return .{ .sha256 = t } else |_| {}
+    return .{ .file = t };
+}
+
 /// The first-run screen's event loop (event-driven). False if the window
 /// was closed.
-fn runSetup(tv: *TermView, st: *setup_mod.Setup) bool {
+fn runSetup(tv: *Presenter, st: *setup_mod.Setup) bool {
     const Ctx = struct {
         st: *setup_mod.Setup,
-        tv: *TermView,
+        tv: *Presenter,
         submitted: bool = false,
 
         fn on(c: *@This(), e: setup_mod.Event) void {
@@ -852,10 +928,10 @@ fn runSetup(tv: *TermView, st: *setup_mod.Setup) bool {
         fn self(p: *anyopaque) *@This() {
             return @ptrCast(@alignCast(p));
         }
-        fn key(p: *anyopaque, k: view.input.Key, m: view.input.Mods) void {
+        fn key(p: *anyopaque, k: ui.input.Key, m: ui.input.Mods) void {
             self(p).on(self(p).st.key(k, m));
         }
-        fn char(p: *anyopaque, cp: u21, m: view.input.Mods) void {
+        fn char(p: *anyopaque, cp: u21, m: ui.input.Mods) void {
             self(p).on(self(p).st.char(cp, m));
         }
         fn answer(_: *anyopaque, _: []const u8) void {}
@@ -863,22 +939,19 @@ fn runSetup(tv: *TermView, st: *setup_mod.Setup) bool {
             self(p).on(self(p).st.button(b));
         }
         fn resized(_: *anyopaque, _: u32, _: u32, _: u16, _: u16) void {}
-        const vt: view.input.InputSink.VTable = .{ .key = key, .char = char, .answer = answer, .button = button, .resized = resized };
+        const vt: ui.input.InputSink.VTable = .{ .key = key, .char = char, .answer = answer, .button = button, .resized = resized };
     };
     var ctx: Ctx = .{ .st = st, .tv = tv };
-    const sink: view.input.InputSink = .{ .ctx = &ctx, .vtable = &Ctx.vt };
+    const sink: ui.input.InputSink = .{ .ctx = &ctx, .vtable = &Ctx.vt };
     tv.setTitle("Portal - connect");
-    const empty: view.grid.Grid = .{};
+    const empty: ui.grid.Grid = .{};
     var bufs: setup_mod.Setup.Bufs = .{};
     while (true) {
         if (!tv.pollEvents(sink)) return false;
         if (ctx.submitted) return true;
-        tv.build(&empty, .{
-            .status = .{ .tone = .warn, .label = "not connected" },
-            .panel = st.panel(&bufs),
-        });
+        tv.build(&empty, shell_mod.standby(null, "not connected", "", st.panel(&bufs)));
         tv.present();
-        tv.waitEvents(TermView.forever);
+        tv.waitEvents(Presenter.forever);
     }
 }
 
@@ -955,6 +1028,13 @@ fn pinnedCa(
     p.save(io, der) catch |err| return P.f(why_buf, "Cannot save the pinned CA to {s}: {t}.", .{ p.path(), err });
     std.debug.print("portal connect: https://{s}/ must present a certificate from SHA-256 {s} (pinned: {s})\n", .{ host, x509check.formatFingerprint(fp, &fp_buf), p.path() });
     return .{ .ok = der };
+}
+
+test "classify the certificate field" {
+    try std.testing.expect(classify("  ") == .pinned);
+    const fp = "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89";
+    try std.testing.expect(classify(fp) == .sha256);
+    try std.testing.expectEqualStrings("C:\\Users\\me\\portal-ca.pem", classify("\"C:\\Users\\me\\portal-ca.pem\"").file);
 }
 
 test {

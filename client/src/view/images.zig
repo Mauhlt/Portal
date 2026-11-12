@@ -1,4 +1,4 @@
-//! TermView's inline images: PNG blobs from `grid.Images` are decoded
+//! The Presenter's inline images: PNG blobs from `grid.Images` are decoded
 //! (imgdec: pre-validated, bounded allocator), scaled on the CPU to the
 //! exact pixel size they are drawn at, and packed into the image region of
 //! the renderer's texture (rows `region_y ..` below the glyph atlas), so
@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const imgdec = @import("imgdec");
-const grid_mod = @import("grid.zig");
+const grid_mod = @import("portal_ui").grid;
 
 pub const region_w: u32 = 2048;
 pub const region_h: u32 = 2048;

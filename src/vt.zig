@@ -276,12 +276,12 @@ fn clampDim(v: u16) u16 {
     return std.math.clamp(v, min_dim, max_dim);
 }
 
-const ansi16 = [16]u32{
-    0x000000, 0xCD0000, 0x00CD00, 0xCDCD00, 0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
-    0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00, 0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
-};
+/// The 16 ANSI colours: Portal's theme (shared/theme.zig), so every
+/// client shows the scheme the UI is drawn in.
+const ansi16 = @import("shared").theme.ansi16;
 
-/// xterm's default 256-colour palette resolved to 0x00RRGGBB.
+/// The 256-colour palette resolved to 0x00RRGGBB: the theme's 16 ANSI
+/// colours, then xterm's colour cube and grey ramp.
 pub fn paletteColor(n: u8) u32 {
     if (n < 16) return ansi16[n];
     if (n < 232) {
@@ -1878,8 +1878,8 @@ test "SGR combos and palette resolution" {
     t.feed("\x1b[1;3;4;9;31;42mA");
     var c = cellAt(&t, 0, 0);
     try testing.expectEqual(attr_bold | attr_italic | attr_underline | attr_strike, c.attrs);
-    try testing.expectEqual(@as(u32, 0xCD0000), c.fg);
-    try testing.expectEqual(@as(u32, 0x00CD00), c.bg);
+    try testing.expectEqual(ansi16[1], c.fg);
+    try testing.expectEqual(ansi16[2], c.bg);
     t.feed("\x1b[22;23;24;29;39;49mB");
     c = cellAt(&t, 1, 0);
     try testing.expectEqual(@as(u8, 0), c.attrs);
@@ -1901,8 +1901,8 @@ test "SGR combos and palette resolution" {
     try testing.expectEqual(@as(u32, 0x070809), cellAt(&t, 5, 0).fg);
     t.feed("\x1b[0;95;105mG");
     c = cellAt(&t, 6, 0);
-    try testing.expectEqual(@as(u32, 0xFF00FF), c.fg);
-    try testing.expectEqual(@as(u32, 0xFF00FF), c.bg);
+    try testing.expectEqual(ansi16[13], c.fg);
+    try testing.expectEqual(ansi16[13], c.bg);
     t.feed("\x1b[m\x1b[2;5;21mH");
     try testing.expectEqual(attr_dim | attr_underline, cellAt(&t, 7, 0).attrs);
     t.feed("\x1b[4:0mI");
@@ -1919,10 +1919,10 @@ test "SGR combos and palette resolution" {
     try testing.expectEqual(@as(u32, 0xFFFFFF), paletteColor(231));
     try testing.expectEqual(@as(u32, 0x5F87AF), paletteColor(67));
     try testing.expectEqual(@as(u32, 0xEEEEEE), paletteColor(255));
-    try testing.expectEqual(@as(u32, 0x5C5CFF), paletteColor(12));
+    try testing.expectEqual(ansi16[12], paletteColor(12));
     // 256+ index ignored.
     t.feed("\x1b[0;31;38;5;300mL");
-    try testing.expectEqual(@as(u32, 0xCD0000), cellAt(&t, 11, 0).fg);
+    try testing.expectEqual(ansi16[1], cellAt(&t, 11, 0).fg);
 }
 
 // --- test decoder for the wire format -------------------------------------
@@ -2051,7 +2051,7 @@ test "encodeRows round-trip" {
     try testing.expectEqualStrings("ab", r0[0].text);
     try testing.expectEqual(color_default, r0[0].fg);
     try testing.expectEqualStrings("cd", r0[1].text);
-    try testing.expectEqual(@as(u32, 0xCD0000), r0[1].fg);
+    try testing.expectEqual(ansi16[1], r0[1].fg);
     try testing.expectEqual(attr_bold, r0[1].attrs);
     try testing.expectEqualStrings("  ", r0[2].text);
     try testing.expectEqualStrings("x", r0[3].text);
@@ -2086,8 +2086,8 @@ test "inverse with explicit colours swaps" {
     var d = try decodeFrame(out.items);
     defer d.deinit();
     const runs = d.rows_list[0].runs;
-    try testing.expectEqual(@as(u32, 0x00CD00), runs[0].fg);
-    try testing.expectEqual(@as(u32, 0xCD0000), runs[0].bg);
+    try testing.expectEqual(ansi16[2], runs[0].fg);
+    try testing.expectEqual(ansi16[1], runs[0].bg);
     try testing.expectEqualStrings("   ", runs[1].text); // hidden wide = 2 spaces
 }
 
@@ -2126,7 +2126,7 @@ test "save and restore cursor" {
     defer t.deinit();
     t.feed("\x1b[2;5H\x1b[31m\x1b7\x1b[H\x1b[m\x1b8X");
     try expectCursor(&t, 5, 1);
-    try testing.expectEqual(@as(u32, 0xCD0000), cellAt(&t, 4, 1).fg);
+    try testing.expectEqual(ansi16[1], cellAt(&t, 4, 1).fg);
     t.feed("\x1b[3;3H\x1b[s\x1b[H\x1b[u");
     try expectCursor(&t, 2, 2);
     t.feed("\x1b[?25l");
@@ -2367,7 +2367,7 @@ test "unknown sequences do not corrupt state" {
     t.feed("\x1b[!p"); // DECSTR resets pen
     t.feed("\x1b[1;32m\x1b[12;3$zA");
     try expectRow(&t, 0, "A");
-    try testing.expectEqual(@as(u32, 0x00CD00), cellAt(&t, 0, 0).fg);
+    try testing.expectEqual(ansi16[2], cellAt(&t, 0, 0).fg);
     // C0 inside CSI executes, sequence continues.
     t.feed("\x1b[2\r;3HB");
     try expectCursor(&t, 3, 1);

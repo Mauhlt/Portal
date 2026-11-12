@@ -447,7 +447,7 @@ test "draw a frame end to end and clip at every pan offset" {
     // The red background of 'A' is there.
     const ax: usize = @intCast(l.pad + 1);
     const ay: usize = @intCast(l.pad + 1);
-    try testing.expectEqual(pixel(0xCD0000), r.fb.pixels[ay * l.w + ax]);
+    try testing.expectEqual(pixel(@import("shared").theme.ansi16[1]), r.fb.pixels[ay * l.w + ax]);
 
     // Pans and zooms far outside the content must clip, never index out.
     const zl = layout.compute(.{ .css_w = 50, .css_h = 60, .dpr = 2, .cols = 10, .rows = 3, .zoom = .{ .fit = false, .font_px = 30 }, .m = gl.metrics() });
