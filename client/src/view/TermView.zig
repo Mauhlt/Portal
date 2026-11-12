@@ -25,9 +25,10 @@ const Instanced2D = Renderer.Instanced2D;
 const platform = @import("platform/platform.zig");
 const input = @import("input.zig");
 const grid_mod = @import("grid.zig");
-const wcwidth = @import("wcwidth.zig");
-const fontset = @import("font/fontset.zig");
-const Atlas = @import("font/atlas.zig").Atlas;
+const Font = @import("Font");
+const wcwidth = Font.wcwidth;
+const fontset = Font.fontset;
+const Atlas = Font.atlas.Atlas;
 const images = @import("images.zig");
 
 /// The texture: glyph atlas in rows 0..2047, inline images below it.

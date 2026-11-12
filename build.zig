@@ -19,6 +19,8 @@ fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     opts.addOption(bool, "gui", app == .gui);
     root.addOptions("build_options", opts);
     root.addAnonymousImport("app_wasm", .{ .root_source_file = wasm_bin });
+    // src/vt.zig (a file of the root module) takes its cell widths from it.
+    root.addImport("Font", fontModule(b, target, optimize));
     const gui_mods = addGuiModules(b, root, target, optimize);
     return .{ .root = root, .gui = gui_mods };
 }
@@ -149,6 +151,9 @@ pub fn build(b: *std.Build) void {
     // The shared GUI modules' own unit tests (client/src/view, client/src).
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.view })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.client })).step);
+    // The Renderer's Font module (parser, rasteriser, widths, atlas): its
+    // own tests, run here too so vetting a compiler covers them.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fontModule(b, target, .Debug) })).step);
     // Inline images: PNG checks and the bounded decoder (fuzzed).
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.pngcheck })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.imgdec })).step);
@@ -205,8 +210,9 @@ fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
 
 /// The browser client's module graph: `vt` (src/vt.zig, for the colour
 /// sentinels, cell widths and, in tests, real server frames), `keymap`
-/// (src/keymap.zig, instruction-line rules) and the
-/// bundled fonts as `font_regular` / `font_bold`.
+/// (src/keymap.zig, instruction-line rules), the Renderer's `Font` module
+/// (TrueType parser + rasteriser) and the bundled fonts as `font_regular` /
+/// `font_bold`.
 fn keymapModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     return b.createModule(.{ .root_source_file = b.path("src/keymap.zig"), .target = target, .optimize = optimize });
 }
@@ -214,9 +220,12 @@ fn keymapModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
 fn clientModule(b: *std.Build, root_src: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     const img = imageModules(b, target, optimize);
     const m = b.createModule(.{ .root_source_file = b.path(root_src), .target = target, .optimize = optimize });
+    const font = fontModule(b, target, optimize);
     const vt_mod = b.createModule(.{ .root_source_file = b.path("src/vt.zig"), .target = target, .optimize = optimize });
     vt_mod.addImport("pngcheck", img.pngcheck);
+    vt_mod.addImport("Font", font);
     m.addImport("vt", vt_mod);
+    m.addImport("Font", font);
     // The input box checks instruction lines with the server's own rules.
     m.addImport("keymap", keymapModule(b, target, optimize));
     m.addImport("imgdec", img.imgdec);
@@ -224,6 +233,23 @@ fn clientModule(b: *std.Build, root_src: []const u8, target: std.Build.ResolvedT
     m.addAnonymousImport("font_regular", .{ .root_source_file = b.path("src/web/fonts/DejaVuSansMono.ttf") });
     m.addAnonymousImport("font_bold", .{ .root_source_file = b.path("src/web/fonts/DejaVuSansMono-Bold.ttf") });
     return m;
+}
+
+// ---- fonts ----
+
+/// The Renderer's "Font" module (TrueType parser, rasteriser, cell-width
+/// table, system font set, glyph atlas). It imports nothing but std, so the
+/// wasm32 browser client and the server's terminal emulator (src/vt.zig)
+/// use it without compiling the Renderer's Vulkan module; the native view
+/// gets the same module instance. The dependency arguments must match
+/// addGuiModules' exactly, so every user shares one Font module (a file in
+/// two modules of one compilation is an error).
+fn fontModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return rendererDep(b, target, optimize).module("Font");
+}
+
+fn rendererDep(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Dependency {
+    return b.dependency("Renderer", .{ .target = target, .optimize = optimize, .demo = false });
 }
 
 // ---- inline images ----
@@ -278,10 +304,10 @@ fn imageModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
 const GuiModules = struct { view: *std.Build.Module, client: *std.Build.Module, imgdec: *std.Build.Module, pngcheck: *std.Build.Module };
 
 /// Adds "view" (client/src/view: window, Vulkan drawing via the owner's
-/// Renderer, fonts; used by `portal run`'s window) and "client"
+/// Renderer, fonts via its Font module; used by `portal run`'s window) and "client"
 /// (client/src: the remote viewer behind `portal connect`) to `mod`.
 fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) GuiModules {
-    const renderer = b.dependency("Renderer", .{ .target = target, .optimize = optimize, .demo = false });
+    const renderer = rendererDep(b, target, optimize);
     const link_libc = target.result.os.tag != .windows; // dlopen off Windows
     const img = imageModules(b, target, optimize);
     const view = b.createModule(.{
@@ -291,6 +317,7 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
         .link_libc = link_libc,
         .imports = &.{
             .{ .name = "Renderer", .module = renderer.module("Renderer") },
+            .{ .name = "Font", .module = renderer.module("Font") },
             .{ .name = "imgdec", .module = img.imgdec },
         },
     });
