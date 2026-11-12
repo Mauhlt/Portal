@@ -37,10 +37,13 @@ const tls = std.crypto.tls;
 const TlsClient = tls.Client;
 const Certificate = std.crypto.Certificate;
 const x509check = @import("x509check.zig");
+/// Record protection and the byte cursor: the server's own code
+/// (shared/tls13.zig).
+const tls13 = @import("shared").tls13;
+const Cursor = tls13.Cursor;
 
 const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
-const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
 const record_len_max = tls.max_ciphertext_len; // 2^14 + 256
 const rec_header = tls.record_header_len;
@@ -70,6 +73,8 @@ pub const GateError = error{
     TlsHandshakeTooLarge,
     NoHandshakeSecret,
     NoServerCertificate,
+    /// A handshake message whose lengths do not add up.
+    TlsDecodeError,
 } || x509check.PinError;
 
 /// Releases socket bytes to std's TLS reader (as its `input`). In plain mode
@@ -195,13 +200,12 @@ const Gate = struct {
 /// encrypted EncryptedExtensions and Certificate.
 const Inspector = struct {
     stage: enum { hello, encrypted, done } = .hello,
-    suite: enum { aes_128_gcm, chacha20_poly1305 } = .aes_128_gcm,
+    suite: tls13.Suite = .aes_128_gcm_sha256,
     keylog_buf: [512]u8 = undefined,
     keylog: Io.Writer = undefined,
-    key: [32]u8 = @splat(0),
-    iv: [12]u8 = @splat(0),
+    /// The server's handshake traffic protection, once `key_ready`.
+    traffic: tls13.Traffic = undefined,
     key_ready: bool = false,
-    seq: u64 = 0,
     hs: [hs_cap]u8 = undefined,
     hs_len: usize = 0,
     hs_pos: usize = 0,
@@ -217,8 +221,7 @@ const Inspector = struct {
 
     fn wipe(i: *Inspector) void {
         std.crypto.secureZero(u8, &i.keylog_buf);
-        std.crypto.secureZero(u8, &i.key);
-        std.crypto.secureZero(u8, &i.iv);
+        if (i.key_ready) i.traffic.wipe();
         std.crypto.secureZero(u8, &i.hs);
         i.key_ready = false;
     }
@@ -233,14 +236,7 @@ const Inspector = struct {
         var secret: [32]u8 = undefined;
         defer std.crypto.secureZero(u8, &secret);
         _ = std.fmt.hexToBytes(&secret, rest[65..][0..64]) catch return error.NoHandshakeSecret;
-        switch (i.suite) {
-            .aes_128_gcm => {
-                @memset(&i.key, 0);
-                i.key[0..16].* = tls.hkdfExpandLabel(Hkdf, secret, "key", "", 16);
-            },
-            .chacha20_poly1305 => i.key = tls.hkdfExpandLabel(Hkdf, secret, "key", "", 32),
-        }
-        i.iv = tls.hkdfExpandLabel(Hkdf, secret, "iv", "", 12);
+        i.traffic = .init(i.suite, secret);
         i.key_ready = true;
     }
 
@@ -308,58 +304,39 @@ const Inspector = struct {
     }
 
     fn serverHello(i: *Inspector, body: []const u8) GateError!void {
-        var d: Reader = .{ .b = body };
+        var d: Cursor = .{ .b = body };
         if (try d.int(u8) != 2) return error.TlsHandshakeMalformed; // server_hello
         const mlen = try d.int(u24);
         if (mlen != d.left()) return error.TlsHandshakeMalformed; // one message, whole
         _ = try d.int(u16); // legacy_version
         const random = try d.bytes(32);
         if (std.mem.eql(u8, random, &tls.hello_retry_request_sequence)) return error.HelloRetryRequest;
-        _ = try d.bytes(try d.int(u8)); // legacy_session_id_echo (std checks it)
+        _ = try d.vec(u8); // legacy_session_id_echo (std checks it)
         const suite = try d.int(u16);
         _ = try d.int(u8); // compression
-        var ext: Reader = .{ .b = try d.bytes(try d.int(u16)) };
+        var ext: Cursor = .{ .b = try d.vec(u16) };
         if (d.left() != 0) return error.TlsHandshakeMalformed;
         var version: ?u16 = null;
         while (ext.left() > 0) {
             const et = try ext.int(u16);
-            var e: Reader = .{ .b = try ext.bytes(try ext.int(u16)) };
+            var e: Cursor = .{ .b = try ext.vec(u16) };
             if (et == 43) { // supported_versions
                 if (version != null) return error.TlsHandshakeMalformed;
                 version = try e.int(u16);
             }
         }
         if (version != 0x0304) return error.NotTls13;
-        i.suite = switch (suite) {
-            0x1301 => .aes_128_gcm,
-            0x1303 => .chacha20_poly1305,
-            else => return error.UnsupportedCipherSuite,
-        };
+        i.suite = tls13.Suite.fromCode(suite) orelse return error.UnsupportedCipherSuite;
     }
 
-    /// Decrypts one record into `hs`; returns the inner content type.
+    /// Decrypts one record into `hs` (with the server's own record code,
+    /// shared/tls13.zig); returns the inner content type.
     fn decrypt(i: *Inspector, header: *const [5]u8, body: []const u8) GateError!u8 {
-        if (body.len < 16 + 1) return error.TlsHandshakeMalformed;
-        const ct_len = body.len - 16;
-        if (hs_cap - i.hs_len < ct_len) return error.TlsHandshakeTooLarge;
-        var nonce = i.iv;
-        var seq_be: [8]u8 = undefined;
-        std.mem.writeInt(u64, &seq_be, i.seq, .big);
-        for (0..8) |k| nonce[4 + k] ^= seq_be[k];
-        const out = i.hs[i.hs_len..][0..ct_len];
-        const tag = body[ct_len..][0..16].*;
-        const ok = switch (i.suite) {
-            .aes_128_gcm => Aes128Gcm.decrypt(out, body[0..ct_len], tag, header, nonce, i.key[0..16].*),
-            .chacha20_poly1305 => ChaCha20Poly1305.decrypt(out, body[0..ct_len], tag, header, nonce, i.key),
-        };
-        ok catch return error.TlsHandshakeMalformed;
-        i.seq += 1;
-        var n = ct_len;
-        while (n > 0 and out[n - 1] == 0) n -= 1; // padding
-        if (n == 0) return error.TlsHandshakeMalformed;
-        const inner = out[n - 1];
-        if (inner == 22) i.hs_len += n - 1;
-        return inner;
+        if (body.len < tls13.tag_len + 1) return error.TlsHandshakeMalformed;
+        if (hs_cap - i.hs_len < body.len - tls13.tag_len) return error.TlsHandshakeTooLarge;
+        const o = i.traffic.open(header, body, i.hs[i.hs_len..]) catch return error.TlsHandshakeMalformed;
+        if (o.content_type == 22) i.hs_len += o.len;
+        return o.content_type;
     }
 
     /// Processes complete handshake messages; true once the certificate
@@ -390,38 +367,20 @@ const Inspector = struct {
     }
 
     fn certificate(i: *Inspector, body: []const u8) GateError!void {
-        var d: Reader = .{ .b = body };
+        var d: Cursor = .{ .b = body };
         if (try d.int(u8) != 0) return error.TlsHandshakeMalformed; // certificate_request_context
-        var list: Reader = .{ .b = try d.bytes(try d.int(u24)) };
+        var list: Cursor = .{ .b = try d.vec(u24) };
         if (d.left() != 0) return error.TlsHandshakeMalformed;
         if (list.left() == 0) return error.NoServerCertificate;
-        const leaf = try list.bytes(try list.int(u24));
-        _ = try list.bytes(try list.int(u16)); // extensions
+        const leaf = try list.vec(u24);
+        _ = try list.vec(u16); // extensions
         // Further entries (intermediates) are allowed; std walks them only
         // after the leaf, which it must also find signed by the pinned CA.
         while (list.left() > 0) {
-            try x509check.validateCertificate(try list.bytes(try list.int(u24)));
-            _ = try list.bytes(try list.int(u16));
+            try x509check.validateCertificate(try list.vec(u24));
+            _ = try list.vec(u16);
         }
         try x509check.verifyLeaf(leaf, i.pin.ca_der, i.pin.ip, i.now_sec);
-    }
-};
-
-const Reader = struct {
-    b: []const u8,
-    i: usize = 0,
-
-    fn left(r: *const Reader) usize {
-        return r.b.len - r.i;
-    }
-    fn bytes(r: *Reader, n: usize) error{TlsHandshakeMalformed}![]const u8 {
-        if (r.left() < n) return error.TlsHandshakeMalformed;
-        defer r.i += n;
-        return r.b[r.i..][0..n];
-    }
-    fn int(r: *Reader, comptime T: type) error{TlsHandshakeMalformed}!T {
-        const n = @divExact(@typeInfo(T).int.bits, 8);
-        return std.mem.readInt(T, (try r.bytes(n))[0..n], .big);
     }
 };
 

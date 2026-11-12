@@ -285,22 +285,8 @@ pub fn ensureLeaf(s: Store, ca: *const Ca, sans: []const x509.SanEntry, now: i64
 
 // ------------------------------------------------------------------ export
 
-pub fn pem(gpa: Allocator, der_bytes: []const u8) ![]u8 {
-    const enc = std.base64.standard.Encoder;
-    const b64 = try gpa.alloc(u8, enc.calcSize(der_bytes.len));
-    defer gpa.free(b64);
-    _ = enc.encode(b64, der_bytes);
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    try out.appendSlice(gpa, "-----BEGIN CERTIFICATE-----\n");
-    var i: usize = 0;
-    while (i < b64.len) : (i += 64) {
-        try out.appendSlice(gpa, b64[i..@min(i + 64, b64.len)]);
-        try out.append(gpa, '\n');
-    }
-    try out.appendSlice(gpa, "-----END CERTIFICATE-----\n");
-    return out.toOwnedSlice(gpa);
-}
+/// portal-ca.pem (shared/pki/pem.zig, also the native client's writer).
+pub const pem = @import("shared").pki.pem.alloc;
 
 /// A UUID derived from the CA certificate, so the same CA always yields the
 /// same profile UUIDs.

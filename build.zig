@@ -19,6 +19,7 @@ fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     opts.addOption(bool, "gui", app == .gui);
     root.addOptions("build_options", opts);
     root.addAnonymousImport("app_wasm", .{ .root_source_file = wasm_bin });
+    root.addImport("shared", sharedModule(b, target, optimize));
     // src/vt.zig (a file of the root module) takes its cell widths from it.
     root.addImport("Font", fontModule(b, target, optimize));
     // One instance per compilation: src/keymap.zig and the client module
@@ -163,6 +164,9 @@ pub fn build(b: *std.Build) void {
     // The shared GUI modules' own unit tests (client/src/view, client/src).
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.view })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.client })).step);
+    // The protocol code every program shares (shared/root.zig), including
+    // its fuzz tests.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sharedModule(b, target, .Debug) })).step);
     // The Renderer's Font module (parser, rasteriser, widths, atlas): its
     // own tests, run here too so vetting a compiler covers them.
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fontModule(b, target, .Debug) })).step);
@@ -218,6 +222,7 @@ fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
             .imports = &.{
                 .{ .name = "imgcheck", .module = gui.imgcheck },
                 .{ .name = "inputrules", .module = gui.inputrules },
+                .{ .name = "shared", .module = sharedModule(b, target, optimize) },
                 .{ .name = "inputline", .module = b.createModule(.{
                     .root_source_file = b.path("client/src/inputline.zig"),
                     .target = target,
@@ -244,6 +249,13 @@ fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     b.step("e2e", "Run end-to-end tests against real portalctl processes (minutes)").dependOn(&run.step);
 }
 
+/// "shared" (shared/root.zig, its own package so that client/build.zig can
+/// use it too): the protocol code the server, both clients and the e2e
+/// tests must agree on.
+fn sharedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.dependency("shared", .{ .target = target, .optimize = optimize }).module("shared");
+}
+
 /// The browser client's module graph: `vt` (src/vt.zig, for the colour
 /// sentinels, cell widths and, in tests, real server frames), `inputrules`
 /// (src/inputrules: the input policy, key names and input line, shared
@@ -264,6 +276,8 @@ fn clientModule(b: *std.Build, root_src: []const u8, target: std.Build.ResolvedT
     m.addImport("datafeed", datafeedModule(b, target, optimize));
     m.addImport("imgdec", img.imgdec);
     m.addImport("imgcheck", img.imgcheck);
+    // The screen-frame decoder, shared with the native client.
+    m.addImport("shared", sharedModule(b, target, optimize));
     m.addAnonymousImport("font_regular", .{ .root_source_file = b.path("src/web/fonts/DejaVuSansMono.ttf") });
     m.addAnonymousImport("font_bold", .{ .root_source_file = b.path("src/web/fonts/DejaVuSansMono-Bold.ttf") });
     return m;
@@ -351,6 +365,7 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
     const renderer = rendererDep(b, target, optimize);
     const link_libc = target.result.os.tag != .windows; // dlopen off Windows
     const img = imageModules(b, target, optimize);
+    const shared = sharedModule(b, target, optimize);
     const view = b.createModule(.{
         .root_source_file = b.path("client/src/view/root.zig"),
         .target = target,
@@ -360,6 +375,7 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
             .{ .name = "Renderer", .module = renderer.module("Renderer") },
             .{ .name = "Font", .module = renderer.module("Font") },
             .{ .name = "imgdec", .module = img.imgdec },
+            .{ .name = "shared", .module = shared },
         },
     });
     const client = b.createModule(.{
@@ -369,6 +385,7 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
         .link_libc = link_libc,
         .imports = &.{
             .{ .name = "view", .module = view },
+            .{ .name = "shared", .module = shared },
             .{ .name = "inputrules", .module = inputrules },
             .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
         },

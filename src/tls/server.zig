@@ -45,17 +45,24 @@ const X25519 = crypto.dh.X25519;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 const ChaCha20Poly1305 = crypto.aead.chacha_poly.ChaCha20Poly1305;
 pub const Ecdsa = crypto.sign.ecdsa.EcdsaP256Sha256;
+/// Record protection, suites, HKDF-Expand-Label and the byte cursor are
+/// shared with the native client's handshake inspector (shared/tls13.zig).
+const tls13 = @import("shared").tls13;
+pub const Suite = tls13.Suite;
+pub const Traffic = tls13.Traffic;
+pub const Cursor = tls13.Cursor;
+pub const expandLabel = tls13.expandLabel;
 
 const ContentType = tls.ContentType;
 const HandshakeType = tls.HandshakeType;
 pub const AlertDescription = tls.Alert.Description;
 
-pub const record_header_len = tls.record_header_len;
+pub const record_header_len = tls13.record_header_len;
 /// Largest TLSPlaintext / TLSInnerPlaintext content.
-pub const max_plaintext = tls.max_ciphertext_inner_record_len; // 2^14
+pub const max_plaintext = tls13.max_plaintext; // 2^14
 /// Content + inner content type (we never add padding; peers may).
-pub const max_inner = max_plaintext + 1;
-pub const tag_len = 16;
+pub const max_inner = tls13.max_inner;
+pub const tag_len = tls13.tag_len;
 /// Largest TLSCiphertext.length a peer may send (2^14 + 256).
 pub const max_ciphertext = tls.max_ciphertext_len;
 /// The raw socket reader must buffer one whole record.
@@ -69,18 +76,6 @@ pub const entropy_len = 96;
 /// Before AES-GCM's per-key limit (2^24.5 records, RFC 8446 5.5) we rotate
 /// our sending key with a KeyUpdate.
 pub const key_update_after = 1 << 23;
-
-pub const Suite = enum {
-    aes_128_gcm_sha256,
-    chacha20_poly1305_sha256,
-
-    pub fn code(s: Suite) u16 {
-        return switch (s) {
-            .aes_128_gcm_sha256 => 0x1301,
-            .chacha20_poly1305_sha256 => 0x1303,
-        };
-    }
-};
 
 pub const Credentials = struct {
     /// DER certificates, leaf first.
@@ -141,10 +136,6 @@ fn errorFor(desc: AlertDescription) Error {
 
 // ------------------------------------------------------------ key schedule
 
-pub fn expandLabel(secret: [32]u8, label: []const u8, context: []const u8, comptime len: usize) [len]u8 {
-    return tls.hkdfExpandLabel(Hkdf, secret, label, context, len);
-}
-
 pub fn emptyHash() [32]u8 {
     return tls.emptyHash(Sha256);
 }
@@ -200,124 +191,7 @@ pub fn certificateVerifyContent(transcript_hash: [32]u8) [64 + 33 + 1 + 32]u8 {
     return pad ++ "TLS 1.3, server CertificateVerify".* ++ [1]u8{0} ++ transcript_hash;
 }
 
-// ------------------------------------------------------------ record layer
-
-/// One direction's traffic protection.
-pub const Traffic = struct {
-    suite: Suite,
-    secret: [32]u8,
-    key: [32]u8,
-    iv: [12]u8,
-    seq: u64 = 0,
-
-    pub fn init(suite: Suite, secret: [32]u8) Traffic {
-        var t: Traffic = .{ .suite = suite, .secret = secret, .key = @splat(0), .iv = expandLabel(secret, "iv", "", 12) };
-        switch (suite) {
-            .aes_128_gcm_sha256 => t.key[0..16].* = expandLabel(secret, "key", "", 16),
-            .chacha20_poly1305_sha256 => t.key = expandLabel(secret, "key", "", 32),
-        }
-        return t;
-    }
-
-    /// KeyUpdate: next generation of this direction's secret.
-    pub fn update(t: *Traffic) void {
-        var next = expandLabel(t.secret, "traffic upd", "", 32);
-        defer crypto.secureZero(u8, &next);
-        const suite = t.suite;
-        t.wipe();
-        t.* = init(suite, next);
-    }
-
-    pub fn wipe(t: *Traffic) void {
-        crypto.secureZero(u8, &t.secret);
-        crypto.secureZero(u8, &t.key);
-        crypto.secureZero(u8, &t.iv);
-    }
-
-    fn nonce(t: *const Traffic) [12]u8 {
-        var n = t.iv;
-        var s: [8]u8 = undefined;
-        std.mem.writeInt(u64, &s, t.seq, .big);
-        for (n[4..], s) |*a, b| a.* ^= b;
-        return n;
-    }
-
-    /// Encrypts `inner` (content followed by its content type) as one
-    /// TLSCiphertext record into `out`. Returns the record length.
-    pub fn seal(t: *Traffic, out: []u8, inner: []const u8) Error!usize {
-        if (inner.len == 0 or inner.len > max_inner) return error.TlsInternalError;
-        const total = record_header_len + inner.len + tag_len;
-        if (out.len < total) return error.BufferTooSmall;
-        if (t.seq == std.math.maxInt(u64)) return error.TlsInternalError;
-        out[0] = @backingInt(ContentType.application_data);
-        out[1] = 0x03;
-        out[2] = 0x03;
-        std.mem.writeInt(u16, out[3..5], @intCast(inner.len + tag_len), .big);
-        const n = t.nonce();
-        const c = out[record_header_len..][0..inner.len];
-        const tag = out[record_header_len + inner.len ..][0..tag_len];
-        switch (t.suite) {
-            .aes_128_gcm_sha256 => Aes128Gcm.encrypt(c, tag, inner, out[0..record_header_len], n, t.key[0..16].*),
-            .chacha20_poly1305_sha256 => ChaCha20Poly1305.encrypt(c, tag, inner, out[0..record_header_len], n, t.key),
-        }
-        t.seq += 1;
-        return total;
-    }
-
-    pub const Opened = struct { content_type: u8, len: usize };
-
-    /// Decrypts a TLSCiphertext body (ciphertext followed by the tag) into
-    /// `out`, removes padding and returns the inner content type and
-    /// content length. Does not send alerts; see `Connection.readRecord`.
-    pub fn open(t: *Traffic, header: *const [record_header_len]u8, body: []const u8, out: []u8) error{ BadRecordMac, RecordOverflow, NoContentType, SequenceOverflow }!Opened {
-        if (body.len < tag_len + 1) return error.BadRecordMac;
-        const clen = body.len - tag_len;
-        if (clen > max_inner) return error.RecordOverflow;
-        if (out.len < clen) return error.RecordOverflow;
-        if (t.seq == std.math.maxInt(u64)) return error.SequenceOverflow;
-        const n = t.nonce();
-        const m = out[0..clen];
-        const tag = body[clen..][0..tag_len].*;
-        switch (t.suite) {
-            .aes_128_gcm_sha256 => Aes128Gcm.decrypt(m, body[0..clen], tag, header, n, t.key[0..16].*) catch return error.BadRecordMac,
-            .chacha20_poly1305_sha256 => ChaCha20Poly1305.decrypt(m, body[0..clen], tag, header, n, t.key) catch return error.BadRecordMac,
-        }
-        t.seq += 1;
-        var i = clen;
-        while (i > 0) {
-            i -= 1;
-            if (m[i] != 0) return .{ .content_type = m[i], .len = i };
-        }
-        return error.NoContentType;
-    }
-};
-
 // ------------------------------------------------------- ClientHello parse
-
-/// Bounds-checked big-endian cursor.
-pub const Cursor = struct {
-    b: []const u8,
-    i: usize = 0,
-
-    pub fn done(c: *const Cursor) bool {
-        return c.i >= c.b.len;
-    }
-    pub fn bytes(c: *Cursor, n: usize) error{TlsDecodeError}![]const u8 {
-        if (c.b.len - c.i < n) return error.TlsDecodeError;
-        defer c.i += n;
-        return c.b[c.i..][0..n];
-    }
-    pub fn int(c: *Cursor, comptime T: type) error{TlsDecodeError}!T {
-        const n = @divExact(@bitSizeOf(T), 8);
-        const s = try c.bytes(n);
-        return std.mem.readInt(T, s[0..n], .big);
-    }
-    /// A vector with a `L`-sized length prefix.
-    pub fn vec(c: *Cursor, comptime L: type) error{TlsDecodeError}![]const u8 {
-        const n = try c.int(L);
-        return c.bytes(n);
-    }
-};
 
 pub const ClientHello = struct {
     random: [32]u8 = @splat(0),
@@ -944,8 +818,9 @@ pub const Connection = struct {
                     c.received_close = true;
                     return;
                 }
-                c.diag.received_alert = desc;
-                return error.TlsAlertReceived;
+                // A fatal alert: the peer is gone, as for a plaintext one
+                // during the handshake (no reply, the write side is dead).
+                return c.alertReceived(rec.data);
             },
             @backingInt(ContentType.handshake) => {
                 // Only KeyUpdate is valid after the handshake (no client
@@ -1113,6 +988,11 @@ pub const Connection = struct {
     fn maybeKeyUpdate(c: *Connection) Error!void {
         const requested = c.key_update_due.swap(false, .acq_rel);
         if (!requested and c.write_keys.seq < key_update_after) return;
+        // Always update_not_requested (the trailing 0), also when answering
+        // the peer's update_requested. Portal must keep it that way: std's
+        // TLS client (the native client) mishandles update_requested while
+        // it reads and writes concurrently (its reader would rotate the
+        // write keys under its writer).
         try c.sealOne(.handshake, &.{ @backingInt(HandshakeType.key_update), 0, 0, 1, 0 });
         c.write_keys.update();
     }

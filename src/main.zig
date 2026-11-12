@@ -2037,7 +2037,6 @@ test {
     _ = @import("web.zig"); // also pulls in http1.zig tests
     _ = @import("tls/server.zig"); // also server_test.zig
     _ = @import("tls/x509.zig");
-    _ = @import("tls/der.zig");
     _ = @import("tls/dpapi.zig");
     _ = @import("tls/pki.zig");
     _ = @import("sync.zig");
