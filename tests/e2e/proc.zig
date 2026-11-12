@@ -3,9 +3,11 @@
 //! * Every child goes into one job object with KILL_ON_JOB_CLOSE, so all of
 //!   them die when the harness exits, however it exits (failure, panic,
 //!   Ctrl+C). Instances are also killed explicitly at the end of each group.
-//! * `portal run` needs a real console: it is started with CREATE_NEW_CONSOLE
-//!   and a hidden window (STARTF_USESHOWWINDOW + SW_HIDE) so it does not
-//!   steal focus. std.process.spawn exposes neither, hence CreateProcessW.
+//! * The exe under test is portalctl.exe, the console tool (portal.exe is
+//!   the GUI window and has no console). `portalctl run --console` needs a
+//!   real console: it is started with CREATE_NEW_CONSOLE and a hidden
+//!   window (STARTF_USESHOWWINDOW + SW_HIDE) so it does not steal focus.
+//!   std.process.spawn exposes neither, hence CreateProcessW.
 //! * Each instance gets a scratch data directory by setting LOCALAPPDATA in
 //!   the child's environment block only. The harness's own environment is
 //!   never modified.
@@ -381,8 +383,8 @@ pub const Instance = struct {
     host: []const u8 = "",
     origin: []const u8 = "",
 
-    /// Starts `portal run --listen 127.0.0.1:<port> <run_args...>` and waits
-    /// until it answers HTTP.
+    /// Starts `portalctl run --console --listen 127.0.0.1:<port> <run_args...>`
+    /// and waits until it answers HTTP.
     pub fn start(h: *Harness, data_dir: []const u8, port: u16, run_args: []const []const u8) !*Instance {
         const inst = try h.gpa.create(Instance);
         inst.* = .{ .h = h, .port = port, .data_dir = data_dir };

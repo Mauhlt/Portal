@@ -1,14 +1,57 @@
 const std = @import("std");
 
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+/// Which program a build of src/main.zig is (build option `gui`):
+///   portal.exe     the Portal window (Windows GUI subsystem: no console;
+///                  errors go to message boxes). The desk's session window
+///                  and `portal connect`, the remote viewer.
+///   portalctl.exe  the console tool: pair, devices, unpair, ca, version,
+///                  run --console (scripting, tests, fallback).
+/// Both are the same code with a different entry dispatch.
+const App = enum { gui, ctl };
 
+fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, app: App, wasm_bin: std.Build.LazyPath) struct { root: *std.Build.Module, gui: GuiModules } {
     const root = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    const opts = b.addOptions();
+    opts.addOption(bool, "gui", app == .gui);
+    root.addOptions("build_options", opts);
+    root.addAnonymousImport("app_wasm", .{ .root_source_file = wasm_bin });
+    const gui_mods = addGuiModules(b, root, target, optimize);
+    return .{ .root = root, .gui = gui_mods };
+}
+
+/// portal-show.exe: `portal-show <file.png>` (src/show.zig), a console
+/// program because it runs inside sessions and writes to their terminal.
+fn showModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, pngcheck: *std.Build.Module) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("src/show_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "pngcheck", .module = pngcheck }},
+    });
+}
+
+/// portal-launcher: the GUI build is installed as bin\portal.exe, the
+/// console build as bin\portalctl.exe and bin\portal-show.exe; each runs
+/// the same-named exe of the current release.
+fn launcherModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, gui: bool) *std.Build.Module {
+    const m = b.createModule(.{
+        .root_source_file = b.path("src/tools/launcher.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const opts = b.addOptions();
+    opts.addOption(bool, "gui", gui);
+    m.addOptions("build_options", opts);
+    return m;
+}
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
 
     // Browser client: Zig compiled to wasm32-freestanding (src/wasm), with
     // the bundled font embedded, itself embedded into portal.exe and served
@@ -21,14 +64,20 @@ pub fn build(b: *std.Build) void {
     });
     wasm.entry = .disabled; // a library of exports, no _start
     wasm.rdynamic = true; // keep every `export fn`
-    root.addAnonymousImport("app_wasm", .{ .root_source_file = wasm.getEmittedBin() });
     b.step("wasm", "Build the browser client (zig-out/web/app.wasm)").dependOn(
         &b.addInstallFile(wasm.getEmittedBin(), "web/app.wasm").step,
     );
-    const gui_mods = addGuiModules(b, root, target, optimize);
 
-    const exe = b.addExecutable(.{ .name = "portal", .root_module = root });
+    const gui_root = rootModule(b, target, optimize, .gui, wasm.getEmittedBin());
+    const ctl_root = rootModule(b, target, optimize, .ctl, wasm.getEmittedBin());
+
+    const exe = b.addExecutable(.{ .name = "portal", .root_module = gui_root.root });
+    exe.subsystem = .windows; // no console window, ever
     b.installArtifact(exe);
+    const ctl_exe = b.addExecutable(.{ .name = "portalctl", .root_module = ctl_root.root });
+    b.installArtifact(ctl_exe);
+    const show_exe = b.addExecutable(.{ .name = "portal-show", .root_module = showModule(b, target, optimize, gui_root.gui.pngcheck) });
+    b.installArtifact(show_exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -39,11 +88,11 @@ pub fn build(b: *std.Build) void {
     } else if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-    b.step("run", "Run portal").dependOn(&run_cmd.step);
+    b.step("run", "Run portal (the window)").dependOn(&run_cmd.step);
 
     // Release tooling (src/tools): portal-release builds, tests and promotes
-    // releases; portal-launcher is installed as %LOCALAPPDATA%\Portal\bin\portal.exe
-    // and runs the current release.
+    // releases; the launchers are installed into %LOCALAPPDATA%\Portal\bin
+    // and run the current release.
     const release_mod = b.createModule(.{
         .root_source_file = b.path("src/tools/release.zig"),
         .target = target,
@@ -51,15 +100,11 @@ pub fn build(b: *std.Build) void {
     });
     const release_exe = b.addExecutable(.{ .name = "portal-release", .root_module = release_mod });
     b.installArtifact(release_exe);
-    const launcher_exe = b.addExecutable(.{
-        .name = "portal-launcher",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tools/launcher.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
+    const launcher_exe = b.addExecutable(.{ .name = "portal-launcher", .root_module = launcherModule(b, target, optimize, true) });
+    launcher_exe.subsystem = .windows;
     b.installArtifact(launcher_exe);
+    const launcher_con = b.addExecutable(.{ .name = "portal-launcher-console", .root_module = launcherModule(b, target, optimize, false) });
+    b.installArtifact(launcher_con);
 
     // `zig build release` tests and promotes with the compiler running this
     // build. The tool runs from the repo root so it finds src/ and build.zig.
@@ -79,30 +124,28 @@ pub fn build(b: *std.Build) void {
 
     // `zig build test` is what ZVC runs to vet a new compiler before promoting
     // it, and what `zig build release` runs before promoting a new build.
-    // The test step must also compile the real executable: unit tests alone
+    // The test step must also compile the real executables: unit tests alone
     // never analyse `main`, the web server, ConPTY or logging code, so a std
     // change breaking those would otherwise pass `zig build test`.
-    const tests = b.addTest(.{ .root_module = root });
-    const test_step = b.step("test", "Run unit tests and compile the exe (debug + ReleaseSafe) and release tools");
-    test_step.dependOn(&b.addRunArtifact(tests).step);
+    const test_step = b.step("test", "Run unit tests and compile the exes (debug + ReleaseSafe) and release tools");
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = ctl_root.root })).step);
+
     test_step.dependOn(&exe.step);
-    const exe_safe = b.addExecutable(.{
-        .name = "portal-releasesafe-check",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = .ReleaseSafe,
-        }),
-    });
-    exe_safe.root_module.addAnonymousImport("app_wasm", .{ .root_source_file = wasm.getEmittedBin() });
+    test_step.dependOn(&ctl_exe.step);
+    test_step.dependOn(&show_exe.step);
+    const safe_gui = rootModule(b, target, .ReleaseSafe, .gui, wasm.getEmittedBin());
+    const exe_safe = b.addExecutable(.{ .name = "portal-releasesafe-check", .root_module = safe_gui.root });
+    exe_safe.subsystem = .windows;
     test_step.dependOn(&exe_safe.step);
+    const ctl_safe = b.addExecutable(.{ .name = "portalctl-releasesafe-check", .root_module = rootModule(b, target, .ReleaseSafe, .ctl, wasm.getEmittedBin()).root });
+    test_step.dependOn(&ctl_safe.step);
     // Browser client: its pure logic (decoder, layout, keys, reconnects,
     // font parser, rasteriser, renderer) runs natively in Debug, where
     // safety checks catch what would be a wasm trap or silent corruption.
     const client_tests = b.addTest(.{ .root_module = clientModule(b, "src/wasm/tests.zig", target, .Debug) });
     test_step.dependOn(&b.addRunArtifact(client_tests).step);
     test_step.dependOn(&wasm.step);
-    _ = addGuiModules(b, exe_safe.root_module, target, .ReleaseSafe);
+    const gui_mods = gui_root.gui;
     // The shared GUI modules' own unit tests (client/src/view, client/src).
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.view })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.client })).step);
@@ -110,19 +153,22 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.pngcheck })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.imgdec })).step);
     // Release tooling: unit tests (release.zig pulls in releases_lib.zig's)
-    // and full compiles of both tools.
+    // and full compiles of the tools.
     const tool_tests = b.addTest(.{ .root_module = release_mod });
     test_step.dependOn(&b.addRunArtifact(tool_tests).step);
     test_step.dependOn(&release_exe.step);
     test_step.dependOn(&launcher_exe.step);
+    test_step.dependOn(&launcher_con.step);
 
-    addE2e(b, target, optimize, exe, gui_mods.pngcheck);
+    addE2e(b, target, optimize, gui_mods.pngcheck, ctl_exe, show_exe);
 }
 
 /// `zig build e2e [-- group...]`: end-to-end tests (tests/e2e) that launch
-/// real `portal` processes in hidden consoles and drive them over sockets.
+/// real `portalctl run --console` processes in hidden consoles and drive
+/// them over sockets. portalctl.exe and portal-show.exe are copied into one
+/// folder, as in a release, so sessions find portal-show next to Portal.
 /// Deliberately not part of `test`: it spawns processes and takes minutes.
-fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, portal: *std.Build.Step.Compile, pngcheck: *std.Build.Module) void {
+fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, pngcheck: *std.Build.Module, ctl: *std.Build.Step.Compile, show: *std.Build.Step.Compile) void {
     const e2e_exe = b.addExecutable(.{
         .name = "portal-e2e",
         .root_module = b.createModule(.{
@@ -133,15 +179,18 @@ fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
             .imports = &.{.{ .name = "pngcheck", .module = pngcheck }},
         }),
     });
+    const bin = b.addWriteFiles();
+    const ctl_path = bin.addCopyFile(ctl.getEmittedBin(), "portalctl.exe");
+    _ = bin.addCopyFile(show.getEmittedBin(), "portal-show.exe");
     const run = b.addRunArtifact(e2e_exe);
-    run.addArtifactArg(portal);
+    run.addFileArg(ctl_path);
     run.has_side_effects = true;
     if (@hasDecl(@TypeOf(run.*), "addPassthruArgs")) {
         run.addPassthruArgs();
     } else if (b.args) |args| {
         run.addArgs(args);
     }
-    b.step("e2e", "Run end-to-end tests against real portal processes (minutes)").dependOn(&run.step);
+    b.step("e2e", "Run end-to-end tests against real portalctl processes (minutes)").dependOn(&run.step);
 }
 
 /// The browser client's module graph: `vt` (src/vt.zig, for the colour

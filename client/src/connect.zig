@@ -1,10 +1,19 @@
-//! The remote viewer: `portal connect` (in Portal's own executable) and the
-//! standalone `portal-client` both run `main` below. Module "client" in
-//! Portal's root build; imports only std and "view".
+//! The remote viewer: `portal connect` (in the Portal window's executable,
+//! a GUI program with no console) and the standalone `portal-client` both
+//! run `main` below. Module "client" in Portal's root build; imports only
+//! std and "view".
 //!
+//!   connect                                             the last server, or
+//!                                                       the first-run screen
 //!   connect --server 10.8.0.1:8420 --ca portal-ca.pem   pin the CA, connect
 //!   connect --server 10.8.0.1:8420                      connect (CA pinned)
 //!   connect --server ADDR --forget     delete this device's credential + pin
+//!
+//! Everything happens in the window: with no server or no trusted CA yet,
+//! a first-run screen (setup.zig) asks for the address and the certificate
+//! (file, or the SHA-256 for the pairing-time download), then pairs. Errors
+//! that end the program go to `report_fn` (a message box in portal.exe) as
+//! well as stderr.
 //!
 //! HTTPS/WSS only, with the server certificate pinned to the Portal CA the
 //! user imported for that server (net/pin.zig, net/tlsconn.zig); plain HTTP
@@ -21,20 +30,28 @@ const remote = @import("remote.zig");
 const http = @import("net/http.zig");
 const pin_mod = @import("net/pin.zig");
 const x509check = @import("net/x509check.zig");
+const setup_mod = @import("setup.zig");
+
+/// Called with every message that ends the program (and --forget's
+/// confirmation). portal.exe shows a message box: it has no console.
+pub var report_fn: ?*const fn (text: []const u8) void = null;
 
 const usage =
-    \\usage: {s} --server IP:PORT [--ca FILE | --ca-sha256 HEX] [--forget]
+    \\usage: {s} [--server IP:PORT] [--ca FILE | --ca-sha256 HEX] [--forget]
     \\
     \\  --server IP:PORT   Portal server address inside the WireGuard tunnel,
-    \\                     e.g. 10.8.0.1:8420 (literal IP, no host names)
+    \\                     e.g. 10.8.0.1:8420 (literal IP, no host names).
+    \\                     Default: the last server; on first use the window
+    \\                     asks for it.
     \\  --ca FILE          trust the Portal CA in FILE (portal-ca.pem or
-    \\                     portal-ca.cer from `portal ca export` on the
-    \\                     desktop) for this server, and remember it
-    \\  --ca-sha256 HEX    the CA fingerprint `portal ca export` printed.
-    \\                     With --ca: the file must match it. Alone: download
-    \\                     the CA from the desktop while `portal pair` is
-    \\                     open (http://IP:PORT+1/ca.cer), check it against
-    \\                     HEX, and remember it
+    \\                     portal-ca.cer, from Export certificate in the
+    \\                     Portal window or `portalctl ca export`) for this
+    \\                     server, and remember it
+    \\  --ca-sha256 HEX    the CA fingerprint the desk shows. With --ca: the
+    \\                     file must match it. Alone: download the CA from the
+    \\                     desktop while a pairing window is open
+    \\                     (http://IP:PORT+1/ca.cer), check it against HEX,
+    \\                     and remember it
     \\  --forget           delete this device's stored credentials and the
     \\                     remembered CA for this server, and exit
     \\  --insecure-plain-http
@@ -43,9 +60,8 @@ const usage =
     \\                     encrypted; uses its own credential, never the
     \\                     HTTPS one)
     \\
-    \\First run: on the desktop run `portal ca export` and `portal pair <name>`;
-    \\here run with --ca (or --ca-sha256), then click Pair. Later runs need
-    \\only --server.
+    \\First run: open Pair a device in the Portal window on the desktop, then
+    \\click Pair here. Later runs need nothing.
     \\
 ;
 
@@ -61,8 +77,16 @@ const insecure_warning =
     \\
 ;
 
+fn report(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print(fmt ++ "\n", args);
+    if (report_fn) |f| {
+        var buf: [2048]u8 = undefined;
+        f(std.fmt.bufPrint(&buf, fmt, args) catch "portal connect: error");
+    }
+}
+
 fn fatal(prog: []const u8, comptime fmt: []const u8, args: anytype) noreturn {
-    std.debug.print("{s}: " ++ fmt ++ "\n", .{prog} ++ args);
+    report("{s}: " ++ fmt, .{prog} ++ args);
     std.process.exit(1);
 }
 
@@ -73,6 +97,9 @@ const Host = struct {
     sink: remote.RemoteSink,
     drawn_version: u64 = std.math.maxInt(u64),
     title_status: ?client_mod.Status = null,
+    bufs: remote.Bufs = .{},
+    pin_fp_buf: [95]u8 = undefined,
+    pin_fp_len: usize = 0,
 
     /// Snapshot status under the lock, build the frame, then present.
     fn frame(h: *Host) void {
@@ -84,7 +111,16 @@ const Host = struct {
         const mode = s.mode;
         const detail = detail_buf[0..s.detail_len];
         @memcpy(detail, s.detail());
-        const o = remote.overlay(st, mode, detail, h.client.host(), s.grid.cols > 0);
+        const o = remote.overlay(.{
+            .status = st,
+            .mode = mode,
+            .detail = detail,
+            .host = h.client.host(),
+            .has_grid = s.grid.cols > 0,
+            .code = s.pair_code,
+            .err = s.last_error,
+            .pin_fp = h.pin_fp_buf[0..h.pin_fp_len],
+        }, &h.bufs);
         h.tv.build(&s.grid, o);
         s.mutex.unlock(h.client.io);
         h.tv.present();
@@ -134,22 +170,19 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
         } else if (std.mem.eql(u8, a, "--insecure-plain-http")) {
             insecure = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
-            std.debug.print(usage, .{prog});
+            report(usage, .{prog});
             std.process.exit(0);
         } else {
-            std.debug.print(usage, .{prog});
-            fatal(prog, "unknown argument '{s}'", .{a});
+            fatal(prog, "unknown argument '{s}'\n\n" ++ usage, .{ a, prog });
         }
     }
-    const server_arg = server orelse {
-        std.debug.print(usage, .{prog});
-        std.process.exit(2);
-    };
-    var host_buf: [64]u8 = undefined;
-    const host = http.canonicalHost(server_arg, &host_buf) catch
-        fatal(prog, "bad --server '{s}' (want a literal IP:PORT such as 10.8.0.1:8420)", .{server_arg});
+    var last_buf: [64]u8 = undefined;
+    if (server == null) server = pin_mod.loadLastServer(io, &last_buf);
 
     if (forget) {
+        const s = server orelse fatal(prog, "--forget needs --server IP:PORT", .{});
+        var hb: [64]u8 = undefined;
+        const host = http.canonicalHost(s, &hb) catch fatal(prog, "bad --server '{s}' (want a literal IP:PORT such as 10.8.0.1:8420)", .{s});
         var tbuf: [credstore.max_target]u8 = undefined;
         for ([_]bool{ false, true }) |plain| {
             credstore.delete(credstore.targetName(host, plain, &tbuf)) catch |err|
@@ -158,26 +191,88 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
         if (pin_mod.Pin.forHost(host)) |p| {
             p.delete(io) catch |err| fatal(prog, "could not delete {s}: {t}", .{ p.path(), err });
         } else |_| {}
-        std.debug.print("{s}: forgot the credentials and the pinned CA for {s}\n", .{ prog, host });
+        report("{s}: forgot the credentials and the pinned CA for {s}", .{ prog, host });
         std.process.exit(0);
     }
+    if (insecure) {
+        if (ca_file != null or ca_sha256 != null) fatal(prog, "--insecure-plain-http cannot be combined with --ca / --ca-sha256", .{});
+        if (server == null) fatal(prog, "--insecure-plain-http needs --server IP:PORT", .{});
+        std.debug.print(insecure_warning, .{});
+    }
+
+    // The window comes first: a first run, or a server that can't be
+    // trusted yet, is answered inside it.
+    const tv = TermView.init(gpa, io, .{ .title = "Portal" }) catch |err| fatal(prog, "cannot open the window: {t}", .{err});
 
     const ca_buf = gpa.create([x509check.max_cert_len]u8) catch fatal(prog, "out of memory", .{});
-    const transport: client_mod.Transport = if (insecure) blk: {
-        if (ca_file != null or ca_sha256 != null) fatal(prog, "--insecure-plain-http cannot be combined with --ca / --ca-sha256", .{});
-        std.debug.print(insecure_warning, .{});
-        break :blk .insecure_plain_http;
-    } else .{ .tls = pinnedCa(gpa, io, prog, host, ca_file, ca_sha256, ca_buf) };
+    const host_store = gpa.create([64]u8) catch fatal(prog, "out of memory", .{});
+    var server_text: []const u8 = server orelse "";
+    var transport: client_mod.Transport = .insecure_plain_http;
+    var pair_now = false;
+    if (!insecure) {
+        var why_buf: [600]u8 = undefined;
+        var why: ?[]const u8 = null;
+        // Try what the command line (or the last run) gave, without asking.
+        if (server) |s| {
+            const want_pin = ca_file != null or ca_sha256 != null or hasPin(io, s);
+            if (want_pin) {
+                switch (pinnedCa(gpa, io, s, ca_file, ca_sha256, ca_buf, &why_buf)) {
+                    .ok => |der| transport = .{ .tls = der },
+                    .problem => |m| why = m,
+                }
+            } else why = "";
+        } else why = "";
+        if (why) |first_note| {
+            // First-run screen.
+            var cert_prefill: []const u8 = ca_file orelse ca_sha256 orelse "";
+            var dbuf: [pin_mod.max_path]u8 = undefined;
+            if (cert_prefill.len == 0) if (pin_mod.defaultCaFile(&dbuf)) |p| {
+                if (std.Io.Dir.cwd().statFile(io, p, .{})) |_| cert_prefill = p else |_| {}
+            };
+            var st = setup_mod.Setup.init(server orelse "", cert_prefill);
+            if (first_note.len > 0) st.setNote("{s}", .{first_note});
+            while (true) {
+                if (!runSetup(tv, &st)) std.process.exit(0); // window closed
+                const s_in = std.mem.trim(u8, st.server.text(), " ");
+                var hb: [64]u8 = undefined;
+                _ = http.canonicalHost(s_in, &hb) catch {
+                    st.setNote("Enter the desktop's address as a literal IP:PORT, e.g. 10.8.0.1:8420.", .{});
+                    continue;
+                };
+                const cert = setup_mod.classify(st.cert.text());
+                const file: ?[]const u8 = if (cert == .file) cert.file else null;
+                const sha: ?[]const u8 = if (cert == .sha256) cert.sha256 else null;
+                if (cert == .pinned and !hasPin(io, s_in)) {
+                    st.setNote("Give the Portal certificate (portal-ca.pem from Export certificate at the desk) or the SHA-256 the desk shows.", .{});
+                    continue;
+                }
+                switch (pinnedCa(gpa, io, s_in, file, sha, ca_buf, &why_buf)) {
+                    .ok => |der| {
+                        transport = .{ .tls = der };
+                        @memcpy(host_store[0..s_in.len], s_in);
+                        server_text = host_store[0..s_in.len];
+                        pair_now = true;
+                        break;
+                    },
+                    .problem => |m| st.setNote("{s}", .{m}),
+                }
+            }
+        }
+    }
 
     const shared = gpa.create(client_mod.Shared) catch fatal(prog, "out of memory", .{});
     shared.* = .{};
     const client = gpa.create(client_mod.Client) catch fatal(prog, "out of memory", .{});
-    client.* = client_mod.Client.init(gpa, io, shared, server_arg, transport) catch
-        fatal(prog, "bad --server '{s}' (want a literal IP:PORT such as 10.8.0.1:8420)", .{server_arg});
+    client.* = client_mod.Client.init(gpa, io, shared, server_text, transport) catch
+        fatal(prog, "bad --server '{s}' (want a literal IP:PORT such as 10.8.0.1:8420)", .{server_text});
+    pin_mod.saveLastServer(io, client.host()) catch {};
 
-    const tv = TermView.init(gpa, io, .{ .title = "Portal" }) catch |err| fatal(prog, "cannot open the window: {t}", .{err});
     const host_ui = gpa.create(Host) catch fatal(prog, "out of memory", .{});
     host_ui.* = .{ .tv = tv, .shared = shared, .client = client, .sink = .{ .client = client } };
+    switch (transport) {
+        .tls => |der| host_ui.pin_fp_len = x509check.formatFingerprint(x509check.fingerprint(der), &host_ui.pin_fp_buf).len,
+        .insecure_plain_http => {},
+    }
     tv.setLiveRedraw(host_ui, Host.liveRedraw);
     shared.wake_ctx = tv;
     shared.wake_fn = struct {
@@ -186,6 +281,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
             v.wake();
         }
     }.f;
+    // The first-run screen's Pair button: pair as soon as we know we must.
+    if (pair_now) shared.pair_requested.store(true, .release);
 
     // The network thread runs for the life of the process (its socket reads
     // cannot be cancelled portably); exiting the process ends it.
@@ -202,27 +299,98 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     std.process.exit(0);
 }
 
-/// The CA to trust for `host`: imported from --ca, downloaded and checked
-/// against --ca-sha256, or the one pinned earlier. Exits with instructions
-/// when there is none: the client never trusts a server on first use.
+fn hasPin(io: std.Io, server: []const u8) bool {
+    var hb: [64]u8 = undefined;
+    const host = http.canonicalHost(server, &hb) catch return false;
+    const p = pin_mod.Pin.forHost(host) catch return false;
+    var probe: [x509check.max_cert_len]u8 = undefined;
+    const got = p.load(io, &probe) catch return false;
+    return got != null;
+}
+
+/// The first-run screen's event loop (event-driven). False if the window
+/// was closed.
+fn runSetup(tv: *TermView, st: *setup_mod.Setup) bool {
+    const Ctx = struct {
+        st: *setup_mod.Setup,
+        tv: *TermView,
+        submitted: bool = false,
+
+        fn on(c: *@This(), e: setup_mod.Event) void {
+            switch (e) {
+                .none => {},
+                .submit => c.submitted = true,
+                .paste => {
+                    const raw = c.tv.window.clipboardText(std.heap.page_allocator, 4096) orelse return;
+                    defer std.heap.page_allocator.free(raw);
+                    c.st.paste(raw);
+                },
+            }
+        }
+        fn self(p: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(p));
+        }
+        fn key(p: *anyopaque, k: view.input.Key, m: view.input.Mods) void {
+            self(p).on(self(p).st.key(k, m));
+        }
+        fn char(p: *anyopaque, cp: u21, m: view.input.Mods) void {
+            self(p).on(self(p).st.char(cp, m));
+        }
+        fn answer(_: *anyopaque, _: []const u8) void {}
+        fn button(p: *anyopaque, b: u32) void {
+            self(p).on(self(p).st.button(b));
+        }
+        fn resized(_: *anyopaque, _: u32, _: u32, _: u16, _: u16) void {}
+        const vt: view.input.InputSink.VTable = .{ .key = key, .char = char, .answer = answer, .button = button, .resized = resized };
+    };
+    var ctx: Ctx = .{ .st = st, .tv = tv };
+    const sink: view.input.InputSink = .{ .ctx = &ctx, .vtable = &Ctx.vt };
+    tv.setTitle("Portal - connect");
+    const empty: view.grid.Grid = .{};
+    var bufs: setup_mod.Setup.Bufs = .{};
+    while (true) {
+        if (!tv.pollEvents(sink)) return false;
+        if (ctx.submitted) return true;
+        tv.build(&empty, .{
+            .status = .{ .tone = .warn, .label = "not connected" },
+            .panel = st.panel(&bufs),
+        });
+        tv.present();
+        tv.waitEvents(TermView.forever);
+    }
+}
+
+const PinResult = union(enum) { ok: []const u8, problem: []const u8 };
+
+/// The CA to trust for `server`: imported from `ca_file`, downloaded and
+/// checked against `ca_sha256`, or the one pinned earlier. Never trusts a
+/// server on first use: with none of these it is a problem to show.
 fn pinnedCa(
     gpa: std.mem.Allocator,
     io: std.Io,
-    prog: []const u8,
-    host: []const u8,
+    server: []const u8,
     ca_file: ?[]const u8,
     ca_sha256: ?[]const u8,
     out: *[x509check.max_cert_len]u8,
-) []const u8 {
+    why_buf: []u8,
+) PinResult {
+    const P = struct {
+        fn f(buf: []u8, comptime fmt: []const u8, args: anytype) PinResult {
+            return .{ .problem = std.fmt.bufPrint(buf, fmt, args) catch "cannot use that certificate" };
+        }
+    };
+    var hb: [64]u8 = undefined;
+    const host = http.canonicalHost(server, &hb) catch
+        return P.f(why_buf, "Bad server address '{s}' (want a literal IP:PORT such as 10.8.0.1:8420).", .{server});
     const p = pin_mod.Pin.forHost(host) catch |err|
-        fatal(prog, "no per-user config directory for the pinned CA ({t})", .{err});
+        return P.f(why_buf, "No per-user config directory for the pinned CA ({t}).", .{err});
     const expected: ?[32]u8 = if (ca_sha256) |t| (x509check.parseFingerprint(t) catch
-        fatal(prog, "--ca-sha256 wants the 64 hex digits `portal ca export` prints (AB:CD:...)", .{})) else null;
+        return P.f(why_buf, "The SHA-256 must be the 64 hex digits the desk shows (AB:CD:...).", .{})) else null;
 
     var old_buf: [x509check.max_cert_len]u8 = undefined;
     const old: ?[]const u8 = p.load(io, &old_buf) catch |err| blk: {
         if (ca_file == null and ca_sha256 == null)
-            fatal(prog, "the pinned CA {s} is unreadable ({t}); re-import it with --ca", .{ p.path(), err });
+            return P.f(why_buf, "The CA pinned for {s} ({s}) is unreadable ({t}); give the certificate again.", .{ host, p.path(), err });
         break :blk null;
     };
 
@@ -230,57 +398,41 @@ fn pinnedCa(
     var source: []const u8 = undefined;
     if (ca_file) |f| {
         der = pin_mod.readCaFile(io, f, out) catch |err|
-            fatal(prog, "cannot use {s} as the Portal CA ({t}); pass portal-ca.pem or portal-ca.cer from `portal ca export`", .{ f, err });
+            return P.f(why_buf, "Cannot use {s} as the Portal CA ({t}): give portal-ca.pem or portal-ca.cer from Export certificate at the desk.", .{ f, err });
         source = f;
     } else if (expected) |want| {
         if (old) |o| if (std.mem.eql(u8, &x509check.fingerprint(o), &want)) {
             @memcpy(out[0..o.len], o);
-            return finish(prog, host, p.path(), out[0..o.len], "already pinned");
+            return .{ .ok = out[0..o.len] };
         };
-        std.debug.print("{s}: downloading the CA from the desktop's pairing page (port + 1, open while `portal pair` runs)...\n", .{prog});
         der = client_mod.fetchCaCertificate(gpa, io, host, out) catch |err|
-            fatal(prog, "could not download the CA: {s}. Run `portal pair <name>` on the desktop first, or use --ca FILE.", .{client_mod.describe(err)});
+            return P.f(why_buf, "Could not download the CA from the desktop: {s}. Open Pair a device in the Portal window first (the download runs while pairing is open), or give the certificate file.", .{client_mod.describe(err)});
         source = "the download";
     } else if (old) |o| {
         @memcpy(out[0..o.len], o);
-        return finish(prog, host, p.path(), out[0..o.len], "pinned");
+        return .{ .ok = out[0..o.len] };
     } else {
-        fatal(prog,
-            \\no Portal CA is pinned for {s}, so the server cannot be authenticated.
-            \\  On the desktop run `portal ca export` (it prints the SHA-256 fingerprint),
-            \\  copy portal-ca.pem here and run:
-            \\      {s} --server {s} --ca portal-ca.pem
-            \\  or, while `portal pair <name>` is open on the desktop:
-            \\      {s} --server {s} --ca-sha256 <fingerprint>
-        , .{ host, prog, host, prog, host });
+        return P.f(why_buf, "No Portal CA is trusted for {s} yet, so the server cannot be authenticated. Give the certificate file or its SHA-256.", .{host});
     }
 
     var fp_buf: [95]u8 = undefined;
     const fp = x509check.fingerprint(der);
     if (expected) |want| if (!std.mem.eql(u8, &fp, &want)) {
-        fatal(prog, "the CA from {s} has SHA-256 {s}, which is not the --ca-sha256 given. Not trusted.", .{ source, x509check.formatFingerprint(fp, &fp_buf) });
+        return P.f(why_buf, "The CA from {s} has SHA-256 {s}, which is not the one given. Not trusted.", .{ source, x509check.formatFingerprint(fp, &fp_buf) });
     };
     // A Portal CA is self-signed; this catches passing the server
     // certificate or some unrelated file by mistake.
-    const parsed = x509check.parse(der) catch fatal(prog, "{s} is not a usable CA certificate", .{source});
+    const parsed = x509check.parse(der) catch return P.f(why_buf, "{s} is not a usable CA certificate.", .{source});
     parsed.verify(parsed, std.Io.Clock.real.now(io).toSeconds()) catch |err|
-        fatal(prog, "{s} is not a valid self-signed CA certificate ({t})", .{ source, err });
+        return P.f(why_buf, "{s} is not a valid self-signed CA certificate ({t}).", .{ source, err });
 
     if (old) |o| if (!std.mem.eql(u8, o, der)) {
         var ofp: [95]u8 = undefined;
-        std.debug.print("{s}: replacing the CA pinned for {s} (was SHA-256 {s})\n", .{ prog, host, x509check.formatFingerprint(x509check.fingerprint(o), &ofp) });
+        std.debug.print("portal connect: replacing the CA pinned for {s} (was SHA-256 {s})\n", .{ host, x509check.formatFingerprint(x509check.fingerprint(o), &ofp) });
     };
-    p.save(io, der) catch |err| fatal(prog, "cannot save the pinned CA to {s}: {t}", .{ p.path(), err });
-    return finish(prog, host, p.path(), der, "pinned now");
-}
-
-fn finish(prog: []const u8, host: []const u8, path: []const u8, der: []const u8, how: []const u8) []const u8 {
-    var fp_buf: [95]u8 = undefined;
-    const name = if (x509check.parse(der)) |p| p.commonName() else |_| "?";
-    std.debug.print("{s}: https://{s}/ - the server certificate must be signed by\n  {s}, SHA-256 {s}\n  ({s}: {s})\n", .{
-        prog, host, name, x509check.formatFingerprint(x509check.fingerprint(der), &fp_buf), how, path,
-    });
-    return der;
+    p.save(io, der) catch |err| return P.f(why_buf, "Cannot save the pinned CA to {s}: {t}.", .{ p.path(), err });
+    std.debug.print("portal connect: https://{s}/ must present a certificate from SHA-256 {s} (pinned: {s})\n", .{ host, x509check.formatFingerprint(fp, &fp_buf), p.path() });
+    return .{ .ok = der };
 }
 
 test {

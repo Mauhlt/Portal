@@ -5,8 +5,11 @@
 //! `Grid` snapshot plus an `Overlay` describing the chrome, and receive
 //! input through an `InputSink`.
 //!
-//! Layout, top to bottom: top bar (optional, `Overlay.top_bar`), grid,
-//! answer bar (optional), status line.
+//! Layout (`Layout`, kept in `regions`), top to bottom: top bar (optional,
+//! `Overlay.top_bar`), the terminal (grid), the bottom region
+//! (`Overlay.bottom`: stacked panes such as the answer buttons, a button
+//! row or a text field, each with its own height), status line. A modal
+//! `Overlay.panel` is drawn as a layer over all of them.
 //!
 //!     var tv = try TermView.init(gpa, io, .{ .title = "Portal" });
 //!     defer tv.deinit();
@@ -65,6 +68,59 @@ pub const TopBar = struct {
     right_tone: Tone = .muted,
     /// Draw `right` as a filled, high-contrast badge (someone is watching).
     right_badge: bool = false,
+    /// Clickable actions, drawn right-aligned left of `right`; a click
+    /// reaches the host as InputSink.button(id).
+    buttons: []const TopButton = &.{},
+};
+
+pub const TopButton = struct { label: []const u8, id: u32 };
+
+/// A line of panel text. Long lines wrap at spaces.
+pub const PanelText = struct {
+    text: []const u8,
+    tone: Tone = .muted,
+    bold: bool = false,
+};
+
+/// A one-line text field (the host owns the text and the editing). A
+/// click reaches the host as InputSink.button(id). `choice` draws it as a
+/// selector ("< value >") that the host cycles.
+pub const PanelField = struct {
+    label: []const u8,
+    value: []const u8,
+    hint: []const u8 = "",
+    id: u32,
+    focused: bool = false,
+    choice: bool = false,
+};
+
+pub const PanelButton = struct {
+    label: []const u8,
+    id: u32,
+    focused: bool = false,
+    tone: Tone = .normal,
+};
+
+/// A list entry (e.g. a paired device) with an optional button at its right.
+pub const PanelRow = struct {
+    text: []const u8,
+    tone: Tone = .normal,
+    selected: bool = false,
+    button: ?PanelButton = null,
+};
+
+/// A modal box drawn over everything else (pairing approval, device list,
+/// first-run settings). Layout, top to bottom: title, lines, rows, fields,
+/// after, note, buttons.
+pub const Panel = struct {
+    title: []const u8,
+    title_tone: Tone = .normal,
+    lines: []const PanelText = &.{},
+    rows: []const PanelRow = &.{},
+    fields: []const PanelField = &.{},
+    after: []const PanelText = &.{},
+    note: PanelText = .{ .text = "" },
+    buttons: []const PanelButton = &.{},
 };
 
 /// A linear (reading-order) cell selection, inclusive, start <= end.
@@ -82,13 +138,65 @@ pub const Selection = struct {
     }
 };
 
+/// A pixel rectangle of the window.
+pub const Rect = struct {
+    x: f32 = 0,
+    y: f32 = 0,
+    w: f32 = 0,
+    h: f32 = 0,
+
+    pub fn contains(r: Rect, px: f32, py: f32) bool {
+        return px >= r.x and px < r.x + r.w and py >= r.y and py < r.y + r.h;
+    }
+};
+
+/// The window's regions for one frame, top to bottom: top bar, terminal
+/// (the grid), the bottom region (`Overlay.bottom`, its panes stacked in
+/// order), status line. A modal `Overlay.panel` is a layer over all of
+/// them, not a region. Kept after each build in `TermView.regions` so
+/// hosts can map clicks to regions.
+pub const Layout = struct {
+    top: Rect = .{},
+    terminal: Rect = .{},
+    bottom: Rect = .{},
+    status: Rect = .{},
+    /// Each bottom pane's rectangle (same order as Overlay.bottom).
+    panes: [max_panes]Rect = @splat(.{}),
+    n_panes: usize = 0,
+};
+
+pub const max_panes = 4;
+
+/// One horizontal pane of the bottom region. Panes are drawn in order
+/// from the top of the region down; their clicks reach the host through
+/// InputSink.button / .answer like every other button.
+pub const Pane = struct {
+    /// Height in logical pixels (scaled with the window's DPI); 0 picks the
+    /// content's natural height.
+    height: f32 = 0,
+    content: union(enum) {
+        /// The answer buttons (input.answers): InputSink.answer.
+        answers,
+        /// A centred row of buttons: InputSink.button(id).
+        buttons: []const PanelButton,
+        /// A text box (e.g. an input line): drawn like a panel field; a
+        /// click reports its id. The host owns the text and the editing.
+        field: PanelField,
+    },
+};
+
 pub const Overlay = struct {
     /// `.grid` draws the grid (if it has cells); `.message` a centred notice.
     screen: union(enum) { grid, message: Message } = .grid,
     top_bar: ?TopBar = null,
     selection: ?Selection = null,
+    /// Shorthand for one `.answers` pane at the top of the bottom region.
     show_answers: bool = false,
+    /// The bottom region under the terminal (at most `max_panes`).
+    bottom: []const Pane = &.{},
     status: StatusLine = .{},
+    /// A modal layer over the whole layout (pairing, devices, settings).
+    panel: ?Panel = null,
 };
 
 pub const Sizing = union(enum) {
@@ -132,7 +240,7 @@ atlas: Atlas,
 theme: grid_mod.Theme,
 sizing: Sizing,
 instances: std.ArrayList(Instanced2D.Instance) = .empty,
-buttons: [16]Button = undefined,
+buttons: [64]Button = undefined,
 n_buttons: usize = 0,
 zoom_steps: i32 = 0,
 atlas_full: bool = false,
@@ -140,6 +248,8 @@ dirty: bool = true,
 /// Cells that fit the window at the current font size (fixed_em sizing).
 capacity: [2]u16 = .{ 0, 0 },
 reported_capacity: [2]u16 = .{ 0, 0 },
+/// The regions of the last built frame (see Layout).
+regions: Layout = .{},
 /// Where the last built grid was drawn (pixels), for mouse -> cell.
 layout: struct { ox: f32 = 0, oy: f32 = 0, cw: f32 = 1, ch: f32 = 1, cols: u16 = 0, rows: u16 = 0 } = .{},
 live_ctx: ?*anyopaque = null,
@@ -469,9 +579,47 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
     const s = tv.window.scale();
     const ui = tv.fonts.metrics(@round(13 * s));
     const status_h: f32 = @round(@as(f32, @floatFromInt(ui.cell_h)) * 1.6);
-    const bar_h: f32 = if (overlay.show_answers) @round(@as(f32, @floatFromInt(ui.cell_h)) * 2.4) else 0;
     const top_h: f32 = if (overlay.top_bar != null) topBarHeight(ui) else 0;
-    const grid_h = @max(0, H - status_h - bar_h - top_h);
+    // The bottom region: its panes' heights, but never more than half the
+    // window (the terminal keeps the rest).
+    var panes: [max_panes]Pane = undefined;
+    var n_panes: usize = 0;
+    if (overlay.show_answers) {
+        panes[0] = .{ .content = .answers };
+        n_panes = 1;
+    }
+    for (overlay.bottom) |p| if (n_panes < max_panes) {
+        panes[n_panes] = p;
+        n_panes += 1;
+    };
+    var heights: [max_panes]f32 = undefined;
+    var bar_h: f32 = 0;
+    for (panes[0..n_panes], 0..) |p, i| {
+        heights[i] = paneHeight(ui, p, s);
+        bar_h += heights[i];
+    }
+    const room = @max(0, H - status_h - top_h);
+    if (bar_h > room / 2) {
+        const k = (room / 2) / bar_h;
+        bar_h = 0;
+        for (heights[0..n_panes]) |*h| {
+            h.* = @floor(h.* * k);
+            bar_h += h.*;
+        }
+    }
+    const grid_h = @max(0, room - bar_h);
+    tv.regions = .{
+        .top = .{ .w = W, .h = top_h },
+        .terminal = .{ .y = top_h, .w = W, .h = grid_h },
+        .bottom = .{ .y = top_h + grid_h, .w = W, .h = bar_h },
+        .status = .{ .y = H - status_h, .w = W, .h = status_h },
+        .n_panes = n_panes,
+    };
+    var py = top_h + grid_h;
+    for (heights[0..n_panes], 0..) |h, i| {
+        tv.regions.panes[i] = .{ .y = py, .w = W, .h = h };
+        py += h;
+    }
 
     tv.layout.cols = 0;
     tv.layout.rows = 0;
@@ -484,8 +632,13 @@ fn buildOnce(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
         .message => |msg| tv.drawMessage(ui, msg, W, top_h, grid_h, s),
     }
     if (overlay.top_bar) |tb| tv.drawTopBar(ui, tb, W, top_h, s);
-    if (overlay.show_answers) tv.drawAnswerBar(ui, top_h + grid_h, W, bar_h, s);
+    for (panes[0..n_panes], 0..) |p, i| tv.drawPane(ui, p, tv.regions.panes[i], s);
     tv.drawStatus(ui, overlay.status, H - status_h, W, status_h, s);
+    if (overlay.panel) |p| {
+        // Modal: buttons under the panel stop reacting.
+        tv.n_buttons = 0;
+        tv.drawPanel(ui, p, W, H, s);
+    }
 }
 
 fn topBarHeight(ui: fontset.Metrics) f32 {
@@ -503,19 +656,35 @@ fn drawTopBar(tv: *TermView, ui: fontset.Metrics, tb: TopBar, W: f32, h: f32, s:
     }
     const ty = @round((h - @as(f32, @floatFromInt(ui.cell_h))) / 2);
     var right_w: f32 = 0;
+    // Buttons first (right to left), then the right-hand text left of them.
+    if (tb.buttons.len > 0) {
+        const bh = @round(h * 0.78);
+        const by = @round((h - bh) / 2);
+        var bx = W - pad;
+        var i = tb.buttons.len;
+        while (i > 0) {
+            i -= 1;
+            const b = tb.buttons[i];
+            const bw = textWidth(ui, b.label) + 2 * @as(f32, @floatFromInt(ui.cell_w));
+            bx -= bw;
+            _ = tv.addButton(ui, bx, by, bh, b.label, .{ .x = 0, .y = 0, .w = 0, .h = 0, .action = .{ .button = b.id } });
+            bx -= @round(6 * s);
+        }
+        right_w = W - bx;
+    }
     if (tb.right.len > 0) {
         const tw = textWidth(ui, tb.right);
         if (tb.right_badge) {
             const bw = tw + 2 * pad;
             const bh = @round(h * 0.8);
-            const bx = W - pad - bw;
+            const bx = W - right_w - pad - bw;
             const color = toneColor(tb.right_tone);
             tv.rect(bx, @round((h - bh) / 2), bw, bh, color);
             _ = tv.text(ui, bx + pad, ty, tb.right, ui_bg, true);
-            right_w = bw + pad;
+            right_w += bw + pad;
         } else {
-            _ = tv.text(ui, W - pad - tw, ty, tb.right, toneColor(tb.right_tone), false);
-            right_w = tw + pad;
+            _ = tv.text(ui, W - right_w - pad - tw, ty, tb.right, toneColor(tb.right_tone), false);
+            right_w += tw + pad;
         }
     }
     // Title, cut to the space left of the right-hand text.
@@ -728,4 +897,259 @@ fn drawStatus(tv: *TermView, ui: fontset.Metrics, st: StatusLine, y: f32, W: f32
         x = tv.text(ui, x, ty, st.extra, toneColor(st.extra_tone), false);
     }
     if (st.right.len > 0) _ = tv.text(ui, W - pad - textWidth(ui, st.right), ty, st.right, toneColor(.muted), false);
+}
+
+// ------------------------------------------------------------ panel
+
+const panel_bg: Rgb = .{ 0x26, 0x2A, 0x31 };
+const panel_edge: Rgb = .{ 0x4A, 0x52, 0x5E };
+const field_bg: Rgb = .{ 0x17, 0x19, 0x1D };
+const focus_edge: Rgb = .{ 0x6C, 0xA8, 0xE8 };
+
+/// Byte length of the next line of `s` that fits `max_w` pixels: breaks
+/// after the last space that fits, or mid-word if a word alone is too
+/// long. Always at least one codepoint (no endless loop in a narrow box).
+pub fn wrapLen(cell_w: u32, s: []const u8, max_w: f32) usize {
+    var used: f32 = 0;
+    var last_space: ?usize = null;
+    var i: usize = 0;
+    while (i < s.len) {
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const end = @min(i + n, s.len);
+        const cp = std.unicode.utf8Decode(s[i..end]) catch 0xFFFD;
+        const cw: f32 = @floatFromInt(wcwidth.of(cp) * cell_w);
+        if (used + cw > max_w and i > 0) return last_space orelse i;
+        if (cp == ' ') last_space = end;
+        used += cw;
+        i = end;
+    }
+    return s.len;
+}
+
+test "wrapLen" {
+    try std.testing.expectEqual(@as(usize, 11), wrapLen(1, "hello world", 20));
+    try std.testing.expectEqual(@as(usize, 6), wrapLen(1, "hello world", 8));
+    try std.testing.expectEqual(@as(usize, 3), wrapLen(1, "abcdef", 3));
+    try std.testing.expectEqual(@as(usize, 1), wrapLen(10, "abc", 1));
+    try std.testing.expectEqual(@as(usize, 0), wrapLen(1, "", 5));
+}
+
+/// Draws (or, with `draw` false, only measures) wrapped text; returns the
+/// height used.
+fn wrapped(tv: *TermView, m: fontset.Metrics, x: f32, y0: f32, max_w: f32, t: PanelText, paint: bool) f32 {
+    const lh: f32 = @round(@as(f32, @floatFromInt(m.cell_h)) * 1.35);
+    var y = y0;
+    var rest = t.text;
+    if (rest.len == 0) return @round(lh * 0.5); // an empty line is a small gap
+    while (rest.len > 0) {
+        const n = wrapLen(m.cell_w, rest, max_w);
+        if (paint) _ = tv.text(m, x, y, std.mem.trimEnd(u8, rest[0..n], " "), toneColor(t.tone), t.bold);
+        y += lh;
+        rest = std.mem.trimStart(u8, rest[n..], " ");
+    }
+    return y - y0;
+}
+
+/// `s` cut to `max_w` pixels, keeping its end (typed text, paths) when
+/// `keep_end`, else its start.
+fn clipText(m: fontset.Metrics, s: []const u8, max_w: f32, keep_end: bool) []const u8 {
+    if (textWidth(m, s) <= max_w) return s;
+    if (!keep_end) return s[0..fitLen(m.cell_w, s, max_w)];
+    var start: usize = 0;
+    while (start < s.len and textWidth(m, s[start..]) > max_w) {
+        start += std.unicode.utf8ByteSequenceLength(s[start]) catch 1;
+    }
+    return s[@min(start, s.len)..];
+}
+
+/// Bytes of `s` whose text fits `max_w` pixels.
+fn fitLen(cell_w: u32, s: []const u8, max_w: f32) usize {
+    var used: f32 = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const end = @min(i + n, s.len);
+        const cp = std.unicode.utf8Decode(s[i..end]) catch 0xFFFD;
+        const cw: f32 = @floatFromInt(wcwidth.of(cp) * cell_w);
+        if (used + cw > max_w) return i;
+        used += cw;
+        i = end;
+    }
+    return s.len;
+}
+
+fn outline(tv: *TermView, x: f32, y: f32, w: f32, h: f32, t: f32, c: Rgb) void {
+    tv.rect(x, y, w, t, c);
+    tv.rect(x, y + h - t, w, t, c);
+    tv.rect(x, y, t, h, c);
+    tv.rect(x + w - t, y, t, h, c);
+}
+
+fn registerButton(tv: *TermView, x: f32, y: f32, w: f32, h: f32, id: u32) void {
+    if (tv.n_buttons >= tv.buttons.len) return;
+    tv.buttons[tv.n_buttons] = .{ .x = x, .y = y, .w = w, .h = h, .action = .{ .button = id } };
+    tv.n_buttons += 1;
+}
+
+fn panelButton(tv: *TermView, m: fontset.Metrics, x: f32, y: f32, h: f32, b: PanelButton, s: f32, paint: bool) f32 {
+    const pad: f32 = @floatFromInt(m.cell_w * 2);
+    const w = textWidth(m, b.label) + 2 * pad;
+    if (!paint) return w;
+    const bg: Rgb = switch (b.tone) {
+        .good => .{ 0x2E, 0x6B, 0x3A },
+        .bad => .{ 0x7A, 0x30, 0x30 },
+        .warn => .{ 0x7A, 0x5A, 0x20 },
+        else => button_bg,
+    };
+    tv.rect(x, y, w, h, bg);
+    if (b.focused) tv.outline(x, y, w, h, @max(2, @round(2 * s)), focus_edge);
+    _ = tv.text(m, x + pad, y + @round((h - @as(f32, @floatFromInt(m.cell_h))) / 2), b.label, button_fg, true);
+    tv.registerButton(x, y, w, h, b.id);
+    return w;
+}
+
+/// One layout pass over the panel's contents, inside the box at (x, y0)
+/// with inner width `w`. Returns the height used. Measuring and drawing
+/// share this code so they always agree.
+fn panelBody(tv: *TermView, ui: fontset.Metrics, big: fontset.Metrics, p: Panel, x: f32, y0: f32, w: f32, s: f32, paint: bool) f32 {
+    var y = y0;
+    const lh: f32 = @floatFromInt(ui.cell_h);
+    y += tv.wrapped(big, x, y, w, .{ .text = p.title, .tone = p.title_tone, .bold = true }, paint);
+    y += @round(lh * 0.4);
+    for (p.lines) |l| y += tv.wrapped(ui, x, y, w, l, paint);
+    // Rows: text on the left, an optional button on the right.
+    if (p.rows.len > 0) {
+        y += @round(lh * 0.4);
+        const rh = @round(lh * 1.9);
+        for (p.rows) |r| {
+            if (paint and r.selected) tv.rect(x - @round(4 * s), y, w + @round(8 * s), rh, .{ 0x33, 0x39, 0x44 });
+            var tw = w;
+            if (r.button) |b| {
+                const bh = @round(rh * 0.8);
+                const bw = tv.panelButton(ui, 0, 0, bh, b, s, false);
+                _ = tv.panelButton(ui, x + w - bw, y + @round((rh - bh) / 2), bh, b, s, paint);
+                tw = w - bw - @round(8 * s);
+            }
+            if (paint) _ = tv.text(ui, x, y + @round((rh - lh) / 2), clipText(ui, r.text, tw, false), toneColor(r.tone), false);
+            y += rh;
+        }
+    }
+    // Fields: a label above a boxed value.
+    if (p.fields.len > 0) y += @round(lh * 0.5);
+    for (p.fields) |f| {
+        if (paint) _ = tv.text(ui, x, y, f.label, toneColor(.normal), true);
+        y += @round(lh * 1.3);
+        const fh = @round(lh * 1.9);
+        if (paint) {
+            tv.rect(x, y, w, fh, field_bg);
+            tv.outline(x, y, w, fh, if (f.focused) @max(2, @round(2 * s)) else @max(1, @round(s)), if (f.focused) focus_edge else panel_edge);
+            const cw: f32 = @floatFromInt(ui.cell_w);
+            const tx = x + cw;
+            const ty = y + @round((fh - lh) / 2);
+            const inner = w - 2 * cw;
+            if (f.choice) {
+                var buf: [96]u8 = undefined;
+                const v = std.fmt.bufPrint(&buf, "\u{2039} {s} \u{203A}", .{f.value}) catch f.value;
+                _ = tv.text(ui, tx, ty, v, button_fg, true);
+            } else if (f.value.len == 0 and !f.focused) {
+                _ = tv.text(ui, tx, ty, clipText(ui, f.hint, inner, false), toneColor(.muted), false);
+            } else {
+                const shown = clipText(ui, f.value, inner - cw, true);
+                const end = tv.text(ui, tx, ty, shown, button_fg, false);
+                if (f.focused) tv.rect(end, ty, @max(2, @round(2 * s)), lh, focus_edge); // caret
+            }
+            tv.registerButton(x, y, w, fh, f.id);
+        }
+        y += fh + @round(lh * 0.5);
+    }
+    for (p.after) |l| y += tv.wrapped(ui, x, y, w, l, paint);
+    if (p.note.text.len > 0) {
+        y += @round(lh * 0.3);
+        y += tv.wrapped(ui, x, y, w, p.note, paint);
+    }
+    // Buttons, right-aligned on one row.
+    if (p.buttons.len > 0) {
+        y += @round(lh * 0.8);
+        const bh = @round(lh * 2.1);
+        const gap = @round(8 * s);
+        var total: f32 = 0;
+        for (p.buttons) |b| total += tv.panelButton(ui, 0, 0, bh, b, s, false) + gap;
+        var bx = x + w - total + gap;
+        for (p.buttons) |b| bx += tv.panelButton(ui, bx, y, bh, b, s, paint) + gap;
+        y += bh;
+    }
+    return y - y0;
+}
+
+fn drawPanel(tv: *TermView, ui: fontset.Metrics, p: Panel, W: f32, H: f32, s: f32) void {
+    // Dim everything behind the panel.
+    tv.pushA(0, 0, W, H, tv.atlas.whiteUv(), .{ 0, 0, 0 }, 150);
+    const big = tv.fonts.metrics(@round(17 * s));
+    const pad = @round(20 * s);
+    const margin = @round(16 * s);
+    const max_inner: f32 = @floatFromInt(ui.cell_w * 78);
+    const w = @max(1, @min(W - 2 * margin - 2 * pad, max_inner));
+    const h = tv.panelBody(ui, big, p, 0, 0, w, s, false);
+    const bw = w + 2 * pad;
+    const bh = h + 2 * pad;
+    const bx = @round(@max(0, (W - bw) / 2));
+    const by = @round(@max(0, (H - bh) / 2));
+    tv.rect(bx, by, bw, bh, panel_bg);
+    tv.outline(bx, by, bw, bh, @max(1, @round(s)), panel_edge);
+    _ = tv.panelBody(ui, big, p, bx + pad, by + pad, w, s, true);
+}
+
+// ------------------------------------------------------------ bottom panes
+
+/// A pane's height in pixels: its own, or its content's natural height.
+fn paneHeight(ui: fontset.Metrics, p: Pane, s: f32) f32 {
+    if (p.height > 0) return @round(p.height * s);
+    const ch: f32 = @floatFromInt(ui.cell_h);
+    return switch (p.content) {
+        .answers, .buttons => @round(ch * 2.4),
+        .field => @round(ch * 2.6),
+    };
+}
+
+fn drawPane(tv: *TermView, ui: fontset.Metrics, p: Pane, r: Rect, s: f32) void {
+    if (r.h < 1) return;
+    switch (p.content) {
+        .answers => tv.drawAnswerBar(ui, r.y, r.w, r.h, s),
+        .buttons => |bs| {
+            tv.rect(r.x, r.y, r.w, r.h, ui_bg);
+            const gap = @round(6 * s);
+            const bh = @min(@round(r.h * 0.72), @round(@as(f32, @floatFromInt(ui.cell_h)) * 2));
+            const by = r.y + @round((r.h - bh) / 2);
+            var total: f32 = 0;
+            for (bs) |b| total += tv.panelButton(ui, 0, 0, bh, b, s, false) + gap;
+            var x = r.x + @round(@max(gap, (r.w - total + gap) / 2));
+            for (bs) |b| x += tv.panelButton(ui, x, by, bh, b, s, true) + gap;
+        },
+        .field => |f| {
+            tv.rect(r.x, r.y, r.w, r.h, ui_bg);
+            const pad = @round(6 * s);
+            const box: Rect = .{ .x = r.x + pad, .y = r.y + pad, .w = @max(1, r.w - 2 * pad), .h = @max(1, r.h - 2 * pad) };
+            tv.rect(box.x, box.y, box.w, box.h, field_bg);
+            tv.outline(box.x, box.y, box.w, box.h, if (f.focused) @max(2, @round(2 * s)) else @max(1, @round(s)), if (f.focused) focus_edge else panel_edge);
+            const cw: f32 = @floatFromInt(ui.cell_w);
+            const lh: f32 = @floatFromInt(ui.cell_h);
+            const tx = box.x + cw;
+            const ty = box.y + @round(@min(cw, (box.h - lh) / 2));
+            const inner = box.w - 2 * cw;
+            if (f.value.len == 0 and !f.focused) {
+                _ = tv.text(ui, tx, ty, clipText(ui, f.hint, inner, false), toneColor(.muted), false);
+            } else {
+                const end = tv.text(ui, tx, ty, clipText(ui, f.value, inner - cw, true), button_fg, false);
+                if (f.focused) tv.rect(end, ty, @max(2, @round(2 * s)), lh, focus_edge);
+            }
+            tv.registerButton(box.x, box.y, box.w, box.h, f.id);
+        },
+    }
+}
+
+test "Rect contains" {
+    const r: Rect = .{ .x = 10, .y = 20, .w = 5, .h = 5 };
+    try std.testing.expect(r.contains(10, 20));
+    try std.testing.expect(!r.contains(15, 20));
+    try std.testing.expect(!r.contains(9.9, 22));
 }

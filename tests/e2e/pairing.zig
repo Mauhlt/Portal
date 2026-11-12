@@ -70,7 +70,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     {
         var resp = try get(inst, "/pair", null);
         defer resp.deinit();
-        _ = r.check("pair page explains the desk step (no button)", resp.status == 200 and resp.bodyContains("portal pair") and !resp.bodyContains("type=\"submit\""), "{d}", .{resp.status});
+        _ = r.check("pair page explains the desk step (no button)", resp.status == 200 and resp.bodyContains("Pair a device") and !resp.bodyContains("type=\"submit\""), "{d}", .{resp.status});
     }
     {
         var resp = try post(inst, "/pair", null, true);

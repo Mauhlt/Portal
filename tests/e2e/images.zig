@@ -1,4 +1,5 @@
-//! Inline images end to end: a program in the session runs `portal show`
+//! Inline images end to end: a program in the session runs `portal-show`
+//! (found on the session's PATH, which Portal starts with its own folder)
 //! on a PNG this test writes; viewers must receive the blob ('I') and the
 //! placement ('P') with the right geometry, strictly decoded; a viewer
 //! without a session gets nothing.
@@ -32,7 +33,9 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
 
     // The session program waits for the viewer to connect, shows the image,
     // then idles. Paths under the scratch root have no spaces.
-    const script = try std.fmt.allocPrint(h.gpa, "echo IMG-READY & ping -n 6 127.0.0.1 >nul & {s} show {s} --cols {d} & echo IMG-SHOWN & ping -n 600 127.0.0.1 >nul", .{ h.exe, png_path, want_cols });
+    // `portal-show` by name: the session's PATH must lead to the one next
+    // to portalctl.exe.
+    const script = try std.fmt.allocPrint(h.gpa, "echo IMG-READY & ping -n 6 127.0.0.1 >nul & portal-show {s} --cols {d} & echo IMG-SHOWN & ping -n 600 127.0.0.1 >nul", .{ png_path, want_cols });
     const inst = try proc.Instance.start(h, dir, port, &.{ "--", "cmd.exe", "/c", script });
     defer inst.kill();
 

@@ -573,7 +573,7 @@ pub fn describeError(err: anyerror) []const u8 {
     return switch (err) {
         error.BadDeviceFile => "the device list (devices.txt in %LOCALAPPDATA%\\Portal) is damaged or from a newer Portal. " ++
             "To recover: close Portal, move devices.txt somewhere else (keep it if you want to report the problem), " ++
-            "start Portal again, and re-pair every device with `portal pair <name>`",
+            "start Portal again, and re-pair every device (Pair a device in the Portal window)",
         error.DeviceStoreBusy => "the device list is locked by another Portal process; try again",
         error.DeviceStoreWriteFailed => "could not replace devices.txt (disk full, or the file is locked by another program)",
         else => "could not access the device list in %LOCALAPPDATA%\\Portal",

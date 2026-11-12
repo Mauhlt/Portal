@@ -2,7 +2,10 @@
 //! reconnects (docs/protocol.md).
 //!
 //!   no stored device credential -> wait for the user to press "Pair"
-//!       -> POST /pair -> store the device cookie in the OS credential store
+//!       -> POST /pair (registers a request, returns its token)
+//!       -> GET /pair/wait every 2 s, showing the request code, until the
+//!          desk approves (device + session cookies) or denies
+//!       -> store the device cookie in the OS credential store
 //!   stored credential -> POST /auth/refresh -> store the rotated value
 //!       immediately (before anything else), keep the session in memory
 //!   GET /ws with the session cookie -> 'G' frames into the shared grid
@@ -41,11 +44,16 @@ pub const connect_timeout_ms = 15_000;
 pub const request_timeout_ms = 15_000;
 pub const idle_timeout_ms = 60_000;
 pub const ping_interval_ms = 20_000;
+/// The server keeps a pairing request (its token cookie) for 10 minutes.
+pub const pair_request_lifetime_ms = 600_000;
 
 pub const Status = enum {
     starting,
     need_pairing,
     pairing,
+    /// The request is registered; the desk has not answered yet
+    /// (Shared.pair_code is the request code).
+    pair_waiting,
     pair_closed,
     refreshing,
     connecting,
@@ -67,6 +75,14 @@ pub const Shared = struct {
     /// Bumped on any change the UI should redraw for.
     version: std.atomic.Value(u64) = .init(0),
     pair_requested: std.atomic.Value(bool) = .init(false),
+    pair_cancel: std.atomic.Value(bool) = .init(false),
+    /// Wakes the network thread when the user asks to pair or cancels.
+    wake: Io.Event = .unset,
+    /// While waiting for the desk: the request code it shows.
+    pair_code: ?[4]u8 = null,
+    /// The last connection error, until the next successful connection
+    /// (the overlay explains certificate and pinning errors).
+    last_error: ?anyerror = null,
     wake_ctx: ?*anyopaque = null,
     wake_fn: ?*const fn (*anyopaque) void = null,
 
@@ -129,6 +145,9 @@ pub const Client = struct {
     last_ping_ms: std.atomic.Value(i64) = .init(0),
     /// Last connection error printed to stderr (printed once per change).
     last_logged: ?anyerror = null,
+    /// Delay between `GET /pair/wait` polls (tests shorten it).
+    pair_poll_ms: i64 = 2000,
+    reason_buf: [160]u8 = undefined,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, shared: *Shared, server: []const u8, transport: Transport) !Client {
         var c: Client = .{
@@ -182,6 +201,8 @@ pub const Client = struct {
         s.status = status;
         const d = std.fmt.bufPrint(&s.detail_buf, fmt, args) catch s.detail_buf[0..0];
         s.detail_len = d.len;
+        if (status != .pair_waiting) s.pair_code = null;
+        if (status == .connected) s.last_error = null;
         if (status != .connected) s.mode = if (status == .session_ended) s.mode else .unknown;
         s.mutex.unlock(c.io);
         c.notify();
@@ -198,6 +219,9 @@ pub const Client = struct {
 
     /// Prints connection errors to stderr once per distinct error.
     fn logError(c: *Client, err: anyerror) void {
+        c.shared.mutex.lockUncancelable(c.io);
+        c.shared.last_error = err;
+        c.shared.mutex.unlock(c.io);
         if (c.last_logged) |l| if (l == err) return;
         c.last_logged = err;
         std.debug.print("portal connect: {s}: {s} ({t})\n", .{ c.host(), describe(err), err });
@@ -236,15 +260,14 @@ pub const Client = struct {
         }
     }
 
+    /// Shows why and sleeps once until the retry (no countdown ticks).
     fn retryWait(c: *Client, backoff: *i64, why: []const u8) void {
-        var left = backoff.*;
-        while (left > 0) : (left -= 250) {
-            c.shared.mutex.lockUncancelable(c.io);
-            c.shared.retry_in_ms = left;
-            c.shared.mutex.unlock(c.io);
-            c.setStatus(.retrying, "{s}; retrying in {d} s", .{ why, @divTrunc(left + 999, 1000) });
-            c.sleepMs(@min(250, left));
-        }
+        const left = backoff.*;
+        c.shared.mutex.lockUncancelable(c.io);
+        c.shared.retry_in_ms = left;
+        c.shared.mutex.unlock(c.io);
+        c.setStatus(.retrying, "{s}; retrying in {d} s", .{ why, @divTrunc(left + 999, 1000) });
+        c.sleepMs(left);
         backoff.* = @min(backoff.* * 2, 15000);
     }
 
@@ -266,40 +289,118 @@ pub const Client = struct {
             c.setStatus(.refreshing, "signing in", .{});
             return c.refresh(&device, backoff);
         }
-        // Not paired: wait for the user.
+        // Not paired: wait for the user (event-driven: requestPairing wakes us).
         c.shared.mutex.lockUncancelable(c.io);
-        const already = c.shared.status == .need_pairing;
+        const already = c.shared.status == .need_pairing or c.shared.status == .pair_closed;
         c.shared.mutex.unlock(c.io);
         if (!already) c.setStatus(.need_pairing, "", .{}); // keep any "no longer paired" note
-        while (!c.shared.pair_requested.swap(false, .acq_rel)) c.sleepMs(100);
-        c.setStatus(.pairing, "pairing", .{});
-        return c.pair();
-    }
-
-    fn pair(c: *Client) ?http.Cookie {
-        var resp_buf: [http.max_head_bytes]u8 = undefined;
-        defer std.crypto.secureZero(u8, &resp_buf);
-        var req_buf: [512]u8 = undefined;
-        var w: Io.Writer = .fixed(&req_buf);
-        http.writePairRequest(&w, c.host(), c.secure()) catch return null;
-        var r = c.roundTrip(w.buffered(), &resp_buf) catch |err| {
-            c.logError(err);
-            c.setStatus(.pair_closed, "could not reach the server: {s}", .{describe(err)});
-            return null;
-        };
-        defer if (r.device) |*d| d.wipe();
-        switch (http.pairOutcome(&r)) {
-            .ok => {
-                credstore.save(c.target(), r.device.?.value()) catch |err| {
+        while (!c.shared.pair_requested.swap(false, .acq_rel)) {
+            c.shared.wake.wait(c.io) catch {};
+            c.shared.wake.reset();
+        }
+        _ = c.shared.pair_cancel.swap(false, .acq_rel);
+        c.setStatus(.pairing, "asking the desk", .{});
+        const r = c.pairFlow();
+        switch (r) {
+            .paired => |p| {
+                var dev = p.device;
+                defer dev.wipe();
+                credstore.save(c.target(), dev.value()) catch |err| {
                     c.setStatus(.store_unavailable, "could not save the device credential ({t})", .{err});
                     return null;
                 };
-                return r.session.?;
+                return p.session;
             },
-            .closed => c.setStatus(.pair_closed, "pairing window is closed", .{}),
-            .unexpected => c.setStatus(.pair_closed, "unexpected pairing response (HTTP {d})", .{r.status}),
+            .failed => |why| {
+                c.setStatus(.pair_closed, "{s}", .{why});
+                return null;
+            },
+            .cancelled => {
+                c.setStatus(.need_pairing, "pairing cancelled", .{});
+                return null;
+            },
         }
-        return null;
+    }
+
+    pub const PairFlowResult = union(enum) {
+        paired: struct { device: http.Cookie, session: http.Cookie },
+        /// Why not (shown to the user).
+        failed: []const u8,
+        cancelled,
+    };
+
+    /// The desk-approved pairing (docs/protocol.md section 1): `POST /pair`
+    /// registers a request and returns its token; then `GET /pair/wait`
+    /// until the desk answers. While waiting the request code is shown
+    /// (Shared.pair_code) so the user can match it with the desk's. Waits
+    /// between polls are real deadlines (`pair_poll_ms`, the browsers'
+    /// 2 s refresh), cut short by cancelPairing; the whole wait ends when
+    /// the request's 10-minute lifetime is over. Nothing is stored here.
+    pub fn pairFlow(c: *Client) PairFlowResult {
+        var resp_buf: [http.max_head_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &resp_buf);
+        var req_buf: [512]u8 = undefined;
+        defer std.crypto.secureZero(u8, &req_buf);
+        var w: Io.Writer = .fixed(&req_buf);
+        http.writePairRequest(&w, c.host(), c.secure()) catch return .{ .failed = "request too long" };
+        var token: http.Cookie = blk: {
+            var r = c.roundTrip(w.buffered(), &resp_buf) catch |err| {
+                c.logError(err);
+                return .{ .failed = c.reason("could not reach the server: {s}", .{describe(err)}) };
+            };
+            defer if (r.pairreq) |*t| t.wipe();
+            switch (http.pairStartOutcome(&r)) {
+                .requested => break :blk r.pairreq.?,
+                .closed => return .{ .failed = "no pairing window is open at the desk (Pair a device in the Portal window, or portalctl pair <name>)" },
+                .busy => return .{ .failed = "too many requests are waiting at the desk; answer them there, then try again" },
+                .denied => return .{ .failed = "the desk denied this device in this pairing window" },
+                .unexpected => return .{ .failed = c.reason("unexpected pairing response (HTTP {d})", .{r.status}) },
+            }
+        };
+        defer token.wipe();
+
+        const deadline = watchdog.nowMs(c.io) + pair_request_lifetime_ms;
+        var failures: u32 = 0;
+        while (true) {
+            if (c.shared.pair_cancel.swap(false, .acq_rel)) return .cancelled;
+            w = .fixed(&req_buf);
+            http.writePairWaitRequest(&w, c.host(), c.secure(), &token) catch return .{ .failed = "request too long" };
+            var delay = c.pair_poll_ms;
+            if (c.roundTrip(w.buffered(), &resp_buf)) |resp| {
+                var r = resp;
+                defer if (r.device) |*d| d.wipe();
+                failures = 0;
+                switch (http.pairWaitOutcome(&r)) {
+                    .waiting => {
+                        c.shared.mutex.lockUncancelable(c.io);
+                        if (r.request_code) |code| c.shared.pair_code = code;
+                        c.shared.mutex.unlock(c.io);
+                        c.setStatus(.pair_waiting, "approve this device at the desk", .{});
+                    },
+                    .paired => return .{ .paired = .{ .device = r.device.?, .session = r.session.? } },
+                    .denied => return .{ .failed = "the desk denied this request" },
+                    .expired => return .{ .failed = "the request expired or the pairing window closed; pair again" },
+                    .unexpected => return .{ .failed = c.reason("unexpected answer while waiting (HTTP {d})", .{r.status}) },
+                }
+            } else |err| {
+                // A lost poll is retried (with backoff) until the deadline.
+                c.logError(err);
+                failures += 1;
+                delay = @min(c.pair_poll_ms * (@as(i64, 1) << @intCast(@min(failures, 3))), 15_000);
+                c.setStatus(.pair_waiting, "{s}; trying again", .{describe(err)});
+            }
+            const now = watchdog.nowMs(c.io);
+            if (now >= deadline) return .{ .failed = "the pairing request expired; pair again" };
+            // Sleep until the next poll, or until the user cancels.
+            c.shared.wake.reset();
+            if (c.shared.pair_cancel.load(.acquire)) continue;
+            c.shared.wake.waitTimeout(c.io, .{ .duration = .{ .raw = .fromMilliseconds(@min(delay, deadline - now)), .clock = .awake } }) catch {};
+        }
+    }
+
+    /// Formats a failure reason into the client's buffer.
+    fn reason(c: *Client, comptime fmt: []const u8, args: anytype) []const u8 {
+        return std.fmt.bufPrint(&c.reason_buf, fmt, args) catch "pairing failed";
     }
 
     fn refresh(c: *Client, device: *const http.Cookie, backoff: *i64) ?http.Cookie {
@@ -569,6 +670,14 @@ pub const Client = struct {
 
     pub fn requestPairing(c: *Client) void {
         c.shared.pair_requested.store(true, .release);
+        c.shared.wake.set(c.io);
+    }
+
+    /// Stops waiting for the desk (the request stays at the desk until it
+    /// expires; the device just stops asking).
+    pub fn cancelPairing(c: *Client) void {
+        c.shared.pair_cancel.store(true, .release);
+        c.shared.wake.set(c.io);
     }
 };
 
@@ -635,4 +744,174 @@ fn fetchTask(gpa: std.mem.Allocator, io: Io, addr: net.IpAddress, host_: []const
 test "bare IP" {
     try std.testing.expectEqualStrings("10.8.0.1", bareIp("10.8.0.1:8420"));
     try std.testing.expectEqualStrings("fd00::1", bareIp("[fd00::1]:8420"));
+}
+
+// ------------------------------------------------------------------ pairing against a scripted server
+
+/// A local plain-HTTP server that answers one request per connection from
+/// a script, like Portal's pairing routes, and records what it was asked.
+const ScriptServer = struct {
+    server: net.Server,
+    replies: []const []const u8,
+    /// Request heads, as received (first line + headers).
+    seen: [8][512]u8 = undefined,
+    seen_len: [8]usize = @splat(0),
+    n: usize = 0,
+
+    fn serve(s: *ScriptServer, io: Io) void {
+        for (s.replies) |reply| {
+            const conn = s.server.accept(io) catch return;
+            defer conn.close(io);
+            var len: usize = 0;
+            const buf = &s.seen[s.n];
+            while (len < buf.len) {
+                var vec = [_][]u8{buf[len..]};
+                const got = conn.readWithControl(io, &vec, &.{}) catch return;
+                if (got.data_len == 0) return;
+                len += got.data_len;
+                if (std.mem.indexOf(u8, buf[0..len], "\r\n\r\n") != null) break;
+            }
+            s.seen_len[s.n] = len;
+            s.n += 1;
+            var wb: [1024]u8 = undefined;
+            var w = conn.writer(io, &wb);
+            w.interface.writeAll(reply) catch return;
+            w.interface.flush() catch return;
+        }
+    }
+
+    fn request(s: *const ScriptServer, i: usize) []const u8 {
+        return s.seen[i][0..s.seen_len[i]];
+    }
+};
+
+const tok43 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123-_6";
+const reply_requested = "HTTP/1.1 303 See Other\r\nLocation: /pair/wait\r\n" ++
+    "Set-Cookie: portal_pairreq=" ++ tok43 ++ "; Path=/; HttpOnly; SameSite=Strict; Max-Age=600\r\nContent-Length: 0\r\n\r\n";
+const reply_waiting = "HTTP/1.1 200 OK\r\nX-Portal-Request-Code: 7f3a\r\nContent-Type: text/html\r\nContent-Length: 4\r\n\r\nwait";
+
+fn runScript(replies: []const []const u8, srv: *ScriptServer) !Client.PairFlowResult {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var addr: net.IpAddress = try .parseLiteral("127.0.0.1:0");
+    srv.* = .{ .server = try addr.listen(io, .{}), .replies = replies };
+    addr = srv.server.socket.address;
+    var host_buf: [32]u8 = undefined;
+    const host_text = try std.fmt.bufPrint(&host_buf, "{f}", .{addr});
+    var fut = try io.concurrent(ScriptServer.serve, .{ srv, io });
+    defer {
+        fut.cancel(io);
+        srv.server.deinit(io);
+    }
+    var shared: Shared = .{};
+    var c = try Client.init(gpa, io, &shared, host_text, .insecure_plain_http);
+    c.pair_poll_ms = 5;
+    const r = c.pairFlow();
+    if (r == .paired) {
+        // The request code was shown while waiting (cleared on later
+        // statuses, so check what the waiting status left behind).
+        try std.testing.expect(shared.version.load(.acquire) > 0);
+    }
+    return r;
+}
+
+test "pairing: request, wait (code shown), approved at the desk" {
+    var srv: ScriptServer = undefined;
+    const approved = "HTTP/1.1 303 See Other\r\nLocation: /\r\n" ++
+        "Set-Cookie: portal_device=laptop." ++ tok43 ++ "; Path=/; HttpOnly; SameSite=Strict; Max-Age=7776000\r\n" ++
+        "Set-Cookie: portal_session=" ++ tok43 ++ "; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200\r\n" ++
+        "Set-Cookie: portal_pairreq=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0\r\nContent-Length: 0\r\n\r\n";
+    const r = try runScript(&.{ reply_requested, reply_waiting, reply_waiting, approved }, &srv);
+    try std.testing.expect(r == .paired);
+    try std.testing.expectEqualStrings("laptop." ++ tok43, r.paired.device.value());
+    try std.testing.expectEqualStrings(tok43, r.paired.session.value());
+    // POST /pair with Host and Origin, then the waits with the token.
+    try std.testing.expectEqual(@as(usize, 4), srv.n);
+    try std.testing.expect(std.mem.startsWith(u8, srv.request(0), "POST /pair HTTP/1.1\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, srv.request(0), "\r\nOrigin: http://127.0.0.1:") != null);
+    for (1..4) |i| {
+        try std.testing.expect(std.mem.startsWith(u8, srv.request(i), "GET /pair/wait HTTP/1.1\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, srv.request(i), "\r\nCookie: portal_pairreq=" ++ tok43 ++ "\r\n") != null);
+    }
+}
+
+test "pairing: denied, expired, refused, and the code is published" {
+    var srv: ScriptServer = undefined;
+    const denied = "HTTP/1.1 303 See Other\r\nLocation: /pair?e=denied\r\nContent-Length: 0\r\n\r\n";
+    const r1 = try runScript(&.{ reply_requested, reply_waiting, denied }, &srv);
+    try std.testing.expect(r1 == .failed);
+    try std.testing.expect(std.mem.indexOf(u8, r1.failed, "denied") != null);
+
+    const expired = "HTTP/1.1 303 See Other\r\nLocation: /pair?e=expired\r\nContent-Length: 0\r\n\r\n";
+    const r2 = try runScript(&.{ reply_requested, expired }, &srv);
+    try std.testing.expect(r2 == .failed);
+    try std.testing.expect(std.mem.indexOf(u8, r2.failed, "expired") != null);
+
+    const closed = "HTTP/1.1 303 See Other\r\nLocation: /pair?e=closed\r\nContent-Length: 0\r\n\r\n";
+    const r3 = try runScript(&.{closed}, &srv);
+    try std.testing.expect(r3 == .failed);
+    try std.testing.expect(std.mem.indexOf(u8, r3.failed, "no pairing window") != null);
+
+    // The waiting page's code reaches Shared for the overlay.
+    const io = std.testing.io;
+    var addr: net.IpAddress = try .parseLiteral("127.0.0.1:0");
+    srv = .{ .server = try addr.listen(io, .{}), .replies = &.{ reply_requested, reply_waiting, denied } };
+    addr = srv.server.socket.address;
+    var host_buf: [32]u8 = undefined;
+    const host_text = try std.fmt.bufPrint(&host_buf, "{f}", .{addr});
+    var fut = try io.concurrent(ScriptServer.serve, .{ &srv, io });
+    defer {
+        fut.cancel(io);
+        srv.server.deinit(io);
+    }
+    var shared: Shared = .{};
+    var c = try Client.init(std.testing.allocator, io, &shared, host_text, .insecure_plain_http);
+    c.pair_poll_ms = 5;
+    var seen_code = false;
+    // Watch the shared state from the UI side: wake_fn runs on every change.
+    const Watch = struct {
+        var flag: *bool = undefined;
+        var sh: *Shared = undefined;
+        fn f(_: *anyopaque) void {
+            if (sh.pair_code) |code| if (std.mem.eql(u8, &code, "7f3a")) {
+                flag.* = true;
+            };
+        }
+    };
+    Watch.flag = &seen_code;
+    Watch.sh = &shared;
+    shared.wake_ctx = &shared;
+    shared.wake_fn = Watch.f;
+    _ = c.pairFlow();
+    try std.testing.expect(seen_code);
+}
+
+test "pairing: cancel stops the wait" {
+    var srv: ScriptServer = undefined;
+    const io = std.testing.io;
+    var addr: net.IpAddress = try .parseLiteral("127.0.0.1:0");
+    srv = .{ .server = try addr.listen(io, .{}), .replies = &.{ reply_requested, reply_waiting, reply_waiting, reply_waiting } };
+    addr = srv.server.socket.address;
+    var host_buf: [32]u8 = undefined;
+    const host_text = try std.fmt.bufPrint(&host_buf, "{f}", .{addr});
+    var fut = try io.concurrent(ScriptServer.serve, .{ &srv, io });
+    defer {
+        fut.cancel(io);
+        srv.server.deinit(io);
+    }
+    var shared: Shared = .{};
+    var c = try Client.init(std.testing.allocator, io, &shared, host_text, .insecure_plain_http);
+    c.pair_poll_ms = 60_000; // only a cancel can end the wait in time
+    const Cancel = struct {
+        var client: *Client = undefined;
+        fn f(_: *anyopaque) void {
+            if (client.shared.status == .pair_waiting) client.cancelPairing();
+        }
+    };
+    Cancel.client = &c;
+    shared.wake_ctx = &shared;
+    shared.wake_fn = Cancel.f;
+    const t0 = watchdog.nowMs(io);
+    try std.testing.expect(c.pairFlow() == .cancelled);
+    try std.testing.expect(watchdog.nowMs(io) - t0 < 10_000);
 }

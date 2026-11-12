@@ -13,6 +13,7 @@
 
 pub const TermView = @import("TermView.zig");
 pub const grid = @import("grid.zig");
+pub const form = @import("form.zig");
 pub const images = @import("images.zig");
 pub const input = @import("input.zig");
 pub const platform = @import("platform/platform.zig");
@@ -27,6 +28,7 @@ pub const font = struct {
 test {
     _ = TermView;
     _ = grid;
+    _ = form;
     _ = images;
     _ = platform;
     _ = wcwidth;

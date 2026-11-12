@@ -1,11 +1,13 @@
 //! Portal end-to-end tests: `zig build e2e`.
 //!
-//! Launches real `portal run` instances (hidden consoles, scratch
-//! LOCALAPPDATA, ports 18420+) and drives them over raw sockets: pairing,
-//! grid frames, input policies, and transport hardening. Prints a PASS/FAIL
-//! line per check and a summary; exits nonzero if anything failed.
+//! Launches real `portalctl run --console` instances (hidden consoles,
+//! scratch LOCALAPPDATA, ports 18420+) and drives them over raw sockets:
+//! pairing, grid frames, input policies, and transport hardening. Prints a
+//! PASS/FAIL line per check and a summary; exits nonzero if anything failed.
 //!
-//!   e2e <path-to-portal.exe> [group...]
+//!   e2e <path-to-portalctl.exe> [group...]
+//!
+//! portal-show.exe must sit next to portalctl.exe (the build arranges it).
 //!
 //! Groups: pairing, grid, keys, text, transport, privacy, images, instruct,
 //! console, idle (default: all).
@@ -58,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.items.len >= 1 and std.mem.eql(u8, args.items[0], "--inject"))
         @import("win.zig").ExitProcess(console_tests.injectMain(args.items[1..]));
     if (args.items.len < 1) {
-        std.debug.print("usage: e2e <portal.exe> [group...]\n", .{});
+        std.debug.print("usage: e2e <portalctl.exe> [group...]\n", .{});
         std.process.exit(2);
     }
     const exe = args.items[0];
