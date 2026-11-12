@@ -133,6 +133,18 @@ selection with the mouse, Ctrl+Shift+C / Ctrl+Shift+V or right-click to copy
 to zoom. Resizing the window resizes the session; remote viewers adapt.
 There is no scrollback yet.
 
+**Inline images.** `portal show picture.png [--cols N]`, run inside the
+session (by you, or by the session program through its shell tool), shows a
+PNG in the window, in `portal connect`, and for browser viewers. Images
+scroll with the text and disappear when their cells are erased or the
+screen is cleared. Resizing the window also clears them, because ConPTY
+repaints the whole screen. Programs can also use the kitty graphics
+protocol directly (PNG only; see `src/vt_gfx.zig`). Limits: 6 MiB per PNG,
+8192 px per side and 32 Mpx, 64 images and 64 MiB per session. Images
+only ever come from a program in the session; viewers can't request
+files. The browser client currently draws a labelled box instead of the
+pixels (see `docs/image-decoder-findings.md`).
+
 Portal is a console-subsystem program (so `portal pair`, `devices` etc.
 print and return exit codes normally); `portal run` frees its console once
 the window is up. Double-clicking it therefore shows a console window for a

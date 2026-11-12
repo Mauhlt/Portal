@@ -15,10 +15,35 @@ pub const Sync = struct {
     /// Last copied title, NUL-free UTF-8.
     title_buf: [vt.max_title_bytes]u8 = undefined,
     title_len: usize = 0,
+    /// term.imagesGen() when images were last copied.
+    images_gen: ?u64 = null,
+    place_buf: std.ArrayList(grid.Placement) = .empty,
 
     pub fn deinit(s: *Sync, gpa: std.mem.Allocator) void {
         gpa.free(s.row_gens);
         s.row_gens = &.{};
+        s.place_buf.deinit(gpa);
+    }
+
+    /// Copies the visible screen's placements, and the PNG bytes of any
+    /// image the grid doesn't have yet (decoding happens later, in the
+    /// view, outside the session lock). Returns false on allocation
+    /// failure (retried next time).
+    fn syncImages(s: *Sync, gpa: std.mem.Allocator, g: *grid.Grid, term: *const vt.Terminal) bool {
+        s.place_buf.clearRetainingCapacity();
+        for (term.placements()) |p| {
+            if (p.row < std.math.minInt(i16) or p.row > std.math.maxInt(i16)) continue;
+            s.place_buf.append(gpa, .{ .id = p.image, .col = p.col, .row = @intCast(p.row), .cols = p.cols, .rows = p.rows }) catch return false;
+            if (g.images.blob(p.image) == null) {
+                const png = term.imagePng(p.image) orelse continue;
+                g.images.putBlob(gpa, p.image, png) catch |e| switch (e) {
+                    error.OutOfMemory => return false,
+                    error.TooLarge => {},
+                };
+            }
+        }
+        g.images.setPlacements(gpa, s.place_buf.items) catch return false;
+        return true;
     }
 
     pub fn title(s: *const Sync) []const u8 {
@@ -59,6 +84,11 @@ pub const Sync = struct {
             g.cursor_x = cur.x;
             g.cursor_y = cur.y;
             g.cursor_visible = cur.visible;
+            changed = true;
+        }
+        const ig = term.imagesGen();
+        if (s.images_gen == null or s.images_gen.? != ig) {
+            if (s.syncImages(gpa, g, term)) s.images_gen = ig;
             changed = true;
         }
         const t = term.title();
@@ -163,6 +193,39 @@ test "sync copies dirty rows, cursor, title and follows resizes" {
     try testing.expectEqual(@as(u16, 20), g.cols);
     try testing.expectEqual(@as(u16, 5), g.rows);
     try testing.expectEqual(@as(u21, 'h'), g.cell(0, 0).cp);
+}
+
+test "sync copies image placements and blobs" {
+    const gpa = testing.allocator;
+    var term = try vt.Terminal.init(gpa, 20, 5);
+    defer term.deinit();
+    var g: grid.Grid = .{};
+    defer g.deinit(gpa);
+    var s: Sync = .{};
+    defer s.deinit(gpa);
+    _ = s.sync(gpa, &g, &term);
+    try testing.expectEqual(@as(usize, 0), g.images.placements.items.len);
+
+    const png = try @import("pngcheck").testImage(gpa, 20, 20);
+    defer gpa.free(png);
+    const b64 = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+    defer gpa.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, png);
+    var seq: std.ArrayList(u8) = .empty;
+    defer seq.deinit(gpa);
+    try seq.print(gpa, "\x1b[2;3H\x1b_Ga=T,f=100,c=4,r=2,C=1;{s}\x1b\\", .{b64});
+    term.feed(seq.items);
+    try testing.expect(s.sync(gpa, &g, &term));
+    try testing.expectEqual(@as(usize, 1), g.images.placements.items.len);
+    const p = g.images.placements.items[0];
+    try testing.expectEqual(@as(u16, 2), p.col);
+    try testing.expectEqual(@as(i16, 1), p.row);
+    try testing.expectEqualSlices(u8, png, g.images.blob(p.id).?);
+    // Erased: placement and blob go.
+    term.feed("\x1b[2J");
+    try testing.expect(s.sync(gpa, &g, &term));
+    try testing.expectEqual(@as(usize, 0), g.images.placements.items.len);
+    try testing.expectEqual(@as(usize, 0), g.images.blobs.items.len);
 }
 
 test "selection text" {

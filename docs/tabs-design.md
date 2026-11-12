@@ -82,7 +82,12 @@ These are hard requirements for the tabs and recent-projects work, enforced by
    can't be subscribed to. Closed sessions keep no screen buffer to replay.
 5. **Program-controlled strings stay in the grid.** Window titles set by
    programs (OSC 0/2, which the agent uses and which can contain paths) are
-   not sent as metadata. Tab names are desk-assigned.
+   not sent as metadata. Tab names are desk-assigned. Inline images are
+   part of the session too. They exist only because a program in the
+   session emitted them (kitty graphics, `portal show`), and they go only to
+   viewers of that session ('I'/'P' frames). No route or message lets a
+   client ask for an image or a file, and the server never reads one: kitty
+   file and shared-memory transmission (t=f/t/s) are ignored.
 6. **Nothing without a session.** Without a live session, every route except
    `/pair` and the static assets reveals nothing: 303 to `/pair` with an empty
    body, or 401.

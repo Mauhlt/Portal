@@ -106,6 +106,9 @@ pub fn build(b: *std.Build) void {
     // The shared GUI modules' own unit tests (client/src/view, client/src).
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.view })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.client })).step);
+    // Inline images: PNG checks and the bounded decoder (fuzzed).
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.pngcheck })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.imgdec })).step);
     // Release tooling: unit tests (release.zig pulls in releases_lib.zig's)
     // and full compiles of both tools.
     const tool_tests = b.addTest(.{ .root_module = release_mod });
@@ -113,19 +116,21 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&release_exe.step);
     test_step.dependOn(&launcher_exe.step);
 
-    addE2e(b, target, optimize, exe);
+    addE2e(b, target, optimize, exe, gui_mods.pngcheck);
 }
 
 /// `zig build e2e [-- group...]`: end-to-end tests (tests/e2e) that launch
 /// real `portal` processes in hidden consoles and drive them over sockets.
 /// Deliberately not part of `test`: it spawns processes and takes minutes.
-fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, portal: *std.Build.Step.Compile) void {
+fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, portal: *std.Build.Step.Compile, pngcheck: *std.Build.Module) void {
     const e2e_exe = b.addExecutable(.{
         .name = "portal-e2e",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/e2e/main.zig"),
             .target = target,
             .optimize = optimize,
+            // The images group writes its test PNG with pngcheck's encoder.
+            .imports = &.{.{ .name = "pngcheck", .module = pngcheck }},
         }),
     });
     const run = b.addRunArtifact(e2e_exe);
@@ -143,16 +148,68 @@ fn addE2e(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
 /// sentinels, cell widths and, in tests, real server frames) and the
 /// bundled fonts as `font_regular` / `font_bold`.
 fn clientModule(b: *std.Build, root_src: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const img = imageModules(b, target, optimize);
     const m = b.createModule(.{ .root_source_file = b.path(root_src), .target = target, .optimize = optimize });
-    m.addImport("vt", b.createModule(.{ .root_source_file = b.path("src/vt.zig"), .target = target, .optimize = optimize }));
+    const vt_mod = b.createModule(.{ .root_source_file = b.path("src/vt.zig"), .target = target, .optimize = optimize });
+    vt_mod.addImport("pngcheck", img.pngcheck);
+    m.addImport("vt", vt_mod);
+    m.addImport("imgdec", img.imgdec);
+    m.addImport("pngcheck", img.pngcheck);
     m.addAnonymousImport("font_regular", .{ .root_source_file = b.path("src/web/fonts/DejaVuSansMono.ttf") });
     m.addAnonymousImport("font_bold", .{ .root_source_file = b.path("src/web/fonts/DejaVuSansMono-Bold.ttf") });
     return m;
 }
 
+// ---- inline images ----
+
+const ImageModules = struct { pngcheck: *std.Build.Module, imgdec: *std.Build.Module };
+
+/// "pngcheck" (client/src/image/pngcheck.zig: PNG structure + limits, no
+/// deps; also imported by src/vt.zig) and "imgdec" (client/src/image:
+/// bounded PNG -> RGBA8 on top of the owner's Image package).
+///
+/// Natively, imgdec imports Image's own published "Image" module. For
+/// wasm32 it gets a module built from the same pinned source (Image's
+/// src/root.zig) with a stub "Vulkan" (client/src/image/vk_stub.zig: just
+/// `Format`, the only Vulkan type the PNG path touches), so the browser
+/// build never compiles or links the Vulkan bindings.
+fn imageModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) ImageModules {
+    const pngcheck = b.createModule(.{
+        .root_source_file = b.path("client/src/image/pngcheck.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const image = if (target.result.cpu.arch.isWasm()) blk: {
+        const dep = b.dependency("Image", .{});
+        const opts = b.addOptions();
+        // 16-byte vectors: wasm32 without simd128 scalarises them anyway,
+        // and narrow ones keep the module small.
+        opts.addOption(usize, "vector_bytes", 16);
+        break :blk b.createModule(.{
+            .root_source_file = dep.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "Vulkan", .module = b.createModule(.{ .root_source_file = b.path("client/src/image/vk_stub.zig"), .target = target, .optimize = optimize }) },
+                .{ .name = "build_options", .module = opts.createModule() },
+            },
+        });
+    } else b.dependency("Image", .{ .target = target }).module("Image");
+    const imgdec = b.createModule(.{
+        .root_source_file = b.path("client/src/image/imgdec.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "Image", .module = image },
+            .{ .name = "pngcheck", .module = pngcheck },
+        },
+    });
+    return .{ .pngcheck = pngcheck, .imgdec = imgdec };
+}
+
 // ---- GUI modules (shared with client/, which still builds on its own) ----
 
-const GuiModules = struct { view: *std.Build.Module, client: *std.Build.Module };
+const GuiModules = struct { view: *std.Build.Module, client: *std.Build.Module, imgdec: *std.Build.Module, pngcheck: *std.Build.Module };
 
 /// Adds "view" (client/src/view: window, Vulkan drawing via the owner's
 /// Renderer, fonts; used by `portal run`'s window) and "client"
@@ -160,12 +217,16 @@ const GuiModules = struct { view: *std.Build.Module, client: *std.Build.Module }
 fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) GuiModules {
     const renderer = b.dependency("Renderer", .{ .target = target, .optimize = optimize, .demo = false });
     const link_libc = target.result.os.tag != .windows; // dlopen off Windows
+    const img = imageModules(b, target, optimize);
     const view = b.createModule(.{
         .root_source_file = b.path("client/src/view/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
-        .imports = &.{.{ .name = "Renderer", .module = renderer.module("Renderer") }},
+        .imports = &.{
+            .{ .name = "Renderer", .module = renderer.module("Renderer") },
+            .{ .name = "imgdec", .module = img.imgdec },
+        },
     });
     const client = b.createModule(.{
         .root_source_file = b.path("client/src/connect.zig"),
@@ -176,5 +237,7 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
     });
     mod.addImport("view", view);
     mod.addImport("client", client);
-    return .{ .view = view, .client = client };
+    // src/vt.zig (a file of the root module) validates transmitted images.
+    mod.addImport("pngcheck", img.pngcheck);
+    return .{ .view = view, .client = client, .imgdec = img.imgdec, .pngcheck = img.pngcheck };
 }

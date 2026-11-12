@@ -45,6 +45,7 @@ const Session = @import("session.zig").Session;
 const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
 const tls = @import("tls/server.zig");
+const web_images = @import("web_images.zig");
 
 const index_html = @embedFile("web/index.html");
 const pair_html = @embedFile("web/pair.html");
@@ -1180,6 +1181,9 @@ pub const Server = struct {
         defer frame.deinit(srv.gpa);
         var rows: std.ArrayList(u16) = .empty;
         defer rows.deinit(srv.gpa);
+        // Inline images: 'I' blobs and 'P' placements (web_images.zig).
+        var images: web_images.Sender = .{ .last_ms = srv.nowMs() };
+        defer images.deinit(srv.gpa);
 
         const hello = std.fmt.bufPrint(&msg, "{{\"t\":\"hello\",\"input\":\"{t}\"}}", .{s.policy}) catch return;
         if (!ws.send(srv, hello, .text)) return;
@@ -1195,7 +1199,7 @@ pub const Server = struct {
             s.mutex.lockUncancelable(srv.io);
             if (!s.closed and !full and s.term.gen == sent_gen and !ws.dead.load(.acquire)) {
                 s.cond.waitTimeout(srv.io, &s.mutex, .{ .duration = .{
-                    .raw = .fromMilliseconds(auth_recheck_ms),
+                    .raw = .fromMilliseconds(if (images.pending) web_images.retry_ms else auth_recheck_ms),
                     .clock = .awake,
                 } }) catch |err| switch (err) {
                     error.Timeout => {},
@@ -1233,6 +1237,9 @@ pub const Server = struct {
                     full = false;
                 }
             }
+            if (encode_ok) images.collect(srv.gpa, t, srv.nowMs()) catch {
+                encode_ok = false;
+            };
             const closed = s.closed;
             const exit_code = s.exit_code;
             s.mutex.unlock(srv.io);
@@ -1242,7 +1249,10 @@ pub const Server = struct {
 
             if (changed) {
                 if (!ws.send(srv, frame.items, .binary)) return;
-            } else if (closed) {
+            }
+            var image_frames = images.frames();
+            while (image_frames.next()) |f| if (!ws.send(srv, f, .binary)) return;
+            if (!changed and closed) {
                 const m = std.fmt.bufPrint(&msg, "{{\"t\":\"exit\",\"code\":{d}}}", .{exit_code}) catch return;
                 _ = ws.send(srv, m, .text);
                 return;
@@ -1348,6 +1358,7 @@ const testing = std.testing;
 
 test {
     _ = http1;
+    _ = web_images;
 }
 
 fn testKey(last: u8) IpKey {

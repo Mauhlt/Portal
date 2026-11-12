@@ -10,5 +10,10 @@
         // Branch portal-client in a worktree for now; once the owner merges
         // that branch, change this to "../Renderer".
         .Renderer = .{ .path = "../Renderer-wt-portal" },
+        // The owner's Image package: its PNG decoder (and inflate) decode
+        // inline images in every client (client/src/image/imgdec.zig).
+        // PINNED by the owner's request to Image@d9da247: a detached
+        // worktree of their Image repo at that commit, used read-only.
+        .Image = .{ .path = "../Image-wt-portal" },
     },
 }

@@ -134,9 +134,111 @@ fn walk(p: []const u8, h: Header, grid: ?*Grid) Error!void {
     if (off != p.len) return error.Malformed; // trailing bytes
 }
 
+/// Applies an 'I' frame (an image blob, docs/protocol.md): u8 'I', u32 id,
+/// u32 len, len PNG bytes. The bytes are only stored here (bounded); the
+/// view validates and decodes them with a bounded allocator.
+pub fn applyBlob(g: *Grid, gpa: std.mem.Allocator, p: []const u8) Error!void {
+    if (p.len < 9 or p[0] != 'I') return error.Malformed;
+    const id = try rd32(p, 1);
+    const len = try rd32(p, 5);
+    if (len != p.len - 9) return error.Malformed;
+    if (len > grid_mod.max_blob_bytes) return error.TooLarge;
+    g.images.putBlob(gpa, id, p[9..]) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TooLarge => error.TooLarge,
+    };
+    g.generation +%= 1;
+}
+
+const placement_len = 14;
+
+/// Applies a 'P' frame (the visible screen's placements): u8 'P', u16 n,
+/// n x { u32 id, u16 col, i16 row, u16 cols, u16 rows, u16 reserved }.
+/// Validated whole before anything changes; ids without a blob are
+/// skipped. Blobs no longer listed are dropped (the cache rule).
+pub fn applyPlacements(g: *Grid, gpa: std.mem.Allocator, p: []const u8) Error!void {
+    if (p.len < 3 or p[0] != 'P') return error.Malformed;
+    const n = try rd16(p, 1);
+    if (p.len != 3 + @as(usize, n) * placement_len) return error.Malformed;
+    var list: [grid_mod.max_placements]grid_mod.Placement = undefined;
+    var k: usize = 0;
+    var off: usize = 3;
+    for (0..n) |_| {
+        defer off += placement_len;
+        const e = p[off..][0..placement_len];
+        const pl: grid_mod.Placement = .{
+            .id = std.mem.readInt(u32, e[0..4], .little),
+            .col = std.mem.readInt(u16, e[4..6], .little),
+            .row = std.mem.readInt(i16, e[6..8], .little),
+            .cols = std.mem.readInt(u16, e[8..10], .little),
+            .rows = std.mem.readInt(u16, e[10..12], .little),
+        };
+        if (pl.cols == 0 or pl.rows == 0 or pl.cols > grid_mod.max_cols or pl.rows > grid_mod.max_rows) continue;
+        if (g.images.blob(pl.id) == null) continue;
+        if (k == list.len) break;
+        list[k] = pl;
+        k += 1;
+    }
+    try g.images.setPlacements(gpa, list[0..k]);
+    g.generation +%= 1;
+}
+
 // ------------------------------------------------------------------ tests
 
 const testing = std.testing;
+
+test "image frames: blobs, placements, cache rule, malformed input" {
+    const gpa = testing.allocator;
+    var g: Grid = .{};
+    defer g.deinit(gpa);
+    try applyBlob(&g, gpa, "I\x07\x00\x00\x00\x03\x00\x00\x00abc");
+    try testing.expectEqualStrings("abc", g.images.blob(7).?);
+    // id 7 at (1, -1) 3x2; id 9 has no blob: skipped; zero size: skipped.
+    const pf = "P\x03\x00" ++
+        "\x07\x00\x00\x00\x01\x00\xff\xff\x03\x00\x02\x00\x00\x00" ++
+        "\x09\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01\x00\x00\x00" ++
+        "\x07\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00";
+    try applyPlacements(&g, gpa, pf);
+    try testing.expectEqual(@as(usize, 1), g.images.placements.items.len);
+    const p0 = g.images.placements.items[0];
+    try testing.expectEqual(@as(i16, -1), p0.row);
+    try testing.expectEqual(@as(u16, 3), p0.cols);
+    // Empty 'P': the blob is dropped.
+    try applyPlacements(&g, gpa, "P\x00\x00");
+    try testing.expect(g.images.blob(7) == null);
+
+    // Malformed: wrong lengths, truncations at every point, trailing bytes.
+    try testing.expectError(error.Malformed, applyBlob(&g, gpa, "I\x01\x00\x00\x00\x05\x00\x00\x00abc"));
+    try testing.expectError(error.Malformed, applyBlob(&g, gpa, "I\x01\x00\x00\x00\x01\x00\x00\x00abc"));
+    try testing.expectError(error.Malformed, applyBlob(&g, gpa, "I\x01"));
+    for (0..pf.len) |n| try testing.expect(std.meta.isError(applyPlacements(&g, gpa, pf[0..n])));
+    try testing.expectError(error.Malformed, applyPlacements(&g, gpa, pf ++ "x"));
+}
+
+test "fuzz: random image frames never panic and stay bounded" {
+    const gpa = testing.allocator;
+    var g: Grid = .{};
+    defer g.deinit(gpa);
+    var prng: std.Random.DefaultPrng = .init(0x1717);
+    const rand = prng.random();
+    var buf: [600]u8 = undefined;
+    for (0..20000) |_| {
+        const n = rand.uintAtMost(usize, buf.len);
+        rand.bytes(buf[0..n]);
+        if (n > 0) buf[0] = if (rand.boolean()) 'I' else 'P';
+        if (n >= 9 and buf[0] == 'I' and rand.boolean()) std.mem.writeInt(u32, buf[5..9], @intCast(n - 9), .little);
+        if (n >= 3 and buf[0] == 'P' and rand.boolean()) {
+            const k: u16 = @intCast((n - 3) / placement_len);
+            std.mem.writeInt(u16, buf[1..3], k, .little);
+            _ = applyPlacements(&g, gpa, buf[0 .. 3 + @as(usize, k) * placement_len]) catch {};
+            continue;
+        }
+        if (n >= 5 and rand.uintLessThan(u8, 4) == 0) std.mem.writeInt(u32, buf[1..5], rand.uintAtMost(u32, 8), .little);
+        _ = (if (buf[0] == 'I') applyBlob(&g, gpa, buf[0..n]) else applyPlacements(&g, gpa, buf[0..n])) catch {};
+        try testing.expect(g.images.blobs.items.len <= grid_mod.max_blobs);
+        try testing.expect(g.images.placements.items.len <= grid_mod.max_placements);
+    }
+}
 
 /// Test helper that builds frames.
 pub const FrameBuilder = struct {

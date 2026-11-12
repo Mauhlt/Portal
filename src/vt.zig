@@ -9,7 +9,9 @@
 //!   * No input can panic, overflow, hit `unreachable` or index out of bounds.
 //!   * Memory is bounded: dimensions are clamped to 1..1000, OSC payloads to
 //!     `max_osc_bytes`, CSI parameters to `max_params` values of at most
-//!     65535 each. `feed` never allocates.
+//!     65535 each. `feed` allocates only for inline images (vt_gfx.zig:
+//!     kitty graphics, stored as PNG bytes under hard limits, never decoded
+//!     here); an allocation failure there drops the image, nothing else.
 //!   * Nothing is ever written back: no DSR/DA replies, no answerback.
 //!
 //! The parser is Paul Williams' DEC ANSI state machine
@@ -21,6 +23,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const width = @import("vt_width.zig");
+/// Inline images (kitty graphics subset): store, placements, wire frames.
+pub const gfx = @import("vt_gfx.zig");
 /// Cell width of a code point (0, 1 or 2). Public so the browser client
 /// (src/wasm), which imports this file as a module, lays out wide
 /// characters with exactly the table the emulator used.
@@ -139,6 +143,11 @@ const State = enum {
     dcs_ignore,
     osc_string,
     sos_pm_apc_string,
+    /// After ESC _: a 'G' starts a graphics command, anything else is an
+    /// APC string to discard.
+    apc_start,
+    /// Inside a graphics command (APC G... or OSC 7070;G...).
+    gfx_string,
 };
 
 /// Incremental UTF-8 decoder (WHATWG algorithm: rejects overlongs,
@@ -344,6 +353,8 @@ pub const Terminal = struct {
     parser: Parser = .{},
     title_buf: [max_title_bytes]u8 = @splat(0),
     title_len: u16 = 0,
+    /// Inline images and their placements (per screen).
+    images: gfx.Graphics = .{},
 
     pub fn init(gpa: Allocator, cols_in: u16, rows_in: u16) !Terminal {
         const cols = clampDim(cols_in);
@@ -374,7 +385,25 @@ pub const Terminal = struct {
         t.alt.deinit(t.gpa);
         t.gpa.free(t.row_gen);
         t.gpa.free(t.tabs);
+        t.images.deinit(t.gpa);
         t.* = undefined;
+    }
+
+    /// Image placements on the visible screen (cells; rows may be negative
+    /// once partly scrolled off the top).
+    pub fn placements(t: *const Terminal) []const gfx.Placement {
+        return t.images.placements(t.alt_active);
+    }
+
+    /// Changes whenever images or placements change (or the screen switches).
+    pub fn imagesGen(t: *const Terminal) u64 {
+        return t.images.gen;
+    }
+
+    /// The PNG bytes of an image by wire id, while it is stored.
+    pub fn imagePng(t: *const Terminal, image: u32) ?[]const u8 {
+        const s = t.images.find(image) orelse return null;
+        return s.png;
     }
 
     pub fn rowGen(t: *const Terminal, row: u16) u64 {
@@ -453,9 +482,10 @@ pub const Terminal = struct {
     /// Feed raw PTY output. Sequences and UTF-8 may be split across calls.
     pub fn feed(t: *Terminal, bytes: []const u8) void {
         const before = t.cursor();
+        const images_before = t.images.gen;
         for (bytes) |b| t.step(b);
         const after = t.cursor();
-        if (before.x != after.x or before.y != after.y or before.visible != after.visible)
+        if (before.x != after.x or before.y != after.y or before.visible != after.visible or images_before != t.images.gen)
             t.bumpGen();
     }
 
@@ -492,6 +522,7 @@ pub const Terminal = struct {
         t.clampCursor(&t.cur);
         t.cur.pending_wrap = false;
         for (&t.saved) |*s| t.clampCursor(s);
+        t.images.resize(cols, rows);
         t.markAll();
     }
 
@@ -553,9 +584,23 @@ pub const Terminal = struct {
         const row = t.line(y);
         const a = @min(from, row.len);
         const b = @min(to, row.len);
-        if (a < b) @memset(row[a..b], t.blank());
+        if (a < b) {
+            @memset(row[a..b], t.blank());
+            t.images.erase(t.alt_active, @min(y, t.rows - 1), a, b);
+        }
         fixWide(row);
         t.markRow(y);
+    }
+
+    /// Rows that scrolled in: blank, without touching image placements
+    /// (an image extending below the screen keeps scrolling up into view).
+    fn blankRows(t: *Terminal, from: u16, to_exclusive: u16) void {
+        var y = from;
+        while (y < to_exclusive and y < t.rows) : (y += 1) {
+            const row = t.line(y);
+            @memset(row, t.blank());
+            t.markRow(y);
+        }
     }
 
     fn eraseRows(t: *Terminal, from: u16, to_exclusive: u16) void {
@@ -571,7 +616,8 @@ pub const Terminal = struct {
         if (n == 0) return;
         const map = t.screen().map[top .. @as(usize, bot) + 1];
         std.mem.rotate(u16, map, n);
-        t.eraseRows(bot + 1 - n, bot + 1);
+        t.images.scroll(t.alt_active, top, bot, -@as(i32, n));
+        t.blankRows(bot + 1 - n, bot + 1);
         t.markRange(top, bot);
     }
 
@@ -583,7 +629,8 @@ pub const Terminal = struct {
         if (n == 0) return;
         const map = t.screen().map[top .. @as(usize, bot) + 1];
         std.mem.rotate(u16, map, map.len - n);
-        t.eraseRows(top, top + n);
+        t.images.scroll(t.alt_active, top, bot, n);
+        t.blankRows(top, top + n);
         t.markRange(top, bot);
     }
 
@@ -649,6 +696,7 @@ pub const Terminal = struct {
         const x: usize = t.cur.x;
         const row = t.line(t.cur.y);
         const pen = t.cur.pen;
+        t.images.erase(t.alt_active, t.cur.y, x, x + w);
         if (w == 2) {
             putCell(row, x, .{ .cp = cp, .wide = .lead, .attrs = pen.attrs, .fg = pen.fg, .bg = pen.bg });
             putCell(row, x + 1, .{ .cp = ' ', .wide = .cont, .attrs = pen.attrs, .fg = pen.fg, .bg = pen.bg });
@@ -681,11 +729,13 @@ pub const Terminal = struct {
         // "Anywhere" transitions.
         switch (b) {
             0x18, 0x1A => { // CAN, SUB: abort any sequence
+                if (p.state == .gfx_string) t.images.abort(t.gpa);
                 p.state = .ground;
                 return;
             },
             0x1B => {
                 if (p.state == .osc_string) t.oscEnd();
+                if (p.state == .gfx_string) t.gfxEnd();
                 p.clear();
                 p.state = .escape;
                 return;
@@ -714,7 +764,8 @@ pub const Terminal = struct {
                     p.clear();
                     p.state = .dcs_entry;
                 },
-                'X', '^', '_' => p.state = .sos_pm_apc_string,
+                'X', '^' => p.state = .sos_pm_apc_string,
+                '_' => p.state = .apc_start,
                 '[' => {
                     p.clear();
                     p.state = .csi_entry;
@@ -820,13 +871,39 @@ pub const Terminal = struct {
             .dcs_passthrough, .dcs_ignore, .sos_pm_apc_string => {
                 if (b == 0x07) p.state = .ground;
             },
+            .apc_start => {
+                if (b == 'G') {
+                    t.images.begin();
+                    p.state = .gfx_string;
+                } else if (b == 0x07) {
+                    p.state = .ground;
+                } else p.state = .sos_pm_apc_string;
+            },
+            .gfx_string => {
+                if (b == 0x07) {
+                    t.gfxEnd();
+                    p.state = .ground;
+                } else t.images.put(t.gpa, b);
+            },
             .osc_string => switch (b) {
                 0x07 => {
                     t.oscEnd();
                     p.state = .ground;
                 },
                 0x00...0x06, 0x08...0x1F => {},
-                0x20...0xFF => p.oscPut(b),
+                0x20...0xFF => {
+                    p.oscPut(b);
+                    // OSC 7070;G...: a graphics command (ConPTY passes
+                    // unknown OSCs through but drops APC strings).
+                    if (p.osc_len == gfx.osc_number.len + 2 and
+                        std.mem.eql(u8, p.osc[0..gfx.osc_number.len], gfx.osc_number) and
+                        p.osc[gfx.osc_number.len] == ';' and p.osc[gfx.osc_number.len + 1] == 'G')
+                    {
+                        p.osc_len = 0;
+                        t.images.begin();
+                        p.state = .gfx_string;
+                    }
+                },
             },
         }
     }
@@ -920,6 +997,7 @@ pub const Terminal = struct {
     }
 
     fn decaln(t: *Terminal) void {
+        t.images.clearScreen(t.alt_active);
         for (0..t.rows) |y| {
             const row = t.line(@intCast(y));
             @memset(row, .{ .cp = 'E' });
@@ -940,6 +1018,7 @@ pub const Terminal = struct {
             b.* = @intCast(i);
         }
         for (t.tabs, 0..) |*s, i| s.* = i % 8 == 0;
+        t.images.reset(t.gpa);
         t.alt_active = false;
         t.cur = .{};
         t.saved = .{ .{}, .{} };
@@ -965,6 +1044,24 @@ pub const Terminal = struct {
         t.autowrap = true;
         t.cursor_visible = true;
         t.app_cursor = false;
+    }
+
+    /// End of a graphics command: store / place / delete, then move the
+    /// cursor past a new placement as kitty does (unless C=1): down to the
+    /// image's last row (scrolling as needed), and to the column after it.
+    fn gfxEnd(t: *Terminal) void {
+        const placed = t.images.end(t.gpa, .{
+            .cols = t.cols,
+            .rows = t.rows,
+            .x = @min(t.cur.x, t.cols - 1),
+            .y = @min(t.cur.y, t.rows - 1),
+            .alt = t.alt_active,
+        }) orelse return;
+        if (!placed.move_cursor) return;
+        var n = placed.rows;
+        while (n > 1) : (n -= 1) t.index();
+        t.cur.pending_wrap = false;
+        t.cur.x = @intCast(@min(@as(u32, placed.col) + placed.cols, @as(u32, t.cols) - 1));
     }
 
     fn oscEnd(t: *Terminal) void {
@@ -1188,6 +1285,7 @@ pub const Terminal = struct {
         const row = t.line(t.cur.y);
         const x: usize = t.cur.x;
         const n: usize = @min(n_in, row.len - x);
+        t.images.erase(t.alt_active, t.cur.y, x, row.len);
         std.mem.copyBackwards(Cell, row[x + n ..], row[x .. row.len - n]);
         @memset(row[x .. x + n], t.blank());
         fixWide(row);
@@ -1199,6 +1297,7 @@ pub const Terminal = struct {
         const row = t.line(t.cur.y);
         const x: usize = t.cur.x;
         const n: usize = @min(n_in, row.len - x);
+        t.images.erase(t.alt_active, t.cur.y, x, row.len);
         std.mem.copyForwards(Cell, row[x .. row.len - n], row[x + n ..]);
         @memset(row[row.len - n ..], t.blank());
         fixWide(row);
@@ -1253,12 +1352,14 @@ pub const Terminal = struct {
 
     fn clearScreen(t: *Terminal, s: *Screen) void {
         @memset(s.cells, t.blank());
+        t.images.clearScreen(s == &t.alt);
         t.markAll();
     }
 
     fn switchScreen(t: *Terminal, alt: bool) void {
         if (t.alt_active == alt) return;
         t.alt_active = alt;
+        t.images.gen +%= 1; // the visible placement list changed
         t.markAll();
     }
 
@@ -2473,4 +2574,8 @@ test "realistic ConPTY-style redraw corpus" {
     // Full-screen app.
     t.feed("\x1b[?1049h\x1b[H\x1b[48;5;236m\x1b[2Kstatus\x1b[m\x1b[10;1Hbottom\x1b[?1049l");
     try expectRow(&t, 0, "╭───╮");
+}
+
+test {
+    _ = @import("vt_gfx_test.zig");
 }

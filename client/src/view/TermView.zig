@@ -25,6 +25,11 @@ const grid_mod = @import("grid.zig");
 const wcwidth = @import("wcwidth.zig");
 const fontset = @import("font/fontset.zig");
 const Atlas = @import("font/atlas.zig").Atlas;
+const images = @import("images.zig");
+
+/// The texture: glyph atlas in rows 0..2047, inline images below it.
+const tex_w: u32 = 2048;
+const tex_h: u32 = images.region_y + images.region_h;
 
 const TermView = @This();
 const Rgb = grid_mod.Rgb;
@@ -138,6 +143,8 @@ reported_capacity: [2]u16 = .{ 0, 0 },
 layout: struct { ox: f32 = 0, oy: f32 = 0, cw: f32 = 1, ch: f32 = 1, cols: u16 = 0, rows: u16 = 0 } = .{},
 live_ctx: ?*anyopaque = null,
 live_fn: ?platform.LiveFn = null,
+/// Inline images (decode, scale, pack into the texture's image region).
+img: images.Layer,
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*TermView {
     const self = try gpa.create(TermView);
@@ -149,18 +156,21 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*TermView {
     const fb = window.framebufferSize();
     const renderer = try Instanced2D.init(gpa, window.surfaceSource(), fb[0], fb[1], .{
         .app_name = "Portal",
-        .texture_width = 2048,
-        .texture_height = 2048,
+        .texture_width = tex_w,
+        .texture_height = tex_h,
     });
     errdefer renderer.deinit();
+    var atlas = try Atlas.init(gpa, tex_w, 2048);
+    atlas.tex_h = tex_h;
     self.* = .{
         .gpa = gpa,
         .window = window,
         .renderer = renderer,
         .fonts = fonts,
-        .atlas = try Atlas.init(gpa, 2048, 2048),
+        .atlas = atlas,
         .theme = options.theme,
         .sizing = options.sizing,
+        .img = .init(gpa),
     };
     window.setLiveCallback(self, liveThunk);
     return self;
@@ -170,6 +180,7 @@ pub fn deinit(tv: *TermView) void {
     tv.renderer.deinit();
     tv.window.deinit();
     tv.atlas.deinit();
+    tv.img.deinit();
     tv.fonts.deinit();
     tv.instances.deinit(tv.gpa);
     tv.gpa.destroy(tv);
@@ -322,7 +333,11 @@ fn handleViewEvent(tv: *TermView, e: input.Event) void {
 // ------------------------------------------------------------ drawing
 
 fn push(tv: *TermView, x: f32, y: f32, w: f32, h: f32, uv: [4]f32, c: Rgb) void {
-    tv.instances.append(tv.gpa, .{ .rect = .{ x, y, w, h }, .uv = uv, .color = .{ c[0], c[1], c[2], 255 } }) catch {};
+    tv.pushA(x, y, w, h, uv, c, 255);
+}
+
+fn pushA(tv: *TermView, x: f32, y: f32, w: f32, h: f32, uv: [4]f32, c: Rgb, a: u8) void {
+    tv.instances.append(tv.gpa, .{ .rect = .{ x, y, w, h }, .uv = uv, .color = .{ c[0], c[1], c[2], a } }) catch {};
 }
 
 fn rect(tv: *TermView, x: f32, y: f32, w: f32, h: f32, c: Rgb) void {
@@ -377,11 +392,15 @@ fn addButton(tv: *TermView, m: fontset.Metrics, x: f32, y: f32, h: f32, label: [
 /// lock around this, not around present()).
 pub fn build(tv: *TermView, grid: *const Grid, overlay: Overlay) void {
     tv.buildOnce(grid, overlay);
-    if (tv.atlas_full) {
-        // Out of atlas space: start over with only what is on screen now.
-        tv.atlas.wipe();
+    if (tv.atlas_full or tv.img.full) {
+        // Out of atlas / image space: start over with only what is on
+        // screen now.
+        if (tv.atlas_full) tv.atlas.wipe();
+        if (tv.img.full) tv.img.wipe();
         tv.buildOnce(grid, overlay);
     }
+    // Images still waiting to be decoded: come back next frame.
+    if (tv.img.needs_more) tv.dirty = true;
 }
 
 /// Uploads new glyphs and presents the last built frame.
@@ -389,6 +408,10 @@ pub fn present(tv: *TermView) void {
     if (tv.atlas.takeDirty()) |d| {
         tv.renderer.updateTexture(d.x, d.y, d.w, d.h, d.bytes) catch |err| std.log.warn("atlas upload failed: {t}", .{err});
     }
+    for (tv.img.uploads.items) |u| {
+        tv.renderer.updateTexture(u.x, images.region_y + u.y, u.w, u.h, u.px) catch |err| std.log.warn("image upload failed: {t}", .{err});
+    }
+    tv.img.clearUploads();
     const bg = tv.theme.bg;
     tv.renderer.drawFrame(.{
         @as(f32, @floatFromInt(bg[0])) / 255,
@@ -519,6 +542,25 @@ fn drawGrid(tv: *TermView, g: *const Grid, sel: ?Selection, m: fontset.Metrics, 
     const H = y0 + area_h;
     tv.layout = .{ .ox = ox, .oy = oy, .cw = cw, .ch = ch, .cols = g.cols, .rows = g.rows };
     const t = tv.theme;
+    // Pass 1: cell backgrounds (cursor and selection come later, over images).
+    for (0..g.rows) |y| {
+        const py = oy + ch * @as(f32, @floatFromInt(y));
+        if (py >= H) break;
+        for (g.row(y), 0..) |c, x| {
+            if (c.kind == .continuation) continue;
+            const px = ox + cw * @as(f32, @floatFromInt(x));
+            if (px >= W) break;
+            const cells: u32 = if (c.kind == .wide) 2 else 1;
+            const bg = t.resolveBg(c.bg);
+            const hpx = @min(ch, H - py);
+            if (!std.mem.eql(u8, &bg, &t.bg)) tv.rect(px, py, cw * @as(f32, @floatFromInt(cells)), hpx, bg);
+        }
+    }
+    // Pass 2: inline images, clipped to the grid and the window.
+    const n_inst = tv.instances.items.len;
+    tv.drawImages(g, m, ox, oy, @min(ox + gw, W), @min(oy + gh, H));
+    const has_images = tv.instances.items.len > n_inst;
+    // Pass 3: cursor, selection, glyphs and decorations.
     for (0..g.rows) |y| {
         const py = oy + ch * @as(f32, @floatFromInt(y));
         if (py >= H) break;
@@ -529,22 +571,71 @@ fn drawGrid(tv: *TermView, g: *const Grid, sel: ?Selection, m: fontset.Metrics, 
             const cells: u32 = if (c.kind == .wide) 2 else 1;
             var fg = t.resolveFg(c.fg);
             var bg = t.resolveBg(c.bg);
+            var over: ?u8 = null; // alpha of a cursor / selection fill
             if (g.cursor_visible and x == g.cursor_x and y == g.cursor_y) {
                 fg = t.bg;
                 bg = t.cursor;
+                over = 255;
             } else if (sel) |sl| if (sl.contains(x, y)) {
                 bg = t.selection;
+                // Translucent where images could be under it.
+                over = if (has_images) 170 else 255;
             };
             if (c.attrs.dim) fg = mix(fg, bg);
             const wpx = cw * @as(f32, @floatFromInt(cells));
             // Clip the last row/column to the grid area (zoomed past the window).
             const hpx = @min(ch, H - py);
-            if (!std.mem.eql(u8, &bg, &t.bg)) tv.rect(px, py, wpx, hpx, bg);
+            if (over) |a| tv.pushA(px, py, wpx, hpx, tv.atlas.whiteUv(), bg, a);
             if (c.cp != ' ') tv.glyph(c.cp, .{ .bold = c.attrs.bold, .italic = c.attrs.italic }, m, cells, px, py, fg);
             const stroke: f32 = @floatFromInt(m.stroke);
             if (c.attrs.underline) tv.rect(px, py + @as(f32, @floatFromInt(m.underline_y)), wpx, stroke, fg);
             if (c.attrs.strike) tv.rect(px, py + @round(m.baseline * 0.62), wpx, stroke, fg);
         }
+    }
+}
+
+/// Pushes the grid's image placements (above backgrounds, below text).
+fn drawImages(tv: *TermView, g: *const Grid, m: fontset.Metrics, ox: f32, oy: f32, clip_x1: f32, clip_y1: f32) void {
+    tv.img.begin();
+    defer tv.img.end();
+    const cw: f32 = @floatFromInt(m.cell_w);
+    const ch: f32 = @floatFromInt(m.cell_h);
+    for (g.images.placements.items) |p| {
+        const x = ox + cw * @as(f32, @floatFromInt(p.col));
+        const y = oy + ch * @as(f32, @floatFromInt(p.row));
+        const w = cw * @as(f32, @floatFromInt(p.cols));
+        const h = ch * @as(f32, @floatFromInt(p.rows));
+        if (x >= clip_x1 or y >= clip_y1 or x + w <= ox or y + h <= oy) continue;
+        const dw: u32 = @intCast(@min(@as(u64, m.cell_w) * p.cols, 1 << 16));
+        const dh: u32 = @intCast(@min(@as(u64, m.cell_h) * p.rows, 1 << 16));
+        switch (tv.img.prepare(&g.images, p.id, dw, dh, tex_w, tex_h)) {
+            .image => |uv| if (images.clip(x, y, w, h, uv, ox, oy, clip_x1, clip_y1)) |c| {
+                tv.pushA(c.rect[0], c.rect[1], c.rect[2], c.rect[3], c.uv, .{ 255, 255, 255 }, 255);
+            },
+            .placeholder => |dims| tv.placeholder(m, x, y, w, h, dims, ox, oy, clip_x1, clip_y1),
+            .none => {},
+        }
+    }
+}
+
+/// A box with the image's pixel size, for images that can't be decoded.
+fn placeholder(tv: *TermView, m: fontset.Metrics, x: f32, y: f32, w: f32, h: f32, dims: [2]u32, cx0: f32, cy0: f32, cx1: f32, cy1: f32) void {
+    const c = toneColor(.muted);
+    const s: f32 = @floatFromInt(@max(m.stroke, 1));
+    const white = tv.atlas.whiteUv();
+    const edges = [_][4]f32{ .{ x, y, w, s }, .{ x, y + h - s, w, s }, .{ x, y, s, h }, .{ x + w - s, y, s, h } };
+    for (edges) |e| if (images.clip(e[0], e[1], e[2], e[3], white, cx0, cy0, cx1, cy1)) |r| {
+        tv.push(r.rect[0], r.rect[1], r.rect[2], r.rect[3], r.uv, c);
+    };
+    var buf: [48]u8 = undefined;
+    const label = if (dims[0] > 0)
+        std.fmt.bufPrint(&buf, "image {d}\u{00D7}{d}", .{ dims[0], dims[1] }) catch "image"
+    else
+        "image";
+    const lw = textWidth(m, label);
+    const ch: f32 = @floatFromInt(m.cell_h);
+    if (lw + 2 * s <= w and h >= ch and y >= cy0 and y + ch <= cy1 and x + lw < cx1) {
+        _ = tv.text(m, x + @round((w - lw) / 2), y + @round((h - ch) / 2), label, c, false);
     }
 }
 

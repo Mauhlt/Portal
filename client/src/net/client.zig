@@ -371,11 +371,26 @@ pub const Client = struct {
     fn handleFrame(c: *Client, frame: ws.Frame, backoff: *i64) ?StreamResult {
         switch (frame.opcode) {
             .binary => {
-                if (frame.payload.len == 0 or frame.payload[0] != 'G') return null; // unknown: ignore
-                c.shared.mutex.lockUncancelable(c.io);
-                const r = gframe.apply(&c.shared.grid, c.gpa, frame.payload);
-                c.shared.mutex.unlock(c.io);
-                r catch |err| return .{ .failed = @errorName(err) }; // reconnect for a fresh snapshot
+                if (frame.payload.len == 0) return null;
+                switch (frame.payload[0]) {
+                    'G' => {
+                        c.shared.mutex.lockUncancelable(c.io);
+                        const r = gframe.apply(&c.shared.grid, c.gpa, frame.payload);
+                        c.shared.mutex.unlock(c.io);
+                        r catch |err| return .{ .failed = @errorName(err) }; // reconnect for a fresh snapshot
+                    },
+                    // Inline images: a bad one is dropped, the stream goes on.
+                    'I', 'P' => {
+                        c.shared.mutex.lockUncancelable(c.io);
+                        const r = if (frame.payload[0] == 'I')
+                            gframe.applyBlob(&c.shared.grid, c.gpa, frame.payload)
+                        else
+                            gframe.applyPlacements(&c.shared.grid, c.gpa, frame.payload);
+                        c.shared.mutex.unlock(c.io);
+                        r catch return null;
+                    },
+                    else => return null, // unknown: ignore
+                }
                 c.notify();
             },
             .text => {

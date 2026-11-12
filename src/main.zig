@@ -9,6 +9,7 @@
 //!                                    in this console with --console
 //!   portal connect --server IP:PORT  view a remote Portal (client/src)
 //!   portal ca [init|export|show]     the private CA behind Portal's HTTPS
+//!   portal show <file.png>           show an image inline (show.zig)
 //!   portal version
 
 const std = @import("std");
@@ -107,6 +108,11 @@ const usage =
     \\      Watch a Portal running on another machine (pair with it first:
     \\      `portal pair <name>` there, then click Pair here).
     \\
+    \\  portal show <file.png> [--cols N] [--stdout]
+    \\      Show a PNG inline in this terminal (kitty graphics). Inside a
+    \\      Portal session the image appears in the window and for remote
+    \\      viewers. Reads only the file named; nothing is sent anywhere else.
+    \\
     \\  portal version
     \\
 ;
@@ -133,6 +139,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "connect")) @import("client").main(gpa, io, "portal connect", args[1..]);
     if (std.mem.eql(u8, cmd, "ca")) return cmdCa(gpa, io, init.environ_map, args[1..]);
+    if (std.mem.eql(u8, cmd, "show")) std.process.exit(@import("show.zig").main(gpa, io, args[1..]));
     if (std.mem.eql(u8, cmd, "version")) {
         std.debug.print("portal {s} (built with zig {s})\n", .{ portal_version, builtin.zig_version_string });
         return;
@@ -1071,6 +1078,7 @@ test {
     _ = @import("log.zig");
     _ = @import("devices.zig");
     _ = @import("vt.zig");
+    _ = @import("show.zig");
     _ = @import("web.zig"); // also pulls in http1.zig tests
     _ = @import("tls/server.zig"); // also server_test.zig
     _ = @import("tls/x509.zig");
