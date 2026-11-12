@@ -1,11 +1,11 @@
 //! Portal end-to-end tests: `zig build e2e`.
 //!
 //! Launches real `portalctl run --console` instances (hidden consoles,
-//! scratch LOCALAPPDATA, ports 18420+) and drives them over raw sockets:
+//! scratch LOCALAPPDATA, a random block of ports) and drives them over raw sockets:
 //! pairing, grid frames, input policies, and transport hardening. Prints a
 //! PASS/FAIL line per check and a summary; exits nonzero if anything failed.
 //!
-//!   e2e <path-to-portalctl.exe> [group...]
+//!   e2e <path-to-portalctl.exe> [--base-port N] [group...]
 //!
 //! portal-show.exe must sit next to portalctl.exe (the build arranges it).
 //!
@@ -29,7 +29,17 @@ const tls_tests = @import("tls_tests.zig");
 const webinput = @import("webinput.zig");
 const sync_tests = @import("sync_tests.zig");
 
-pub const base_port: u16 = 18420;
+/// Each run picks its own base port (a multiple of 200 in 20000..59800),
+/// so concurrent runs don't collide; `--base-port N` fixes it. Portal binds
+/// exclusively, so a clash fails loudly instead of sharing a port.
+const port_span: u16 = 200;
+
+fn pickBasePort(io: std.Io) u16 {
+    var rnd: [2]u8 = undefined;
+    io.random(&rnd);
+    const slots: u16 = (59800 - 20000) / port_span;
+    return 20000 + (std.mem.readInt(u16, &rnd, .little) % slots) * port_span;
+}
 
 const Group = struct {
     name: []const u8,
@@ -66,17 +76,29 @@ pub fn main(init: std.process.Init) !void {
     if (args.items.len >= 1 and std.mem.eql(u8, args.items[0], "--inject"))
         @import("win.zig").ExitProcess(console_tests.injectMain(args.items[1..]));
     if (args.items.len < 1) {
-        std.debug.print("usage: e2e <portalctl.exe> [group...]\n", .{});
+        std.debug.print("usage: e2e <portalctl.exe> [--base-port N] [group...]\n", .{});
         std.process.exit(2);
     }
     const exe = args.items[0];
-    const selected = args.items[1..];
+    var selected = args.items[1..];
+    var base_port = pickBasePort(io);
+    if (selected.len >= 2 and std.mem.eql(u8, selected[0], "--base-port")) {
+        base_port = std.fmt.parseInt(u16, selected[1], 10) catch {
+            std.debug.print("--base-port needs a port number\n", .{});
+            std.process.exit(2);
+        };
+        if (base_port > 65535 - port_span) {
+            std.debug.print("--base-port must leave room for {d} ports\n", .{port_span});
+            std.process.exit(2);
+        }
+        selected = selected[2..];
+    }
 
     net.init();
     var h = try proc.Harness.init(gpa, io, init.environ_map, exe);
     var r: Runner = .{ .gpa = gpa };
     const t0 = net.now();
-    std.debug.print("portal e2e: {s}\nscratch: {s}\n", .{ exe, h.root });
+    std.debug.print("portal e2e: {s}\nscratch: {s}\nports: {d}..{d}\n", .{ exe, h.root, base_port, base_port + port_span - 1 });
 
     for (groups) |g| {
         if (selected.len > 0) {

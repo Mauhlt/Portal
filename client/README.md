@@ -66,8 +66,8 @@ tunnel addresses. The client pins that CA per server:
 ## Build
 
 ```
-zig build                                  # zig-out/bin/portal-client(.exe), portal-mock-server
-zig build test                             # unit tests + compile checks (Debug, ReleaseSafe, mock)
+zig build                                  # zig-out/bin/portal-client(.exe)
+zig build test                             # unit tests + compile checks (Debug, ReleaseSafe)
 zig build -Dtarget=x86_64-linux-gnu        # cross-compiles without any SDK
 zig build -Dtarget=aarch64-macos
 ```
@@ -87,7 +87,6 @@ branch `portal-client`). After that branch is merged, change it to
 | `src/remote.zig` | `RemoteSink` (InputSink → protocol frames) and the overlay (pairing screen, status). |
 | `src/net/` | `http.zig` (requests, strict response/Set-Cookie parsing), `ws.zig` (masked client frames, server frame parser), `client.zig` (connection thread), `tlsconn.zig` (TCP/TLS connection, certificate gate), `x509check.zig` (bounds-checked certificate checks, PEM, fingerprints), `pin.zig` (per-server pinned CA files), `watchdog.zig` (deadlines). |
 | `src/credstore.zig` | OS credential store: Windows Credential Manager; macOS Keychain and Linux Secret Service (libsecret) via dlopen. |
-| `tools/mock_server.zig` | Mock Portal server for end-to-end tests. |
 
 `portal run`'s local window (Portal's `src/gui.zig`) uses `view` too: it
 fills a `Grid` from `vt.Terminal` (`src/localgrid.zig`), its `InputSink`
@@ -115,25 +114,16 @@ makes `InputSink.resized` report the cols/rows for the PTY.
 
 ## Testing
 
-`tools/mock_server.zig` implements `/pair` (single-use window), `/auth/refresh`
-(rotation, 10-minute grace for the previous secret, revocation on a stale
-secret, source-address binding) and `/ws` (scripted snapshot, diffs, colours,
-attributes, wide characters, a resize), and logs every client frame:
-
-```
-zig-out/bin/portal-mock-server --input keys --pair-window 120 --resize-after 8 --revoke-after 0
-zig-out/bin/portal-client --server 127.0.0.1:18420 --insecure-plain-http
-```
-
-The mock server speaks plain HTTP only. TLS is tested against the real
-server (`portal run`, `portal ca export`, `portal pair`) and by unit tests
-with certificates Portal made (`src/net/testdata/`).
+The client is tested against the real server: Portal's e2e suite
+(`zig build e2e` at the repository root) pairs, signs in and streams over
+HTTPS/WSS, and unit tests cover TLS with certificates Portal made
+(`src/net/testdata/`).
 
 ## Status
 
 Tested on Windows 11 (NVIDIA): pairing, refresh/rotation across restarts,
 revocation and logout back to the pairing screen, keys/text/answer-bar
-input, grid resize, window resize, against both the mock server and the real
+input, grid resize, window resize, against the real
 Portal server (`portal run` + `portal pair`), over HTTPS/WSS with a pinned CA
 (pin by file and by downloaded fingerprint, wrong CA refused, plain-HTTP
 server refused without --insecure-plain-http, 80 s idle kept alive by pings).
