@@ -2,7 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Portal">
 <meta name="referrer" content="no-referrer">
 <title>Portal</title>
 <link rel="stylesheet" href="/static/xterm.css">
@@ -16,8 +18,9 @@
     <button data-key="1">1</button>
     <button data-key="2">2</button>
     <button data-key="3">3</button>
-    <button data-key="up" aria-label="Up">↑</button>
-    <button data-key="down" aria-label="Down">↓</button>
+    <button data-key="4">4</button>
+    <button data-key="y">Yes</button>
+    <button data-key="n">No</button>
     <button data-key="enter">Enter</button>
     <button data-key="esc">Esc</button>
   </nav>
@@ -28,6 +31,16 @@
   <form method="post" action="/logout"><button type="submit">Sign out</button></form>
 </header>
 <div id="wrap"><div id="term"></div></div>
+<nav id="answers" aria-label="Answer the agent" hidden>
+  <button data-key="1">1</button>
+  <button data-key="2">2</button>
+  <button data-key="3">3</button>
+  <button data-key="4">4</button>
+  <button data-key="y">Yes</button>
+  <button data-key="n">No</button>
+  <button data-key="enter">Enter</button>
+  <button data-key="esc">Esc</button>
+</nav>
 <script src="/static/xterm.js"></script>
 <script src="/static/app.js"></script>
 </body>

@@ -52,6 +52,47 @@ PersistentKeepalive = 25
 `AllowedIPs = 10.8.0.1/32` sends only Portal traffic through the tunnel; the
 rest of your laptop's browsing is unaffected.
 
+## 2b. iPhone (optional)
+
+1. Install **WireGuard** from the App Store (free, official).
+2. In the app, tap **+**, then **Create from scratch**, and generate a key pair.
+   Give the phone its own address:
+
+   ```ini
+   [Interface]
+   PrivateKey = <generated on the phone>
+   Address = 10.8.0.3/32
+
+   [Peer]
+   # desktop
+   PublicKey = <desktop's public key>
+   Endpoint = <home public IP or DDNS name>:51820
+   AllowedIPs = 10.8.0.1/32
+   PersistentKeepalive = 25
+   ```
+
+   (On the desktop you can instead create the config, show it as a QR code
+   with any QR tool, and scan it in the app. Then delete the file, since it
+   contains the phone's private key.)
+3. On the desktop tunnel, add a peer for the phone:
+
+   ```ini
+   [Peer]
+   # iphone
+   PublicKey = <phone's public key>
+   AllowedIPs = 10.8.0.3/32
+   ```
+4. Add the phone to the firewall rule in step 4 (`-RemoteAddress 10.8.0.2,10.8.0.3`).
+5. Turn the tunnel on in the WireGuard app, open Safari, and go to
+   `http://10.8.0.1:8420/`. Optional: Share, then **Add to Home Screen**, for a
+   full-screen icon.
+
+On the phone, Portal shows a row of large answer buttons (1–4, Yes, No, Enter,
+Esc) and does not open the keyboard. Use the default `--input keys` mode: you
+can approve or decline what the agent asks, but not give it new instructions.
+If the phone is lost, delete its `[Peer]` block on the desktop; that revokes
+it instantly without affecting the laptop.
+
 ## 3. Router
 
 Forward **UDP 51820** to the desktop's LAN IP. Give the desktop a DHCP
@@ -70,6 +111,8 @@ New-NetFirewallRule -DisplayName "Portal (WireGuard only)" -Direction Inbound `
   -Protocol TCP -LocalPort 8420 -LocalAddress 10.8.0.1 -RemoteAddress 10.8.0.2 `
   -InterfaceAlias "<your tunnel name>" -Action Allow
 ```
+
+With an iPhone too, use `-RemoteAddress 10.8.0.2,10.8.0.3`.
 
 Each release has its own `portal.exe` path, so Windows may prompt for every
 new release. Do **not** click Cancel: that silently creates a *Block* rule for

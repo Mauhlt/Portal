@@ -59,3 +59,20 @@ header form button[type=submit] { width: auto; padding: 4px 10px; background: va
 .spacer { flex: 1; }
 #wrap { flex: 1; overflow: auto; background: #000; padding: 4px; }
 #term { display: inline-block; }
+
+/* phone / touch: big answer bar, no on-screen keyboard */
+#answers { display: none; }
+@media (pointer: coarse) {
+  body.viewer { height: 100dvh; }
+  header { padding: 6px max(10px, env(safe-area-inset-left)); }
+  header #keys, header #smaller, header #bigger { display: none; }
+  #answers {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+    padding: 8px max(10px, env(safe-area-inset-left)) max(8px, env(safe-area-inset-bottom));
+    border-top: 1px solid var(--border); background: var(--panel);
+  }
+  #answers[hidden] { display: none; }
+  #answers button { min-height: 48px; font-size: 18px; font-weight: 600; }
+  #answers button.wide { grid-column: span 2; }
+  #wrap { -webkit-overflow-scrolling: touch; }
+}
