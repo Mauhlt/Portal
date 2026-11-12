@@ -1,4 +1,5 @@
-//! Authentication primitives. Pure logic: callers supply time (ms, monotonic)
+//! Authentication primitives. Pure logic: callers supply time (wall-clock ms,
+//! so time asleep counts towards expiry; a clock that jumps back fails closed)
 //! and randomness, which keeps everything here unit-testable.
 //!
 //! Model:
@@ -115,6 +116,33 @@ pub const Sessions = struct {
         }
     }
 
+    /// When the session `cookie_value` will expire if not refreshed (the
+    /// earlier of its idle and absolute limits), or null if it is not live.
+    /// Lets a viewer sleep until then instead of polling.
+    pub fn expiresAt(s: *Sessions, cookie_value: []const u8, now_ms: i64) ?i64 {
+        s.expire(now_ms);
+        const idx = s.find(cookie_value) orelse return null;
+        const v = s.slots[idx].?;
+        return @min(v.last_seen_ms +| s.idle_timeout_ms, v.created_ms +| s.absolute_timeout_ms);
+    }
+
+    /// Ends the sessions of devices for which `paired(ctx, tag)` is false.
+    /// Sessions created at or after `since_ms` are kept: the caller's view
+    /// of the device list may predate them. Untagged sessions are kept.
+    /// Returns how many were ended.
+    pub fn revokeUnpaired(s: *Sessions, since_ms: i64, ctx: anytype, comptime paired: fn (@TypeOf(ctx), []const u8) bool) usize {
+        var n: usize = 0;
+        for (&s.slots) |*slot| {
+            const v = slot.* orelse continue;
+            if (v.tag_len == 0 or v.created_ms >= since_ms) continue;
+            if (!paired(ctx, v.tag[0..v.tag_len])) {
+                slot.* = null;
+                n += 1;
+            }
+        }
+        return n;
+    }
+
     pub fn revoke(s: *Sessions, cookie_value: []const u8) void {
         if (s.find(cookie_value)) |idx| s.slots[idx] = null;
     }
@@ -175,7 +203,6 @@ test "verify accepts right secret, rejects others" {
     wrong[0] ^= 1;
     try testing.expect(!verify(h, &wrong));
 }
-
 
 fn testCookie(fill: u8) [encoded_len]u8 {
     const raw: [secret_bytes]u8 = @splat(fill);
@@ -247,3 +274,35 @@ test "sessions: clock going backwards fails closed" {
 }
 
 
+
+test "sessions: expiresAt is the earlier limit" {
+    var s: Sessions = .{ .idle_timeout_ms = 100, .absolute_timeout_ms = 250 };
+    const a = testCookie(1);
+    s.create(&a, 0);
+    try testing.expectEqual(@as(?i64, 100), s.expiresAt(&a, 10));
+    try testing.expect(s.validate(&a, 90));
+    try testing.expectEqual(@as(?i64, 190), s.expiresAt(&a, 95));
+    try testing.expect(s.validate(&a, 180));
+    try testing.expectEqual(@as(?i64, 250), s.expiresAt(&a, 181));
+    try testing.expectEqual(@as(?i64, null), s.expiresAt(&testCookie(2), 181));
+}
+
+test "sessions: revokeUnpaired keeps new and untagged sessions" {
+    var s: Sessions = .{};
+    const a = testCookie(1);
+    const b = testCookie(2);
+    const c = testCookie(3);
+    const d = testCookie(4);
+    s.createTagged(&a, 0, "gone");
+    s.createTagged(&b, 0, "kept");
+    s.create(&d, 0);
+    s.createTagged(&c, 50, "gone"); // created after the device list was read
+    const n = s.revokeUnpaired(40, {}, struct {
+        fn f(_: void, tag: []const u8) bool {
+            return std.mem.eql(u8, tag, "kept");
+        }
+    }.f);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(!s.isLive(&a, 60));
+    try testing.expect(s.isLive(&b, 60) and s.isLive(&c, 60) and s.isLive(&d, 60));
+}

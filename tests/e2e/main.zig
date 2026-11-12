@@ -8,7 +8,7 @@
 //!   e2e <path-to-portal.exe> [group...]
 //!
 //! Groups: pairing, grid, keys, text, transport, privacy, images, instruct,
-//! console (default: all).
+//! console, idle (default: all).
 
 const std = @import("std");
 const net = @import("net.zig");
@@ -22,6 +22,7 @@ const transport = @import("transport.zig");
 const privacy = @import("privacy.zig");
 const console_tests = @import("console_tests.zig");
 const images = @import("images.zig");
+const idle = @import("idle.zig");
 
 pub const base_port: u16 = 18420;
 
@@ -42,6 +43,7 @@ const groups = [_]Group{
     .{ .name = "instruct", .run = input_tests.runInstruct, .port_offset = 70 },
     .{ .name = "console", .run = console_tests.run, .port_offset = 80 },
     .{ .name = "images", .run = images.run, .port_offset = 60 },
+    .{ .name = "idle", .run = idle.run, .port_offset = 90 },
 };
 
 pub fn main(init: std.process.Init) !void {

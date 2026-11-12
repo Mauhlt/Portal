@@ -1,5 +1,5 @@
-//! Device pairing, sign-in, rotation, revocation and the device CLI
-//! (ported from pair_smoke.py, extended).
+//! Device pairing (desk approval), sign-in, rotation, revocation and the
+//! device CLI.
 
 const std = @import("std");
 const net = @import("net.zig");
@@ -14,14 +14,52 @@ const post = client.post;
 
 pub const ping_child = [_][]const u8{ "--", "cmd.exe", "/c", "echo PORTAL-SMOKE-TEST & ping -n 600 127.0.0.1" };
 
+/// Another loopback source address: a second "device" or a racing peer.
+const other_ip = [4]u8{ 127, 0, 0, 2 };
+
 fn has(s: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, s, needle) != null;
 }
+
+fn refusedTo(c: client.Collected, where: []const u8) bool {
+    return switch (c) {
+        .refused => |r| std.mem.eql(u8, std.mem.sliceTo(&r, 0), where),
+        else => false,
+    };
+}
+
+/// Whether this machine lets us connect from 127.0.0.2.
+fn otherIpWorks(inst: *proc.Instance) bool {
+    var r = http.request(inst.h.gpa, inst.port, .{ .path = "/pair", .host = inst.host, .source = other_ip }) catch return false;
+    r.deinit();
+    return true;
+}
+
+fn logCount(inst: *proc.Instance, needle: []const u8) usize {
+    const text = inst.log() catch return 0;
+    defer inst.h.gpa.free(text);
+    return std.mem.count(u8, text, needle);
+}
+
+const SignInJob = struct {
+    inst: *proc.Instance,
+    cookie: []const u8,
+    result: ?client.Creds = null,
+    failed: bool = false,
+
+    fn run(j: *SignInJob) void {
+        j.result = client.signIn(j.inst, j.cookie) catch {
+            j.failed = true;
+            return;
+        };
+    }
+};
 
 pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const gpa = h.gpa;
     const dir = try h.dataDir("pairing");
     var inst = try proc.Instance.start(h, dir, port, &ping_child);
+    const two_ips = otherIpWorks(inst);
 
     // ------------------------------------------------ before any pairing
     {
@@ -50,6 +88,11 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("POST /pair with a foreign Origin is 403", resp.status == 403, "{d}", .{resp.status});
     }
     {
+        var resp = try get(inst, "/pair/wait", null);
+        defer resp.deinit();
+        _ = r.check("waiting page without a request reveals nothing", resp.status == 303 and std.mem.eql(u8, resp.location(), "/pair?e=expired") and resp.body.len == 0, "{d} {s}", .{ resp.status, resp.location() });
+    }
+    {
         const d = try inst.cli(&.{"devices"});
         _ = r.check("portal devices: none paired yet", d.code == 0 and d.has("No paired devices"), "code={d} out={s}", .{ d.code, d.out });
     }
@@ -66,38 +109,131 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("portal unpair of an unknown device fails", u.code != 0, "code={d}", .{u.code});
     }
 
-    // --------------------------------------------------------- first pair
-    {
-        const p = try inst.cli(&.{ "pair", "laptop" });
-        _ = r.check("portal pair opens a window", p.code == 0 and p.has("Pairing open"), "code={d} out={s}", .{ p.code, p.out });
-    }
-    {
-        var resp = try get(inst, "/pair", null);
-        defer resp.deinit();
-        _ = r.check("pair page shows the button and device name", resp.bodyContains("Pair this device") and resp.bodyContains("laptop"), "", .{});
-        const d = try inst.cli(&.{"devices"});
-        _ = r.check("portal devices shows the open window", d.has("Pairing window open for 'laptop'"), "{s}", .{d.out});
-    }
+    // ------------------------- first pair: desk approval, racing request
     var c1: client.Creds = undefined;
     {
-        var resp = try post(inst, "/pair", null, true);
-        defer resp.deinit();
-        const creds = client.Creds.fromResponse(&resp);
-        const dv = resp.cookie(client.device_cookie) orelse "";
-        const sv = resp.cookie(client.session_cookie) orelse "";
-        _ = r.check("pairing issues device + session cookies", resp.status == 303 and std.mem.eql(u8, resp.location(), "/") and
-            std.mem.startsWith(u8, dv, "laptop.") and dv.len == "laptop.".len + 43 and sv.len == 43, "{d} {s} dev={s} sess={s}", .{ resp.status, resp.location(), dv, sv });
-        const dl = resp.setCookieLine(client.device_cookie) orelse "";
-        const sl = resp.setCookieLine(client.session_cookie) orelse "";
-        _ = r.check("cookies are HttpOnly, SameSite=Strict, Path=/", has(dl, "HttpOnly") and has(dl, "SameSite=Strict") and has(dl, "Path=/") and
-            has(sl, "HttpOnly") and has(sl, "SameSite=Strict") and has(sl, "Path=/"), "{s} / {s}", .{ dl, sl });
-        _ = r.check("device cookie lives 90 days, no Secure without --https", has(dl, "Max-Age=7776000") and !has(dl, "Secure"), "{s}", .{dl});
-        c1 = creds orelse return error.NoCookies;
+        const pc = try inst.liveCli(&.{ "pair", "laptop" });
+        defer pc.deinit();
+        _ = r.check("portal pair opens a window and waits at the desk", pc.waitFor("Waiting for the device", 15_000) and pc.alive(), "{s}", .{pc.output()});
+        _ = r.check("portal pair prints the CA state (none yet with --no-tls)", pc.has("Portal CA"), "{s}", .{pc.output()});
+        _ = r.check("pairing window becomes visible to the server", client.waitPairOpen(inst, 10_000), "", .{});
+        _ = r.check("portal pair reports that this server has no certificate download (--no-tls)", pc.waitFor("--no-tls: no certificate download", 10_000), "{s}", .{pc.output()});
+        {
+            var resp = try get(inst, "/pair", null);
+            defer resp.deinit();
+            _ = r.check("pair page shows the button and device name", resp.bodyContains("type=\"submit\"") and resp.bodyContains("laptop"), "", .{});
+            const d = try inst.cli(&.{"devices"});
+            _ = r.check("portal devices shows the open window", d.has("Pairing window open for 'laptop'"), "{s}", .{d.out});
+        }
+
+        // A racing peer asks first (it polled the page and tapped quickly).
+        var racer: ?client.PairReq = null;
+        if (two_ips) {
+            const rq = try client.requestPair(inst, other_ip);
+            _ = r.check("racing peer only gets a pending request, no credential", rq.waiting() and rq.set_cookies == 1, "{d} {s} cookies={d}", .{ rq.status, rq.location(), rq.set_cookies });
+            racer = rq;
+            _ = r.check("desk is asked about the racing peer, with its address", pc.waitFor("from 127.0.0.2 (request ", 10_000), "{s}", .{pc.output()});
+        } else r.skip("racing request from another address", "cannot connect from 127.0.0.2", .{});
+
+        // The real device asks.
+        const rq = try client.requestPair(inst, null);
+        _ = r.check("POST /pair registers a request and sends the device to wait", rq.waiting() and rq.set_cookies == 1, "{d} {s} cookies={d}", .{ rq.status, rq.location(), rq.set_cookies });
+        {
+            const again = try client.requestPair(inst, null);
+            _ = r.check("third request from the same address... (first: pending)", again.waiting(), "{d} {s}", .{ again.status, again.location() });
+            const third = try client.requestPair(inst, null);
+            _ = r.check("pending requests per address are bounded (busy)", std.mem.eql(u8, third.location(), "/pair?e=busy"), "{s}", .{third.location()});
+        }
+        {
+            var resp = try client.waitPage(inst, rq.cookie(), null);
+            defer resp.deinit();
+            _ = r.check("waiting page: 200, refreshes itself, issues nothing", resp.status == 200 and resp.bodyContains("http-equiv=\"refresh\"") and
+                resp.bodyContains("Request code") and resp.setCookieCount() == 0, "{d} cookies={d}", .{ resp.status, resp.setCookieCount() });
+            var resp2 = try client.waitPage(inst, rq.cookie(), other_ip);
+            defer resp2.deinit();
+            _ = r.check("a request token is bound to its address", !two_ips or (resp2.status == 303 and std.mem.eql(u8, resp2.location(), "/pair?e=expired")), "{d} {s}", .{ resp2.status, resp2.location() });
+        }
+
+        if (racer) |rc| {
+            // The desk sees the racer first: deny it. The window stays open.
+            _ = r.check("desk prompt for the racer", pc.waitForCount("[y/N]", 1, 10_000) and (pc.lastAfter("Pair 'laptop' from ", 9) != null), "{s}", .{pc.output()});
+            const prompt_ip = pc.lastAfter("Pair 'laptop' from ", 9) orelse "";
+            _ = r.check("first prompt is for the oldest request (the racer)", std.mem.eql(u8, prompt_ip, "127.0.0.2"), "{s}", .{prompt_ip});
+            pc.answer("n\r\n");
+            const got = try client.collect(inst, rc.cookie(), other_ip, 10_000);
+            _ = r.check("denied request: clear page, no credential", refusedTo(got, "/pair?e=denied"), "{any}", .{got});
+            _ = r.check("denying keeps the window open", pc.alive() and pc.waitFor("Denied request", 5000), "{s}", .{pc.output()});
+            const again = try client.requestPair(inst, other_ip);
+            _ = r.check("a denied address can't ask again in this window", std.mem.eql(u8, again.location(), "/pair?e=denied"), "{s}", .{again.location()});
+        }
+
+        // Now the real device's prompt; the code matches the device page.
+        const n_prompts: usize = if (racer != null) 2 else 1;
+        _ = r.check("desk prompt for the device", pc.waitForCount("[y/N]", n_prompts, 10_000), "{s}", .{pc.output()});
+        const code = pc.lastAfter("(request ", 4) orelse "????";
+        {
+            var resp = try client.waitPage(inst, rq.cookie(), null);
+            defer resp.deinit();
+            _ = r.check("device page shows the same request code as the desk", resp.bodyContains(code), "code={s}", .{code});
+        }
+        pc.answer("y\r\n");
+        const got = try client.collect(inst, rq.cookie(), null, 10_000);
+        switch (got) {
+            .creds => |c| c1 = c,
+            else => {
+                _ = r.check("approved device collects its credential", false, "{any}", .{got});
+                return error.PairingFailed;
+            },
+        }
+        const dv = c1.deviceValue();
+        _ = r.check("approved device gets device + session cookies", std.mem.startsWith(u8, dv, "laptop.") and dv.len == "laptop.".len + 43 and c1.session_len == client.session_cookie.len + 1 + 43, "{s}", .{dv});
+        _ = r.check("portal pair reports success and exits 0", pc.wait(10_000) == 0 and pc.has("Paired 'laptop' at 127.0.0.1"), "{s}", .{pc.output()});
+        {
+            const again = try client.collect(inst, rq.cookie(), null, 2000);
+            _ = r.check("a request token is single-use", refusedTo(again, "/pair?e=expired"), "{any}", .{again});
+            const late = try client.requestPair(inst, null);
+            _ = r.check("pairing window is single-use", std.mem.eql(u8, late.location(), "/pair?e=closed") and late.set_cookies == 0, "{s}", .{late.location()});
+        }
+        _ = r.ok("approval logged", inst.logHas("approved at the desk"));
     }
     {
-        var resp = try post(inst, "/pair", null, true);
-        defer resp.deinit();
-        _ = r.check("pairing window is single-use", std.mem.eql(u8, resp.location(), "/pair?e=closed") and resp.setCookieCount() == 0, "{s}", .{resp.location()});
+        // Cookie attributes of a freshly issued credential (one more pairing).
+        _ = try inst.cli(&.{ "unpair", "laptop" });
+        const pc = try inst.liveCli(&.{ "pair", "laptop" });
+        defer pc.deinit();
+        _ = pc.waitFor("Waiting for the device", 15_000);
+        const seen = client.waitPairOpen(inst, 10_000);
+        const rq = try client.requestPair(inst, null);
+        if (!r.check("second pairing: request accepted", seen and rq.waiting(), "seen={} {d} {s}", .{ seen, rq.status, rq.location() })) {
+            const text = try inst.log();
+            std.debug.print("---- portal.log\n{s}\n----\n", .{text});
+        }
+        _ = pc.waitFor("[y/N]", 10_000);
+        pc.answer("y\r\n");
+        var resp: http.Response = undefined;
+        var ok = false;
+        const deadline = net.now() + 10_000;
+        while (net.now() < deadline) {
+            resp = try client.waitPage(inst, rq.cookie(), null);
+            if (resp.status == 303) {
+                ok = true;
+                break;
+            }
+            resp.deinit();
+            net.sleep(50);
+        }
+        if (ok) {
+            defer resp.deinit();
+            const dl = resp.setCookieLine(client.device_cookie) orelse "";
+            const sl = resp.setCookieLine(client.session_cookie) orelse "";
+            const ql = resp.setCookieLine(client.pairreq_cookie) orelse "";
+            _ = r.check("cookies are HttpOnly, SameSite=Strict, Path=/", has(dl, "HttpOnly") and has(dl, "SameSite=Strict") and has(dl, "Path=/") and
+                has(sl, "HttpOnly") and has(sl, "SameSite=Strict") and has(sl, "Path=/"), "{s} / {s} (303 to {s}; desk: {s})", .{ dl, sl, resp.location(), pc.output() });
+            _ = r.check("device cookie lives 90 days, no Secure without TLS", has(dl, "Max-Age=7776000") and !has(dl, "Secure"), "{s}", .{dl});
+            _ = r.check("the request cookie is cleared on success", has(ql, "Max-Age=0"), "{s}", .{ql});
+            c1 = client.Creds.fromResponse(&resp) orelse return error.NoCookies;
+        } else _ = r.check("second pairing completes", false, "{s}", .{pc.output()});
+        _ = pc.wait(10_000);
     }
     {
         var resp = try get(inst, "/", c1.sessionCookie());
@@ -107,6 +243,38 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
             std.mem.eql(u8, resp.header("x-content-type-options") orelse "", "nosniff") and
             std.mem.eql(u8, resp.header("x-frame-options") orelse "", "DENY") and
             std.mem.eql(u8, resp.header("cache-control") orelse "", "no-store"), "", .{});
+    }
+
+    // ------------------------------------------------ deny path, CLI exit
+    {
+        const pc = try inst.liveCli(&.{ "pair", "phone" });
+        defer pc.deinit();
+        _ = pc.waitFor("Waiting for the device", 15_000);
+        _ = client.waitPairOpen(inst, 10_000);
+        const rq = try client.requestPair(inst, null);
+        _ = r.check("deny path: desk prompt", pc.waitFor("[y/N]", 10_000), "{s}", .{pc.output()});
+        pc.answer("\r\n"); // Enter alone means No
+        const got = try client.collect(inst, rq.cookie(), null, 10_000);
+        _ = r.check("Enter alone denies: device told so, no credential", refusedTo(got, "/pair?e=denied"), "{any}", .{got});
+        const d = try inst.cli(&.{"devices"});
+        _ = r.check("denied device was not paired", !d.has("phone ") and d.has("request "), "{s}", .{d.out});
+        _ = r.ok("denial logged", inst.logHas("denied at the desk"));
+        // Killing `portal pair` closes the window at once (process watch).
+        pc.kill();
+        const t0 = net.now();
+        var closed = false;
+        while (net.now() - t0 < 5000) {
+            var resp = try get(inst, "/pair", null);
+            defer resp.deinit();
+            if (!resp.bodyContains("type=\"submit\"")) {
+                closed = true;
+                break;
+            }
+            net.sleep(50);
+        }
+        _ = r.check("window closes as soon as `portal pair` exits", closed, "after {d} ms", .{net.now() - t0});
+        const late = try client.requestPair(inst, null);
+        _ = r.check("no requests after `portal pair` exited", std.mem.eql(u8, late.location(), "/pair?e=closed"), "{s}", .{late.location()});
     }
 
     // ------------------------------------------------ rotation and grace
@@ -120,12 +288,17 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         defer resp.deinit();
         _ = r.check("rotated sign-in gives a working session", resp.status == 200, "{d}", .{resp.status});
     }
-    // c1 is now the previous secret: still valid during the grace period.
+    // c1 is now superseded: still valid during the grace period.
     const c3 = (try client.signIn(inst, c1.deviceCookie())) orelse {
         _ = r.ok("previous credential still valid in grace period", false);
         return error.SignInFailed;
     };
     _ = r.ok("previous credential still valid in grace period", true);
+    {
+        // ...and so is c2, which the sign-in above did not overwrite.
+        const again = try client.signIn(inst, c2.deviceCookie());
+        _ = r.check("a credential issued within the grace window survives a later sign-in with an older one", again != null, "", .{});
+    }
     var c4: client.Creds = undefined;
     {
         var resp = try post(inst, "/auth/refresh", c3.deviceCookie(), true);
@@ -148,38 +321,71 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("portal devices lists the device and its address", d.has("laptop") and d.has("127.0.0.1") and d.has("last used"), "{s}", .{d.out});
     }
 
-    // --------------------------------------------- wrong source address
-    var c5: client.Creds = c4;
-    wrong_addr: {
-        var resp = http.request(gpa, port, .{ .path = "/", .host = inst.host, .cookie = c4.deviceCookie(), .source = .{ 127, 0, 0, 2 } }) catch |err| {
-            r.skip("credential from another address is rejected", "cannot connect from 127.0.0.2: {t}", .{err});
-            break :wrong_addr;
+    // ------------------- parallel sign-ins with the same credential (tabs)
+    var cur: client.Creds = c4;
+    {
+        var jobs: [4]SignInJob = undefined;
+        var threads: [4]?std.Thread = @splat(null);
+        for (&jobs, &threads) |*j, *t| {
+            j.* = .{ .inst = inst, .cookie = cur.deviceCookie() };
+            t.* = std.Thread.spawn(.{}, SignInJob.run, .{j}) catch null;
+        }
+        for (threads) |t| if (t) |th| th.join();
+        var ok: usize = 0;
+        for (jobs) |j| {
+            if (j.result != null) ok += 1;
+        }
+        _ = r.check("4 parallel sign-ins with the same device cookie all succeed", ok == jobs.len, "{d}/{d}", .{ ok, jobs.len });
+        _ = r.ok("...and none revoked the device", !inst.logHas("DEVICE REVOKED"));
+        var still: usize = 0;
+        for (jobs) |j| if (j.result) |res| {
+            var resp = try get(inst, "/", res.sessionCookie());
+            defer resp.deinit();
+            if (resp.status == 200) still += 1;
         };
+        _ = r.check("every parallel sign-in's session works", still == ok, "{d}/{d}", .{ still, ok });
+        if (jobs[jobs.len - 1].result) |res| cur = res;
+        cur = (try client.signIn(inst, cur.deviceCookie())) orelse {
+            _ = r.ok("device still signs in after parallel sign-ins", false);
+            return error.SignInFailed;
+        };
+        _ = r.ok("device still signs in after parallel sign-ins", true);
+    }
+
+    // --------------------------------------------- wrong source address
+    wrong_addr: {
+        if (!two_ips) {
+            r.skip("credential from another address is rejected", "cannot connect from 127.0.0.2", .{});
+            break :wrong_addr;
+        }
+        var resp = try http.request(gpa, port, .{ .path = "/", .host = inst.host, .cookie = cur.deviceCookie(), .source = other_ip });
         defer resp.deinit();
-        _ = r.check("credential from another address is rejected (not revoked)", resp.status == 303 and
-            std.mem.eql(u8, resp.location(), "/pair?e=address"), "{d} {s}", .{ resp.status, resp.location() });
+        _ = r.check("credential from another address is rejected like an unknown one (not revoked)", resp.status == 303 and
+            std.mem.eql(u8, resp.location(), "/pair"), "{d} {s}", .{ resp.status, resp.location() });
         _ = r.check("wrong-address attempt clears the cookies", has(resp.setCookieLine(client.device_cookie) orelse "", "Max-Age=0"), "", .{});
-        c5 = (try client.signIn(inst, c4.deviceCookie())) orelse {
+        cur = (try client.signIn(inst, cur.deviceCookie())) orelse {
             _ = r.ok("device still works from its own address", false);
             return error.SignInFailed;
         };
         _ = r.ok("device still works from its own address", true);
-        _ = r.ok("wrong-address attempt logged", inst.logHas("unexpected address"));
+        _ = r.ok("wrong-address attempt logged (the distinction stays local)", inst.logHas("unexpected address"));
     }
 
-    // ------------------------------- stale credential (older than grace)
+    // ------------------------ stale credential (out of the grace ring)
     {
-        // c2's secret was replaced twice since: neither current nor previous.
-        var resp = try get(inst, "/", c2.deviceCookie());
+        // Rotate enough times that c1 falls out of the 4-entry grace ring.
+        var i: usize = 0;
+        while (i < 5) : (i += 1) cur = (try client.signIn(inst, cur.deviceCookie())) orelse return error.SignInFailed;
+        var resp = try get(inst, "/", c1.deviceCookie());
         defer resp.deinit();
-        _ = r.check("stale (twice-rotated) credential revokes the device", std.mem.eql(u8, resp.location(), "/pair?e=revoked"), "{d} {s}", .{ resp.status, resp.location() });
-        var resp2 = try get(inst, "/", c5.deviceCookie());
+        _ = r.check("a credential that fell out of the grace ring revokes the device", std.mem.eql(u8, resp.location(), "/pair?e=revoked"), "{d} {s}", .{ resp.status, resp.location() });
+        var resp2 = try get(inst, "/", cur.deviceCookie());
         defer resp2.deinit();
         _ = r.check("revoked device's newest credential no longer works", std.mem.eql(u8, resp2.location(), "/pair"), "{s}", .{resp2.location()});
-        var resp3 = try post(inst, "/auth/refresh", c5.deviceCookie(), true);
+        var resp3 = try post(inst, "/auth/refresh", cur.deviceCookie(), true);
         defer resp3.deinit();
         _ = r.check("revoked device's refresh is 401", resp3.status == 401, "{d}", .{resp3.status});
-        var resp4 = try get(inst, "/", c5.sessionCookie());
+        var resp4 = try get(inst, "/", cur.sessionCookie());
         defer resp4.deinit();
         _ = r.check("revocation ends the device's sessions", resp4.status == 303, "{d}", .{resp4.status});
         _ = r.ok("revocation logged", inst.logHas("DEVICE REVOKED"));
@@ -216,8 +422,8 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         const got = v.waitLogout(15_000);
         const dt = net.now() - t0;
         _ = r.check("open viewer told to log out after unpair", got, "after {d} ms", .{dt});
-        _ = r.check("...within the 5 s recheck (+slack)", dt < 12_000, "{d} ms", .{dt});
-        _ = r.check("viewer connection closed after logout", v.waitClose(5000), "", .{});
+        _ = r.check("...promptly (event-driven, no polling interval)", dt < 3000, "{d} ms", .{dt});
+        _ = r.check("viewer connection closed after logout", v.waitClose(12_000), "", .{});
         var resp = try get(inst, "/", c7.deviceCookie());
         defer resp.deinit();
         _ = r.check("unpaired device can't sign in", std.mem.eql(u8, resp.location(), "/pair"), "{s}", .{resp.location()});
@@ -240,23 +446,42 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         defer resp3.deinit();
         _ = r.check("logged-out session is gone", resp3.status == 303, "{d}", .{resp3.status});
     }
+    {
+        // Session expired (or Portal restarted): the device cookie alone
+        // still unpairs the device, instead of claiming to.
+        const c9 = try client.pair(inst, "tablet");
+        var resp = try post(inst, "/logout", c9.deviceCookie(), true);
+        defer resp.deinit();
+        _ = r.check("logout without a live session still unpairs (device cookie)", std.mem.eql(u8, resp.location(), "/pair?bye"), "{s}", .{resp.location()});
+        const d = try inst.cli(&.{"devices"});
+        _ = r.check("...and the device is really gone", !d.has("tablet"), "{s}", .{d.out});
+        var resp2 = try post(inst, "/logout", null, true);
+        defer resp2.deinit();
+        _ = r.check("logout with nothing to unpair does not claim it did", std.mem.eql(u8, resp2.location(), "/pair"), "{s}", .{resp2.location()});
+    }
 
     // ------------------------------- restart: sessions are memory-only
     {
         const c9 = try client.pair(inst, "laptop");
+        const revoked_before = logCount(inst, "DEVICE REVOKED");
         _ = r.ok("server alive before restart", inst.alive() and client.alive(inst));
         inst.kill();
         inst = try proc.Instance.start(h, dir, port + 5, &ping_child);
         var resp = try get(inst, "/", c9.sessionCookie());
         defer resp.deinit();
         _ = r.check("after a restart the old session is gone", resp.status == 303 and std.mem.eql(u8, resp.location(), "/pair"), "{d} {s}", .{ resp.status, resp.location() });
-        const c10 = try client.signIn(inst, c9.deviceCookie());
-        _ = r.check("after a restart the device signs in silently", c10 != null, "", .{});
-        if (c10) |c| {
+        // Two tabs reopening at once after the restart: neither revokes.
+        var jobs: [2]SignInJob = .{ .{ .inst = inst, .cookie = c9.deviceCookie() }, .{ .inst = inst, .cookie = c9.deviceCookie() } };
+        var threads: [2]?std.Thread = @splat(null);
+        for (&jobs, &threads) |*j, *t| t.* = std.Thread.spawn(.{}, SignInJob.run, .{j}) catch null;
+        for (threads) |t| if (t) |th| th.join();
+        _ = r.check("after a restart, two tabs sign in silently at once", jobs[0].result != null and jobs[1].result != null, "", .{});
+        if (jobs[0].result) |c| {
             var resp2 = try get(inst, "/", c.sessionCookie());
             defer resp2.deinit();
-            _ = r.check("...and its new session works", resp2.status == 200, "{d}", .{resp2.status});
+            _ = r.check("...and their new sessions work", resp2.status == 200, "{d}", .{resp2.status});
         }
+        _ = r.ok("...without revoking the device", logCount(inst, "DEVICE REVOKED") == revoked_before);
     }
 
     r.skip("pairing window expiry", "shortest window is 1 minute; covered by devices.zig unit tests", .{});

@@ -103,6 +103,8 @@ pub extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn CreatePipe(read: *HANDLE, write: *HANDLE, sa: ?*const SECURITY_ATTRIBUTES, size: DWORD) callconv(.winapi) BOOL;
 pub extern "kernel32" fn SetHandleInformation(h: HANDLE, mask: DWORD, flags: DWORD) callconv(.winapi) BOOL;
 pub extern "kernel32" fn ReadFile(h: HANDLE, buf: [*]u8, len: DWORD, read: ?*DWORD, overlapped: ?*anyopaque) callconv(.winapi) BOOL;
+pub extern "kernel32" fn WriteFile(h: HANDLE, buf: [*]const u8, len: DWORD, written: ?*DWORD, overlapped: ?*anyopaque) callconv(.winapi) BOOL;
+pub extern "kernel32" fn PeekNamedPipe(h: HANDLE, buf: ?[*]u8, len: DWORD, read: ?*DWORD, avail: ?*DWORD, left: ?*DWORD) callconv(.winapi) BOOL;
 pub extern "kernel32" fn CreateProcessW(
     app: ?[*:0]const u16,
     cmdline: ?[*:0]u16,

@@ -1,7 +1,8 @@
 //! Portal: watch (and answer prompts in) a terminal session running on this
 //! desktop from a browser elsewhere, over a private network (WireGuard).
 //!
-//!   portal pair <name>               let a device pair (2-minute window)
+//!   portal pair <name>               let a device pair (2-minute window,
+//!                                    each request approved at the desk)
 //!   portal devices                   list paired devices
 //!   portal unpair <name>             revoke a device
 //!   portal run [options] [-- cmd...] start a session (default cmd: claude)
@@ -47,13 +48,19 @@ const usage =
     \\
     \\Usage:
     \\  portal pair <name> [--minutes N]
-    \\      Open a pairing window (default 2 minutes, max 10) for a device
-    \\      called <name> (a-z, 0-9, -). On the device, with WireGuard on,
-    \\      open https://10.8.0.1:8420/ and tap "Pair this device". Nothing
-    \\      to type: the device gets its own credential, which rotates on
-    \\      every use and is bound to its WireGuard address. While the
-    \\      window is open, `portal run` also serves the Portal CA
-    \\      certificate on http://10.8.0.1:8421/ (listen port + 1).
+    \\      Pair a device called <name> (a-z, 0-9, -). Stays running for the
+    \\      window (default 2 minutes, max 10) and asks you, here, about each
+    \\      device that asks to pair:
+    \\        Pair 'iphone' from 10.8.0.3 (request 7f3a)? [y/N]
+    \\      On the device, with WireGuard on, open the address `portal run`
+    \\      listens on (e.g. https://10.8.0.1:8420/ after
+    \\      `portal run --listen 10.8.0.1:8420`) and tap "Pair this device";
+    \\      it shows the same request code. Nothing is typed on the device:
+    \\      it gets its own credential, which rotates on every use and is
+    \\      bound to its WireGuard address. While the window is open,
+    \\      `portal run` also serves the Portal CA certificate on
+    \\      http://<address>:<port+1>/; `portal pair` prints the CA's
+    \\      SHA-256 and whether that download is actually up.
     \\
     \\  portal devices
     \\      List paired devices (and any open pairing window).
@@ -70,14 +77,21 @@ const usage =
     \\                         folder (%USERPROFILE%) when Portal was started
     \\                         without a terminal (double-click, Start menu,
     \\                         shortcut) or from inside its releases folder.
-    \\      --listen IP:PORT   Address to listen on (default {s}).
-    \\                         Use your WireGuard address, e.g. 10.8.0.1:8420.
-    \\                         Wildcard and public addresses are refused.
+    \\      --listen IP:PORT   Address to listen on (default {s}, which
+    \\                         only this desktop can reach). For your other
+    \\                         devices give your WireGuard address, e.g.
+    \\                         --listen 10.8.0.1:8420. Wildcard and public
+    \\                         addresses are refused.
     \\      --host NAME[:PORT] Extra Host header value to accept (repeatable).
     \\      --input MODE       none | keys | instruct | text   (default: keys)
     \\                           none: view only
     \\                           keys: digits, y/n, Enter, single Esc
-    \\                                 (enough to answer prompts)
+    \\                                 (enough to answer prompts). At an
+    \\                                 idle prompt those keys are typed
+    \\                                 like any text, so a device can
+    \\                                 submit a line of digits/y/n (e.g.
+    \\                                 "1", Enter) as a prompt; nothing
+    \\                                 else can be typed
     \\                           instruct: keys, plus whole instruction
     \\                                 lines that Portal checks first: no
     \\                                 ! shell escape, no / slash commands,
@@ -213,6 +227,123 @@ fn openLog(gpa: Allocator, paths: devices.Paths, io: Io) ?Log {
 
 // ---------------------------------------------------------------- devices
 
+const SYNCHRONIZE: w.DWORD = 0x00100000;
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) w.DWORD;
+extern "kernel32" fn OpenProcess(access: w.DWORD, inherit: w.BOOL, pid: w.DWORD) callconv(.winapi) ?w.HANDLE;
+extern "kernel32" fn CreateEventW(sa: ?*anyopaque, manual: w.BOOL, initial: w.BOOL, name: ?[*:0]const u16) callconv(.winapi) ?w.HANDLE;
+extern "kernel32" fn SetEvent(h: w.HANDLE) callconv(.winapi) w.BOOL;
+extern "kernel32" fn ResetEvent(h: w.HANDLE) callconv(.winapi) w.BOOL;
+extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (w.DWORD) callconv(.winapi) w.BOOL, add: w.BOOL) callconv(.winapi) w.BOOL;
+
+/// SHA-256 of the Portal CA, if one exists yet (never creates one).
+fn caFingerprint(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, out: *[95]u8) ?[]const u8 {
+    const store = tlsStore(gpa, io, env) catch return null;
+    defer gpa.free(store.dir);
+    var ca = (pki.loadCa(store) catch return null) orelse return null;
+    defer ca.deinit(gpa);
+    return x509.formatFingerprint(x509.fingerprint(ca.der), out);
+}
+
+/// Lines typed at the `portal pair` console, handed from a reader thread
+/// to the main loop through an event it can wait on with the store watch.
+const ConsoleLines = struct {
+    ready_ev: w.HANDLE,
+    taken_ev: w.HANDLE,
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+    eof: std.atomic.Value(bool) = .init(false),
+    ready: std.atomic.Value(bool) = .init(false),
+
+    fn reader(c: *ConsoleLines) void {
+        const in = w.GetStdHandle(w.STD_INPUT_HANDLE) orelse {
+            c.finish();
+            return;
+        };
+        var line: [256]u8 = undefined;
+        var n: usize = 0;
+        while (true) {
+            var b: [1]u8 = undefined;
+            var got: w.DWORD = 0;
+            if (w.ReadFile(in, &b, 1, &got, null) == 0 or got == 0) {
+                c.finish();
+                return;
+            }
+            if (b[0] == '\r') continue;
+            if (b[0] != '\n') {
+                if (n < line.len) line[n] = b[0];
+                n +|= 1;
+                continue;
+            }
+            const len = @min(n, line.len);
+            @memcpy(c.buf[0..len], line[0..len]);
+            c.len = len;
+            n = 0;
+            c.ready.store(true, .release);
+            _ = SetEvent(c.ready_ev);
+            _ = w.WaitForSingleObject(c.taken_ev, w.INFINITE);
+        }
+    }
+
+    fn finish(c: *ConsoleLines) void {
+        c.eof.store(true, .release);
+        _ = SetEvent(c.ready_ev);
+    }
+
+    /// The next typed line, if one is waiting (copied into `out`).
+    fn take(c: *ConsoleLines, out: []u8) ?[]const u8 {
+        if (!c.ready.load(.acquire)) return null;
+        const n = @min(c.len, out.len);
+        @memcpy(out[0..n], c.buf[0..n]);
+        c.ready.store(false, .release);
+        _ = ResetEvent(c.ready_ev);
+        _ = SetEvent(c.taken_ev);
+        return out[0..n];
+    }
+};
+
+/// "y" / "yes" (any case, surrounding blanks ignored) approves; anything
+/// else, including an empty line, denies.
+pub fn isYes(line: []const u8) bool {
+    const t = std.mem.trim(u8, line, " \t");
+    return std.ascii.eqlIgnoreCase(t, "y") or std.ascii.eqlIgnoreCase(t, "yes");
+}
+
+/// What Ctrl+C / closing the console must undo: the window this
+/// `portal pair` opened.
+var pair_cleanup: ?struct { gpa: Allocator, io: Io, paths: devices.Paths, nonce: u64 } = null;
+
+fn pairCtrlHandler(_: w.DWORD) callconv(.winapi) w.BOOL {
+    if (pair_cleanup) |c| endWindow(c.gpa, c.io, c.paths, c.nonce);
+    std.debug.print("\nPairing cancelled; the window is closed.\n", .{});
+    w.ExitProcess(130);
+}
+
+fn endWindow(gpa: Allocator, io: Io, paths: devices.Paths, nonce: u64) void {
+    devices.withStore(gpa, io, paths, nowUnix(io), nonce, struct {
+        fn op(n: u64, st: *devices.Store) !bool {
+            return st.endPair(n);
+        }
+    }.op) catch {};
+}
+
+fn pairStoreFail(desk: devices.Desk, nonce: u64, err: anyerror) noreturn {
+    desk.cancel(nonce) catch {};
+    fatal("device store error: {s} ({t})", .{ devices.describeError(err), err });
+}
+
+fn pairLog(gpa: Allocator, paths: devices.Paths, io: Io, comptime fmt: []const u8, args: anytype) void {
+    if (openLog(gpa, paths, io)) |opened| {
+        var log = opened;
+        defer log.close();
+        log.print(fmt, args);
+    }
+}
+
+/// `portal pair <name>`: opens a window, then stays here asking the owner
+/// to approve or deny each device that asks (nothing is typed on the
+/// device). Event-driven: it sleeps until the device list changes (a
+/// device asked, collected its credential, the server reported on the
+/// certificate listener), a line is typed, or the window expires.
 fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
     if (args.len == 0) fatal("usage: portal pair <name> [--minutes N]", .{});
     const name = args[0];
@@ -225,33 +356,221 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
 
     const paths = try devicePaths(gpa, io, env);
     defer gpa.free(paths.dir);
-    const now = nowUnix(io);
-    const Ctx = struct { name: []const u8, now: i64, secs: i64 };
-    devices.withStore(gpa, io, paths, now, Ctx{ .name = name, .now = now, .secs = minutes * 60 }, struct {
-        fn op(c: Ctx, st: *devices.Store) !bool {
-            try st.beginPair(c.name, c.now, c.secs);
-            return true;
-        }
-    }.op) catch |err| fatal("could not open the pairing window: {t}", .{err});
-    if (openLog(gpa, paths, io)) |opened| {
-        var log = opened;
-        defer log.close();
-        log.print("pairing window opened for '{s}' ({d} min)", .{ name, minutes });
+    var fp_buf: [95]u8 = undefined;
+    const fingerprint = caFingerprint(gpa, io, env, &fp_buf);
+
+    var nonce_bytes: [8]u8 = undefined;
+    io.randomSecure(&nonce_bytes) catch fatal("no entropy", .{});
+    const nonce = std.mem.readInt(u64, &nonce_bytes, .little) | 1;
+    const pid = GetCurrentProcessId();
+
+    // Watch before opening the window, so no change is missed.
+    var dw = devices.DirWatch.open(gpa, paths);
+    defer dw.close();
+
+    // `portal pair` is a thin console wrapper over devices.Desk, the same
+    // API the Portal window uses (through web.Server.desk*).
+    const desk: devices.Desk = .{ .gpa = gpa, .io = io, .paths = paths };
+    const now0 = nowUnix(io);
+    const replaced = desk.begin(name, minutes * 60, nonce, pid) catch |err|
+        fatal("could not open the pairing window: {s} ({t})", .{ devices.describeError(err), err });
+    var replaced_buf: [devices.max_name]u8 = undefined;
+    var replaced_len: usize = 0;
+    if (replaced) |t| {
+        replaced_len = t.len;
+        @memcpy(replaced_buf[0..t.len], t.get());
+    }
+    pair_cleanup = .{ .gpa = gpa, .io = io, .paths = paths, .nonce = nonce };
+    _ = SetConsoleCtrlHandler(&pairCtrlHandler, 1);
+    pairLog(gpa, paths, io, "pairing window opened for '{s}' ({d} min); requests need approval at the desk", .{ name, minutes });
+
+    if (replaced_len > 0) std.debug.print("(Replaced the open pairing window for '{s}'.)\n", .{replaced_buf[0..replaced_len]});
+    std.debug.print(
+        \\Pairing open for '{s}' for {d} minute(s). Nothing is typed on the device:
+        \\you approve it here.
+        \\
+        \\
+    , .{ name, minutes });
+    if (fingerprint) |fp| {
+        std.debug.print("Portal CA SHA-256: {s}\n", .{fp});
+    } else {
+        std.debug.print("Portal CA: none yet (the first `portal run` creates it).\n", .{});
     }
     std.debug.print(
-        \\Pairing open for '{s}' for {d} minute(s).
         \\
         \\On the device, with WireGuard on:
         \\  1. First time only: open http://<desktop WireGuard address>:<port+1>/
-        \\     (e.g. http://10.8.0.1:8421/) and install the Portal certificate.
-        \\     iPhone/iPad: also enable full trust for it in Settings > General >
-        \\     About > Certificate Trust Settings (`portal ca export` has the steps).
+        \\     (e.g. http://10.8.0.1:8421/) and install the Portal certificate. Its
+        \\     SHA-256 (shown on that page and in the profile details) must match
+        \\     the one above. iPhone/iPad: also enable full trust for it in
+        \\     Settings > General > About > Certificate Trust Settings.
         \\  2. Open https://<desktop WireGuard address>:<port>/ (e.g.
         \\     https://10.8.0.1:8420/) and tap "Pair this device".
-        \\If `portal run` is not running yet, start it first: it serves the
-        \\certificate page while this window is open.
+        \\Each request then appears here with a code, which the device also shows.
+        \\Approve only the request whose code and address match your device.
         \\
-    , .{ name, minutes });
+        \\Waiting for the device... (Ctrl+C cancels)
+        \\
+    , .{});
+
+    var lines: ConsoleLines = .{
+        .ready_ev = CreateEventW(null, 1, 0, null) orelse fatal("cannot create an event", .{}),
+        .taken_ev = CreateEventW(null, 0, 0, null) orelse fatal("cannot create an event", .{}),
+    };
+    const reader = std.Thread.spawn(.{}, ConsoleLines.reader, .{&lines}) catch fatal("cannot start the input thread", .{});
+    reader.detach();
+
+    const start_s = nowUnix(io);
+    var expires: i64 = now0 + minutes * 60;
+    var asked: ?[devices.code_len]u8 = null;
+    var announced: [devices.max_requests * 4][devices.code_len]u8 = undefined;
+    var n_announced: usize = 0;
+    var ca_seen: devices.CaState = .unknown;
+    var ca_hint_done = false;
+    var first = true;
+    while (true) {
+        if (!first) dw.rearm();
+        first = false;
+        const now = nowUnix(io);
+
+        // A typed answer applies to the request currently asked.
+        var answer: ?struct { code: [devices.code_len]u8, yes: bool } = null;
+        var line_buf: [256]u8 = undefined;
+        if (lines.take(&line_buf)) |line| {
+            if (asked) |code| {
+                answer = .{ .code = code, .yes = isYes(line) };
+            } else std.debug.print("(no request is waiting for an answer)\n", .{});
+        }
+        if (lines.eof.load(.acquire) and !lines.ready.load(.acquire)) {
+            endWindow(gpa, io, paths, nonce);
+            fatal("input closed: `portal pair` must ask you to approve the device, so run it in a terminal. The window is closed.", .{});
+        }
+
+        const Snap = struct {
+            lost: bool = false,
+            pairing: ?devices.Pairing = null,
+            answer_result: ?devices.AnswerResult = null,
+            done: ?devices.Request = null,
+        };
+        var snap: Snap = .{};
+        if (answer) |a| snap.answer_result = desk.answer(nonce, &a.code, a.yes) catch |err| pairStoreFail(desk, nonce, err);
+        snap.pairing = desk.get(nonce) catch |err| pairStoreFail(desk, nonce, err);
+        if (snap.pairing) |p| {
+            snap.done = devices.pairedRequest(&p);
+            if (snap.done != null) desk.cancel(nonce) catch |err| pairStoreFail(desk, nonce, err);
+        } else snap.lost = true;
+
+        if (answer) |a| if (snap.answer_result) |r| {
+            const ip: []const u8 = blk: {
+                const p = snap.pairing orelse break :blk "?";
+                const i = p.findCode(&a.code) orelse break :blk "?";
+                break :blk p.requests[i].?.ip.get();
+            };
+            switch (r) {
+                .approved => {
+                    std.debug.print("Approved request {s} from {s}. Waiting for the device to collect its credential...\n", .{ &a.code, ip });
+                    pairLog(gpa, paths, io, "pairing request {s} for '{s}' from {s} approved at the desk", .{ &a.code, name, ip });
+                },
+                .denied => {
+                    std.debug.print("Denied request {s} from {s}. Further requests from that address are refused in this window.\n", .{ &a.code, ip });
+                    pairLog(gpa, paths, io, "pairing request {s} for '{s}' from {s} denied at the desk", .{ &a.code, name, ip });
+                },
+                .not_pending, .no_such_request => std.debug.print("Request {s} is no longer waiting.\n", .{&a.code}),
+                .window_gone => {},
+            }
+            asked = null;
+        };
+
+        if (snap.done) |r| {
+            std.debug.print("Paired '{s}' at {s}.\n", .{ name, r.ip.get() });
+            return;
+        }
+        if (snap.lost) {
+            if (now > expires) {
+                std.debug.print("The pairing window expired; nothing was paired. Run `portal pair {s}` again when the device is ready.\n", .{name});
+                pairLog(gpa, paths, io, "pairing window for '{s}' expired; nothing was paired", .{name});
+            } else {
+                std.debug.print("The pairing window was closed or replaced by another `portal pair`.\n", .{});
+            }
+            w.ExitProcess(1);
+        }
+        const p = snap.pairing.?;
+        expires = p.expires;
+
+        // What the running server reports about the certificate listener.
+        if (p.ca != ca_seen) {
+            ca_seen = p.ca;
+            switch (p.ca) {
+                .up => std.debug.print("Certificate download is up: http://{s}/ (served by `portal run`).\n", .{p.ca_where.get()}),
+                .failed => std.debug.print(
+                    \\WARNING: `portal run` could NOT open the certificate download listener on
+                    \\  {s}. Another program may be using that port: do not install a
+                    \\  certificate from that address. Use `portal ca export` instead, and
+                    \\  check the SHA-256 above.
+                    \\
+                , .{p.ca_where.get()}),
+                .off => std.debug.print("`portal run` uses --no-tls: no certificate download.\n", .{}),
+                .unknown => {},
+            }
+        }
+        if (p.ca == .unknown and !ca_hint_done and now - start_s >= 3) {
+            ca_hint_done = true;
+            std.debug.print("No running `portal run` has picked up this window yet (start it, as this Windows user).\n", .{});
+        }
+
+        // Announce new requests; ask about one at a time, oldest first.
+        if (asked) |code| {
+            const still = if (p.findCode(&code)) |i| p.requests[i].?.state == .pending else false;
+            if (!still) {
+                std.debug.print("\nRequest {s} is no longer waiting.\n", .{&code});
+                asked = null;
+            }
+        }
+        var order: [devices.max_requests]usize = undefined;
+        var n_order: usize = 0;
+        for (p.requests, 0..) |slot, i| if (slot != null) {
+            order[n_order] = i;
+            n_order += 1;
+        };
+        std.mem.sort(usize, order[0..n_order], &p, struct {
+            fn lt(pp: *const devices.Pairing, a: usize, b: usize) bool {
+                return pp.requests[a].?.created < pp.requests[b].?.created;
+            }
+        }.lt);
+        for (order[0..n_order]) |i| {
+            const r = p.requests[i].?;
+            var seen = false;
+            for (announced[0..n_announced]) |c| seen = seen or std.mem.eql(u8, &c, &r.code);
+            if (seen or r.state != .pending) continue;
+            if (n_announced < announced.len) {
+                announced[n_announced] = r.code;
+                n_announced += 1;
+            }
+            if (asked != null) std.debug.print("\n  (another request is waiting: '{s}' from {s}, request {s}; asked next)\n", .{ name, r.ip.get(), &r.code });
+        }
+        if (asked == null and !p.decided()) {
+            for (order[0..n_order]) |i| {
+                const r = p.requests[i].?;
+                if (r.state != .pending) continue;
+                std.debug.print("\nPair '{s}' from {s} (request {s})? [y/N] ", .{ name, r.ip.get(), &r.code });
+                asked = r.code;
+                break;
+            }
+        }
+
+        var handles: [2]w.HANDLE = undefined;
+        var n_h: w.DWORD = 0;
+        handles[n_h] = lines.ready_ev;
+        n_h += 1;
+        if (dw.h) |h| {
+            handles[n_h] = h;
+            n_h += 1;
+        }
+        var ms = devices.waitMs(now, expires);
+        if (p.ca == .unknown and !ca_hint_done) ms = @min(ms, 3000);
+        if (dw.h == null) ms = @min(ms, 1000); // no change notification: re-check each second
+        _ = devices.WaitForMultipleObjects(n_h, &handles, 0, ms);
+    }
 }
 
 fn cmdDevices(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) !void {
@@ -268,10 +587,16 @@ fn cmdDevices(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) !void
                     d.name.get(), d.ip.get(), @divTrunc(c.now -| d.last_seen, 60),
                 });
             }
-            if (st.pairingName(c.now)) |n| std.debug.print("Pairing window open for '{s}'.\n", .{n});
+            if (st.pairing) |p| if (st.pairingName(c.now) != null) {
+                std.debug.print("Pairing window open for '{s}' ({d} s left; answer requests in its `portal pair` console).\n", .{ p.name.get(), p.expires - c.now });
+                for (p.requests) |slot| {
+                    const r = slot orelse continue;
+                    std.debug.print("  request {s} from {s}: {t}\n", .{ &r.code, r.ip.get(), r.state });
+                }
+            };
             return false;
         }
-    }.op) catch |err| fatal("could not read the device list: {t}", .{err});
+    }.op) catch |err| fatal("could not read the device list: {s} ({t})", .{ devices.describeError(err), err });
 }
 
 fn cmdUnpair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
@@ -285,13 +610,9 @@ fn cmdUnpair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: 
             c.removed.* = st.remove(c.name);
             return c.removed.*;
         }
-    }.op) catch |err| fatal("could not update the device list: {t}", .{err});
+    }.op) catch |err| fatal("could not update the device list: {s} ({t})", .{ devices.describeError(err), err });
     if (!removed) fatal("no paired device named '{s}' (see `portal devices`)", .{args[0]});
-    if (openLog(gpa, paths, io)) |opened| {
-        var log = opened;
-        defer log.close();
-        log.print("device '{s}' unpaired from the desktop", .{args[0]});
-    }
+    pairLog(gpa, paths, io, "device '{s}' unpaired from the desktop", .{args[0]});
     std.debug.print("Unpaired '{s}'. Its open viewers are disconnected within a few seconds.\n", .{args[0]});
 }
 
@@ -550,61 +871,156 @@ fn sanEql(a: x509.SanEntry, b: x509.SanEntry) bool {
     };
 }
 
-/// Opens the certificate download listener (plain HTTP, listen port + 1)
-/// while a pairing window is open and closes it when the window ends.
-const CaWindow = struct {
+/// The server side of pairing, event-driven: sleeps until a file in the
+/// data directory is renamed (every device-store change ends in one), the
+/// `portal pair` process that owns the open window exits, or the window
+/// expires. On each wake it re-reads the store once and
+///   * refreshes the HTTPS server's in-memory pairing view (so requests
+///     before sign-in never read the file),
+///   * ends the sessions of devices that are no longer paired (`portal
+///     unpair` from another process); a failed read revokes nothing,
+///   * opens the certificate download listener (plain HTTP, listen port
+///     + 1) while a window is open, closes it afterwards, and reports
+///     whether it is actually up back into the store, where `portal pair`
+///     shows it. A listener that can't be opened (e.g. another program is
+///     squatting the port) is logged loudly and reported as failed.
+const PairWatch = struct {
     srv: *web.Server,
-    addr: std.Io.net.IpAddress,
+    /// The certificate download server; null with --no-tls.
+    ca_srv: ?*web.Server,
+    ca_addr: std.Io.net.IpAddress,
     paths: devices.Paths,
     io: Io,
     gpa: Allocator,
 
-    fn pairingOpen(cw: *CaWindow) bool {
-        var open = false;
-        const now = nowUnix(cw.io);
-        const Ctx = struct { now: i64, open: *bool };
-        devices.withStore(cw.gpa, cw.io, cw.paths, now, Ctx{ .now = now, .open = &open }, struct {
-            fn op(c: Ctx, st: *devices.Store) !bool {
-                c.open.* = st.pairingName(c.now) != null;
+    fn readStore(pw: *PairWatch, out: *devices.Store) !void {
+        devices.withStore(pw.gpa, pw.io, pw.paths, nowUnix(pw.io), out, struct {
+            fn op(o: *devices.Store, st: *devices.Store) !bool {
+                o.* = st.*;
                 return false;
             }
-        }.op) catch return false;
-        return open;
+        }.op) catch |err| return err;
     }
 
-    fn watch(cw: *CaWindow) void {
-        const io = cw.io;
+    /// Records the certificate listener's state for window `nonce`.
+    fn report(pw: *PairWatch, nonce: u64, state: devices.CaState, where: []const u8) void {
+        const Ctx = struct { nonce: u64, state: devices.CaState, where: []const u8 };
+        devices.withStore(pw.gpa, pw.io, pw.paths, nowUnix(pw.io), Ctx{ .nonce = nonce, .state = state, .where = where }, struct {
+            fn op(c: Ctx, st: *devices.Store) !bool {
+                const p = &(st.pairing orelse return false);
+                if (p.nonce != c.nonce or (p.ca == c.state and std.mem.eql(u8, p.ca_where.get(), c.where))) return false;
+                p.ca = c.state;
+                p.ca_where.set(if (devices.validWhere(c.where)) c.where else "");
+                return true;
+            }
+        }.op) catch |err| pw.srv.noteStoreError(err);
+    }
+
+    fn watch(pw: *PairWatch) void {
+        const io = pw.io;
+        var dw = devices.DirWatch.open(pw.gpa, pw.paths);
+        if (dw.h == null) pw.srv.log.print("WARNING: cannot watch {s} for changes; re-reading the device list every 2 s instead", .{pw.paths.dir});
+        var where_buf: [80]u8 = undefined;
+        const where = std.fmt.bufPrint(&where_buf, "{f}", .{pw.ca_addr}) catch "?";
         var active: ?Io.Future(void) = null;
-        var failed = false;
-        var host_buf: [80]u8 = undefined;
-        const where = std.fmt.bufPrint(&host_buf, "{f}", .{cw.addr}) catch "?";
+        var failed_nonce: u64 = 0;
+        var proc_h: ?w.HANDLE = null;
+        var proc_nonce: u64 = 0;
+        var gone_nonce: u64 = 0;
+        var first = true;
         while (true) {
-            io.sleep(.fromMilliseconds(1000), .awake) catch {};
-            const open = cw.pairingOpen();
-            if (open and active == null and !failed) {
-                const l = cw.addr.listen(io, .{ .reuse_address = false }) catch |err| {
-                    cw.srv.log.print("pairing: cannot open the certificate download listener on {s}: {t}", .{ where, err });
-                    failed = true;
-                    continue;
-                };
-                cw.srv.listener = l;
-                cw.srv.stop.store(false, .release);
-                active = io.concurrent(web.Server.run, .{cw.srv}) catch {
-                    var ll = l;
-                    ll.deinit(io);
-                    failed = true;
-                    continue;
-                };
-                cw.srv.log.print("pairing window open: certificate download on http://{s}/", .{where});
-            } else if (!open) {
-                failed = false;
-                if (active) |*f| {
-                    cw.srv.stop.store(true, .release);
+            _ = pw.srv.pairwatch_wakes.fetchAdd(1, .monotonic);
+            if (!first) dw.rearm(); // before reading: a change made meanwhile signals again
+            first = false;
+            const read_start = pw.srv.realNowMs();
+            const now = nowUnix(io);
+            var st: devices.Store = .{};
+            var window: ?devices.Pairing = null;
+            if (pw.readStore(&st)) |_| {
+                pw.srv.applyStore(&st, read_start);
+                window = st.pairing;
+            } else |err| {
+                pw.srv.noteStoreError(err);
+                window = pw.srv.pairingSnapshot(now); // keep the last known view
+            }
+
+            // Follow the owning `portal pair` process.
+            if (window) |p| {
+                if (p.nonce != proc_nonce) {
+                    if (proc_h) |h| _ = w.CloseHandle(h);
+                    proc_nonce = p.nonce;
+                    proc_h = OpenProcess(SYNCHRONIZE, 0, p.pid);
+                    if (proc_h == null) {
+                        gone_nonce = p.nonce;
+                        pw.srv.pairingProcessGone(p.nonce);
+                        pw.srv.log.print("pairing window closed: its `portal pair` (pid {d}) is not running (error {d})", .{ p.pid, w.GetLastError() });
+                    }
+                }
+            } else if (proc_h) |h| {
+                _ = w.CloseHandle(h);
+                proc_h = null;
+                proc_nonce = 0;
+            }
+            const open: ?devices.Pairing = if (window) |p|
+                (if (now <= p.expires and p.nonce != gone_nonce) p else null)
+            else
+                null;
+
+            if (pw.ca_srv) |cs| {
+                if (open) |p| {
+                    if (active == null and failed_nonce != p.nonce) {
+                        if (pw.ca_addr.listen(io, .{ .reuse_address = false })) |l| {
+                            cs.listener = l;
+                            cs.stop.store(false, .release);
+                            if (io.concurrent(web.Server.run, .{cs})) |f| {
+                                active = f;
+                                pw.srv.log.print("pairing window open: certificate download on http://{s}/", .{where});
+                            } else |_| {
+                                var ll = l;
+                                ll.deinit(io);
+                            }
+                        } else |err| {
+                            pw.srv.log.print("PAIRING WARNING: cannot open the certificate download listener on {s}: {t}. " ++
+                                "Another program may be using that port; devices must not trust a certificate page served there " ++
+                                "(use `portal ca export` and compare SHA-256 fingerprints).", .{ where, err });
+                        }
+                        if (active == null) failed_nonce = p.nonce;
+                    }
+                    pw.report(p.nonce, if (active != null) .up else .failed, where);
+                } else if (active) |*f| {
+                    cs.stop.store(true, .release);
                     f.cancel(io); // interrupts the blocked accept, waits for run() to return
                     active = null;
-                    cw.srv.listener.deinit(io);
-                    cw.srv.log.print("pairing window closed: certificate download on http://{s}/ stopped", .{where});
+                    cs.listener.deinit(io);
+                    pw.srv.log.print("pairing window closed: certificate download on http://{s}/ stopped", .{where});
                 }
+            } else if (open) |p| pw.report(p.nonce, .off, "");
+
+            var handles: [2]w.HANDLE = undefined;
+            var n: w.DWORD = 0;
+            if (dw.h) |h| {
+                handles[n] = h;
+                n += 1;
+            }
+            const proc_slot = n;
+            if (proc_h) |h| if (open != null) {
+                handles[n] = h;
+                n += 1;
+            };
+            var ms = devices.waitMs(now, if (open) |p| p.expires else null);
+            if (dw.h == null) ms = @min(ms, 2000);
+            const r = if (n == 0) blk: {
+                io.sleep(.fromMilliseconds(ms), .awake) catch {};
+                break :blk devices.WAIT_TIMEOUT;
+            } else devices.WaitForMultipleObjects(n, &handles, 0, ms);
+            if (n > proc_slot and r == devices.WAIT_OBJECT_0 + proc_slot) {
+                // `portal pair` exited (Ctrl+C, closed console, killed):
+                // the window closes now, not at its expiry.
+                gone_nonce = proc_nonce;
+                pw.srv.pairingProcessGone(proc_nonce);
+                pw.srv.log.print("pairing window closed: `portal pair` exited", .{});
+                if (proc_h) |h| _ = w.CloseHandle(h);
+                proc_h = null;
             }
         }
     }
@@ -998,17 +1414,17 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .secure_cookie = !opts.no_tls,
             .devices = paths,
             .tls = if (opts.no_tls) null else &tls_creds,
+            .ca_fingerprint = if (opts.no_tls) null else ca_download.fingerprint,
         },
     };
 
     // While a pairing window is open: plain HTTP on port+1 serving only
     // the CA certificate, so a new device can install it before its first
-    // HTTPS visit.
+    // HTTPS visit. PairWatch (always running) opens and closes it.
     var ca_server: web.Server = undefined;
-    var ca_window: CaWindow = undefined;
+    var ca_addr = addr;
     const ca_listener_on = !opts.no_tls and addr.getPort() < 65535;
     if (ca_listener_on) {
-        var ca_addr = addr;
         ca_addr.setPort(addr.getPort() + 1);
         var ca_hosts: std.ArrayList([]const u8) = .empty;
         for (opts.hosts.items) |h| {
@@ -1028,8 +1444,15 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
                 .ca_download = &ca_download,
             },
         };
-        ca_window = .{ .srv = &ca_server, .addr = ca_addr, .paths = paths, .io = io, .gpa = gpa };
     }
+    var pair_watch: PairWatch = .{
+        .srv = &server,
+        .ca_srv = if (ca_listener_on) &ca_server else null,
+        .ca_addr = ca_addr,
+        .paths = paths,
+        .io = io,
+        .gpa = gpa,
+    };
 
     log.print("start: v{s} zig {s}, listening on {s}, input={t}{s}, command={s}", .{
         portal_version, builtin.zig_version_string, opts.listen, opts.policy, policyNote(opts.policy), opts.command[0],
@@ -1058,9 +1481,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     const accept_thread = std.Thread.spawn(.{}, web.Server.run, .{&server}) catch |err|
         fatal("cannot start web server thread: {t}", .{err});
     accept_thread.detach();
-    if (ca_listener_on) {
-        const t = std.Thread.spawn(.{}, CaWindow.watch, .{&ca_window}) catch |err|
-            fatal("cannot start certificate download thread: {t}", .{err});
+    {
+        const t = std.Thread.spawn(.{}, PairWatch.watch, .{&pair_watch}) catch |err|
+            fatal("cannot start the pairing watcher thread: {t}", .{err});
         t.detach();
     }
 
@@ -1148,6 +1571,14 @@ test {
     _ = @import("tls/der.zig");
     _ = @import("tls/dpapi.zig");
     _ = @import("tls/pki.zig");
+}
+
+test "isYes" {
+    try std.testing.expect(isYes("y"));
+    try std.testing.expect(isYes(" YES "));
+    try std.testing.expect(!isYes(""));
+    try std.testing.expect(!isYes("n"));
+    try std.testing.expect(!isYes("yy"));
 }
 
 test "parseListen" {

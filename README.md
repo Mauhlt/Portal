@@ -26,9 +26,14 @@ in the same executable.
 `--input` policies:
 
 * `keys` (default): digits, y/n, Enter, and a single Esc. Enough to answer
-  the agent's numbered "1 / 2 / 3" prompts and nothing else. Arrows and
-  Backspace are deliberately excluded: at an empty prompt, Up+Enter would
-  resubmit an older prompt from history.
+  numbered "1 / 2 / 3" prompts. Be aware that at an idle input prompt
+  these keys are typed like any other text, so a device can submit a line
+  made only of digits and y/n (for example "1", Enter) as a prompt to the
+  session program. It cannot type letters other than y/n, slash commands
+  or a `!`. Arrows and Backspace are deliberately excluded: at an empty
+  prompt, Up+Enter would resubmit an older prompt from history. Web input
+  is also rate limited per connection, and a key sent right after an Esc
+  is held back 50 ms so the two can't be read as Alt+key.
 * `none`: view only.
 * `instruct`: answer keys **plus whole instruction lines**, which Portal checks before typing. A line is refused if it starts with `!` (the agent would run it in a shell), `/` (slash commands can change permissions or folders) or `#` (memory), or contains control characters or line breaks. The agent still asks permission before running anything; you answer with the buttons.
 * `text`: **full remote control of the program.** Typed text is an agent
@@ -49,24 +54,34 @@ so escape sequences can't come from them either.
 The Portal window shows `N REMOTE VIEWER(S) WATCHING` as an amber badge (and
 `— N REMOTE VIEWER(S)` in its title bar) while anyone is watching
 (`--console` mode: the console title), and every login attempt and viewer
-connection is written to `%LOCALAPPDATA%\Portal\portal.log`.
+connection is written to `%LOCALAPPDATA%\Portal\portal.log` (moved to
+`portal.log.1` when it passes 10 MB; lines that a peer can cause before
+signing in are rate limited, with counts of what was suppressed).
 
 ## Security layers
 
 1. **Network**: Portal refuses to listen on `0.0.0.0` or any public address.
    Bind it to your WireGuard interface address. Only devices holding a
    WireGuard key can reach it; WireGuard encrypts everything.
-2. **Device pairing, no passwords**: each device is paired once at the
-   desk (`portal pair <name>` opens a 2-minute window; tap "Pair this
-   device"). It gets its own random 256-bit credential, which you never see:
+2. **Device pairing, approved at the desk, no passwords**: each device is
+   paired once (`portal pair <name>` opens a 2-minute window; tap "Pair
+   this device"). Tapping only creates a *request*; `portal pair` shows it
+   with the device's address and a request code that the device's page
+   also shows, and only a request you approve with `y` gets a credential.
+   Anyone else who reaches the port during the window (another WireGuard
+   peer, the LAN, a local process) can't take the slot: their request just
+   appears at the desk, and you deny it. Nothing is typed on the device.
+   The device gets its own random 256-bit credential, which you never see:
    * stored only as a SHA-256 hash on the desktop, and in an HttpOnly cookie
      or the OS credential store on the device;
    * bound to the device's WireGuard address;
-   * **rotated on every use**. If an older credential is ever presented
-     again (a copied cookie), the device is revoked and logged, and must be
+   * **rotated on every use**. Credentials issued in the last 10 minutes
+     stay valid until their own expiry (so two tabs signing in at once
+     don't lock the device out); if any older one is ever presented again
+     (a copied cookie), the device is revoked and logged, and must be
      paired again;
    * revocable any time with `portal unpair <name>`, which also disconnects
-     its open viewers within seconds.
+     its open viewers at once.
 3. **HTTPS (TLS 1.3) inside the tunnel**: Portal serves HTTPS itself (a
    small TLS 1.3 server built on Zig std's crypto: x25519, AES-128-GCM /
    ChaCha20-Poly1305, ECDSA P-256). Its certificate comes from a private
@@ -152,19 +167,38 @@ moment; a shortcut set to "Run: Minimized" avoids that.
 
 ### 4. Pair each device once (at the desk)
 
+With `portal run --listen 10.8.0.1:8420` running (the default listen
+address, 127.0.0.1, is reachable from this desktop only), open a second
+terminal:
+
 ```powershell
 portal pair laptop          # or: portal pair iphone
 ```
 
-Within 2 minutes, on that device: turn the WireGuard tunnel **on**. If this
-device does not trust the Portal CA yet, first open `http://10.8.0.1:8421/`
-(listen port + 1; served only while a pairing window is open) and install
-the certificate (see below). Then open `https://10.8.0.1:8420/` and tap
-**Pair this device**. Pair through the
-WireGuard address even at home, because that's the address the device will
-use when away (browsers keep credentials per address). If your router can't
-reach its own public IP from inside the house, put the phone on cellular for
-those 30 seconds.
+It prints the Portal CA's SHA-256 fingerprint, whether `portal run` is
+serving the certificate download, and then waits. Within 2 minutes, on
+that device: turn the WireGuard tunnel **on**. If this device does not
+trust the Portal CA yet, first open `http://10.8.0.1:8421/` (listen port
++ 1; served only while a pairing window is open), install the
+certificate (see below) and check that its fingerprint matches the one
+`portal pair` printed. Then open `https://10.8.0.1:8420/` and tap **Pair
+this device**. The device shows a request code, and the desk asks:
+
+```
+Pair 'laptop' from 10.8.0.2 (request 7f3a)? [y/N]
+```
+
+Answer `y` only if the address and code match your device; anything else
+denies that request and keeps the window open for the right one. The
+device's page then signs in by itself. Pair through the WireGuard address
+even at home, because that's the address the device will use when away
+(browsers keep credentials per address). If your router can't reach its
+own public IP from inside the house, put the phone on cellular for those
+30 seconds.
+
+If `portal pair` reports that the certificate download could not be
+opened, another program may be holding that port: don't install a
+certificate from it; use `portal ca export` instead.
 
 From then on, opening `https://10.8.0.1:8420/` from anywhere with the tunnel on
 just works. `portal devices` lists paired devices; `portal unpair <name>`
@@ -193,7 +227,9 @@ portal ca export            # writes portal-ca.cer / .pem / .mobileconfig, print
   Settings > General > VPN & Device Management > the Portal profile >
   **Install**. Then Settings > General > About > Certificate Trust Settings
   > **enable full trust** for "Portal Local CA". Check the fingerprint
-  against `portal ca export`.
+  against the one `portal pair` (or `portal ca export`) prints: the
+  download page is plain HTTP, so only that comparison proves it is
+  Portal's.
 * **Windows**: double-click `portal-ca.cer` > Install Certificate > Current
   User > Trusted Root Certification Authorities.
 * **macOS**: open `portal-ca.mobileconfig` (or add the `.cer` in Keychain
