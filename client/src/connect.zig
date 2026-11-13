@@ -80,6 +80,10 @@ pub const Platform = struct {
     scan_qr: ?*const fn () void = null,
     /// UI thread: a scanned QR text, copied into `buf`, at most once.
     take_scanned: ?*const fn (buf: []u8) ?[]const u8 = null,
+    /// UI thread: why scanning did not start (e.g. camera access denied),
+    /// copied into `buf`, at most once; shown as the setup screen's note.
+    /// The device wakes the window when it has one.
+    take_scan_note: ?*const fn (buf: []u8) ?[]const u8 = null,
 };
 pub var platform: Platform = .{};
 
@@ -408,7 +412,13 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
 
     // The window comes first: a first run, or a server that can't be
     // trusted yet, is answered inside it.
-    const tv = Presenter.init(gpa, io, .{ .title = "Portal" }) catch |err| fatal(prog, "cannot open the window: {t}", .{err});
+    const tv = Presenter.init(gpa, io, .{ .title = "Portal" }) catch |err| {
+        // No monospace font: say which files were tried (on iOS the
+        // system font paths are found at run time and may differ).
+        if (err == error.NoMonospaceFont)
+            fatal(prog, "cannot open the window: no monospace font (tried: {s})", .{view.font.fontset.triedPaths()});
+        fatal(prog, "cannot open the window: {t}", .{err});
+    };
     // The hero art while connecting and signing in (Presenter.beginSplash:
     // ends once connected or the user is needed, at any input, or after a
     // few seconds).
@@ -1058,6 +1068,10 @@ fn runSetup(tv: *Presenter, st: *setup_mod.Setup) bool {
             // A good scan fills the form and pairs at once.
             if (take(&qbuf)) |text| if (st.fromQr(text)) return true;
         }
+        if (platform.take_scan_note) |take| {
+            var nbuf: [256]u8 = undefined;
+            if (take(&nbuf)) |note| st.setNote("{s}", .{note});
+        }
         if (ctx.submitted) return true;
         tv.build(&empty, shell_mod.standby(null, "not connected", "", st.panel(&bufs)));
         tv.present();
@@ -1110,8 +1124,13 @@ fn pinnedCa(
             @memcpy(out[0..o.len], o);
             return .{ .ok = out[0..o.len] };
         };
-        der = client_mod.fetchCaCertificate(gpa, io, host, out) catch |err|
+        der = client_mod.fetchCaCertificate(gpa, io, host, out) catch |err| {
+            // iOS: unreachable on the local network is usually the Local
+            // Network permission, not the desktop.
+            if (client_mod.localNetworkHint(err, host)) |hint|
+                return P.f(why_buf, "Could not reach the desktop: {s}. {s}", .{ client_mod.describe(err), hint });
             return P.f(why_buf, "Could not download the CA from the desktop: {s}. Open Pair a device in the Portal window first (the download runs while pairing is open), or give the certificate file.", .{client_mod.describe(err)});
+        };
         source = "the download";
     } else if (old) |o| {
         @memcpy(out[0..o.len], o);
