@@ -1,7 +1,7 @@
 # Project tabs: design notes
 
 **Status (2026-11-12): implemented**, except the per-device recent list
-and the hooks / terminal-bell fallbacks for "waiting". What exists:
+and the terminal-bell fallback for "waiting". What exists:
 
 * `src/tabs.zig`: the tab hub (one program, pseudo console and screen per
   tab, reference counted, random 128-bit ids, display names from the
@@ -22,8 +22,14 @@ and the hooks / terminal-bell fallbacks for "waiting". What exists:
   7501)"), but the agent (2.1.323) still never reports its state inside
   ConPTY: conhost answers its DA1 sentinel before any terminal's reply can
   arrive. Checked live 2026-11-12: the probe arrived, Portal replied, no
-  `state=` report followed. The hook below (Session.state / Hub.gen) is
-  where a fallback would plug in. No agent settings were changed.
+  `state=` report followed.
+* Agent hooks (fallback 2 below) are implemented, approved by the
+  owner 2026-11-12, and installed only on request (`portalctl hooks
+  install`, or the desk's Settings, "Agent integration"):
+  `src/hookmsg.zig` (the message and the mapping), `src/hookpipe.zig`
+  (the pipe and `portalctl hook`), `src/agenthooks.zig` (settings.json),
+  `Session.setHookState` (the same Hub.gen / convo / notify paths as
+  OSC 7501). Covered by unit tests and the e2e `hooks` group.
 * Privacy rules 1, 2, 3, 5, 6 and 7 are covered by `tests/e2e/privacy.zig`
   and `tests/e2e/tabs_tests.zig` (no paths in hello/tabs/session/ended,
   unknown, malformed and closed ids all get the same `nosession`, rejected
@@ -58,20 +64,70 @@ never open or close projects. That stays desk-only: Ctrl+T folder picker, or
    * Treat the message as untrusted. Program output can contain anything, so
      a hostile file the agent prints could fake a status. It only changes a
      highlight; it never grants input.
-2. **Fallback: agent hooks.** Hooks inherit the agent process environment, so Portal sets `PORTAL_SESSION_ID` per tab when spawning it. A `portal hook` command reads the hook JSON from stdin and tells
-   the running Portal over a current-user-only local pipe.
-   * `PermissionRequest` fires immediately when a permission prompt appears,
-     so it marks the tab blocked.
-   * `UserPromptSubmit` and `PreToolUse` mean working, so they clear the
-     highlight.
-   * `Stop` means the turn finished and the agent is waiting for the next prompt.
-     It does not fire after an Esc or Ctrl+C interrupt.
-   * `StopFailure` means an API error.
-   * `Notification` (permission_prompt after ~6 s without typing,
-     idle_prompt after ~60 s) is only a backstop.
-   * The hook must print nothing to stdout and must return fast.
-   * Configuring hooks means editing `~/.claude/settings.json`. **Only with the
-     owner's explicit approval.**
+2. **Fallback: agent hooks (implemented).** Hooks inherit the agent process environment, so Portal sets `PORTAL_TAB=<32 hex>` for each tab's program:
+   a random 128-bit value per tab launch, added after childenv.zig's
+   filter (which still drops every inherited `PORTAL_*`, an inherited
+   `PORTAL_TAB` included). It is not the tab's protocol id, and it is
+   never logged or sent to a device. `portalctl hook` (console
+   subsystem, so stdin is clean) reads the hook JSON from stdin (at most
+   1 MiB), keeps `hook_event_name`, `tool_name` and `notification_type`
+   (the common fields and the per-event ones), and sends `{tab, event, tool?, ntype?}` as a few text
+   lines to the running Portal over a current-user-only local pipe. It
+   never prints, always exits 0, never waits more than 200 ms for the
+   pipe, and without `PORTAL_TAB` (any agent session outside
+   Portal) it exits at once without even parsing.
+   * Mapping (hookmsg.effect):
+     | Event | Meaning | Tab |
+     |---|---|---|
+     | `UserPromptSubmit` | the user submitted a prompt | `working` |
+     | `PermissionRequest` | a permission prompt is about to show (`tool_name`, `tool_input`) | `waiting`, the permission card "The agent wants to <phrase>. Allow it?" (Yes = `1`, No = `esc`); the phrase from `tool_name`'s category (transcript.category: Bash runs a command, Edit edits a file, ...), any other tool "use a tool": the name itself is never shown |
+     | `Notification`, `notification_type` `permission_prompt` | the prompt has waited a few seconds | `waiting` (a backstop) |
+     | `Notification`, `idle_prompt` | the session has been idle for about a minute | `idle` (not `waiting`: an idle prompt is not an answer menu, so Up/Down stay refused) |
+     | `Stop` | the turn finished (not after a user interrupt) | `done` (then `idle` from idle_prompt) |
+     | `StopFailure` | the turn ended with an API error (`error`: rate_limit, ...) | `error` |
+     | `SessionEnd` | the session ended (`reason`: clear, logout, prompt_input_exit, ...) | `idle` |
+     Other notification types and every other event change nothing;
+     settings.json's Notification entry has the matcher
+     `permission_prompt|idle_prompt`, so the others don't even start it.
+   * `PreToolUse` (and PostToolUse) are not used: they fire on every tool
+     call. So after a permission answer no hook says "working again";
+     instead the tab's transcript does: a tool result after a hook's
+     permission wait means the prompt was answered (`working`), and
+     the agent's interrupt record (`[Request interrupted by user`) means
+     `idle` (no Stop follows an interrupt). Residual: a parallel tool's
+     result arriving during the prompt ends the highlight early.
+   * Precedence: whichever reported last wins. A hook's state stays until
+     the program's own OSC 7501 state changes (Session.osc_state).
+   * Untrusted: the message is parsed strictly (enumerated events, names
+     `[A-Za-z0-9_-]{1,64}`, unknown keys ignored, anything else dropped);
+     an id for no open tab changes nothing and is logged at most once a
+     minute without the id. A program in the tab can read PORTAL_TAB and
+     fake a state, exactly like faking OSC 7501: it only changes a
+     highlight and, like a real permission prompt, opens instruct's
+     Up/Down gate for that tab (docs/protocol.md section 4).
+   * The pipe (hookpipe.zig): `\\.\pipe\portal-hook-<first 16 bytes of
+     SHA-256(user SID, data folder)>`; a security descriptor whose owner
+     and only ACE are the current user's SID (read/write; no one else,
+     not SYSTEM, not Administrators); `PIPE_REJECT_REMOTE_CLIENTS`, so
+     no SMB client, from another machine or from this one, and nothing
+     a paired device can reach (devices only talk HTTP/WebSocket);
+     `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a squatter makes Portal log and
+     listen to nothing rather than share. The client opens it with
+     `SECURITY_IDENTIFICATION` and sends only if the serving process runs
+     as the same user (GetNamedPipeServerProcessId). The server thread
+     blocks in an overlapped ConnectNamedPipe next to a stop event and
+     reads each client with a 500 ms deadline; one listening instance
+     always exists, so back-to-back hooks queue in order. No polling.
+   * Installing means editing `~/.claude/settings.json`: approved by the
+     owner (2026-11-12) as an explicit action only, `portalctl hooks
+     install` or the Settings item; nothing installs it by itself.
+     agenthooks.zig adds one matcher group per event in exec form
+     (`"command": "<LOCALAPPDATA>\\Portal\\bin\\portalctl.exe", "args":
+     ["hook"], "timeout": 10`: with `args` the command is spawned directly, so the Windows path needs no shell quoting),
+     textually, keeping every other byte; uninstall cuts exactly those
+     entries, so install + uninstall restores the file.
+   * Latency: about 20 ms per hook end to end on the development machine
+     (the e2e `hooks` group prints it).
 3. **Last resort:** `preferredNotifChannel: "terminal_bell"`, which makes
    the agent ring BEL, and vt.zig counts BEL per session. Also a settings
    change, so it too needs the owner's approval.

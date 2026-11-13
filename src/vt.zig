@@ -2721,7 +2721,7 @@ test "OSC 7501 feature detection: the probe gets the fixed reply" {
     defer t.deinit();
     var buf: [max_reply_bytes]u8 = undefined;
     try testing.expectEqualStrings("", t.takeReplies(&buf)); // nothing unasked
-    // the agent's probe: BEL-terminated, then a DA1 sentinel (never answered).
+    // The agent's probe: BEL-terminated, then a DA1 sentinel (never answered).
     t.feed("\x1b]7501;?\x07\x1b[c");
     try testing.expectEqualStrings("\x1b]7501;?\x07", t.takeReplies(&buf));
     try testing.expectEqualStrings("", t.takeReplies(&buf)); // answered once

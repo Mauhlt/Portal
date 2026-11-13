@@ -46,8 +46,9 @@ Input modes (`--input`, or Remote input in the window's Settings):
   a shell, the default is `keys` instead (see below).
   **Up/Down** (for arrow-select menus without numbers, such as the agent's
   folder-trust prompt) are accepted only while the shown tab's
-  program waits for an answer: it reports OSC 7501 `state=blocked`, or its
-  Conversation view has an open question. Otherwise Portal refuses them
+  program waits for an answer: it reports OSC 7501 `state=blocked`, an
+  agent hook reported a permission prompt (see "Agent
+  integration" below), or its Conversation view has an open question. Otherwise Portal refuses them
   (`rejected` `NotWaiting`), because at an idle prompt Up recalls an older
   prompt from history (possibly a `!` shell command or a slash command
   typed at the desk) and Enter would submit it past the line checks.
@@ -55,9 +56,10 @@ Input modes (`--input`, or Remote input in the window's Settings):
   button row; the native viewers' instruct panel). A program
   that never reports OSC 7501 and asks nothing in its transcript (no
   question open) never gets them; that includes the agent if it does not
-  detect OSC 7501 support in Portal's terminal, and its folder-trust
-  prompt, which comes before any transcript, can then only be answered at
-  the desk.
+  detect OSC 7501 support in Portal's terminal (it does not under ConPTY)
+  and the integration below is not installed. Its folder-trust prompt
+  comes before any transcript and any hook, so it can only be answered
+  at the desk.
 * `keys`: digits, y/n, Enter, and a single Esc. Enough to answer
   numbered "1 / 2 / 3" prompts. Be aware that at an idle input prompt
   these keys are typed like any other text, so a device can submit a line
@@ -187,6 +189,12 @@ promotes the result. It also installs launchers into
 `%LOCALAPPDATA%\Portal\bin` on your PATH once, then type `portal`, or pin
 `portal.exe` to Start.
 
+For the other Windows devices, `zig build package` writes ready-to-copy
+ReleaseSafe folders: `zig-out/portal-x86_64-windows` (the desktop) and
+`zig-out/portal-aarch64-windows` (Snapdragon X laptops, the Surface).
+Installing and pairing each device, in order:
+[docs/pairing.md](docs/pairing.md).
+
 ### 2. WireGuard (free, open source)
 
 See [docs/wireguard.md](docs/wireguard.md) for the full walk-through. In short:
@@ -248,8 +256,8 @@ play / pause key do, once speech-to-text exists).
 in the top bar, in a colour derived from its name (or `color = NAME
 #rrggbb` lines in settings.txt), with its own program (the configured one,
 started in that folder), its own pseudo console and its own screen. A tab
-whose program waits for an answer (it reports OSC 7501 `state=blocked`) is
-outlined in amber with a dot. Only the desk opens and closes projects:
+whose program waits for an answer (it reports OSC 7501 `state=blocked`, or
+an agent hook said so) is outlined in amber with a dot. Only the desk opens and closes projects:
 Ctrl+Shift+T or **+** (folder picker), `portal open <folder> [--name NAME]`
 or `portalctl open <folder>` from a terminal (handed to the running Portal
 through its data folder), Ctrl+Shift+W or a tab's **×** to close one (its
@@ -272,9 +280,43 @@ reach the session):
 | Ctrl+Shift+P | Pair a device… | open a 2-minute pairing window and approve or deny each request |
 | Ctrl+Shift+D | Devices | paired devices with address and last use; Unpair |
 | Ctrl+Shift+E | Export certificate… | write portal-ca.cer / .pem / .mobileconfig to a folder (default `%USERPROFILE%\Downloads\Portal-CA`) |
-| Ctrl+Shift+S | Settings | listen address, program, project, input mode for the next start |
+| Ctrl+Shift+S | Settings | listen address, program, project, input mode for the next start; system monitor, background art and the agent integration (these apply at once) |
 
 Panels are keyboard driven: Tab / arrows move, Enter activates, Esc closes.
+
+**Agent integration (hooks).** The agent can't tell Portal its
+state in-band under Windows' pseudo console (docs/protocol.md, "Program
+status (OSC 7501)"), so Portal offers agent hooks instead. They are
+off until you install them, once, either in Settings ("Agent
+integration", Left/Right or a click: Install / Remove) or from a terminal:
+
+```
+portalctl hooks install      # adds Portal's hooks to the agent's settings.json
+portalctl hooks status       # installed / not installed / partly
+portalctl hooks uninstall    # removes exactly Portal's entries again
+```
+
+This edits `%USERPROFILE%\.claude\settings.json` (or
+`%CLAUDE_CONFIG_DIR%\settings.json`): one entry each for
+`UserPromptSubmit`, `PermissionRequest`, `Notification`
+(`permission_prompt` and `idle_prompt` only), `Stop`, `StopFailure` and
+`SessionEnd`, each running the installed
+`%LOCALAPPDATA%\Portal\bin\portalctl.exe hook` (exec form, no shell).
+Everything else in the file stays byte for byte; a file that isn't valid
+JSON is refused with the reason; the previous file is kept next to it as
+`settings.json.portal-backup-<date>-<time>`; the write is atomic; running
+install again changes nothing. Every agent session then runs the
+hook, but outside Portal it does nothing at all (no `PORTAL_TAB` in its
+environment: it exits at once, prints nothing). In a Portal tab it tells
+the running Portal, over a local pipe only your Windows account can open
+(never the network, never a device), that the agent works (a prompt was
+sent), waits for a permission answer (the tab is highlighted, devices get
+"The agent wants to run a command. Allow it?" with Yes / No, and Up/Down
+work), is done, failed (an API error) or idle. Only the event name, the
+tool's name (to pick a fixed phrase; it is never shown) and the
+notification type travel; prompts, tool input and paths don't. One hook
+takes about 20 ms. Sessions started before the install normally pick it up
+without a restart (the agent watches its settings).
 
 **Inline images.** `portal-show picture.png [--cols N]`, run inside the
 session (by you, or by the session program through its shell tool), shows a

@@ -40,6 +40,7 @@ const localinput = @import("localinput.zig");
 const deskui = @import("deskui.zig");
 const devices = @import("devices.zig");
 const settings = @import("settings.zig");
+const agenthooks = @import("agenthooks.zig");
 const guard = @import("guard.zig");
 const pki = @import("tls/pki.zig");
 const web = @import("web.zig");
@@ -101,6 +102,9 @@ pub const Desk = struct {
     /// null, or why not.
     open_ctx: *const anyopaque,
     open_fn: *const fn (ctx: *const anyopaque, gpa: std.mem.Allocator, hub: *tabs.Hub, dir: []const u8) ?[]const u8,
+    /// Portal's environment (where the agent's settings.json and the
+    /// installed portalctl are: Settings, "Agent integration").
+    env: *const std.process.Environ.Map,
 };
 
 pub const Ended = enum { window_closed, finished };
@@ -462,6 +466,7 @@ pub const LocalHost = struct {
                 } else h.saveSettings();
             },
             .setup_cancel => {},
+            .agent_hooks => h.agentHooks(),
             .begin_pair => {
                 const d = h.desk orelse return;
                 const nonce = d.srv.deskBegin(h.ui.name.text(), devices.default_pair_window_s) catch |err| {
@@ -643,6 +648,64 @@ pub const LocalHost = struct {
         h.ui.openSetup(false, s.listen.get() orelse h.opts.listen_host, s.program.get() orelse "", s.project.get() orelse "", s.input orelse h.opts.policy);
         h.ui.setup.sysmon = s.system_monitor orelse false;
         h.ui.setup.bg_art = s.background_art orelse true;
+        h.ui.setup.agent = h.agentStatus(false);
+    }
+
+    /// The agent's settings.json and the hook command: the installed
+    /// launcher (agenthooks.defaultExe).
+    fn agentPaths(h: *LocalHost, path: *[]u8, exe: *[]u8) bool {
+        const env = (h.desk orelse return false).env;
+        path.* = agenthooks.settingsPath(h.gpa, env) catch return false;
+        exe.* = agenthooks.defaultExe(h.gpa, env) catch {
+            h.gpa.free(path.*);
+            return false;
+        };
+        return true;
+    }
+
+    fn agentStatus(h: *LocalHost, note: bool) deskui.AgentHooks {
+        var path: []u8 = undefined;
+        var exe: []u8 = undefined;
+        if (!h.agentPaths(&path, &exe)) return .unreadable;
+        defer h.gpa.free(path);
+        defer h.gpa.free(exe);
+        const r = agenthooks.statusFile(h.gpa, h.io, path, exe) catch |err| {
+            if (note) h.ui.setNote(.bad, "The agent's settings.json can't be used: {s}.", .{agenthooks.describe(err)});
+            return .unreadable;
+        };
+        return switch (r.state()) {
+            .installed => .installed,
+            .not_installed => .not_installed,
+            .partly => .partly,
+            .other_exe => .other_exe,
+        };
+    }
+
+    /// Settings, "Agent integration": install, or remove when
+    /// installed. The same code as `portalctl hooks install | uninstall`.
+    fn agentHooks(h: *LocalHost) void {
+        const before = h.agentStatus(true);
+        if (before == .unreadable) {
+            h.ui.setup.agent = .unreadable;
+            return;
+        }
+        var path: []u8 = undefined;
+        var exe: []u8 = undefined;
+        if (!h.agentPaths(&path, &exe)) return;
+        defer h.gpa.free(path);
+        defer h.gpa.free(exe);
+        const op: agenthooks.Op = if (before == .installed) .uninstall else .install;
+        const ch = agenthooks.editFile(h.gpa, h.io, path, op, exe) catch |err| {
+            h.ui.setNote(.bad, "{s} was not changed: {s}.", .{ path, agenthooks.describe(err) });
+            return;
+        };
+        defer if (ch.backup) |b| h.gpa.free(b);
+        h.ui.setup.agent = h.agentStatus(true);
+        if (h.desk) |d| d.srv.log.print("settings: agent integration {s}", .{if (op == .install) "installed" else "removed"});
+        if (op == .install)
+            h.ui.setNote(.good, "Installed. Agent sessions in Portal tabs now report their state.{s}", .{if (ch.backup != null) " The previous settings.json is backed up next to it." else ""})
+        else
+            h.ui.setNote(.good, "Removed. The rest of settings.json is unchanged.", .{});
     }
 
     /// The Settings panel (during a session): checked, then saved for the
