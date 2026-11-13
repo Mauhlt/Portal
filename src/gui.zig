@@ -47,6 +47,8 @@ const sync = @import("sync.zig");
 const client = @import("client");
 const sync_manifest = client.sync.manifest;
 const rules = @import("inputrules");
+const activity_wire = @import("shared").activity;
+const sysinfo = @import("shared").sysinfo;
 
 /// Font size of the local terminal, in logical pixels (zoom with Ctrl+= / -).
 pub const font_em: f32 = 15;
@@ -154,6 +156,14 @@ pub const LocalHost = struct {
     setup_submitted: bool = false,
     /// Whether the OS touch keyboard was last asked to show.
     keyboard_shown: bool = false,
+    /// Every tab's background tasks and usage, as of hub.activity_gen.
+    act: activity_wire.Activity = .{},
+    act_gen: u64 = 0,
+    /// The System panel is open here and the monitor accepted it; its
+    /// latest sample.
+    sys_sub: bool = false,
+    sys: sysinfo.Snapshot = .{},
+    sys_gen: u64 = 0,
 
     const title_max = title.max_title_bytes;
 
@@ -348,14 +358,24 @@ pub const LocalHost = struct {
         }
         const changed = if (h.shown) |t| h.sync.sync(h.gpa, &h.grid, &t.session.term) else false;
         h.viewers = hub.viewers;
+        var act_changed = false;
+        if (hub.activity_gen != h.act_gen or list_changed) {
+            hub.activityLocked(&h.act);
+            h.act_gen = hub.activity_gen;
+            act_changed = true;
+        }
         hub.mutex.unlock(h.io);
+        if (h.sys_sub) if (h.desk) |d| if (d.srv.sysmon) |m| if (m.gen.load(.acquire) != h.sys_gen) {
+            h.sys_gen = m.latest(&h.sys);
+            act_changed = true;
+        };
         if (old) |o| o.release();
         // New images become Data items (h.grid is ours: no lock needed).
         if (changed) _ = h.shell.data.sync(h.gpa, &h.grid.images);
 
         if (changed) h.shell.clampSelection(h.grid.cols, h.grid.rows);
         h.shell.touch = client.touchkbd.query();
-        if (!force and !changed and !list_changed and old == null and !h.p.needsRedraw() and h.viewers == h.drawn_viewers) return;
+        if (!force and !changed and !list_changed and !act_changed and old == null and !h.p.needsRedraw() and h.viewers == h.drawn_viewers) return;
         h.drawn_viewers = h.viewers;
         h.updateTitle();
 
@@ -390,6 +410,9 @@ pub const LocalHost = struct {
                 .tools = if (d != null) &deskui.tools else &.{},
                 .can_add = h.list.len < tabs.max_tabs,
             },
+            .activity = if (h.hub != null) &h.act else null,
+            .sys = if (h.sys_sub and h.sys_gen != 0) &h.sys else null,
+            .now = h.nowUnix(),
         });
     }
 
@@ -611,6 +634,7 @@ pub const LocalHost = struct {
         const d = h.desk orelse return;
         const s = &d.saved;
         h.ui.openSetup(false, s.listen.get() orelse h.opts.listen_host, s.program.get() orelse "", s.project.get() orelse "", s.input orelse h.opts.policy);
+        h.ui.setup.sysmon = s.system_monitor orelse false;
     }
 
     /// The Settings panel (during a session): checked, then saved for the
@@ -633,9 +657,15 @@ pub const LocalHost = struct {
         _ = s.program.set(program);
         _ = s.project.set(project);
         s.input = st.input;
+        s.system_monitor = st.sysmon;
         settings.save(h.gpa, h.io, d.paths.dir, &s) catch |err|
             return h.ui.setNote(.bad, "Could not save the settings: {t}.", .{err});
         h.desk.?.saved = s;
+        // "Show system monitor" applies now: off stops any sampling at
+        // once; viewers learn it from the next `activity`.
+        if (d.srv.sysmon) |m| m.setEnabled(st.sysmon);
+        if (h.hub) |hub| hub.setSysmon(st.sysmon);
+        d.srv.log.print("settings: system monitor {s}", .{if (st.sysmon) "on" else "off"});
         h.ui.close();
     }
 
@@ -742,6 +772,8 @@ pub const LocalHost = struct {
             },
             // The window decides the PTY size (of every tab); web viewers adapt.
             .resized => |size| if (h.hub) |hub| hub.setSize(.{ .cols = size[0], .rows = size[1] }),
+            .usage_slash => |i| h.usageSlash(i),
+            .system_panel => |on| h.systemPanel(on),
         }
     }
 
@@ -760,6 +792,40 @@ pub const LocalHost = struct {
             else => return false,
         }
         return true;
+    }
+
+    /// The Usage panel's "Open /usage" (desk only): shows tab `i` and types
+    /// `/usage` + Enter into it, as the person at the desk would. Plan
+    /// limits are only in that screen, never in transcripts; devices are
+    /// never offered this (slash commands stay blocked remotely).
+    fn usageSlash(h: *LocalHost, i: usize) void {
+        const hub = h.hub orelse return;
+        if (i >= h.list.len) return;
+        hub.mutex.lockUncancelable(h.io);
+        const t = hub.acquireLocked(h.list.items[i].id);
+        if (t) |tt| hub.desk_active = tt;
+        hub.mutex.unlock(h.io);
+        const tab = t orelse return;
+        defer tab.release();
+        hub.log.print("desk: /usage typed into tab '{s}' from the Usage panel", .{tab.name()});
+        tab.session.writeInput("/usage");
+        tab.session.writeInput("\r");
+        h.frame(true);
+    }
+
+    /// The System panel opened or closed here: the monitor samples only
+    /// while one is open (and only if the setting is on: then subscribe
+    /// refuses and nothing is measured).
+    fn systemPanel(h: *LocalHost, on: bool) void {
+        const d = h.desk orelse return;
+        const m = d.srv.sysmon orelse return;
+        if (on and !h.sys_sub) {
+            h.sys_sub = m.subscribe();
+        } else if (!on and h.sys_sub) {
+            m.unsubscribe();
+            h.sys_sub = false;
+            h.sys_gen = 0;
+        }
     }
 
     /// The shown tab's session.

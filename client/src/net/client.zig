@@ -47,6 +47,8 @@ const http = @import("http.zig");
 const ws = @import("shared").ws;
 const tabs_wire = @import("shared").tabs;
 const convo_wire = @import("shared").convo;
+const activity_wire = @import("shared").activity;
+const sysinfo = @import("shared").sysinfo;
 const tlsconn = @import("tlsconn.zig");
 const x509check = @import("x509check.zig");
 const watchdog = @import("watchdog.zig");
@@ -139,11 +141,24 @@ test "trust errors" {
     try std.testing.expect(!isTrustError(error.TimedOut));
 }
 
+pub const Activity = activity_wire.Activity;
+pub const SysSnapshot = sysinfo.Snapshot;
+
 pub const Shared = struct {
     mutex: Io.Mutex = .init,
     grid: Grid = .{},
     /// The conversation of the tab shown (convo / convo+ messages).
     convo: ui.convo.Conversation = .{},
+    /// Every tab's background tasks and usage (`activity`), once known.
+    activity: activity_wire.Activity = .{},
+    has_activity: bool = false,
+    /// The latest system monitor sample (`sys`), while the System panel
+    /// is open.
+    sys: sysinfo.Snapshot = .{},
+    has_sys: bool = false,
+    /// The System panel is open: `y:on` was sent (and is sent again after
+    /// a reconnect).
+    sys_wanted: std.atomic.Value(bool) = .init(false),
     /// hello's `input` (null before hello and while disconnected).
     mode: ?keys.Policy = null,
     /// The desktop's open project tabs (hello, then `tabs`), the one shown
@@ -355,6 +370,42 @@ pub const Client = struct {
         c.shared.convo.apply(c.gpa, m) catch {};
         c.shared.mutex.unlock(c.io);
         c.notify();
+    }
+
+    /// An `activity` message (section 3c): parsed strictly, kept whole.
+    fn applyActivity(c: *Client, payload: []const u8) void {
+        const a = c.gpa.create(activity_wire.Activity) catch return;
+        defer c.gpa.destroy(a);
+        if (!activity_wire.parse(payload, a)) return;
+        c.shared.mutex.lockUncancelable(c.io);
+        c.shared.activity = a.*;
+        c.shared.has_activity = true;
+        c.shared.mutex.unlock(c.io);
+        c.notify();
+    }
+
+    /// A `sys` message (section 3d), kept only while the panel is open.
+    fn applySys(c: *Client, payload: []const u8) void {
+        var s: sysinfo.Snapshot = undefined;
+        if (!sysinfo.parse(payload, &s)) return;
+        if (!c.shared.sys_wanted.load(.acquire)) return;
+        c.shared.mutex.lockUncancelable(c.io);
+        c.shared.sys = s;
+        c.shared.has_sys = true;
+        c.shared.mutex.unlock(c.io);
+        c.notify();
+    }
+
+    /// The System panel opened or closed: `y:on` / `y:off` (the desktop
+    /// samples only while some panel is open). Any thread.
+    pub fn setSysPanel(c: *Client, on: bool) void {
+        c.shared.sys_wanted.store(on, .release);
+        if (!on) {
+            c.shared.mutex.lockUncancelable(c.io);
+            c.shared.has_sys = false;
+            c.shared.mutex.unlock(c.io);
+        }
+        _ = c.sendInput(if (on) "y:on" else "y:off");
     }
 
     fn notify(c: *Client) void {
@@ -1032,6 +1083,14 @@ pub const Client = struct {
                     c.applyConvo(frame.payload);
                     return null;
                 }
+                if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"activity\"")) {
+                    c.applyActivity(frame.payload);
+                    return null;
+                }
+                if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"sys\"")) {
+                    c.applySys(frame.payload);
+                    return null;
+                }
                 if (frame.payload.len > 8192) return null;
                 const parsed = std.json.parseFromSlice(Msg, c.gpa, frame.payload, .{ .ignore_unknown_fields = true }) catch return null;
                 defer parsed.deinit();
@@ -1046,6 +1105,8 @@ pub const Client = struct {
                     const back = c.shared.chosen;
                     c.shared.mutex.unlock(c.io);
                     if (back) |id| if (!sameId(c.shared.current, id)) c.sendTabIfOpen(id);
+                    // A System panel still open: subscribe again.
+                    if (c.shared.sys_wanted.load(.acquire)) _ = c.sendInput("y:on");
                     backoff.* = 1000;
                     c.notify();
                     c.signalSync(); // look for updates on every (re)connect

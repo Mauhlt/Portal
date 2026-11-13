@@ -56,6 +56,7 @@ const tls_server = @import("tls/server.zig");
 const x509 = @import("tls/x509.zig");
 const pki = @import("tls/pki.zig");
 const settings = @import("settings.zig");
+const sysmon = @import("sysmon.zig");
 const sync = @import("sync.zig");
 const sync_cli = @import("sync_cli.zig");
 
@@ -1649,6 +1650,12 @@ fn prependOwnDirToPath(gpa: Allocator) void {
     _ = w.SetEnvironmentVariableW(name, new.ptr);
 }
 
+/// The system monitor took a sample: viewers and the window look.
+fn hubBroadcast(ctx: *anyopaque) void {
+    const h: *tabs.Hub = @ptrCast(@alignCast(ctx));
+    h.broadcast();
+}
+
 fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
     var opts = try parseRunArgs(gpa, args);
     defer opts.hosts.deinit(gpa);
@@ -1809,8 +1816,16 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .convo_projects = convoProjects(gpa, env),
         .user_name = env.get("USERNAME"),
         .size = initial,
+        .sysmon_on = saved.system_monitor orelse false,
     };
     if (host) |h| h.attach(hub);
+    // The optional system monitor: samples nothing unless the setting is
+    // on and a System panel is open (sysmon.zig).
+    const sys_backend = gpa.create(sysmon.WinBackend) catch fatal("out of memory", .{});
+    sys_backend.* = .{ .gpa = gpa, .hub = hub };
+    const monitor = gpa.create(sysmon.Monitor) catch fatal("out of memory", .{});
+    monitor.* = .{ .backend = sys_backend.backend(), .notify_ctx = hub, .notify_fn = hubBroadcast };
+    monitor.setEnabled(hub.sysmon_on);
     // The first tab: --project, or the folder's name (never a path).
     var first_name_buf: [tabs_wire.max_name]u8 = undefined;
     const first_name: []const u8 = cfg.project orelse blk: {
@@ -1841,6 +1856,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .ca_fingerprint = if (opts.no_tls) null else ca_download.fingerprint,
             .sync_key = sync_key,
         },
+        .sysmon = monitor,
     };
 
     // While a pairing window is open: plain HTTP on port+1 serving only
@@ -2057,6 +2073,8 @@ test {
     _ = @import("convo/transcript.zig");
     _ = @import("convo/model.zig");
     _ = @import("convo/follow.zig");
+    _ = @import("convo/activity.zig");
+    _ = @import("sysmon.zig");
 }
 
 test "isYes" {

@@ -49,6 +49,11 @@ pub const StatusLine = struct {
     extra: []const u8 = "",
     extra_tone: Tone = .muted,
     right: []const u8 = "",
+    /// The shown tab's background work ("2 shells \u{00B7} 1 monitor"),
+    /// after `extra`; "" hides it. A click reaches the sink as
+    /// InputSink.button(tasks_id).
+    tasks: []const u8 = "",
+    tasks_id: ?u32 = null,
 };
 
 /// The strip above the main slice: the project tabs (one per session,
@@ -89,6 +94,10 @@ pub const TopTab = struct {
     id: u32,
     /// A close box (the desk only; remote viewers can't close tabs).
     close_id: ?u32 = null,
+    /// A small count after the label (background tasks running); ""
+    /// hides it. A click on it reaches the sink as InputSink.button(badge_id).
+    badge: []const u8 = "",
+    badge_id: ?u32 = null,
 };
 
 /// A line of panel text. Long lines wrap at spaces.
@@ -825,7 +834,8 @@ pub const Frame = struct {
         for (tb.tabs) |t| {
             const close_w: f32 = if (t.close_id != null) 2 * cw else 0;
             const dot_w: f32 = if (t.attention) 2 * cw else 0;
-            const natural = textWidth(ui, t.label) + 2 * cw + close_w + dot_w;
+            const badge_w: f32 = if (t.badge.len > 0) textWidth(ui, t.badge) + 2 * cw else 0;
+            const natural = textWidth(ui, t.label) + 2 * cw + close_w + dot_w + badge_w;
             const w = @min(natural, @max(max_each, 3 * cw));
             if (x + w > x1) break;
             const bg = if (t.active) mixBy(t.color, theme.palette.bg, 0.25) else mixBy(t.color, theme.ui.bar, 0.72);
@@ -839,10 +849,21 @@ pub const Frame = struct {
                 _ = f.text(ui, tx, text_y, "\u{25CF}", theme.ui.attention, true);
                 tx += 2 * cw;
             }
-            const label_room = @max(0, x + w - cw - close_w - tx);
+            const label_room = @max(0, x + w - cw - close_w - badge_w - tx);
             const fg: Rgb = if (t.active) theme.ui.tab_text else theme.ui.tab_text_inactive;
             _ = f.text(ui, tx, text_y, clipText(ui, t.label, label_room, false), fg, t.active);
-            f.registerButton(x, ty, w - close_w, th, t.id);
+            f.registerButton(x, ty, w - close_w - badge_w, th, t.id);
+            if (t.badge.len > 0) {
+                // A filled pill left of the close box: the tab's running
+                // background tasks.
+                const bx = x + w - close_w - badge_w + @round(cw / 4);
+                const bw = badge_w - @round(cw / 2);
+                const bh = @round(@as(f32, @floatFromInt(ui.cell_h)) * 1.1);
+                const by = ty + @round((th - bh) / 2);
+                f.rect(bx, by, bw, bh, theme.ui.badge_bg);
+                _ = f.text(ui, bx + @round((bw - textWidth(ui, t.badge)) / 2), text_y, t.badge, theme.ui.badge_fg, true);
+                f.registerButton(x + w - close_w - badge_w, ty, badge_w, th, t.badge_id orelse t.id);
+            }
             if (t.close_id) |cid| {
                 const cx = x + w - close_w;
                 _ = f.text(ui, cx + @round(cw / 2), text_y, "\u{00D7}", fg, false);
@@ -1042,6 +1063,15 @@ pub const Frame = struct {
         if (st.extra.len > 0) {
             x = f.text(ui, x, ty, "  \u{00B7}  ", toneColor(.muted), false);
             x = f.text(ui, x, ty, st.extra, toneColor(st.extra_tone), false);
+        }
+        if (st.tasks.len > 0) {
+            x = f.text(ui, x, ty, "  \u{00B7}  ", toneColor(.muted), false);
+            const x0 = x;
+            x = f.text(ui, x, ty, st.tasks, theme.ui.focus, true);
+            if (st.tasks_id) |tid| {
+                f.rect(x0, ty + @as(f32, @floatFromInt(ui.cell_h)) - @max(1, @round(s)), x - x0, @max(1, @round(s)), theme.ui.focus);
+                f.registerButton(x0, y, x - x0, h, tid);
+            }
         }
         if (st.right.len > 0) _ = f.text(ui, W - pad - textWidth(ui, st.right), ty, st.right, toneColor(.muted), false);
     }
@@ -1579,4 +1609,52 @@ test "scrollRows never goes below following the cursor" {
     try std.testing.expectEqual(@as(u16, 3), f.scroll_back);
     f.scrollRows(-5);
     try std.testing.expectEqual(@as(u16, 0), f.scroll_back);
+}
+
+fn expectHits(f: *const Frame, want: []const u32, absent: []const u32) !void {
+    for (want) |w| {
+        var seen = false;
+        for (f.hits[0..f.n_hits]) |h| switch (h.action) {
+            .button => |id| if (id == w) {
+                seen = true;
+                // The centre of what was registered maps back to it.
+                try std.testing.expectEqual(id, f.hitAt(h.x + h.w / 2, h.y + h.h / 2).?.button);
+            },
+            else => {},
+        };
+        if (!seen) {
+            std.debug.print("not hit-testable: {d}\n", .{w});
+            return error.TestUnexpectedResult;
+        }
+    }
+    for (f.hits[0..f.n_hits]) |h| switch (h.action) {
+        .button => |id| for (absent) |x| try std.testing.expect(id != x),
+        else => {},
+    };
+}
+
+test "badges, the status line's task summary and panel buttons are hit by what was drawn" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    const tabs_ = [_]TopTab{
+        .{ .label = "Alpha", .color = .{ 0x33, 0x66, 0xCC }, .active = true, .id = 1000, .close_id = 1100, .badge = "3", .badge_id = 1200 },
+        .{ .label = "Beta", .color = .{ 0x10, 0xB9, 0x81 }, .id = 1001, .badge_id = 1201 },
+    };
+    const rows = [_]PanelRow{.{ .text = "Alpha", .button = .{ .label = "Open /usage", .id = 1310 } }};
+    const buttons = [_]PanelButton{.{ .label = "Close", .id = 1300 }};
+    var o: Overlay = .{
+        .top_bar = .{ .tabs = &tabs_, .buttons = &.{.{ .label = "Usage", .id = 910 }} },
+        .status = .{ .label = "local session", .tasks = "2 shells \u{00B7} 1 monitor", .tasks_id = 912 },
+    };
+    f.build(&fs, .{ 1200, 800 }, 1, &g, o);
+    // A tab without tasks has no badge to click.
+    try expectHits(&f, &.{ 1000, 1001, 1100, 1200, 912, 910 }, &.{1201});
+    // An open panel is modal: only its own buttons react.
+    o.panel = .{ .title = "Usage", .rows = &rows, .buttons = &buttons };
+    f.build(&fs, .{ 1200, 800 }, 1, &g, o);
+    try expectHits(&f, &.{ 1310, 1300 }, &.{ 1000, 1200, 912, 910 });
 }

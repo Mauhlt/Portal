@@ -219,6 +219,31 @@ test "setup: fields, choice, submit; settings can be cancelled" {
     try testing.expectEqual(Screen.none, s.screen);
 }
 
+test "settings: Show system monitor is a fifth choice (not on the first run), off by default" {
+    var ui: Ui = .{};
+    ui.openSetup(true, "a", "b", "c", .keys);
+    var b: Ui.Bufs = .{};
+    try testing.expectEqual(@as(usize, 4), ui.panel(&b, .{}).?.fields.len);
+    var s: Ui = .{};
+    s.openSetup(false, "a", "b", "c", .keys);
+    try testing.expect(!s.setup.sysmon);
+    var b2: Ui.Bufs = .{};
+    const p = s.panel(&b2, .{}).?;
+    try testing.expectEqual(@as(usize, 5), p.fields.len);
+    try testing.expectEqualStrings("Off", p.fields[4].value);
+    // A click focuses it, a second click flips it; Left/Right and space too.
+    _ = s.button(id.field0 + 4);
+    try testing.expect(!s.setup.sysmon);
+    _ = s.button(id.field0 + 4);
+    try testing.expect(s.setup.sysmon);
+    _ = s.key(.left, .{});
+    try testing.expect(!s.setup.sysmon);
+    _ = s.char(' ', .{});
+    try testing.expect(s.setup.sysmon);
+    try testing.expectEqual(rules.Policy.keys, s.setup.input); // the policy is untouched
+    try testing.expectEqual(Action.setup_submit, s.key(.enter, .{}));
+}
+
 test "export: needs a folder" {
     var ui: Ui = .{};
     ui.openExport("C:\\Users\\me\\Downloads\\Portal-CA");

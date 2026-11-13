@@ -208,6 +208,11 @@ pub const Follower = struct {
     line_cut: bool = false,
     /// Reading started mid-file: the first line is partial, dropped.
     skip_partial: bool = false,
+    /// The offset in the followed transcript of the next byte `feed` gets.
+    pos: u64 = 0,
+    /// Lines ending at or before this offset were written before the tab
+    /// started (its size then): Record.history (activity.zig: stale tasks).
+    history_until: u64 = 0,
     rec: *transcript.Record,
     /// Wakes of the wait loop (tests and the log measure idle cost).
     wakes: u32 = 0,
@@ -469,6 +474,8 @@ pub const Follower = struct {
         if (expected) f.expected_seen = true;
         const size = f.fileSize(stem) orelse 0;
         f.cur = .{ .stem = stem[0..36].*, .offset = if (size > max_initial) size - tail_read else 0 };
+        f.pos = f.cur.?.offset;
+        f.history_until = if (expected) 0 else (f.start_sizes.get(stem) orelse 0);
         f.line.clearRetainingCapacity();
         // Started mid-file: the first (partial) line is dropped.
         f.line_cut = size > max_initial;
@@ -515,6 +522,7 @@ pub const Follower = struct {
         if (size < c.offset) {
             // Replaced or cut: read it again from the start.
             c.offset = 0;
+            f.pos = 0;
             f.line.clearRetainingCapacity();
             f.line_cut = false;
             f.skip_partial = false;
@@ -525,6 +533,7 @@ pub const Follower = struct {
             const want: usize = @intCast(@min(chunk.len, size - c.offset));
             const n = readAt(f.gpa, path, c.offset, chunk[0..want]) catch return;
             if (n == 0) return;
+            f.pos = c.offset;
             c.offset += n;
             f.feed(chunk[0..n]);
         }
@@ -542,7 +551,11 @@ pub const Follower = struct {
             f.line.appendSlice(f.gpa, piece[0..@min(piece.len, room)]) catch {
                 f.line_cut = true;
             };
-            if (nl == null) return;
+            if (nl == null) {
+                f.pos += rest.len;
+                return;
+            }
+            f.pos += nl.? + 1;
             rest = rest[nl.? + 1 ..];
             if (f.skip_partial) {
                 f.skip_partial = false;
@@ -557,6 +570,7 @@ pub const Follower = struct {
     fn lineDone(f: *Follower, line: []const u8, complete: bool) void {
         if (std.mem.trim(u8, line, " \t").len == 0) return;
         if (!transcript.parseLine(f.gpa, line, complete, f.rec)) return;
+        f.rec.history = f.pos <= f.history_until;
         f.sink.apply(f.sink.ctx, f.rec);
     }
 };
@@ -781,7 +795,40 @@ test "follower: notes old transcripts, picks the new one, reads appends and part
     f.changed(stem_c ++ ".jsonl");
     try testing.expectEqualStrings(stem_c, &f.cur.?.stem);
     try testing.expectEqualStrings("fresh|", ts.texts(&buf));
+    try testing.expect(!f.rec.history);
+
+    // /resume of the old transcript: what it held before the tab started
+    // is history (an earlier run), what is appended now is not.
+    try t.append("projects\\C--proj-acme\\" ++ stem_old ++ ".jsonl", recLine("user", "C:\\\\proj\\\\acme", "resumed"));
+    var hist = HistorySink{};
+    f.sink = hist.sink();
+    f.changed(stem_old ++ ".jsonl");
+    try testing.expectEqualStrings(stem_old, &f.cur.?.stem);
+    try testing.expectEqual(@as(u32, 2), hist.seen);
+    try testing.expectEqual(@as(u32, 1), hist.history);
+    try testing.expect(!hist.last_history);
 }
+
+/// Counts records and how many were marked history.
+const HistorySink = struct {
+    seen: u32 = 0,
+    history: u32 = 0,
+    last_history: bool = false,
+
+    fn sink(s: *HistorySink) Sink {
+        return .{ .ctx = s, .apply = apply, .reset = reset, .claim = claim };
+    }
+    fn apply(ctx: *anyopaque, rec: *const transcript.Record) void {
+        const s: *HistorySink = @ptrCast(@alignCast(ctx));
+        s.seen += 1;
+        s.history += @intFromBool(rec.history);
+        s.last_history = rec.history;
+    }
+    fn reset(_: *anyopaque, _: bool) void {}
+    fn claim(_: *anyopaque, _: []const u8) bool {
+        return true;
+    }
+};
 
 test "follower: with a session id, only that transcript until it appears; then /clear is followed" {
     var t = try Tmp.init();

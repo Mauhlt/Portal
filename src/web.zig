@@ -66,6 +66,9 @@ const sync_keypin = @import("client").sync.keypin;
 const keymap = @import("keymap.zig");
 const title = @import("title.zig");
 const win32 = @import("win32.zig");
+const activity_wire = @import("shared").activity;
+const sysinfo = @import("shared").sysinfo;
+const sysmon = @import("sysmon.zig");
 
 
 const index_html = @embedFile("web/index.html");
@@ -393,6 +396,11 @@ pub const Server = struct {
     input_log: LogLimiter = .{},
     thread_log: LogLimiter = .{},
     sync_log: LogLimiter = .{},
+    sysmon_log: LogLimiter = .{},
+
+    /// The optional system monitor (sysmon.zig; null: none). `y:on` from a
+    /// viewer subscribes only while the desk's setting is on.
+    sysmon: ?*sysmon.Monitor = null,
 
     /// The pairing window as last read from the device store, by the
     /// pairing watcher or by a handler that just changed it. Requests
@@ -1938,6 +1946,11 @@ pub const Server = struct {
         want: Want = .none,
         /// Reader only: unknown-session log lines (rate limited).
         unknown_ids: u32 = 0,
+        /// The viewer's System panel is open (`y:on`) and the monitor
+        /// accepted it: the writer sends `sys` after every sample.
+        sys_on: std.atomic.Value(bool) = .init(false),
+        /// Reader only: refused `y:on`s (log rate limit).
+        sys_refused: u32 = 0,
         /// Writer loop iterations (for the wakeup measurement in the log).
         writer_wakes: u32 = 0,
 
@@ -2086,6 +2099,29 @@ pub const Server = struct {
         }
     }
 
+    /// `y:on` / `y:off`: the viewer's System panel opened or closed. Only
+    /// while the desk's "Show system monitor" is on does `y:on` count (and
+    /// start the sampler); otherwise it is ignored and logged here, rate
+    /// limited, and the viewer gets nothing.
+    fn sysPanel(srv: *Server, ws: *WsConn, arg: []const u8) void {
+        const on = std.mem.eql(u8, arg, "on");
+        if (!on and !std.mem.eql(u8, arg, "off")) return;
+        if (!on) {
+            if (ws.sys_on.swap(false, .acq_rel)) if (srv.sysmon) |m| m.unsubscribe();
+            return;
+        }
+        if (ws.sys_on.load(.acquire)) return;
+        const accepted = if (srv.sysmon) |m| m.subscribe() else false;
+        if (!accepted) {
+            ws.sys_refused +|= 1;
+            if (ws.sys_refused <= 3 or std.math.isPowerOfTwo(ws.sys_refused))
+                srv.notePreAuth(&srv.sysmon_log, "viewer from {s} asked for the system monitor, which is off in Settings ({d} so far)", .{ ws.conn.peer(), ws.sys_refused });
+            return;
+        }
+        ws.sys_on.store(true, .release);
+        srv.hub.broadcast();
+    }
+
     fn wsWriteLoop(srv: *Server, ws: *WsConn, initial: ?*tabs.Tab) void {
         const hub = srv.hub;
         // The tab shown, with this task's reference.
@@ -2135,6 +2171,15 @@ pub const Server = struct {
         var convo_rev: u64 = 0;
         var convo_out: std.Io.Writer.Allocating = .init(srv.gpa);
         defer convo_out.deinit();
+        // Every tab's background tasks and usage (section 3c): after hello,
+        // then whenever any of it (or the tab list) changes.
+        var activity_seen: u64 = 0;
+        const act = srv.gpa.create(activity_wire.Activity) catch return;
+        defer srv.gpa.destroy(act);
+        var act_out: std.Io.Writer.Allocating = .init(srv.gpa);
+        defer act_out.deinit();
+        // The system monitor's sample last sent (section 3d).
+        var sys_seen: u64 = 0;
         while (true) {
             ws.writer_wakes +|= 1;
             // Event-driven: wakes on output, resize, a tab list change, a
@@ -2146,7 +2191,9 @@ pub const Server = struct {
             const cur_closed = if (cur) |c| c.session.closed else false;
             const cur_gen = if (cur) |c| c.session.term.gen else sent_gen;
             const convo_changed = if (cur) |c| c.convo.epoch != convo_epoch or c.convo.rev != convo_rev else false;
+            const sys_due = if (srv.sysmon) |m| ws.sys_on.load(.acquire) and m.gen.load(.acquire) != sys_seen else false;
             if (!hub.finished and !full and cur_gen == sent_gen and !(cur_closed and !ended_sent) and !convo_changed and
+                hub.activity_gen == activity_seen and !sys_due and
                 ws.want == .none and hub.gen == seen_gen and !ws.dead.load(.acquire) and expires_in > 0 and
                 srv.sync_gen.load(.acquire) == sync_seen)
             {
@@ -2246,6 +2293,14 @@ pub const Server = struct {
                     convo_rev = cv.rev;
                 }
             }
+            act_out.clearRetainingCapacity();
+            if (encode_ok and (hub.activity_gen != activity_seen or list_changed)) {
+                hub.activityLocked(act);
+                activity_wire.write(&act_out.writer, act) catch {
+                    encode_ok = false;
+                };
+                activity_seen = hub.activity_gen;
+            }
             const cur_id: ?tabs.Id = if (cur) |c| c.id else null;
             hub.mutex.unlock(srv.io);
 
@@ -2278,6 +2333,17 @@ pub const Server = struct {
             if (convo_out.written().len > 0) {
                 if (!ws.send(srv, convo_out.written(), .text)) return;
             }
+            if (act_out.written().len > 0) {
+                if (!ws.send(srv, act_out.written(), .text)) return;
+            }
+            if (srv.sysmon) |m| if (ws.sys_on.load(.acquire) and m.gen.load(.acquire) != sys_seen) {
+                var snap: sysinfo.Snapshot = undefined;
+                sys_seen = m.latest(&snap);
+                var sb: [sysinfo.max_message]u8 = undefined;
+                var sw: std.Io.Writer = .fixed(&sb);
+                sysinfo.write(&sw, &snap) catch return;
+                if (!ws.send(srv, sw.buffered(), .text)) return;
+            };
             const gen_now = srv.sync_gen.load(.acquire);
             if (gen_now != sync_seen) {
                 sync_seen = gen_now;
@@ -2336,6 +2402,8 @@ pub const Server = struct {
 
     fn wsReadLoop(srv: *Server, ws: *WsConn, leftover: []const u8) void {
         defer {
+            // A System panel left open: it is closed now.
+            if (ws.sys_on.swap(false, .acq_rel)) if (srv.sysmon) |m| m.unsubscribe();
             ws.dead.store(true, .release);
             // Wake the writer so it notices promptly.
             srv.hub.mutex.lockUncancelable(srv.io);
@@ -2400,6 +2468,11 @@ pub const Server = struct {
                 // Switching tabs is not input: also in view-only mode.
                 if (payload[0] == 's') {
                     srv.subscribe(ws, payload[2..]);
+                    return true;
+                }
+                // The System panel (read-only, every mode): "y:on" / "y:off".
+                if (payload[0] == 'y') {
+                    srv.sysPanel(ws, payload[2..]);
                     return true;
                 }
                 if (srv.hub.policy == .none) return true;

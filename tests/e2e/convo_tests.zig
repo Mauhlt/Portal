@@ -118,6 +118,28 @@ const Conv = struct {
 
 const Want = struct { gpa: std.mem.Allocator, id: tabs_wire.Id, kind: wire.Kind, text: []const u8, open: ?bool = null };
 
+const act_wire = shared.activity;
+
+/// The tab's entry of the latest `activity` message, if it parses.
+fn lastActivity(v: *const client.Viewer, id: tabs_wire.Id, out: *act_wire.Activity) ?*const act_wire.Tab {
+    const t = v.lastText("\"t\":\"activity\"") orelse return null;
+    if (!act_wire.parse(t, out)) return null;
+    return out.find(id);
+}
+
+const ActWant = struct { id: tabs_wire.Id, shells: u32, monitors: u32, tasks: usize };
+
+/// Pumps until the tab's activity shows these counts.
+fn waitActivity(v: *client.Viewer, want: ActWant, ms: u32) bool {
+    return v.pumpUntil(ms, want, struct {
+        fn f(wt: ActWant, vv: *client.Viewer) bool {
+            var a: act_wire.Activity = undefined;
+            const t = lastActivity(vv, wt.id, &a) orelse return false;
+            return t.running(.shell) == wt.shells and t.running(.monitor) == wt.monitors and t.n_tasks == wt.tasks;
+        }
+    }.f);
+}
+
 /// Pumps until the tab's conversation has the item.
 fn waitItem(v: *client.Viewer, want: Want, ms: u32) bool {
     return v.pumpUntil(ms, want, struct {
@@ -180,7 +202,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     try leaks.add(h.transcriptRoot(&tb));
     try leaks.add("agent-projects");
     // Never sent at all, scrubbed or not.
-    const secrets = [_][]const u8{ "THINKING-SECRET", "ARG-SECRET", "RESULT-SECRET", "injected", "not JSON", "system-reminder", ".jsonl", "e2e00000", "OUTSIDE-SESSION", "0dd51de0" };
+    const secrets = [_][]const u8{ "THINKING-SECRET", "ARG-SECRET", "RESULT-SECRET", "injected", "not JSON", "system-reminder", ".jsonl", "e2e00000", "OUTSIDE-SESSION", "0dd51de0", "SECRET-CMD", "SUMMARY-SECRET", "bshell00", "bmon0000", "task-notification", "output-file" };
 
     const creds = try client.pair(inst, "convo");
     const v = try client.Viewer.open(inst, creds.sessionCookie());
@@ -221,6 +243,33 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("injected context is not a prompt; only the typed one is", n_user == 1, "{s}", .{c.dump(&cdump)});
     }
 
+    // Background tasks and usage (section 3c), from the same transcript: a
+    // shell and a monitor run, another shell finished; each reply's usage
+    // counted once; the description scrubbed, never the command.
+    {
+        const got_act = waitActivity(v, .{ .id = id, .shells = 1, .monitors = 1, .tasks = 3 }, 8000);
+        var a: act_wire.Activity = undefined;
+        const t = lastActivity(v, id, &a);
+        const at = v.lastText("\"t\":\"activity\"") orelse "";
+        _ = r.check("activity: 1 shell and 1 monitor running, 1 shell done", got_act and t != null and t.?.tasks[2].state == .done, "{s}", .{at});
+        const desc = if (user_name.len >= 2) "Run the tests in convo-acme\\src for [user]" else "Run the tests in convo-acme\\src for nobody";
+        _ = r.check("a task's text is its description, scrubbed; a monitor's too", t != null and std.mem.eql(u8, t.?.tasks[0].text(), desc) and t.?.tasks[0].kind == .shell and
+            std.mem.eql(u8, t.?.tasks[1].text(), "Watch the build log") and t.?.tasks[1].kind == .monitor and std.mem.eql(u8, t.?.tasks[2].text(), "Lint the docs"), "{s}", .{at});
+        _ = r.check("usage: each reply once (in 11, out 22, cache read 300, cache write 40), the model, today the same", t != null and t.?.usage.input == 11 and t.?.usage.output == 22 and
+            t.?.usage.cache_read == 300 and t.?.usage.cache_write == 40 and std.mem.eql(u8, t.?.model(), "model-e2e-1") and t.?.today.total() == t.?.usage.total(), "{s}", .{at});
+        _ = r.check("activity: the system monitor is off by default", !a.sysmon, "{s}", .{at});
+    }
+    // Slash commands stay blocked from devices: /usage is the desk's (its
+    // Usage panel), never a device's.
+    {
+        const before = v.countText("\"t\":\"rejected\"");
+        v.send("l:/usage");
+        _ = r.check("a device's l:/usage is rejected (SlashCommand)", v.waitText("\"t\":\"rejected\"", before + 1, 8000) and
+            std.mem.indexOf(u8, v.lastText("\"t\":\"rejected\"") orelse "", "SlashCommand") != null, "{?s}", .{v.lastText("\"t\":\"rejected\"")});
+    }
+    // The system monitor is off: y:on is ignored (and logged at the desk).
+    v.send("y:on");
+
     // Answering uses the ordinary answer keys.
     v.send("k:2");
     _ = r.check("k:2 answers the question (the program got 2)", v.waitFor("FAKE-GOT-2", 8000), "{s}", .{v.dump(&dump)});
@@ -246,6 +295,17 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     _ = r.check("k:1 allows it (the program got 1)", v.waitFor("FAKE-ALLOWED", 8000), "{s}", .{v.dump(&dump)});
     _ = r.check("the permission question closes", waitItem(v, .{ .gpa = gpa, .id = id, .kind = .question, .text = perm, .open = false }, 8000), "", .{});
     _ = r.check("the closing reply arrives", waitItem(v, .{ .gpa = gpa, .id = id, .kind = .assistant, .text = "All done." }, 8000), "", .{});
+    {
+        const done = waitActivity(v, .{ .id = id, .shells = 0, .monitors = 0, .tasks = 3 }, 8000);
+        var a: act_wire.Activity = undefined;
+        const t = lastActivity(v, id, &a);
+        _ = r.check("the shell's notification ends it (done); TaskStop kills the monitor; nothing runs", done and t != null and t.?.tasks[0].state == .done and t.?.tasks[1].state == .killed, "{?s}", .{v.lastText("\"t\":\"activity\"")});
+        _ = r.check("no sys message while the monitor is off", v.countText("\"t\":\"sys\"") == 0, "{d}", .{v.countText("\"t\":\"sys\"")});
+        var lb: [64 * 1024]u8 = undefined;
+        const log_path = try std.fmt.allocPrint(gpa, "{s}\\Portal\\portal.log", .{dir});
+        const log = std.Io.Dir.cwd().readFile(h.io, log_path, &lb) catch "";
+        _ = r.check("the desk logged the refused y:on", std.mem.indexOf(u8, log, "asked for the system monitor") != null, "{d} bytes of log", .{log.len});
+    }
 
     // A tab without a transcript says so; switching sends that tab's
     // snapshot, and switching back the whole conversation again.
@@ -295,12 +355,12 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
                 dirty = s;
                 where = t;
             };
-            if (user_name.len >= 4 and std.mem.indexOf(u8, t, "\"t\":\"convo") != null and client.containsIgnoreCase(t, user_name)) {
+            if (user_name.len >= 4 and (std.mem.indexOf(u8, t, "\"t\":\"convo") != null or std.mem.indexOf(u8, t, "\"t\":\"activity\"") != null) and client.containsIgnoreCase(t, user_name)) {
                 dirty = "the user name";
                 where = t;
             }
         }
-        _ = r.check("no convo message carries a path, the user name, tool arguments, results or thinking", dirty == null, "{?s} in {s}", .{ dirty, where[0..@min(where.len, 600)] });
+        _ = r.check("no convo or activity message carries a path, the user name, a command, tool arguments, results, task ids or thinking", dirty == null, "{?s} in {s}", .{ dirty, where[0..@min(where.len, 600)] });
     }
     _ = r.ok("portal still running", inst.alive() and client.alive(inst));
 }

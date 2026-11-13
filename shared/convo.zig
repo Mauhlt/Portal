@@ -320,18 +320,20 @@ pub fn printable(s: []const u8) bool {
     return true;
 }
 
-const Parser = struct {
+/// The strict, bounded JSON reader the shared message parsers use
+/// (convo, activity, sys): decoded strings go to `out`.
+pub const Parser = struct {
     s: []const u8,
     i: usize = 0,
     /// Decoded strings go here, one after another.
     out: []u8,
     o: usize = 0,
 
-    fn ws(p: *Parser) void {
+    pub fn ws(p: *Parser) void {
         while (p.i < p.s.len and (p.s[p.i] == ' ' or p.s[p.i] == '\t' or p.s[p.i] == '\n' or p.s[p.i] == '\r')) p.i += 1;
     }
 
-    fn eat(p: *Parser, c: u8) bool {
+    pub fn eat(p: *Parser, c: u8) bool {
         if (p.i < p.s.len and p.s[p.i] == c) {
             p.i += 1;
             return true;
@@ -339,7 +341,7 @@ const Parser = struct {
         return false;
     }
 
-    fn put(p: *Parser, c: u8) bool {
+    pub fn put(p: *Parser, c: u8) bool {
         if (p.o >= p.out.len) return false;
         p.out[p.o] = c;
         p.o += 1;
@@ -347,7 +349,7 @@ const Parser = struct {
     }
 
     /// A JSON string, decoded into `out`.
-    fn string(p: *Parser) ?[]const u8 {
+    pub fn string(p: *Parser) ?[]const u8 {
         if (!p.eat('"')) return null;
         const start = p.o;
         while (p.i < p.s.len) {
@@ -387,7 +389,7 @@ const Parser = struct {
         return null;
     }
 
-    fn boolean(p: *Parser) ?bool {
+    pub fn boolean(p: *Parser) ?bool {
         if (std.mem.startsWith(u8, p.s[p.i..], "true")) {
             p.i += 4;
             return true;
@@ -399,7 +401,7 @@ const Parser = struct {
         return null;
     }
 
-    fn number(p: *Parser) ?u32 {
+    pub fn number(p: *Parser) ?u32 {
         const start = p.i;
         while (p.i < p.s.len and p.s[p.i] >= '0' and p.s[p.i] <= '9') p.i += 1;
         if (p.i == start or p.i - start > 10) return null;
@@ -407,9 +409,19 @@ const Parser = struct {
         return std.fmt.parseInt(u32, p.s[start..p.i], 10) catch null;
     }
 
+    /// A non-negative integer up to 2^53 (JSON's exact range).
+    pub fn number64(p: *Parser) ?u64 {
+        const start = p.i;
+        while (p.i < p.s.len and p.s[p.i] >= '0' and p.s[p.i] <= '9') p.i += 1;
+        if (p.i == start or p.i - start > 16) return null;
+        if (p.s[start] == '0' and p.i - start > 1) return null;
+        const v = std.fmt.parseInt(u64, p.s[start..p.i], 10) catch return null;
+        return if (v > (1 << 53)) null else v;
+    }
+
     /// An unknown field's value: a string, number, boolean or null (never
     /// an object or array, so the bounds stay the parser's own).
-    fn scalar(p: *Parser) bool {
+    pub fn scalar(p: *Parser) bool {
         if (p.i >= p.s.len) return false;
         switch (p.s[p.i]) {
             '"' => return p.string() != null,
