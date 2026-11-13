@@ -1,5 +1,7 @@
 # Portal
 
+<p align="center"><img src="docs/brand/portal-hero.jpg" alt="Portal: a neon ring opening onto a split moon and sun, a brain-shaped constellation above and a mountain meadow of neuroscience instruments below" width="480"></p>
+
 Watch a terminal session running on your Windows desktop (typically the
 agent CLI) from a browser or a laptop, and answer its prompts, while you
 are away from home.
