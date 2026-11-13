@@ -579,7 +579,13 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
 ///   zig build ios            build zig-out/ios/Portal.app (on a Mac: needs
 ///                            the iOS SDK and MoltenVK, see the options)
 ///   zig build ios-sign       sign it (env: PORTAL_SIGN_IDENTITY,
-///                            PORTAL_PROVISIONING_PROFILE, PORTAL_TEAM_ID)
+///                            PORTAL_PROVISIONING_PROFILE, PORTAL_TEAM_ID,
+///                            PORTAL_TUNNEL_PROVISIONING_PROFILE with the
+///                            tunnel)
+///   zig build ios-kit        zig-out/ios-kit: the unsigned Portal.app, the
+///                            signer for aarch64-macos and README.txt, to
+///                            build on any host (iOS SDK copied from the
+///                            Mac) and sign + install on a Mac without Zig
 ///
 /// Both build against a copy of Zig's lib dir with one std line fixed
 /// (src/tools/ios_zig_lib.zig: std.Io.Threaded does not compile for iOS
@@ -640,25 +646,43 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
         .optimize = .ReleaseSafe,
     }) });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sign_tool.root_module })).step);
+    // The same signer for the Mac kit: pure Zig, links against Zig's own
+    // libSystem stubs (no macOS SDK) and comes out ad-hoc signed (arm64
+    // macOS). `zig build test` links it so it cannot rot.
+    const mac_sign_tool = b.addExecutable(.{ .name = "portal-ios-sign", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/ios_sign.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos }),
+        .optimize = .ReleaseSafe,
+    }) });
+    test_step.dependOn(&mac_sign_tool.step);
 
     const ios_step = b.step("ios", "Build zig-out/ios/Portal.app (Mac: iOS SDK + -Dmoltenvk=...)");
-    const sign_step = b.step("ios-sign", "Sign zig-out/ios/Portal.app (env PORTAL_SIGN_IDENTITY, PORTAL_PROVISIONING_PROFILE, PORTAL_TEAM_ID)");
+    const sign_step = b.step("ios-sign", "Sign zig-out/ios/Portal.app (env PORTAL_SIGN_IDENTITY, PORTAL_PROVISIONING_PROFILE, PORTAL_TEAM_ID, PORTAL_TUNNEL_PROVISIONING_PROFILE)");
+    const kit_step = b.step("ios-kit", "Build zig-out/ios-kit (unsigned Portal.app + aarch64-macos signer + README.txt) to sign and install on a Mac without Zig (-Dios-sdk, -Dmoltenvk)");
     const sdk_path = sdk orelse {
-        const fail = b.addFail("zig build ios needs the iPhoneOS SDK: run it on a Mac with Xcode, or pass -Dios-sdk=<path> / IOS_SDK");
+        const fail = b.addFail("zig build ios / ios-kit needs the iPhoneOS SDK: run it on a Mac with Xcode, or pass -Dios-sdk=<path to iPhoneOS.sdk> / IOS_SDK (docs/ios-native.md, \"Build on another computer\")");
         ios_step.dependOn(&fail.step);
         sign_step.dependOn(&fail.step);
+        kit_step.dependOn(&fail.step);
+        return;
+    };
+    std.Io.Dir.cwd().access(b.graph.io, b.pathJoin(&.{ sdk_path, "usr/lib/libSystem.tbd" }), .{}) catch {
+        const fail = b.addFail(b.fmt("no iPhoneOS SDK at {s} (no usr/lib/libSystem.tbd): -Dios-sdk must name the iPhoneOS.sdk folder", .{sdk_path}));
+        ios_step.dependOn(&fail.step);
+        sign_step.dependOn(&fail.step);
+        kit_step.dependOn(&fail.step);
         return;
     };
     const mvk = moltenvk orelse {
-        const fail = b.addFail("zig build ios needs MoltenVK for iOS: -Dmoltenvk=<.../MoltenVK/dynamic/dylib/iOS/libMoltenVK.dylib or MoltenVK.framework> (or MOLTENVK_PATH); see docs/ios-native.md");
+        const fail = b.addFail("zig build ios / ios-kit needs MoltenVK for iOS: -Dmoltenvk=<.../MoltenVK.xcframework/ios-arm64/MoltenVK.framework or libMoltenVK.dylib> (or MOLTENVK_PATH); see docs/ios-native.md");
         ios_step.dependOn(&fail.step);
         sign_step.dependOn(&fail.step);
+        kit_step.dependOn(&fail.step);
         return;
     };
 
     const mod = iosModule(b, t, optimize, bundle_id, tunnel);
-    mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
-    mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/lib" }) });
+    addIosSdkPaths(b, mod, sdk_path);
     mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/include" }) });
     for ([_][]const u8{ "UIKit", "QuartzCore", "Foundation", "CoreGraphics", "Metal", "Security", "AVFoundation", "LocalAuthentication" }) |fw|
         mod.linkFramework(fw, .{});
@@ -673,13 +697,14 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     // NetworkExtension, no UIKit window.
     const ext_exe: ?*std.Build.Step.Compile = if (tunnel) blk: {
         const em = tunnelExtModule(b, t, optimize);
-        em.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
-        em.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/lib" }) });
+        addIosSdkPaths(b, em, sdk_path);
         em.linkFramework("Foundation", .{});
         em.linkFramework("NetworkExtension", .{});
         em.linkSystemLibrary("objc", .{});
         break :blk b.addExecutable(.{ .name = "PortalTunnel", .root_module = em, .zig_lib_dir = zig_lib });
     } else null;
+    // This Zig requires darwin_sdk_dir for Darwin targets; it is also the
+    // linker's sysroot (absolute install names of re-exported libraries).
     const libc_txt = b.addWriteFiles().add("libc-ios.txt", b.fmt(
         \\include_dir={s}/usr/include
         \\sys_include_dir={s}/usr/include
@@ -687,8 +712,9 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
         \\msvc_lib_dir=
         \\kernel32_lib_dir=
         \\gcc_dir=
+        \\darwin_sdk_dir={s}
         \\
-    , .{ sdk_path, sdk_path, sdk_path }));
+    , .{ sdk_path, sdk_path, sdk_path, sdk_path }));
     exe.setLibCFile(libc_txt);
     if (ext_exe) |e| e.setLibCFile(libc_txt);
 
@@ -717,6 +743,19 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     const install = b.addInstallDirectory(.{ .source_dir = app.getDirectory().path(b, "Portal.app"), .install_dir = .prefix, .install_subdir = "ios/Portal.app" });
     ios_step.dependOn(&install.step);
 
+    // The Mac kit: build here, sign + install on a Mac that has Xcode but
+    // no Zig (docs/ios-native.md, "Build on another computer").
+    const kit_app = b.addInstallDirectory(.{ .source_dir = app.getDirectory().path(b, "Portal.app"), .install_dir = .prefix, .install_subdir = "ios-kit/Portal.app" });
+    const kit_sign = b.addInstallArtifact(mac_sign_tool, .{ .dest_dir = .{ .override = .{ .custom = "ios-kit" } } });
+    const readme = std.mem.replaceOwned(u8, b.allocator, @embedFile("docs/ios-kit-readme.txt"), "@BUNDLE_ID@", bundle_id) catch @panic("OOM");
+    const kit_readme = b.addInstallFile(b.addWriteFiles().add("README.txt", b.fmt(
+        "Portal for iPhone: bundle id {s}, tunnel extension {s}, {t}.\n\n{s}",
+        .{ bundle_id, if (tunnel) "included (PORTAL_TUNNEL_PROVISIONING_PROFILE needed)" else "not included", optimize, readme },
+    )), "ios-kit/README.txt");
+    kit_step.dependOn(&kit_app.step);
+    kit_step.dependOn(&kit_sign.step);
+    kit_step.dependOn(&kit_readme.step);
+
     // Signs a copy (the cached bundle stays unsigned) and installs it over
     // zig-out/ios/Portal.app.
     const sign = b.addRunArtifact(sign_tool);
@@ -727,6 +766,19 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     const install_signed = b.addInstallDirectory(.{ .source_dir = signed.path(b, "Portal.app"), .install_dir = .prefix, .install_subdir = "ios/Portal.app" });
     install_signed.step.dependOn(&install.step);
     sign_step.dependOn(&install_signed.step);
+}
+
+/// The iPhoneOS SDK's link stubs (.tbd) for `m`. Besides the public
+/// frameworks and usr/lib: PrivateFrameworks and usr/lib/system, where
+/// the linker finds libraries the public stubs re-export (UIKit ->
+/// UIKitCore, libSystem -> libsystem_*) by name first, before it joins
+/// their absolute install names to the sysroot (the libc file's
+/// darwin_sdk_dir), so a Windows host does not depend on that join.
+fn addIosSdkPaths(b: *std.Build, m: *std.Build.Module, sdk_path: []const u8) void {
+    m.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" }) });
+    m.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System/Library/PrivateFrameworks" }) });
+    m.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/lib" }) });
+    m.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/lib/system" }) });
 }
 
 /// The iPhone app's root module for `t`: client/src/ios/main.zig on the
@@ -790,7 +842,7 @@ fn tunnelPlist(b: *std.Build, bundle_id: []const u8) []const u8 {
         \\    </dict>
         \\</dict>
         \\</plist>
-            , .{bundle_id});
+    , .{bundle_id});
 }
 
 /// Info.plist (configuration text, not code): what iOS reads before the
