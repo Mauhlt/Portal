@@ -25,9 +25,9 @@ pub const Screen = enum { none, tasks, usage, system };
 
 /// Button ids, clear of the other panels' and the shell's ranges.
 pub const ids = struct {
-    pub const close: u32 = 1300;
+    pub const close: u32 = 1500;
     /// "Open /usage" of the tab at bar position i (desk only): slash0 + i.
-    pub const slash0: u32 = 1310;
+    pub const slash0: u32 = 1510;
 };
 
 pub const max_rows = 28;

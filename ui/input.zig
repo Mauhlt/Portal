@@ -56,6 +56,25 @@ pub const Mouse = struct {
     mods: Mods = .{},
 };
 
+/// A press, move or release over a content view (window pixels; `scale`:
+/// device pixels per logical pixel), for scrolling and swiping.
+pub const Drag = struct {
+    phase: enum { down, move, up },
+    x: f32,
+    y: f32,
+    scale: f32 = 1,
+};
+
+/// Input that is neither a key nor a pointer: what a device's buttons or
+/// shortcuts mean (the shell decides when each applies).
+pub const Action = enum {
+    /// Start / stop dictation into the instruction line.
+    toggle_dictation,
+    /// A media play / pause button (a headset's): dictation, only with a
+    /// headset microphone attached (Shell.headsetMicPresent).
+    media_play_pause,
+};
+
 /// On-screen answer buttons: the shared list (module "inputrules"), the
 /// same buttons in the same order on every device. `key` is a protocol
 /// key name (docs/protocol.md section 4).
@@ -81,6 +100,13 @@ pub const InputSink = struct {
         /// Mouse input over the grid (optional). Left-button downs that hit
         /// a button are not sent.
         mouse: ?*const fn (ctx: *anyopaque, m: Mouse) void = null,
+        /// Scroll a content view by `dy` pixels (> 0: towards older content
+        /// at the top): the wheel or a drag over it (optional).
+        scroll: ?*const fn (ctx: *anyopaque, dy: f32) void = null,
+        /// A press over a content view, its moves and its release (optional).
+        drag: ?*const fn (ctx: *anyopaque, d: Drag) void = null,
+        /// A device action (optional).
+        action: ?*const fn (ctx: *anyopaque, a: Action) void = null,
     };
 
     pub fn key(s: InputSink, k: Key, m: Mods) void {
@@ -100,5 +126,14 @@ pub const InputSink = struct {
     }
     pub fn mouse(s: InputSink, m: Mouse) void {
         if (s.vtable.mouse) |f| f(s.ctx, m);
+    }
+    pub fn scroll(s: InputSink, dy: f32) void {
+        if (s.vtable.scroll) |f| f(s.ctx, dy);
+    }
+    pub fn drag(s: InputSink, d: Drag) void {
+        if (s.vtable.drag) |f| f(s.ctx, d);
+    }
+    pub fn action(s: InputSink, a: Action) void {
+        if (s.vtable.action) |f| f(s.ctx, a);
     }
 };

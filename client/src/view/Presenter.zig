@@ -235,6 +235,10 @@ pub fn pollEvents(p: *Presenter, sink: input.InputSink) bool {
                 p.nativeTextChanged(sink);
                 if (t == .submit) sink.key(.enter, .{});
             },
+            // The wheel (or an iOS drag, delivered as scroll notches) scrolls
+            // a content view (the conversation) under the pointer; elsewhere
+            // it scrolls grid rows that do not fit (handleViewEvent).
+            .scroll => |w| if (!p.frame.wheel(w.x, w.y, w.dy, sink)) p.handleViewEvent(e),
             else => p.handleViewEvent(e),
         }
         p.dirty = true;
@@ -377,20 +381,28 @@ fn push(p: *Presenter, x: f32, y: f32, w: f32, h: f32, uv: [4]f32, c: draw.Rgba)
 }
 
 fn glyph(p: *Presenter, cp: u21, style: fontset.Style, m: fontset.Metrics, cells: u32, x: f32, y: f32, c: draw.Rgba) void {
+    p.glyphClipped(cp, style, m, cells, x, y, c, null);
+}
+
+fn glyphClipped(p: *Presenter, cp: u21, style: fontset.Style, m: fontset.Metrics, cells: u32, x: f32, y: f32, c: draw.Rgba, clip: ?[4]f32) void {
     const slot = p.atlas.get(&p.fonts, cp, style, m, cells) orelse {
         p.atlas_full = true;
         return;
     };
-    p.push(x, y, @floatFromInt(slot.w), @floatFromInt(slot.h), p.atlas.uv(slot), c);
+    const w: f32 = @floatFromInt(slot.w);
+    const h: f32 = @floatFromInt(slot.h);
+    const cl = clip orelse return p.push(x, y, w, h, p.atlas.uv(slot), c);
+    if (images.clip(x, y, w, h, p.atlas.uv(slot), cl[0], cl[1], cl[2], cl[3])) |r| p.push(r.rect[0], r.rect[1], r.rect[2], r.rect[3], r.uv, c);
 }
 
-fn text(p: *Presenter, m: fontset.Metrics, x0: f32, y: f32, s: []const u8, c: draw.Rgba, bold: bool) void {
+fn text(p: *Presenter, m: fontset.Metrics, x0: f32, y: f32, s: []const u8, c: draw.Rgba, style: fontset.Style, clip: ?[4]f32) void {
     var x = x0;
     var it = (std.unicode.Utf8View.init(s) catch return).iterator();
     while (it.nextCodepoint()) |cp| {
         const w = wcwidth.of(cp);
         if (w == 0) continue;
-        if (cp != ' ' and cp >= 0x20) p.glyph(cp, .{ .bold = bold }, m, w, x, y, c);
+        if (clip) |cl| if (x >= cl[2]) break;
+        if (cp != ' ' and cp >= 0x20) p.glyphClipped(cp, style, m, w, x, y, c, clip);
         x += @floatFromInt(w * m.cell_w);
     }
 }
@@ -408,7 +420,7 @@ fn resolve(p: *Presenter) void {
     for (dl.cmds.items) |c| switch (c) {
         .rect => |r| p.push(r.x, r.y, r.w, r.h, white, r.color),
         .glyph => |g| p.glyph(g.cp, g.style, dl.fonts[g.font], g.cells, g.x, g.y, g.color),
-        .text => |t| p.text(dl.fonts[t.font], t.x, t.y, dl.textOf(t), t.color, t.bold),
+        .text => |t| p.text(dl.fonts[t.font], t.x, t.y, dl.textOf(t), t.color, .{ .bold = t.bold, .italic = t.italic }, t.clip),
         .image => |im| switch (p.img.prepare(im.store, im.id, im.disp_w, im.disp_h, tex_w, tex_h)) {
             .image => |uv| if (images.clip(im.x, im.y, im.w, im.h, uv, im.clip[0], im.clip[1], im.clip[2], im.clip[3])) |cl| {
                 p.push(cl.rect[0], cl.rect[1], cl.rect[2], cl.rect[3], cl.uv, .{ 255, 255, 255, 255 });
@@ -444,7 +456,7 @@ fn placeholder(p: *Presenter, m: fontset.Metrics, im: draw.Image, dims: [2]u32) 
     const lw = ui.frame.textWidth(m, label);
     const ch: f32 = @floatFromInt(m.cell_h);
     if (lw + 2 * s <= w and h >= ch and y >= cy0 and y + ch <= cy1 and x + lw < cx1) {
-        p.text(m, x + @round((w - lw) / 2), y + @round((h - ch) / 2), label, c, false);
+        p.text(m, x + @round((w - lw) / 2), y + @round((h - ch) / 2), label, c, .{}, null);
     }
 }
 

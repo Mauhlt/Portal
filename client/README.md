@@ -24,6 +24,13 @@ client then downloads `/ca.cer` from the desktop's pairing-time page
 **Pair** (or press P) within 2 minutes. After that the client signs in by
 itself on every launch and reconnect, with just `--server`.
 
+The window opens on the **Conversation view** (the Terminal | Conversation
+toggle is in the top bar; docs/layout-design.md). Device settings live in
+`settings.txt` next to the pinned servers (e.g. `%APPDATA%\Portal\settings.txt`):
+
+    # which way a swipe on a Yes/No card says Yes (default left-yes)
+    swipe = left-yes
+
 ## TLS
 
 Portal serves HTTPS/WSS by default with a private CA name-constrained to the

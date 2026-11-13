@@ -228,7 +228,7 @@ pub const Tab = struct {
         const h = t.hub;
         const projects = h.convo_projects orelse return;
         const stop = t.convo_stop orelse return;
-        var f = follow.Follower.init(h.gpa, .{ .ctx = t, .apply = convoApply, .reset = convoReset, .claim = convoClaim }, projects, t.cwd) catch return;
+        var f = follow.Follower.init(h.gpa, .{ .ctx = t, .apply = convoApply, .reset = convoReset, .claim = convoClaim, .contested = convoContested }, projects, t.cwd) catch return;
         defer f.deinit();
         f.expected = t.session_uuid;
         f.run(stop, if (t.convo_poke) |*p| p else null);
@@ -260,18 +260,42 @@ pub const Tab = struct {
         h.notify();
     }
 
-    fn convoClaim(ctx: *anyopaque, stem: []const u8) bool {
+    /// The claim table: a transcript is one tab's at most, and a tab's own
+    /// `--session-id` transcript is never another's (follow.Sink.claim).
+    fn convoClaim(ctx: *anyopaque, stem: []const u8, rival_since: ?i64) follow.Claim {
         const t: *Tab = @ptrCast(@alignCast(ctx));
         const h = t.hub;
-        if (stem.len != 36) return false;
+        if (stem.len != 36) return .taken;
         h.mutex.lockUncancelable(h.io);
         defer h.mutex.unlock(h.io);
         for (h.tabs[0..h.n]) |o| {
-            if (o != t and o.convo_claimed and std.mem.eql(u8, &o.convo_claim, stem)) return false;
+            if (o == t) continue;
+            if (o.convo_claimed and std.mem.eql(u8, &o.convo_claim, stem)) return .taken;
+            if (o.session_uuid) |*u| if (std.mem.eql(u8, u, stem)) return .taken;
+        }
+        if (rival_since) |since| {
+            var mine_buf: [1024]u8 = undefined;
+            const mine = transcript.folderName(transcript.normalizeCwd(t.cwd), &mine_buf) catch "";
+            for (h.tabs[0..h.n]) |o| {
+                if (o == t) continue;
+                const printed = if (o.convo_poke) |*p| p.last_ms.load(.acquire) else follow.Poke.never;
+                if (printed < since) continue;
+                var other_buf: [1024]u8 = undefined;
+                const other = transcript.folderName(transcript.normalizeCwd(o.cwd), &other_buf) catch "";
+                // Same transcript folder (case aside, to err towards "unclear").
+                if (mine.len == 0 or other.len == 0 or std.ascii.eqlIgnoreCase(mine, other)) return .contested;
+            }
         }
         t.convo_claim = stem[0..36].*;
         t.convo_claimed = true;
-        return true;
+        return .ok;
+    }
+
+    /// Desktop log only, and without paths: the tab's name is shown on
+    /// the desktop anyway.
+    fn convoContested(ctx: *anyopaque) void {
+        const t: *Tab = @ptrCast(@alignCast(ctx));
+        t.hub.log.print("tab '{s}': a new transcript appeared while another tab in the same folder was printing too; its conversation view keeps the current one", .{t.name()});
     }
 
     /// Waits for the program, then for its output to drain and its pseudo

@@ -431,9 +431,14 @@ const ConsoleLines = struct {
 };
 
 /// "y" / "yes" (any case, surrounding blanks ignored) approves; anything
-/// else, including an empty line, denies.
+/// else, including an empty line, denies. A leading UTF-8 byte order mark
+/// is ignored: .NET and PowerShell write one at the start of a redirected
+/// stdin (`'y' | portalctl pair laptop`), which would otherwise turn the
+/// first answer into a denial.
 pub fn isYes(line: []const u8) bool {
-    const t = std.mem.trim(u8, line, " \t");
+    const bom = "\xEF\xBB\xBF";
+    const l = if (std.mem.startsWith(u8, line, bom)) line[bom.len..] else line;
+    const t = std.mem.trim(u8, l, " \t");
     return std.ascii.eqlIgnoreCase(t, "y") or std.ascii.eqlIgnoreCase(t, "yes");
 }
 
@@ -2083,6 +2088,11 @@ test "isYes" {
     try std.testing.expect(!isYes(""));
     try std.testing.expect(!isYes("n"));
     try std.testing.expect(!isYes("yy"));
+    // A byte order mark from a .NET / PowerShell pipe is not part of the answer.
+    try std.testing.expect(isYes("\xEF\xBB\xBFy"));
+    try std.testing.expect(isYes("\xEF\xBB\xBF yes"));
+    try std.testing.expect(!isYes("\xEF\xBB\xBF"));
+    try std.testing.expect(!isYes("\xEF\xBB\xBFn"));
 }
 
 test "parseListen" {

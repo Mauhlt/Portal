@@ -14,10 +14,14 @@
 //!   3. a command that needs permission (OSC 7501 kind=permission); waits
 //!      for 1 (allow) or Esc (deny);
 //!   4. the other shell's notification and a TaskStop for the monitor
-//!      (nothing runs any more), a closing reply; then idles until its
+//!      (nothing runs any more), a closing reply; then waits for 1;
+//!   5. `/clear`: prints, then starts a second transcript (a new session
+//!      id of its own, as the agent does); then idles until its
 //!      console closes.
 //!
 //! A tab whose folder's name contains "quiet" writes no transcript at all.
+//! With PORTAL_E2E_SHOWCASE set (manual visual checks only, never the e2e
+//! suite) the reply carries a code block and the question a third option.
 //!
 //! Run as `claude.exe` (a copy of portal-e2e), so Portal treats it as
 //! the agent and passes `--session-id <uuid>`: the transcript is then
@@ -191,6 +195,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     t.rec("{\"type\":\"user\",\"isMeta\":true,\"message\":{\"role\":\"user\",\"content\":\"<system-reminder>injected {c}</system-reminder>\"},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"assistant\",\"timestamp\":\"{t}\",\"message\":{\"model\":\"model-e2e-1\",\"id\":\"m1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":40,\"cache_read_input_tokens\":300,\"output_tokens\":20,\"service_tier\":\"standard\"},\"content\":[{\"type\":\"thinking\",\"thinking\":\"THINKING-SECRET {c}\"}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"assistant\",\"timestamp\":\"{t}\",\"message\":{\"model\":\"model-e2e-1\",\"id\":\"m1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":40,\"cache_read_input_tokens\":300,\"output_tokens\":20,\"service_tier\":\"standard\"},\"content\":[{\"type\":\"text\",\"text\":\"I will look at {c}\\\\build.zig and C:\\\\Users\\\\{u}\\\\notes.txt\"}]},\"cwd\":\"{c}\"}");
+    const showcase = env.get("PORTAL_E2E_SHOWCASE") != null;
+    if (showcase) t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"The build fails because two steps install the same artifact. The fix is small; this is the step that runs the tests afterwards:\\n\\n```zig\\nconst run = b.addRunArtifact(tests);\\ntest_step.dependOn(&run.step); // one step per artifact, never two installs of the same file\\n```\\n\\nI can apply it in one of three ways.\"}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Edit\",\"input\":{\"file_path\":\"{c}\\\\a.zig\",\"old_string\":\"ARG-SECRET\",\"new_string\":\"y\"}}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"t1\",\"type\":\"tool_result\",\"content\":\"RESULT-SECRET {c}\"}]},\"toolUseResult\":{\"filePath\":\"{c}\\\\a.zig\"},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"Write\",\"input\":{\"file_path\":\"{c}\\\\b.zig\",\"content\":\"ARG-SECRET\"}}]},\"cwd\":\"{c}\"}");
@@ -209,10 +215,13 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     t.rec("this line is not JSON {c}");
 
     // 2. A question.
-    t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"q1\",\"name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Which fix should I apply in {c}?\",\"header\":\"Fix\",\"multiSelect\":false,\"options\":[{\"label\":\"Alpha\",\"description\":\"d\"},{\"label\":\"Beta in C:\\\\Windows\\\\x\",\"description\":\"d\"}]}]}}]},\"cwd\":\"{c}\"}");
+    if (showcase)
+        t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"q1\",\"name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Which fix should I apply in {c}?\",\"header\":\"Fix\",\"multiSelect\":false,\"options\":[{\"label\":\"Merge the two steps\",\"description\":\"d\"},{\"label\":\"Rename the second artifact\",\"description\":\"d\"},{\"label\":\"Explain first\",\"description\":\"d\"}]}]}}]},\"cwd\":\"{c}\"}")
+    else
+        t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"q1\",\"name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Which fix should I apply in {c}?\",\"header\":\"Fix\",\"multiSelect\":false,\"options\":[{\"label\":\"Alpha\",\"description\":\"d\"},{\"label\":\"Beta in C:\\\\Windows\\\\x\",\"description\":\"d\"}]}]}}]},\"cwd\":\"{c}\"}");
     say("\x1b]7501;state=blocked:kind=question:app=fake\x07FAKE-ASKED\r\n");
     var choice: u8 = 0;
-    while (key()) |k| if (k == '1' or k == '2') {
+    while (key()) |k| if (k == '1' or k == '2' or (showcase and k == '3')) {
         choice = k;
         break;
     };
@@ -251,6 +260,17 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m5\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"All done.\"}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"system\",\"subtype\":\"turn_duration\",\"durationMs\":5,\"cwd\":\"{c}\"}");
     say("\x1b]7501;state=idle\x07FAKE-DONE\r\n");
+
+    // 5. On 1: `/clear` as the agent does it: the screen first, then a
+    // new session file (not the --session-id one) with the next prompt.
+    while (key()) |k| if (k == '1') break;
+    say("\x1b[2J\x1b[HFAKE-CLEARING\r\n");
+    io.random(&rnd);
+    var t2 = t;
+    t2.path = std.fmt.allocPrint(gpa, "{s}\\e2e00000-0000-4000-8000-{x}.jsonl", .{ dir, &rnd }) catch return 2;
+    t2.rec("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"AFTER-CLEAR prompt\"},\"cwd\":\"{c}\",\"sessionId\":\"y\"}");
+    t2.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m6\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Fresh start.\"}]},\"cwd\":\"{c}\"}");
+    say("FAKE-CLEARED\r\n");
     while (key()) |_| {}
     return 0;
 }

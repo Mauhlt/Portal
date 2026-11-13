@@ -1,5 +1,7 @@
 # Portal
 
+<p align="center"><img src="docs/brand/portal-hero.jpg" alt="Portal: a neon ring opening onto a split moon and sun, a brain-shaped constellation above and a mountain meadow of neuroscience instruments below" width="480"></p>
+
 Watch a terminal session running on your Windows desktop (typically the
 agent CLI) from a browser or a laptop, and answer its prompts, while you
 are away from home.
@@ -84,7 +86,11 @@ toggle away), read from the agent's transcript on the desktop and
 scrubbed of paths and your user name before it is sent. Portal starts
 the agent with its own `--session-id` per tab (unless your configured
 arguments already use `--session-id`, `--resume` or `--continue`), so each
-tab follows exactly its own transcript. Details: docs/protocol.md
+tab follows exactly its own transcript. After `/clear` or `/resume` in a
+tab, the tab moves to the new transcript only if that tab's terminal
+printed within 2 seconds of it appearing or growing, and no other tab in
+the same folder did; a transcript no tab printed near (an agent
+session outside Portal) is never shown. Details: docs/protocol.md
 section 3b.
 
 ## Security layers

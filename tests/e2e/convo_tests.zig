@@ -175,6 +175,8 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
 
     // Another agent session in the same folder, outside Portal, writes its
     // transcript first; then the tab's program may start writing.
+    var outside_path: []const u8 = "";
+    var outside_line: []const u8 = "";
     {
         var tb0: [1024]u8 = undefined;
         const folder = try gpa.dupe(u8, proj);
@@ -191,6 +193,8 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         }
         const line = try std.fmt.allocPrint(gpa, "{{\"type\":\"user\",\"cwd\":\"{s}\",\"sessionId\":\"0dd51de0-0000-4000-8000-000000000001\",\"message\":{{\"role\":\"user\",\"content\":\"OUTSIDE-SESSION\"}}}}\n", .{esc.items});
         try std.Io.Dir.cwd().writeFile(h.io, .{ .sub_path = opath, .data = line });
+        outside_path = opath;
+        outside_line = try std.fmt.allocPrint(gpa, "{{\"type\":\"user\",\"cwd\":\"{s}\",\"sessionId\":\"0dd51de0-0000-4000-8000-000000000001\",\"message\":{{\"role\":\"user\",\"content\":\"OUTSIDE-LATER\"}}}}\n", .{esc.items});
         const go = try std.fmt.allocPrint(gpa, "{s}\\e2e-go", .{proj});
         try std.Io.Dir.cwd().writeFile(h.io, .{ .sub_path = go, .data = "" });
     }
@@ -202,7 +206,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     try leaks.add(h.transcriptRoot(&tb));
     try leaks.add("agent-projects");
     // Never sent at all, scrubbed or not.
-    const secrets = [_][]const u8{ "THINKING-SECRET", "ARG-SECRET", "RESULT-SECRET", "injected", "not JSON", "system-reminder", ".jsonl", "e2e00000", "OUTSIDE-SESSION", "0dd51de0", "SECRET-CMD", "SUMMARY-SECRET", "bshell00", "bmon0000", "task-notification", "output-file" };
+    const secrets = [_][]const u8{ "THINKING-SECRET", "ARG-SECRET", "RESULT-SECRET", "injected", "not JSON", "system-reminder", ".jsonl", "e2e00000", "OUTSIDE-SESSION", "OUTSIDE-LATER", "0dd51de0", "SECRET-CMD", "SUMMARY-SECRET", "bshell00", "bmon0000", "task-notification", "output-file" };
 
     const creds = try client.pair(inst, "convo");
     const v = try client.Viewer.open(inst, creds.sessionCookie());
@@ -341,6 +345,52 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         defer c2.deinit();
         _ = r.check("switching back sends the whole conversation again", c2.on and c2.has(.assistant, "All done.") and c2.has(.user, prompt), "{s}", .{c2.dump(&cdump)});
     } else _ = r.check("the second tab is listed", false, "{?s}", .{v.lastText("\"t\":\"tabs\"")});
+
+    // The outside session writes again while the tab is quiet: not the
+    // tab's (its program printed nothing within follow.adopt_window_ms,
+    // 2 s, before or after).
+    {
+        const Never = struct {
+            fn f(_: void, _: *client.Viewer) bool {
+                return false;
+            }
+        };
+        _ = v.pumpUntil(2500, {}, Never.f);
+        var of = try std.Io.Dir.cwd().createFile(h.io, outside_path, .{ .truncate = false });
+        const end = of.length(h.io) catch 0;
+        of.writePositionalAll(h.io, outside_line, end) catch {};
+        of.close(h.io);
+        const Moved = struct {
+            fn f(wt: Want, vv: *client.Viewer) bool {
+                var c = Conv.build(wt.gpa, vv, wt.id) catch return false;
+                defer c.deinit();
+                return !c.has(.assistant, "All done.");
+            }
+        };
+        // Past its window too, so the next output cannot claim it.
+        const moved = v.pumpUntil(2500, Want{ .gpa = gpa, .id = id, .kind = .assistant, .text = "" }, Moved.f);
+        var c = try Conv.build(gpa, v, id);
+        defer c.deinit();
+        _ = r.check("an outside session writing while the tab is quiet is not followed", !moved and c.has(.assistant, "All done."), "{s}", .{c.dump(&cdump)});
+    }
+
+    // /clear in the tab: it prints, then writes a new session file; the
+    // view follows it and starts over.
+    v.send("k:1");
+    _ = r.check("the fake program clears (prints, then a new transcript)", v.waitFor("FAKE-CLEARED", 8000), "{s}", .{v.dump(&dump)});
+    {
+        const fresh = waitItem(v, .{ .gpa = gpa, .id = id, .kind = .assistant, .text = "Fresh start." }, 8000);
+        var c = try Conv.build(gpa, v, id);
+        defer c.deinit();
+        _ = r.check("after /clear the tab follows its new transcript, from the start", fresh and c.has(.user, "AFTER-CLEAR prompt") and !c.has(.assistant, "All done."), "{s}", .{c.dump(&cdump)});
+    }
+    {
+        // The new transcript: finished tasks dropped, usage starts over.
+        const reset = waitActivity(v, .{ .id = id, .shells = 0, .monitors = 0, .tasks = 0 }, 8000);
+        var a: act_wire.Activity = undefined;
+        const t = lastActivity(v, id, &a);
+        _ = r.check("after /clear: finished tasks are gone and usage starts over", reset and t != null and t.?.usage.input < 11, "{?s}", .{v.lastText("\"t\":\"activity\"")});
+    }
 
     // Nothing Portal sent as text carries a path, a name or a secret.
     {

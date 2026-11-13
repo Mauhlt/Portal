@@ -76,6 +76,104 @@ top bar.
   its Send types the text and presses Enter (inputline with `policy =
   text`); the answer buttons press their keys.
 
+## Devices: the Conversation view, minimal by default
+
+**Owner decisions (2026-11-12):** paired devices (`portal connect`, the
+iPhone app) open on the **Conversation view** (ui/convoview.zig), not the
+terminal; the top bar's Terminal | Conversation toggle switches. The desk
+keeps the terminal. In the Conversation view the window is minimal:
+
+```
+┌────────────────────────────────────────────┐
+│ tabs ...               [Terminal][Convers.]│
+├────────────────────────────────────────────┤
+│                       ┌──────────────────┐ │  the owner's prompt: bubble
+│                       │ fix the tests    │ │
+│                       └──────────────────┘ │
+│ Assistant text, word-wrapped, full width   │
+│ ┌────────────────────────────────────────┐ │  ``` code: monospaced, panel
+│ │ zig build test                         │ │  colour, clipped not wrapped
+│ └────────────────────────────────────────┘ │
+│ ▸ Edited 2 files                           │  tool one-liners: small, dim
+│ ┏ Question · swipe left for Yes, right … ━┓ │  two options: a swipe card
+│ ┃ Run npm test?                           ┃ │
+│ ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ │
+│             [↓ New messages]               │  only when scrolled up
+├────────────────────────────────────────────┤
+│ ③ Data · nothing yet                       │
+├────────────────────────────────────────────┤
+│ ② [🎤 Instruct]                            │  only Instruct
+├────────────────────────────────────────────┤
+│ status line                                │
+└────────────────────────────────────────────┘
+```
+
+* **Questions carry their own controls.** A question with exactly **two
+  options** is a **swipe card** and has no buttons at all. A Yes/No one
+  (options reading yes / no; a permission prompt is Yes = `1`, No = `esc`)
+  answers by default **left = Yes, right = No** (the
+  owner is left-handed; one device setting, `swipe = left-yes | right-yes`
+  in the device's settings.txt next to its pinned servers, e.g.
+  `%APPDATA%\Portal\settings.txt`), with touch or a mouse drag; the Left /
+  Right arrows follow the same mapping. Any other pair is a choice: the
+  first option on the Yes side, the second on the other, the card's header
+  says which ("swipe left: Postgres · right: SQLite"), and it tints towards
+  the neutral `swipe_choice` blue on both sides. Pressed, the card is grabbed: it
+  grows slightly (about 4.5 %, eased in over 120 ms) with a short decaying
+  shake (three swings of 2 degrees over 180 ms) and a light haptic on the
+  iPhone (`View.haptic`), and stays enlarged while held. Dragged, it
+  follows the pointer with a slight tilt, its colour moving from the held
+  yellow towards green on the Yes side and red on the No side, full at the
+  threshold (theme roles `swipe_hold` / `swipe_yes` / `swipe_no`; colour
+  only: no text stamp, no transparency). Released past the threshold it
+  flies off (from its enlarged size) and the answer key goes out through
+  the answer path (`k:<key>`); earlier it springs back to its place and
+  size. Questions with **more than two options** show them as large
+  numbered buttons (the answer bar's hit-target height); a multi-choice
+  shows its options plus Done (Enter). Answered cards keep their text;
+  their controls go. A question without options says to answer it in the
+  Terminal view.
+* **Swipe safety** (accidental approvals): only the newest open question;
+  only past 40 % of the card width and at least 96 logical px; only when the
+  horizontal movement dominates (twice the vertical; anything else scrolls
+  the list); not within 600 ms of the card really reaching the screen
+  (measured from the frame that showed it to the press, no timers; the
+  grab feedback is not guarded, answering is); a tap that became a
+  drag never presses a button (view buttons fire on release).
+* **No answer keys at all** in the Conversation view (owner decision): no
+  answer bar, no Keys button, no fallback Yes / No buttons. Esc
+  (interrupt) and Enter live in the Terminal view, the power mode. The
+  bottom holds only **Instruct**. The **instruction line is hidden**;
+  **Instruct** opens it with
+  the keyboard (the touch keyboard on a tablet) and calls
+  `Shell.startDictation`'s hook, where speech-to-text plugs in (iPhone: the
+  native text field, Apple dictation one tap away; laptops: "speech coming
+  soon" until Portal's mic → stt pipeline exists). Esc or a sent line
+  closes it again. Without `instruct` mode the bottom is empty.
+* **Dictation toggles** (owner decision): press to start, press again to
+  stop; the text lands in the instruction line for review, the user sends.
+  `Shell.toggleDictation` (the input action `toggle_dictation`) calls the
+  device's `Dictation.start` / `.stop` hook; while it runs the bottom row
+  shows a red "● Listening…" (its button stops). On Windows devices Space
+  toggles it only when no text field has the keyboard (in the line, Space
+  types a space); a headset's play / pause button (`media_play_pause`)
+  toggles it only when `Shell.headsetMicPresent()` says a headset with a
+  microphone is attached: a predicate hook for the audio work (../Audio,
+  IMMDevice form factor), false until then. (The Renderer's Win32 window
+  does not deliver WM_APPCOMMAND yet: the glue has nothing to map.)
+* While the Conversation view is shown the keyboard does not reach the
+  terminal (no stray answers): PageUp / PageDown / Home / End scroll, the
+  arrows answer the swipe card.
+* The **Terminal view** keeps the full interaction slice (answer bar, and
+  the instruction line in `instruct` mode).
+* Scrolling: wheel, vertical drag, PageUp / PageDown / Home / End. At the
+  bottom the list follows new items; scrolled up it stays anchored on the
+  item at the top and a pill offers the newest. A tab without a transcript
+  shows "No conversation log for this tab — use Terminal".
+* Event-driven: frames on conversation changes, input and resizes only; the
+  grab feedback (≤ 180 ms) and a fly-off / spring-back (≤ 180 ms) set frame
+  deadlines while they run.
+
 ## Terminal scaling (viewers)
 
 The remote grid's size is the desk's. A viewer picks its cell size from the

@@ -272,11 +272,28 @@ pub const action_em: f32 = 16;
 pub const chrome_em: f32 = 13;
 
 /// A pluggable main-slice view (e.g. the conversation): draws itself into
-/// `r` with the painter's primitives. Its buttons report through the sink.
+/// `r` with the painter's primitives. Its buttons report through the sink
+/// (Painter.tapAnswer / tapButton: on release, unless the press became a
+/// drag). Presses over the main slice reach it as drags (InputSink.drag),
+/// the wheel as InputSink.scroll; the shell hands both to it.
 pub const ContentView = struct {
-    ctx: *const anyopaque,
-    draw: *const fn (ctx: *const anyopaque, p: *Painter, r: Rect) void,
+    ctx: *anyopaque,
+    draw: *const fn (ctx: *anyopaque, p: *Painter, r: Rect) void,
+    /// Scroll by `dy` pixels (> 0: towards the top, older content).
+    scroll: ?*const fn (ctx: *anyopaque, dy: f32) void = null,
+    /// A press, move or release over the view (scrolling, swiping). It may
+    /// return an answer key, which the shell sends like an answer button.
+    drag: ?*const fn (ctx: *anyopaque, d: input.Drag) ?[]const u8 = null,
+    /// A key while the view has the keyboard (or a navigation key while
+    /// the input line has it).
+    key: ?*const fn (ctx: *anyopaque, k: input.Key, m: input.Mods) ViewInput = null,
+    /// One of the view's own button ids (Painter.tapButton); true: its own.
+    button: ?*const fn (ctx: *anyopaque, id: u32) bool = null,
 };
+
+/// What a content view made of a key: nothing, something of its own, or
+/// an answer to send (an answer key, through the answer path).
+pub const ViewInput = union(enum) { ignored, consumed, answer: []const u8 };
 
 pub const Overlay = struct {
     /// What the main slice shows: the grid (if it has cells), a centred
@@ -311,7 +328,28 @@ pub const Sizing = union(enum) {
     fixed_em: f32,
 };
 
-const Hit = struct { x: f32, y: f32, w: f32, h: f32, action: union(enum) { answer: []const u8, button: u32 } };
+const Hit = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    action: union(enum) { answer: []const u8, button: u32 },
+    /// A content view's button: fires on release when the press did not
+    /// turn into a drag (scrolling over a card never presses its buttons).
+    tap: bool = false,
+};
+
+/// A press in a content view: a tap on one of its buttons, or a drag that
+/// scrolls it.
+const Press = struct {
+    active: bool = false,
+    x0: f32 = 0,
+    y0: f32 = 0,
+    moved: bool = false,
+    /// What the press began on (answer keys copied: the view's strings may
+    /// change before the release).
+    action: union(enum) { none, answer: struct { buf: [16]u8 = undefined, len: u8 = 0 }, button: u32 } = .none,
+};
 
 fn toneColor(t: Tone) Rgb {
     return switch (t) {
@@ -387,6 +425,12 @@ pub const Frame = struct {
     /// Set during build.
     fonts: *const fontset.FontSet = undefined,
     scale: f32 = 1,
+    /// The last frame's main slice showed a content view (Overlay.screen
+    /// = .view): presses there tap or drag, the wheel scrolls it.
+    view_shown: bool = false,
+    /// Pixels one wheel notch scrolls (three lines of the chrome font).
+    wheel_px: f32 = 48,
+    press: Press = .{},
 
     pub fn init(gpa: std.mem.Allocator, sizing: Sizing) Frame {
         return .{ .gpa = gpa, .sizing = sizing };
@@ -416,30 +460,81 @@ pub const Frame = struct {
         f.scroll_back = @intCast(std.math.clamp(now + rows, 0, std.math.maxInt(u16)));
     }
 
-    pub fn pointerDown(f: *const Frame, x: f32, y: f32, button: input.MouseButton, mods: input.Mods, sink: input.InputSink) void {
-        if (button == .left) if (f.hitAt(x, y)) |h| {
-            switch (h) {
+    /// In a content view: a press, then a pointer move past this many
+    /// logical pixels, is a drag (scroll), not a tap.
+    pub const drag_slop: f32 = 8;
+
+    pub fn pointerDown(f: *Frame, x: f32, y: f32, button: input.MouseButton, mods: input.Mods, sink: input.InputSink) void {
+        f.press = .{};
+        const hit = if (button == .left) f.hitFull(x, y) else null;
+        if (hit) |h| if (!h.tap) {
+            switch (h.action) {
                 .answer => |a| sink.answer(a),
                 .button => |id| sink.button(id),
             }
             return;
         };
+        if (button == .left and f.view_shown and f.regions.terminal.contains(x, y)) {
+            f.press = .{ .active = true, .x0 = x, .y0 = y };
+            sink.drag(.{ .phase = .down, .x = x, .y = y, .scale = f.scale });
+            if (hit) |h| switch (h.action) {
+                .answer => |a| if (a.len <= 16) {
+                    f.press.action = .{ .answer = .{ .len = @intCast(a.len) } };
+                    @memcpy(f.press.action.answer.buf[0..a.len], a);
+                },
+                .button => |id| f.press.action = .{ .button = id },
+            };
+            return;
+        }
         sink.mouse(f.mouseAt(.down, button, x, y, mods));
     }
 
-    pub fn pointerMove(f: *const Frame, x: f32, y: f32, sink: input.InputSink) void {
+    pub fn pointerMove(f: *Frame, x: f32, y: f32, sink: input.InputSink) void {
+        if (f.press.active) {
+            if (!f.press.moved and @max(@abs(x - f.press.x0), @abs(y - f.press.y0)) > drag_slop * f.scale) f.press.moved = true;
+            sink.drag(.{ .phase = .move, .x = x, .y = y, .scale = f.scale });
+            return;
+        }
         sink.mouse(f.mouseAt(.move, .left, x, y, .{}));
     }
 
-    pub fn pointerUp(f: *const Frame, x: f32, y: f32, button: input.MouseButton, sink: input.InputSink) void {
+    pub fn pointerUp(f: *Frame, x: f32, y: f32, button: input.MouseButton, sink: input.InputSink) void {
+        if (f.press.active) {
+            const pr = f.press;
+            f.press = .{};
+            sink.drag(.{ .phase = .up, .x = x, .y = y, .scale = f.scale });
+            if (pr.moved) return;
+            // A tap: what it began on, if the release is still on it.
+            const h = f.hitFull(x, y) orelse return;
+            if (!h.tap) return;
+            switch (pr.action) {
+                .none => {},
+                .answer => |a| if (h.action == .answer and std.mem.eql(u8, h.action.answer, a.buf[0..a.len])) sink.answer(a.buf[0..a.len]),
+                .button => |id| if (h.action == .button and h.action.button == id) sink.button(id),
+            }
+            return;
+        }
         sink.mouse(f.mouseAt(.up, button, x, y, .{}));
     }
 
-    fn hitAt(f: *const Frame, x: f32, y: f32) ?@FieldType(Hit, "action") {
+    /// A wheel turn of `notches` (> 0: away from the user) at (x, y): scrolls
+    /// a content view under the pointer. False if nothing scrolled.
+    pub fn wheel(f: *Frame, x: f32, y: f32, notches: f32, sink: input.InputSink) bool {
+        if (!f.view_shown or notches == 0 or !f.regions.terminal.contains(x, y)) return false;
+        sink.scroll(notches * f.wheel_px);
+        return true;
+    }
+
+    fn hitFull(f: *const Frame, x: f32, y: f32) ?Hit {
         for (f.hits[0..f.n_hits]) |b| {
-            if (x >= b.x and x < b.x + b.w and y >= b.y and y < b.y + b.h) return b.action;
+            if (x >= b.x and x < b.x + b.w and y >= b.y and y < b.y + b.h) return b;
         }
         return null;
+    }
+
+    fn hitAt(f: *const Frame, x: f32, y: f32) ?@FieldType(Hit, "action") {
+        const h = f.hitFull(x, y) orelse return null;
+        return h.action;
     }
 
     /// Tells the sink if the cells that fit the window changed since the
@@ -542,6 +637,8 @@ pub const Frame = struct {
         f.cells.cols = 0;
         f.cells.rows = 0;
         f.cells.first_row = 0;
+        f.view_shown = overlay.screen == .view and overlay.panel == null;
+        f.wheel_px = @round(@as(f32, @floatFromInt(ui.cell_h)) * 1.35) * 3;
         switch (overlay.screen) {
             .grid => {
                 const m = f.cellMetrics(grid, W, grid_h, s);
@@ -570,9 +667,19 @@ pub const Frame = struct {
     fn shift(f: *Frame, dx: f32, dy: f32) void {
         if (dx == 0 and dy == 0) return;
         for (f.list.cmds.items) |*c| switch (c.*) {
-            inline .rect, .glyph, .text => |*v| {
+            inline .rect, .glyph => |*v| {
                 v.x += dx;
                 v.y += dy;
+            },
+            .text => |*v| {
+                v.x += dx;
+                v.y += dy;
+                if (v.clip) |*cl| {
+                    cl[0] += dx;
+                    cl[1] += dy;
+                    cl[2] += dx;
+                    cl[3] += dy;
+                }
             },
             .image => |*v| {
                 v.x += dx;
@@ -1287,6 +1394,58 @@ pub const Painter = struct {
     act: Metrics,
     /// Device pixels per logical pixel.
     s: f32,
+    /// What `fill`, `run` and the tap targets are clipped to (x0, y0, x1,
+    /// y1; null: nothing).
+    clip: ?[4]f32 = null,
+
+    /// Font metrics for `em` logical pixels, zoomed with Ctrl+= / - like
+    /// the terminal.
+    pub fn metrics(p: *Painter, em: f32) Metrics {
+        return p.f.fonts.metrics(p.f.zoomed(@round(em * p.s * 2) / 2));
+    }
+    fn clipRect(p: *const Painter, x: f32, y: f32, w: f32, h: f32) ?Rect {
+        const c = p.clip orelse return .{ .x = x, .y = y, .w = w, .h = h };
+        const x0 = @max(x, c[0]);
+        const y0 = @max(y, c[1]);
+        const x1 = @min(x + w, c[2]);
+        const y1 = @min(y + h, c[3]);
+        if (!(x1 > x0 and y1 > y0)) return null;
+        return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+    }
+    /// A filled rectangle, clipped.
+    pub fn fill(p: *Painter, x: f32, y: f32, w: f32, h: f32, c: Rgb) void {
+        const r = p.clipRect(x, y, w, h) orelse return;
+        p.f.rect(r.x, r.y, r.w, r.h, c);
+    }
+    /// A rectangle outline `t` thick, clipped.
+    pub fn frameRect(p: *Painter, x: f32, y: f32, w: f32, h: f32, t: f32, c: Rgb) void {
+        p.fill(x, y, w, t, c);
+        p.fill(x, y + h - t, w, t, c);
+        p.fill(x, y, t, h, c);
+        p.fill(x + w - t, y, t, h, c);
+    }
+    /// Text in any colour and style, clipped (also at `x1` across, when
+    /// given). Returns where it ends.
+    pub fn run(p: *Painter, m: Metrics, x: f32, y: f32, s: []const u8, c: Rgb, bold: bool, italic: bool, x1: ?f32) f32 {
+        var cl: [4]f32 = p.clip orelse .{ -1e9, -1e9, 1e9, 1e9 };
+        if (x1) |e| cl[2] = @min(cl[2], e);
+        const lh: f32 = @floatFromInt(m.cell_h);
+        const end = x + textWidth(m, s);
+        if (s.len == 0 or y >= cl[3] or y + lh <= cl[1] or x >= cl[2] or end <= cl[0]) return end;
+        const inside = y >= cl[1] and y + lh <= cl[3] and x >= cl[0] and end <= cl[2];
+        p.f.list.pushTextStyled(p.f.gpa, x, y, s, p.f.font(m), .{ .bold = bold, .italic = italic }, draw.rgba(c, 255), if (inside) null else cl);
+        return end;
+    }
+    /// A tap target that answers `key` (InputSink.answer), clipped.
+    pub fn tapAnswer(p: *Painter, x: f32, y: f32, w: f32, h: f32, key: []const u8) void {
+        const r = p.clipRect(x, y, w, h) orelse return;
+        p.f.addHit(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h, .action = .{ .answer = key }, .tap = true });
+    }
+    /// A tap target that reports `id` (InputSink.button), clipped.
+    pub fn tapButton(p: *Painter, x: f32, y: f32, w: f32, h: f32, id: u32) void {
+        const r = p.clipRect(x, y, w, h) orelse return;
+        p.f.addHit(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h, .action = .{ .button = id }, .tap = true });
+    }
 
     pub fn rect(p: *Painter, r: Rect, c: Rgb) void {
         p.f.rect(r.x, r.y, r.w, r.h, c);
@@ -1328,6 +1487,12 @@ fn fitCount(f: f32) u16 {
     if (!(f >= 1)) return 1; // also NaN
     if (f >= 1000) return 1000;
     return @intFromFloat(@floor(f));
+}
+
+/// The answer bar's button height at its natural pane height (paneHeight
+/// of `.answers`, drawAnswerBar): the hit target size content views match.
+pub fn answerButtonHeight(act: Metrics) f32 {
+    return @round(@round(@as(f32, @floatFromInt(act.cell_h)) * 2.6) * 0.78);
 }
 
 /// The Data slice's header strip.
@@ -1585,6 +1750,87 @@ test "touch: tabs at least 40 logical px tall" {
     const m: Metrics = .{ .em = 13, .cell_w = 8, .cell_h = 16, .baseline = 12, .underline_y = 14, .stroke = 1 };
     for ([_]f32{ 1, 1.5, 2 }) |s| try std.testing.expect(@round(topBarHeight(m, true, s) * 0.8) >= touch_target * s);
     try std.testing.expectEqual(@round(16 * 1.8), topBarHeight(m, false, 1));
+}
+
+const TapRec = struct {
+    answers: [4][16]u8 = undefined,
+    answer_lens: [4]usize = undefined,
+    n_answers: usize = 0,
+    buttons: usize = 0,
+    scrolled: f32 = 0,
+    drags: [3]usize = .{ 0, 0, 0 },
+    last_drag: input.Drag = .{ .phase = .up, .x = 0, .y = 0 },
+    mice: usize = 0,
+    fn of(p: *anyopaque) *TapRec {
+        return @ptrCast(@alignCast(p));
+    }
+    fn key(_: *anyopaque, _: input.Key, _: input.Mods) void {}
+    fn char(_: *anyopaque, _: u21, _: input.Mods) void {}
+    fn answer(p: *anyopaque, k: []const u8) void {
+        const r = of(p);
+        @memcpy(r.answers[r.n_answers][0..k.len], k);
+        r.answer_lens[r.n_answers] = k.len;
+        r.n_answers += 1;
+    }
+    fn button(p: *anyopaque, _: u32) void {
+        of(p).buttons += 1;
+    }
+    fn resized(_: *anyopaque, _: u32, _: u32, _: u16, _: u16) void {}
+    fn mouse(p: *anyopaque, _: input.Mouse) void {
+        of(p).mice += 1;
+    }
+    fn scroll(p: *anyopaque, dy: f32) void {
+        of(p).scrolled += dy;
+    }
+    fn drag(p: *anyopaque, d: input.Drag) void {
+        of(p).drags[@intFromEnum(d.phase)] += 1;
+        of(p).last_drag = d;
+    }
+    const vt: input.InputSink.VTable = .{ .key = key, .char = char, .answer = answer, .button = button, .resized = resized, .mouse = mouse, .scroll = scroll, .drag = drag };
+};
+
+test "content view: a tap on its button answers on release, a drag goes to the view instead, the wheel scrolls" {
+    var f = Frame.init(std.testing.allocator, .fit_grid);
+    defer f.deinit();
+    var r: TapRec = .{};
+    const sink: input.InputSink = .{ .ctx = &r, .vtable = &TapRec.vt };
+    f.view_shown = true;
+    f.regions.terminal = .{ .x = 0, .y = 0, .w = 400, .h = 300 };
+    f.addHit(.{ .x = 10, .y = 10, .w = 100, .h = 40, .action = .{ .answer = "2" }, .tap = true });
+    // Tap: nothing on the press, the answer on the release.
+    f.pointerDown(20, 20, .left, .{}, sink);
+    try std.testing.expectEqual(@as(usize, 0), r.n_answers);
+    f.pointerMove(22, 23, sink);
+    f.pointerUp(22, 23, .left, sink);
+    try std.testing.expectEqual(@as(usize, 1), r.n_answers);
+    try std.testing.expectEqualStrings("2", r.answers[0][0..r.answer_lens[0]]);
+    try std.testing.expectEqual([3]usize{ 1, 1, 1 }, r.drags);
+    // A drag starting on the button (down, or sideways): the view gets it,
+    // the button never answers.
+    f.pointerDown(20, 20, .left, .{}, sink);
+    f.pointerMove(20, 60, sink);
+    f.pointerMove(20, 100, sink);
+    f.pointerUp(20, 20, .left, sink);
+    f.pointerDown(20, 20, .left, .{}, sink);
+    f.pointerMove(90, 22, sink);
+    try std.testing.expectEqual(@as(f32, 90), r.last_drag.x);
+    f.pointerUp(20, 20, .left, sink);
+    try std.testing.expectEqual(@as(usize, 1), r.n_answers);
+    try std.testing.expectEqual([3]usize{ 3, 4, 3 }, r.drags);
+    // Released elsewhere: nothing.
+    f.pointerDown(20, 20, .left, .{}, sink);
+    f.pointerUp(300, 20, .left, sink);
+    try std.testing.expectEqual(@as(usize, 1), r.n_answers);
+    try std.testing.expectEqual(@as(usize, 0), r.mice);
+    // The wheel over the view scrolls; outside, or without a view, not.
+    try std.testing.expect(f.wheel(50, 50, 1, sink));
+    try std.testing.expectEqual(@as(f32, 48), r.scrolled);
+    try std.testing.expect(!f.wheel(50, 350, 1, sink));
+    f.view_shown = false;
+    try std.testing.expect(!f.wheel(50, 50, 1, sink));
+    // Not a view: plain mouse input for the grid.
+    f.pointerDown(300, 200, .left, .{}, sink);
+    try std.testing.expectEqual(@as(usize, 1), r.mice);
 }
 
 test "hit-testing maps clicks to what the last frame drew" {
