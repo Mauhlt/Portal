@@ -741,7 +741,9 @@ pub const Hub = struct {
             return;
         };
         defer t.release();
-        t.session.setHookState(e);
+        // Desktop log only: the tab's name (shown on the desk anyway),
+        // the event and the new state; never the key or anything else.
+        if (t.session.setHookState(e)) h.log.print("hooks: tab '{s}': {t} -> {t}", .{ t.name(), m.event, stateOf(e.state) });
     }
 
     pub fn setDeskActive(h: *Hub, t: *Tab) void {

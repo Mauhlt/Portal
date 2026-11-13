@@ -133,15 +133,16 @@ pub const Session = struct {
     /// An agent hook reported the program's state (tabs.Hub.applyHook,
     /// hookmsg.effect). The same paths as OSC 7501: the tab list's
     /// generation, the Conversation view's question, every viewer and the
-    /// window woken.
-    pub fn setHookState(s: *Session, e: hookmsg.Effect) void {
+    /// window woken. True if the state changed.
+    pub fn setHookState(s: *Session, e: hookmsg.Effect) bool {
         s.mutex.lockUncancelable(s.io);
         s.hook_state = true;
         if (e.cat) |cat| if (s.convo) |c| c.permissionHint(cat);
-        _ = s.setStateLocked(e.state, e.wait);
+        const changed = s.setStateLocked(e.state, e.wait);
         s.mutex.unlock(s.io);
         s.cond.broadcast(s.io);
         s.notify();
+        return changed;
     }
 
     /// Caller holds `mutex`. The transcript shows the program went on
@@ -666,14 +667,14 @@ test "hook states: same generation and convo paths as OSC 7501; OSC wins only wh
         .convo = &c,
     };
     defer s.term.deinit();
-    s.setHookState(.{ .state = .working, .wait = .none });
+    _ = s.setHookState(.{ .state = .working, .wait = .none });
     try std.testing.expectEqual(vt.ProgramState.working, s.state);
     try std.testing.expectEqual(@as(u64, 2), gen);
     // Output without OSC 7501 leaves the hook's state alone.
     s.appendOutput("hello");
     try std.testing.expectEqual(vt.ProgramState.working, s.state);
     // PermissionRequest: waiting, the permission card, Up/Down allowed.
-    s.setHookState(.{ .state = .waiting, .wait = .permission, .cat = .edit });
+    _ = s.setHookState(.{ .state = .waiting, .wait = .permission, .cat = .edit });
     try std.testing.expectEqual(@as(u64, 3), gen);
     try std.testing.expect(c.hasOpenQuestion());
     try std.testing.expectEqualStrings("Claude wants to edit a file. Allow it?", c.last().?.text);
@@ -686,7 +687,7 @@ test "hook states: same generation and convo paths as OSC 7501; OSC wins only wh
     try std.testing.expect(!c.hasOpenQuestion());
     try std.testing.expectError(error.NotWaiting, s.writeWebKey("up", 0));
     // Stop, then an OSC 7501 report takes over.
-    s.setHookState(.{ .state = .done, .wait = .none });
+    _ = s.setHookState(.{ .state = .done, .wait = .none });
     try std.testing.expectEqual(vt.ProgramState.done, s.state);
     s.appendOutput("\x1b]7501;state=working\x07");
     try std.testing.expectEqual(vt.ProgramState.working, s.state);
@@ -695,7 +696,7 @@ test "hook states: same generation and convo paths as OSC 7501; OSC wins only wh
     try std.testing.expect(!s.transcriptMovedOnLocked(false, true)); // not a hook state
     mu.unlock(std.testing.io);
     // A hook after it wins again; an interrupt in the transcript is idle.
-    s.setHookState(.{ .state = .waiting, .wait = .permission });
+    _ = s.setHookState(.{ .state = .waiting, .wait = .permission });
     mu.lockUncancelable(std.testing.io);
     try std.testing.expect(s.transcriptMovedOnLocked(false, true));
     mu.unlock(std.testing.io);
