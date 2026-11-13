@@ -8,6 +8,8 @@
 //!   * a question with its options as answer keys, answered with `k:<key>`
 //!     (no new input power), then closed;
 //!   * a permission prompt (OSC 7501) as Yes/No, answered with `k:1`;
+//!   * the program reads exactly the answers sent: nothing before them,
+//!     nothing from viewers reconnecting or restarting (its e2e-input log);
 //!   * Portal starts the agent (here the fake, run as claude.exe) with
 //!     its own `--session-id`, and follows exactly that transcript: another
 //!     session's transcript in the same folder is not picked up;
@@ -20,6 +22,7 @@ const w = @import("win.zig");
 const proc = @import("proc.zig");
 const client = @import("client.zig");
 const Runner = @import("runner.zig").Runner;
+const console_tests = @import("console_tests.zig");
 const privacy = @import("privacy.zig");
 const shared = @import("shared");
 const tabs_wire = shared.tabs;
@@ -152,6 +155,18 @@ fn waitItem(v: *client.Viewer, want: Want, ms: u32) bool {
     }.f);
 }
 
+/// Whether the fake program in `folder` has read exactly `want` (its
+/// e2e-input log), after `settle_ms` for anything late to arrive.
+fn inputIs(h: *proc.Harness, folder: []const u8, want: []const u8, settle_ms: u32) bool {
+    h.io.sleep(.fromMilliseconds(settle_ms), .awake) catch {};
+    var buf: [256]u8 = undefined;
+    const path = std.fs.path.join(h.gpa, &.{ folder, "e2e-input" }) catch return false;
+    defer h.gpa.free(path);
+    const got = std.Io.Dir.cwd().readFile(h.io, path, &buf) catch |err| return err == error.FileNotFound and want.len == 0;
+    if (!std.mem.eql(u8, got, want)) std.debug.print("    program input: {x} (want {x})\n", .{ got, want });
+    return std.mem.eql(u8, got, want);
+}
+
 fn selfExe(gpa: std.mem.Allocator) ![]u8 {
     var buf: [1024]u16 = undefined;
     const n = w.GetModuleFileNameW(null, &buf, buf.len);
@@ -274,6 +289,9 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     // The system monitor is off: y:on is ignored (and logged at the desk).
     v.send("y:on");
 
+    // Nothing reaches the program but the answers sent (it logs every
+    // byte it reads; a stray key would also show as FAKE-STRAY).
+    _ = r.check("no input reaches the program before an answer is sent", inputIs(h, proj, "", 1000), "{s}", .{v.dump(&dump)});
     // Answering uses the ordinary answer keys.
     v.send("k:2");
     _ = r.check("k:2 answers the question (the program got 2)", v.waitFor("FAKE-GOT-2", 8000), "{s}", .{v.dump(&dump)});
@@ -294,6 +312,19 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         defer c.deinit();
         const p = c.find(.question, perm);
         _ = r.check("a permission prompt becomes a question: Yes = 1, No = esc", got_perm and p != null and std.mem.eql(u8, p.?.options, "Yes=1;No=esc"), "{s}", .{c.dump(&cdump)});
+    }
+    // Viewers coming and going (a device reconnecting, a client
+    // restarting: a fresh hello, the tab chosen again) send nothing.
+    {
+        const sub = tabs_wire.subscribeFrame(id);
+        for (0..3) |_| {
+            const v2 = try client.Viewer.open(inst, creds.sessionCookie());
+            v2.send(&sub);
+            v2.pump(300);
+            v2.deinit();
+        }
+        v.send(&sub);
+        _ = r.check("reconnects and restarts send no input (only the question's answer so far)", inputIs(h, proj, "2", 1500) and !v.waitFor("FAKE-ALLOWED", 1), "{s}", .{v.dump(&dump)});
     }
     v.send("k:1");
     _ = r.check("k:1 allows it (the program got 1)", v.waitFor("FAKE-ALLOWED", 8000), "{s}", .{v.dump(&dump)});
@@ -375,8 +406,12 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     }
 
     // /clear in the tab: it prints, then writes a new session file; the
-    // view follows it and starts over.
-    v.send("k:1");
+    // view follows it and starts over. The `1` is typed at the desk's own
+    // console this time: what reached the program in a visual run as an
+    // "unexplained" answer (that console had the keyboard focus, and the
+    // owner's Numpad-1 presses meant for another window went to it; Portal
+    // types its console's keys into the tab, by design).
+    _ = r.check("a key typed at the desk's console reaches the tab's program (the stray 1, reproduced)", console_tests.inject(gpa, w.GetProcessId(inst.process.?), 0, 0, "1"), "", .{});
     _ = r.check("the fake program clears (prints, then a new transcript)", v.waitFor("FAKE-CLEARED", 8000), "{s}", .{v.dump(&dump)});
     {
         const fresh = waitItem(v, .{ .gpa = gpa, .id = id, .kind = .assistant, .text = "Fresh start." }, 8000);
@@ -412,5 +447,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         }
         _ = r.check("no convo or activity message carries a path, the user name, a command, tool arguments, results, task ids or thinking", dirty == null, "{?s} in {s}", .{ dirty, where[0..@min(where.len, 600)] });
     }
+    _ = r.check("the program got exactly the answers sent (2, 1, 1: the last from the console), nothing stray", inputIs(h, proj, "211", 500) and !v.waitFor("FAKE-STRAY", 1), "{s}", .{v.dump(&dump)});
+    _ = r.check("the quiet tab's program got no input at all", inputIs(h, quiet, "", 1), "", .{});
     _ = r.ok("portal still running", inst.alive() and client.alive(inst));
 }

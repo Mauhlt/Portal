@@ -122,7 +122,13 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Presenter {
         .renderer = renderer,
         .fonts = fonts,
         .atlas = atlas,
-        .frame = .init(gpa, options.sizing),
+        .frame = touch_frame: {
+            var f: ui.frame.Frame = .init(gpa, options.sizing);
+            // iOS: one finger is the pointer; presses act on release and
+            // drags scroll (Frame.touch).
+            f.touch = builtin.os.tag == .ios;
+            break :touch_frame f;
+        },
         .img = .init(gpa),
     };
     window.setLiveCallback(self, liveThunk);
@@ -185,7 +191,7 @@ fn liveThunk(ctx: *anyopaque) void {
 fn liveEvent(p: *Presenter, e: Window.Event) void {
     switch (e) {
         .resize, .scale, .expose, .zoom, .scroll, .insets, .background, .foreground => p.handleViewEvent(e),
-        .close, .key, .char, .mouse_down, .mouse_move, .mouse_up, .text_input => p.deferred.push(e),
+        .close, .key, .char, .mouse_down, .mouse_move, .mouse_up, .text_input, .media => p.deferred.push(e),
     }
 }
 
@@ -290,7 +296,12 @@ pub fn pollEvents(p: *Presenter, sink: input.InputSink) bool {
             },
             .mouse_down => |m| p.frame.pointerDown(m.x, m.y, button(m.button), mods(m.mods), sink),
             .mouse_move => |m| p.frame.pointerMove(m.x, m.y, sink),
-            .mouse_up => |m| p.frame.pointerUp(m.x, m.y, button(m.button), sink),
+            // Cancelled (iOS: the system took the touch): no tap, no swipe.
+            .mouse_up => |m| if (m.cancelled) p.frame.pointerCancel(sink) else p.frame.pointerUp(m.x, m.y, button(m.button), sink),
+            // A headset's play / pause button (Win32 WM_APPCOMMAND): the
+            // shell decides (dictation, only with a headset microphone).
+            // Play, pause and stop alone are not toggles: ignored.
+            .media => |m| if (m == .play_pause) sink.action(.media_play_pause),
             // The native text field (iOS): its edits become the same key
             // presses a keyboard would make, so hosts need nothing new.
             .text_input => |t| {
@@ -298,9 +309,9 @@ pub fn pollEvents(p: *Presenter, sink: input.InputSink) bool {
                 p.nativeTextChanged(sink);
                 if (t == .submit) sink.key(.enter, .{});
             },
-            // The wheel (or an iOS drag, delivered as scroll notches) scrolls
-            // a content view (the conversation) under the pointer; elsewhere
-            // it scrolls grid rows that do not fit (handleViewEvent).
+            // The wheel scrolls a content view (the conversation) under the
+            // pointer; elsewhere grid rows that do not fit (handleViewEvent).
+            // (iOS drags arrive as the pointer: Frame.touch.)
             .scroll => |w| if (!p.frame.wheel(w.x, w.y, w.dy, sink)) p.handleViewEvent(e),
             else => p.handleViewEvent(e),
         }
@@ -322,8 +333,7 @@ fn handleViewEvent(p: *Presenter, e: Window.Event) void {
     switch (e) {
         .background => p.suspended = true,
         .foreground => p.suspended = false,
-        // A drag on a touch screen (the iOS window turns it into scroll
-        // notches) or the wheel: grid rows that do not fit.
+        // The wheel: grid rows that do not fit.
         .scroll => |sc| {
             p.scroll_acc += sc.dy * rows_per_notch;
             const rows = @trunc(p.scroll_acc);

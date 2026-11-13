@@ -1722,6 +1722,65 @@ test "swipe: right answers No; only the newest open question; not off the card; 
     try testing.expectEqual(View.KeyResult.ignored, kn); // answered: no more
 }
 
+test "no answer without a committed swipe: short drags either way, re-synced (reconnected) and fresh (restarted) views, stray releases" {
+    const gpa = testing.allocator;
+    var c: convo.Conversation = .{};
+    defer c.deinit(gpa);
+    var v = View.init(gpa);
+    defer v.deinit();
+    var clk: TestClock = .{};
+    const r = try swipeSetup(gpa, &c, &v, &clk);
+    clk.t = 5000;
+    const card = v.cardRect(1);
+    const cx = card.x + card.w / 2;
+    const cy = card.y + card.h / 2;
+    const need = @max(card.w * swipe_share, swipe_min_px);
+    // Released short, right and left, at every distance below the
+    // threshold (and moved past it, then back): never an answer.
+    var off: f32 = 4;
+    while (off < need) : (off += 7) {
+        for ([_]f32{ off, -off }) |dx| {
+            try testing.expect(v.drag(.{ .phase = .down, .x = cx, .y = cy }) == null);
+            try testing.expect(v.drag(.{ .phase = .move, .x = cx + dx / 2, .y = cy + 1 }) == null);
+            try testing.expect(v.drag(.{ .phase = .move, .x = cx + dx * 3, .y = cy + 1 }) == null);
+            try testing.expect(v.drag(.{ .phase = .move, .x = cx + dx, .y = cy + 2 }) == null);
+            try testing.expect(v.drag(.{ .phase = .up, .x = cx + dx, .y = cy + 2 }) == null);
+            clk.t += spring_ms;
+        }
+    }
+    try testing.expect(v.sent_n == null);
+    // Held while the conversation is sent again (a reconnect's snapshot),
+    // then released short: nothing; a stray release or move: nothing.
+    _ = v.drag(.{ .phase = .down, .x = cx, .y = cy });
+    _ = v.drag(.{ .phase = .move, .x = cx + 60, .y = cy });
+    const perm = [_]wire.Option{ .{ .label = "Yes", .key = "1" }, .{ .label = "No", .key = "esc" } };
+    try testConvo(gpa, &c, true, &.{ .{ .n = 1, .kind = .assistant, .text = "May I run the tests?" }, .{ .n = 2, .kind = .question, .text = "Run npm test?", .open = true, .options = &perm } });
+    v.sync(&c);
+    v.prepare(r, tm.fonts);
+    try testing.expect(v.drag(.{ .phase = .up, .x = cx + 60, .y = cy }) == null);
+    try testing.expect(v.drag(.{ .phase = .up, .x = cx - 300, .y = cy }) == null);
+    try testing.expect(v.drag(.{ .phase = .move, .x = cx - 300, .y = cy }) == null);
+    try testing.expect(v.drag(.{ .phase = .up, .x = cx - 300, .y = cy }) == null);
+    try testing.expect(v.sent_n == null);
+    // A fresh view (the client restarted) on the same open question: a
+    // release without a press, then a press and a short release.
+    var v2 = View.init(gpa);
+    defer v2.deinit();
+    v2.clock = clk.clock();
+    v2.sync(&c);
+    v2.prepare(r, tm.fonts);
+    v2.shown_q = v2.newestOpenQuestion();
+    v2.presented(clk.t);
+    try testing.expect(v2.drag(.{ .phase = .up, .x = cx - 300, .y = cy }) == null);
+    clk.t += swipe_guard_ms;
+    _ = v2.drag(.{ .phase = .down, .x = cx, .y = cy });
+    _ = v2.drag(.{ .phase = .move, .x = cx + 40, .y = cy });
+    try testing.expect(v2.drag(.{ .phase = .up, .x = cx + 40, .y = cy }) == null);
+    try testing.expectEqual(View.KeyResult.ignored, v2.onKey(.up, .{}));
+    try testing.expect(v2.sent_n == null);
+}
+
+
 test "two options never get buttons (Yes/No or a choice); more than two do; multi-choice gets Done" {
     const gpa = testing.allocator;
     var c: convo.Conversation = .{};
