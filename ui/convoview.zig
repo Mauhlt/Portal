@@ -1134,9 +1134,9 @@ fn testConvo(gpa: std.mem.Allocator, c: *convo.Conversation, snapshot: bool, ite
 test "blocks: fenced code detection, unclosed fence" {
     var b = Blocks.init("Here:\n```zig\nconst x = 1;\n  y\n```\ndone\n```\nopen");
     const want = [_]struct { k: @FieldType(Block, "kind"), l: []const u8 }{
-        .{ .k = .text, .l = "Here:" },     .{ .k = .fence, .l = "```zig" }, .{ .k = .code, .l = "const x = 1;" },
-        .{ .k = .code, .l = "  y" },       .{ .k = .fence, .l = "```" },    .{ .k = .text, .l = "done" },
-        .{ .k = .fence, .l = "```" },      .{ .k = .code, .l = "open" },
+        .{ .k = .text, .l = "Here:" }, .{ .k = .fence, .l = "```zig" }, .{ .k = .code, .l = "const x = 1;" },
+        .{ .k = .code, .l = "  y" },   .{ .k = .fence, .l = "```" },    .{ .k = .text, .l = "done" },
+        .{ .k = .fence, .l = "```" },  .{ .k = .code, .l = "open" },
     };
     for (want) |w| {
         const got = b.next().?;

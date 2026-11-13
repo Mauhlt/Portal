@@ -135,6 +135,17 @@ keeps the terminal. In the Conversation view the window is minimal:
   soon" until Portal's mic → stt pipeline exists). Esc or a sent line
   closes it again. In `keys` mode only Keys is offered, in view-only mode
   neither.
+* **Dictation toggles** (owner decision): press to start, press again to
+  stop; the text lands in the instruction line for review, the user sends.
+  `Shell.toggleDictation` (the input action `toggle_dictation`) calls the
+  device's `Dictation.start` / `.stop` hook; while it runs the bottom row
+  shows a red "● Listening…" (its button stops). On Windows devices Space
+  toggles it only when no text field has the keyboard (in the line, Space
+  types a space); a headset's play / pause button (`media_play_pause`)
+  toggles it only when `Shell.headsetMicPresent()` says a headset with a
+  microphone is attached: a predicate hook for the audio work (../Audio,
+  IMMDevice form factor), false until then. (The Renderer's Win32 window
+  does not deliver WM_APPCOMMAND yet: the glue has nothing to map.)
 * While the Conversation view is shown the keyboard does not reach the
   terminal (no stray answers): PageUp / PageDown / Home / End scroll, the
   arrows answer the swipe card.

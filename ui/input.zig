@@ -65,6 +65,16 @@ pub const Drag = struct {
     scale: f32 = 1,
 };
 
+/// Input that is neither a key nor a pointer: what a device's buttons or
+/// shortcuts mean (the shell decides when each applies).
+pub const Action = enum {
+    /// Start / stop dictation into the instruction line.
+    toggle_dictation,
+    /// A media play / pause button (a headset's): dictation, only with a
+    /// headset microphone attached (Shell.headsetMicPresent).
+    media_play_pause,
+};
+
 /// On-screen answer buttons: the shared list (module "inputrules"), the
 /// same buttons in the same order on every device. `key` is a protocol
 /// key name (docs/protocol.md section 4).
@@ -95,6 +105,8 @@ pub const InputSink = struct {
         scroll: ?*const fn (ctx: *anyopaque, dy: f32) void = null,
         /// A press over a content view, its moves and its release (optional).
         drag: ?*const fn (ctx: *anyopaque, d: Drag) void = null,
+        /// A device action (optional).
+        action: ?*const fn (ctx: *anyopaque, a: Action) void = null,
     };
 
     pub fn key(s: InputSink, k: Key, m: Mods) void {
@@ -120,5 +132,8 @@ pub const InputSink = struct {
     }
     pub fn drag(s: InputSink, d: Drag) void {
         if (s.vtable.drag) |f| f(s.ctx, d);
+    }
+    pub fn action(s: InputSink, a: Action) void {
+        if (s.vtable.action) |f| f(s.ctx, a);
     }
 };

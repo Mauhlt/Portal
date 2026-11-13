@@ -13,6 +13,8 @@
 //!   4. a closing reply; then idles until its console closes.
 //!
 //! A tab whose folder's name contains "quiet" writes no transcript at all.
+//! With PORTAL_E2E_SHOWCASE set (manual visual checks only, never the e2e
+//! suite) the reply carries a code block and the question a third option.
 //!
 //! Run as `claude.exe` (a copy of portal-e2e), so Portal treats it as
 //! the agent and passes `--session-id <uuid>`: the transcript is then
@@ -161,6 +163,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     t.rec("{\"type\":\"user\",\"isMeta\":true,\"message\":{\"role\":\"user\",\"content\":\"<system-reminder>injected {c}</system-reminder>\"},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"THINKING-SECRET {c}\"}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"I will look at {c}\\\\build.zig and C:\\\\Users\\\\{u}\\\\notes.txt\"}]},\"cwd\":\"{c}\"}");
+    const showcase = env.get("PORTAL_E2E_SHOWCASE") != null;
+    if (showcase) t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"The build fails because two steps install the same artifact. The fix is small; this is the step that runs the tests afterwards:\\n\\n```zig\\nconst run = b.addRunArtifact(tests);\\ntest_step.dependOn(&run.step); // one step per artifact, never two installs of the same file\\n```\\n\\nI can apply it in one of three ways.\"}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Edit\",\"input\":{\"file_path\":\"{c}\\\\a.zig\",\"old_string\":\"ARG-SECRET\",\"new_string\":\"y\"}}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"t1\",\"type\":\"tool_result\",\"content\":\"RESULT-SECRET {c}\"}]},\"toolUseResult\":{\"filePath\":\"{c}\\\\a.zig\"},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"Write\",\"input\":{\"file_path\":\"{c}\\\\b.zig\",\"content\":\"ARG-SECRET\"}}]},\"cwd\":\"{c}\"}");
@@ -170,10 +174,13 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     t.rec("this line is not JSON {c}");
 
     // 2. A question.
-    t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"q1\",\"name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Which fix should I apply in {c}?\",\"header\":\"Fix\",\"multiSelect\":false,\"options\":[{\"label\":\"Alpha\",\"description\":\"d\"},{\"label\":\"Beta in C:\\\\Windows\\\\x\",\"description\":\"d\"}]}]}}]},\"cwd\":\"{c}\"}");
+    if (showcase)
+        t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"q1\",\"name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Which fix should I apply in {c}?\",\"header\":\"Fix\",\"multiSelect\":false,\"options\":[{\"label\":\"Merge the two steps\",\"description\":\"d\"},{\"label\":\"Rename the second artifact\",\"description\":\"d\"},{\"label\":\"Explain first\",\"description\":\"d\"}]}]}}]},\"cwd\":\"{c}\"}")
+    else
+        t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"q1\",\"name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Which fix should I apply in {c}?\",\"header\":\"Fix\",\"multiSelect\":false,\"options\":[{\"label\":\"Alpha\",\"description\":\"d\"},{\"label\":\"Beta in C:\\\\Windows\\\\x\",\"description\":\"d\"}]}]}}]},\"cwd\":\"{c}\"}");
     say("\x1b]7501;state=blocked:kind=question:app=fake\x07FAKE-ASKED\r\n");
     var choice: u8 = 0;
-    while (key()) |k| if (k == '1' or k == '2') {
+    while (key()) |k| if (k == '1' or k == '2' or (showcase and k == '3')) {
         choice = k;
         break;
     };

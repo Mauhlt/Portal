@@ -205,11 +205,20 @@ pub const State = struct {
 pub const Focus = enum { panel, pair_screen, wait_screen, line, terminal, view };
 
 /// Where a device's speech-to-text plugs in (future: Portal's mic capture
-/// from ../Audio, then stt, typing into the instruction line). `start` is
-/// called when Instruct opens the line.
+/// from ../Audio, then stt, typing into the instruction line for review;
+/// the user sends). Dictation toggles: `start`, then `stop`.
 pub const Dictation = struct {
     ctx: *anyopaque,
     start: *const fn (ctx: *anyopaque) void,
+    stop: *const fn (ctx: *anyopaque) void,
+};
+
+/// Whether a headset with a microphone is attached (the audio work
+/// implements it: ../Audio, IMMDevice form factor). Its media button
+/// toggles dictation only then.
+pub const HeadsetMic = struct {
+    ctx: ?*anyopaque = null,
+    present: *const fn (ctx: ?*anyopaque) bool,
 };
 
 pub const Command = union(enum) {
@@ -305,8 +314,12 @@ pub const Shell = struct {
     /// (Instruct), the full answer bar is shown (Keys).
     instructing: bool = false,
     keys_open: bool = false,
-    /// Speech-to-text, when the device has it (startDictation).
+    /// Speech-to-text, when the device has it (toggleDictation).
     dictation: ?Dictation = null,
+    /// Dictation is running (the bottom row shows "Listening…").
+    dictating: bool = false,
+    /// The headset predicate (headsetMicPresent); none yet: false.
+    headset_mic: ?HeadsetMic = null,
     /// Set by the glue from the OS (Touch).
     touch: Touch = .{},
     /// The on-screen keyboard should be up: the glue shows or hides the
@@ -326,7 +339,7 @@ pub const Shell = struct {
         title: [48]u8 = undefined,
         extra: [256]u8 = undefined,
         right: [128]u8 = undefined,
-        panes: [1]frame.Pane = undefined,
+        panes: [2]frame.Pane = undefined,
         row: [2]frame.PanelButton = undefined,
         top_tabs: [tabs_wire.max_tabs]frame.TopTab = undefined,
         buttons: [8]frame.TopButton = undefined,
@@ -376,10 +389,35 @@ pub const Shell = struct {
         if (sh.device != .viewer or sh.mode != .instruct) return;
         sh.instructing = true;
         if (sh.touch.on_screen_keyboard) sh.keyboard = true;
-        if (sh.dictation) |d| d.start(d.ctx);
+        if (sh.dictating) return;
+        if (sh.dictation) |d| {
+            d.start(d.ctx);
+            sh.dictating = true;
+        }
+    }
+
+    /// Stops dictation; its text stays in the line for review.
+    pub fn stopDictation(sh: *Shell) void {
+        if (!sh.dictating) return;
+        sh.dictating = false;
+        if (sh.dictation) |d| d.stop(d.ctx);
+    }
+
+    /// The `toggle_dictation` action (Space with no text field focused,
+    /// the Instruct / Listening button, a headset's media button).
+    pub fn toggleDictation(sh: *Shell) void {
+        if (sh.dictating) sh.stopDictation() else sh.startDictation();
+    }
+
+    /// A headset with a microphone is attached (false until the audio
+    /// work provides the predicate).
+    pub fn headsetMicPresent(sh: *const Shell) bool {
+        const h = sh.headset_mic orelse return false;
+        return h.present(h.ctx);
     }
 
     fn closeInstruct(sh: *Shell) void {
+        sh.stopDictation();
         sh.instructing = false;
         sh.keyboard = false;
     }
@@ -410,7 +448,7 @@ pub const Shell = struct {
         sh.mode = st.viewer.mode;
         sh.n_tabs = 0;
         sh.shown = null;
-        if (sh.mode != .instruct) sh.instructing = false;
+        if (sh.mode != .instruct and sh.instructing) sh.closeInstruct();
         var o = switch (sh.device) {
             .desk => sh.deskOverlay(st),
             .viewer => sh.viewerOverlay(st),
@@ -473,8 +511,19 @@ pub const Shell = struct {
     fn conversationBottom(sh: *Shell, mode: rules.Policy) []const frame.Pane {
         const b = &sh.bufs;
         if (sh.instructing and mode == .instruct) {
-            b.panes[0] = sh.lineField(if (sh.dictation != null) "Speak or type an instruction (Esc closes)" else "Type an instruction, then Enter or Send (Esc closes) \u{00B7} speech coming soon", true);
-            return b.panes[0..1];
+            var n: usize = 0;
+            // With speech-to-text: its toggle, and the recording indicator.
+            if (sh.dictation != null) {
+                b.row[0] = if (sh.dictating)
+                    .{ .label = "\u{25CF} Listening\u{2026}  (stop)", .id = ids.instruct, .tone = .bad }
+                else
+                    .{ .label = "\u{1F3A4} Dictate", .id = ids.instruct, .tone = .good };
+                b.panes[n] = .{ .content = .{ .buttons = b.row[0..1] } };
+                n += 1;
+            }
+            b.panes[n] = sh.lineField(if (sh.dictating) "Listening \u{2014} the text lands here; Send when ready (Esc closes)" else if (sh.dictation != null) "Type, or Dictate (Esc closes)" else "Type an instruction, then Enter or Send (Esc closes) \u{00B7} speech coming soon", true);
+            n += 1;
+            return b.panes[0..n];
         }
         var n: usize = 0;
         if (mode == .instruct) {
@@ -680,7 +729,18 @@ pub const Shell = struct {
         .mouse = onMouse,
         .scroll = onScroll,
         .drag = onDrag,
+        .action = onAction,
     };
+
+    fn onAction(ctx: *anyopaque, a: input.Action) void {
+        const sh = self(ctx);
+        if (sh.device != .viewer or sh.modalActive() != null) return;
+        switch (a) {
+            .toggle_dictation => sh.toggleDictation(),
+            // A headset's play / pause button: only with its microphone.
+            .media_play_pause => if (sh.headsetMicPresent()) sh.toggleDictation(),
+        }
+    }
 
     fn self(ctx: *anyopaque) *Shell {
         return @ptrCast(@alignCast(ctx));
@@ -793,7 +853,9 @@ pub const Shell = struct {
                 m.char(m.ctx, cp, mods);
             },
             .pair_screen => if (!mods.ctrl and (cp == 'p' or cp == 'P')) sh.command(.pair),
-            .wait_screen, .view => {},
+            .wait_screen => {},
+            // Space with no text field focused: dictation on / off.
+            .view => if (cp == ' ' and !mods.ctrl and !mods.alt and !mods.super) sh.toggleDictation(),
             .line => _ = sh.line.onChar(cp, mods),
             .terminal => {
                 sh.select.active = false;
@@ -838,7 +900,7 @@ pub const Shell = struct {
                 sh.instructing = false;
             },
             ids.view_conversation => sh.main = .conversation,
-            ids.instruct => sh.startDictation(),
+            ids.instruct => if (sh.instructing) sh.toggleDictation() else sh.startDictation(),
             ids.keys => sh.keys_open = !sh.keys_open,
             ids.view0...ids.view_last => if (sh.conversation) |c| if (c.button) |f| {
                 _ = f(c.ctx, id);
@@ -1196,6 +1258,7 @@ const DictRec = struct {
         const d: *DictRec = @ptrCast(@alignCast(p));
         d.started += 1;
     }
+    fn stop(_: *anyopaque) void {}
 };
 
 test "conversation view (devices): the default, minimal bottom row, Keys and Instruct on request" {
@@ -1205,7 +1268,7 @@ test "conversation view (devices): the default, minimal bottom row, Keys and Ins
     var sv: StubView = .{};
     sh.conversation = sv.view();
     var dict: DictRec = .{};
-    sh.dictation = .{ .ctx = &dict, .start = DictRec.start };
+    sh.dictation = .{ .ctx = &dict, .start = DictRec.start, .stop = DictRec.stop };
     var v: Viewer = .{ .status = .connected, .mode = .instruct, .host = "h", .has_grid = true };
     var o = sh.overlay(.{ .viewer = v });
     try testing.expectEqual(MainView.conversation, sh.main);
@@ -1233,7 +1296,8 @@ test "conversation view (devices): the default, minimal bottom row, Keys and Ins
     try testing.expectEqual(@as(usize, 1), dict.started);
     o = sh.overlay(.{ .viewer = v });
     try testing.expectEqual(Focus.line, sh.focus());
-    try testing.expect(o.bottom[0].content == .field and o.bottom[0].content.field.focused);
+    const line = o.bottom[o.bottom.len - 1];
+    try testing.expect(line.content == .field and line.content.field.focused);
     // Esc closes it; Send closes it after sending.
     Shell.onKey(&sh, .escape, .{});
     try testing.expect(!sh.instructing);
@@ -1302,4 +1366,85 @@ test "desk: the terminal stays the default" {
     defer sh.deinit();
     try testing.expectEqual(MainView.terminal, sh.main);
     try testing.expect(sh.overlay(.{}).screen == .grid);
+}
+
+const DictToggle = struct {
+    starts: usize = 0,
+    stops: usize = 0,
+    fn of(p: *anyopaque) *DictToggle {
+        return @ptrCast(@alignCast(p));
+    }
+    fn start(p: *anyopaque) void {
+        of(p).starts += 1;
+    }
+    fn stop(p: *anyopaque) void {
+        of(p).stops += 1;
+    }
+    fn yes(_: ?*anyopaque) bool {
+        return true;
+    }
+};
+
+fn hasLabel(o: frame.Overlay, needle: []const u8) bool {
+    for (o.bottom) |p| if (p.content == .buttons) for (p.content.buttons) |b| {
+        if (std.mem.indexOf(u8, b.label, needle) != null) return true;
+    };
+    return false;
+}
+
+test "dictation toggles: Space only without a focused field, the media key only with a headset mic, the indicator" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .viewer, r.host());
+    defer sh.deinit();
+    var sv: StubView = .{};
+    sh.conversation = sv.view();
+    var d: DictToggle = .{};
+    sh.dictation = .{ .ctx = &d, .start = DictToggle.start, .stop = DictToggle.stop };
+    const v: Viewer = .{ .status = .connected, .mode = .instruct, .host = "h", .has_grid = true };
+    var o = sh.overlay(.{ .viewer = v });
+    try testing.expect(!hasLabel(o, "Listening"));
+    // Space in the conversation (no field focused): starts; the line opens
+    // with the indicator above it.
+    Shell.onChar(&sh, ' ', .{});
+    try testing.expect(sh.dictating and sh.instructing);
+    try testing.expectEqual(@as(usize, 1), d.starts);
+    o = sh.overlay(.{ .viewer = v });
+    try testing.expect(hasLabel(o, "Listening"));
+    try testing.expectEqual(@as(usize, 2), o.bottom.len);
+    try testing.expect(o.bottom[1].content == .field);
+    // The line has the keyboard now: Space types a space.
+    Shell.onChar(&sh, 'a', .{});
+    Shell.onChar(&sh, ' ', .{});
+    try testing.expectEqualStrings("a ", sh.line.text());
+    try testing.expect(sh.dictating);
+    // The indicator's button stops it; the text stays for review.
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(!sh.dictating and sh.instructing);
+    try testing.expectEqual(@as(usize, 1), d.stops);
+    o = sh.overlay(.{ .viewer = v });
+    try testing.expect(!hasLabel(o, "Listening") and hasLabel(o, "Dictate"));
+    try testing.expectEqualStrings("a ", sh.line.text());
+    // Esc closes the line (stopping dictation if it ran).
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.dictating);
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expect(!sh.dictating and !sh.instructing);
+    try testing.expectEqual(@as(usize, 2), d.stops);
+    // The headset's media button: ignored without a headset mic ...
+    try testing.expect(!sh.headsetMicPresent());
+    Shell.onAction(&sh, .media_play_pause);
+    try testing.expect(!sh.dictating);
+    // ... toggles with one; the toggle action always does.
+    sh.headset_mic = .{ .present = DictToggle.yes };
+    Shell.onAction(&sh, .media_play_pause);
+    try testing.expect(sh.dictating);
+    Shell.onAction(&sh, .toggle_dictation);
+    try testing.expect(!sh.dictating);
+    // Not in the Terminal view: Space goes to the terminal there.
+    Shell.onKey(&sh, .escape, .{});
+    Shell.onButton(&sh, ids.view_terminal);
+    _ = sh.overlay(.{ .viewer = .{ .status = .connected, .mode = .text, .host = "h", .has_grid = true } });
+    Shell.onChar(&sh, ' ', .{});
+    try testing.expect(!sh.dictating);
+    try testing.expectEqual(@as(usize, 1), r.chars);
 }
