@@ -1,6 +1,6 @@
 //! The Conversation view (docs/protocol.md section 3b): a fake session
 //! program (fake_agent.zig) writes a synthetic transcript under the
-//! harness's own transcript folder (PORTAL_AGENT_PROJECTS, never the
+//! harness's own transcript folder (CLAUDE_CONFIG_DIR, never the
 //! user's), and a viewer must receive it as `convo` / `convo+` items:
 //!   * prompts and replies as text, scrubbed of paths and the user's name
 //!     (the project folder reads as the tab's name);
@@ -219,7 +219,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     try leaks.add(proj);
     var tb: [1024]u8 = undefined;
     try leaks.add(h.transcriptRoot(&tb));
-    try leaks.add("agent-projects");
+    try leaks.add("agent-config");
     // Never sent at all, scrubbed or not.
     const secrets = [_][]const u8{ "THINKING-SECRET", "ARG-SECRET", "RESULT-SECRET", "injected", "not JSON", "system-reminder", ".jsonl", "e2e00000", "OUTSIDE-SESSION", "OUTSIDE-LATER", "0dd51de0", "SECRET-CMD", "SUMMARY-SECRET", "bshell00", "bmon0000", "task-notification", "output-file" };
 

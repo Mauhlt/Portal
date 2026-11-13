@@ -121,6 +121,30 @@ pub fn runText(h: *proc.Harness, r: *Runner, port: u16) !void {
     _ = r.check("typed command ran (output in grid)", v.waitFor("TXT-Windows_NT-OK", 5000), "{s}", .{v.dump(&dump_buf)});
     _ = waitPrompt(v, 5000);
 
+    // The session program's environment (src/childenv.zig): Portal runs
+    // with a parent agent session's markers and a PORTAL_* variable
+    // set (proc.Harness.envBlock); none reaches the shell. cmd leaves an
+    // undefined %NAME% as it is, and %OS% marks the output line (the typed
+    // line shows %OS% itself).
+    {
+        const Env = struct { cmd: []const u8, want: []const u8, name: []const u8 };
+        const cases = [_]Env{
+            .{ .cmd = "t:echo E1-%OS%[%CLAUDECODE%][%CLAUDE_CODE_CHILD_SESSION%]", .want = "E1-Windows_NT[%CLAUDECODE%][%CLAUDE_CODE_CHILD_SESSION%]", .name = "env: CLAUDECODE and CLAUDE_CODE_CHILD_SESSION not inherited" },
+            .{ .cmd = "t:echo E2-%OS%[%AI_AGENT%][%PORTAL_E2E_MARK%]", .want = "E2-Windows_NT[%AI_AGENT%][%PORTAL_E2E_MARK%]", .name = "env: AI_AGENT and PORTAL_* not inherited" },
+            .{ .cmd = "t:echo E3-%OS%[%PORTAL_AGENT_PROJECTS%]", .want = "E3-Windows_NT[%PORTAL_AGENT_PROJECTS%]", .name = "env: PORTAL_AGENT_PROJECTS (Portal's own) not inherited" },
+            .{ .cmd = "t:echo E4-%OS%[%ANTHROPIC_E2E_KEEP%]", .want = "E4-Windows_NT[kept]", .name = "env: the user's ANTHROPIC_* settings kept" },
+            .{ .cmd = "t:if defined CLAUDE_CONFIG_DIR echo E5-%OS%-CONFIG-KEPT", .want = "E5-Windows_NT-CONFIG-KEPT", .name = "env: CLAUDE_CONFIG_DIR (user configuration) kept" },
+            .{ .cmd = "t:if defined SystemRoot echo E6-%OS%-SYSTEMROOT-KEPT", .want = "E6-Windows_NT-SYSTEMROOT-KEPT", .name = "env: SystemRoot intact" },
+            .{ .cmd = "t:where portal-show", .want = "portal-show.exe", .name = "env: PATH intact (portal-show, next to Portal, is found)" },
+        };
+        for (cases) |c| {
+            v.send(c.cmd);
+            v.send("k:enter");
+            _ = r.check(c.name, v.waitFor(c.want, 5000), "{s}", .{v.dump(&dump_buf)});
+            _ = waitPrompt(v, 5000);
+        }
+    }
+
     v.send("t:REM abcX");
     v.send("k:backspace");
     v.send("t:Y");

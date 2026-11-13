@@ -1,6 +1,7 @@
 //! A fake session program for the convo group: run by Portal in a tab
 //! (`portal-e2e --fake-agent`), it writes a synthetic agent
-//! transcript where Portal looks for one (PORTAL_AGENT_PROJECTS, a
+//! transcript where Portal looks for one (CLAUDE_CONFIG_DIR\projects, as
+//! the agent does; the harness points Portal there too, a
 //! scratch folder: never the user's own), prints progress markers to the
 //! terminal, reports OSC 7501 states, and waits for answer keys on its
 //! console input, the way the real program would:
@@ -32,8 +33,10 @@
 //! Start such consoles hidden or with SW_SHOWMINNOACTIVE.)
 //!
 //! A tab whose folder's name contains "quiet" writes no transcript at all.
-//! With PORTAL_E2E_SHOWCASE set (manual visual checks only, never the e2e
-//! suite) the reply carries a code block and the question a third option.
+//! In a folder whose name contains "showcase" (manual visual checks only,
+//! never the e2e suite) the reply carries a code block and the question a
+//! third option. (Not a PORTAL_* variable: Portal keeps those from its
+//! session programs, src/childenv.zig.)
 //!
 //! Run as `claude.exe` (a copy of portal-e2e), so Portal treats it as
 //! the agent and passes `--session-id <uuid>`: the transcript is then
@@ -219,11 +222,12 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
         drain("QUIET");
         return 0;
     }
-    const projects = env.get("PORTAL_AGENT_PROJECTS") orelse {
+    const config = env.get("CLAUDE_CONFIG_DIR") orelse {
         say("FAKE-NO-ROOT\r\n");
         drain("END");
         return 3;
     };
+    const projects = std.fmt.allocPrint(gpa, "{s}\\projects", .{config}) catch return 2;
     const folder = gpa.alloc(u8, cwd.len) catch return 2;
     for (cwd, folder) |c, *o| o.* = if (std.ascii.isAlphanumeric(c)) c else '-';
     const dir = std.fmt.allocPrint(gpa, "{s}\\{s}", .{ projects, folder }) catch return 2;
@@ -263,7 +267,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     t.rec("{\"type\":\"user\",\"isMeta\":true,\"message\":{\"role\":\"user\",\"content\":\"<system-reminder>injected {c}</system-reminder>\"},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"assistant\",\"timestamp\":\"{t}\",\"message\":{\"model\":\"model-e2e-1\",\"id\":\"m1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":40,\"cache_read_input_tokens\":300,\"output_tokens\":20,\"service_tier\":\"standard\"},\"content\":[{\"type\":\"thinking\",\"thinking\":\"THINKING-SECRET {c}\"}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"assistant\",\"timestamp\":\"{t}\",\"message\":{\"model\":\"model-e2e-1\",\"id\":\"m1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":40,\"cache_read_input_tokens\":300,\"output_tokens\":20,\"service_tier\":\"standard\"},\"content\":[{\"type\":\"text\",\"text\":\"I will look at {c}\\\\build.zig and C:\\\\Users\\\\{u}\\\\notes.txt\"}]},\"cwd\":\"{c}\"}");
-    const showcase = env.get("PORTAL_E2E_SHOWCASE") != null;
+    const showcase = std.mem.indexOf(u8, std.fs.path.basename(cwd), "showcase") != null;
     if (showcase) t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"The build fails because two steps install the same artifact. The fix is small; this is the step that runs the tests afterwards:\\n\\n```zig\\nconst run = b.addRunArtifact(tests);\\ntest_step.dependOn(&run.step); // one step per artifact, never two installs of the same file\\n```\\n\\nI can apply it in one of three ways.\"}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Edit\",\"input\":{\"file_path\":\"{c}\\\\a.zig\",\"old_string\":\"ARG-SECRET\",\"new_string\":\"y\"}}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"t1\",\"type\":\"tool_result\",\"content\":\"RESULT-SECRET {c}\"}]},\"toolUseResult\":{\"filePath\":\"{c}\\\\a.zig\"},\"cwd\":\"{c}\"}");

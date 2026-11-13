@@ -39,7 +39,7 @@ pub const Harness = struct {
         try Io.Dir.cwd().createDirPath(io, root);
         // Transcripts (the Conversation view) are read from here, never
         // from the user's own agent folder.
-        const projects = try std.fmt.allocPrint(gpa, "{s}\\agent-projects", .{root});
+        const projects = try std.fmt.allocPrint(gpa, "{s}\\agent-config\\projects", .{root});
         defer gpa.free(projects);
         try Io.Dir.cwd().createDirPath(io, projects);
 
@@ -78,15 +78,24 @@ pub const Harness = struct {
     }
 
     /// Where every instance reads session transcripts
-    /// (PORTAL_AGENT_PROJECTS); the fake session program writes there.
+    /// (PORTAL_AGENT_PROJECTS); the fake session program writes there
+    /// (CLAUDE_CONFIG_DIR\projects: PORTAL_* never reaches a session).
     pub fn transcriptRoot(h: *const Harness, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "{s}\\agent-projects", .{h.root}) catch unreachable;
+        return std.fmt.bufPrint(buf, "{s}\\agent-config\\projects", .{h.root}) catch unreachable;
+    }
+
+    /// The scratch agent configuration folder (CLAUDE_CONFIG_DIR).
+    pub fn agentConfig(h: *const Harness, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{s}\\agent-config", .{h.root}) catch unreachable;
     }
 
     /// Environment block: the harness's environment with LOCALAPPDATA
     /// pointing at `local_app_data`, transcripts read from the scratch
-    /// tree (PORTAL_AGENT_PROJECTS), a short cmd.exe prompt, and no
-    /// ZIG_PROGRESS.
+    /// tree (PORTAL_AGENT_PROJECTS, CLAUDE_CONFIG_DIR), a short cmd.exe
+    /// prompt, and no ZIG_PROGRESS. Plus what a parent agent session
+    /// would set (CLAUDECODE, CLAUDE_CODE_CHILD_SESSION, AI_AGENT) and a
+    /// Portal-internal variable, which no session program may inherit, and
+    /// a user setting (ANTHROPIC_E2E_KEEP) that it must.
     fn envBlock(h: *Harness, local_app_data: []const u8) ![:0]const u16 {
         var m = try h.env.clone(h.gpa);
         defer m.deinit();
@@ -99,7 +108,13 @@ pub const Harness = struct {
         try m.put("PROMPT", "E2E$G");
         var tb: [1024]u8 = undefined;
         try m.put("PORTAL_AGENT_PROJECTS", h.transcriptRoot(&tb));
-        _ = m.swapRemove("CLAUDE_CONFIG_DIR");
+        var cb: [1024]u8 = undefined;
+        try m.put("CLAUDE_CONFIG_DIR", h.agentConfig(&cb));
+        try m.put("CLAUDECODE", "1");
+        try m.put("CLAUDE_CODE_CHILD_SESSION", "1");
+        try m.put("AI_AGENT", "e2e-parent");
+        try m.put("PORTAL_E2E_MARK", "leaked");
+        try m.put("ANTHROPIC_E2E_KEEP", "kept");
         const block = try m.createWindowsBlock(h.gpa, .{});
         return block.slice;
     }

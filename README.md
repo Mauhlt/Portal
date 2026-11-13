@@ -154,6 +154,21 @@ section 3b.
    unobserved session. Programs are resolved to absolute paths from PATH
    only, never the current directory. Portal refuses to run as
    administrator unless you pass `--allow-elevated`.
+8. **A clean environment for each session program** (`src/childenv.zig`):
+   your environment (and Portal's folder first on PATH), without what
+   would leak the context Portal itself was started from. Started from
+   inside an agent session, Portal would otherwise hand that
+   session's markers to every tab, and each tab's agent would run as its
+   child (transcript saving off, its mode). Removed: `CLAUDECODE`,
+   `AI_AGENT`, every `CLAUDE_*` / `CLAUDE_CODE_*` name, and every
+   `PORTAL_*` name. Kept: everything else (PATH, SystemRoot, USERPROFILE,
+   `ANTHROPIC_*` such as your API key or base URL...), the agent's
+   documented user settings (`CLAUDE_CONFIG_DIR`,
+   `CLAUDE_CODE_GIT_BASH_PATH`, `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` /
+   `_FOUNDRY` and their `_SKIP_*_AUTH`, `CLAUDE_CODE_OAUTH_TOKEN`, client
+   certificates, `CLAUDE_CODE_SHELL`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS`,
+   ...; the full list is `childenv.user_config`), and any `CLAUDE_*` name
+   you set permanently (your user or the system environment variables).
 
 ## Setup
 
