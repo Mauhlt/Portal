@@ -234,6 +234,16 @@ the program asks for it), Ctrl+= / Ctrl+- / Ctrl+0 to zoom. Resizing the
 window resizes the session; remote viewers adapt. There is no scrollback
 yet.
 
+The keyboard types straight into the session. At the bottom there is only
+**Instruct** (as on the paired devices): it opens the instruct panel, a
+line with Send (it types the line and presses Enter, with no checks; an
+answer word such as "yes" or "two" presses that key), Close, and a key
+row: 1, 2, 3, ↑, ↓, Esc, Enter. A click on the terminal gives the
+keyboard back to it while the panel stays open; Esc on an empty line,
+Send or Close shuts the panel. Space always types a space here (it never
+toggles dictation at the desk; the panel's mic button and a headset's
+play / pause key do, once speech-to-text exists).
+
 **Project tabs.** One Portal window holds several projects. Each is a tab
 in the top bar, in a colour derived from its name (or `color = NAME
 #rrggbb` lines in settings.txt), with its own program (the configured one,
@@ -448,9 +458,9 @@ divider to resize it. The interaction slice:
    box takes answer words only;
 * **buttons**: Yes, No, 1, 2, 3, Esc, Enter, Send; in `instruct` mode
   also ↑ and ↓ while the shown tab's program waits for an answer. (The
-  native remote viewers, `portal connect` and the iPhone app, show only
-  an Instruct button; its panel holds the line and a compact key row, see
-  docs/layout-design.md.)
+  native remote viewers, `portal connect` and the iPhone app, and the
+  desk's own window show only an Instruct button; its panel holds the
+  line and a compact key row, see docs/layout-design.md.)
 
 On the iPhone, voice is Apple's keyboard dictation into the input box;
 Portal never records or sends audio from the phone.

@@ -4,8 +4,11 @@
 //!
 //!   .desk     the desktop's own window: tabs with close boxes and "+",
 //!             the desk tools in the top bar, the remote-viewer badge, the
-//!             input box with full control (click it to type there), cell
-//!             selection with copy and paste.
+//!             same Instruct-only bottom as the devices (its instruct panel
+//!             with full control: Send types the line and presses Enter, no
+//!             line checks; every key in its key row), cell selection with
+//!             copy and paste. The keyboard types into the terminal unless
+//!             the panel's line has it.
 //!   .viewer   a paired device (`portal connect`, the iPhone app): tabs it
 //!             can only switch, the Terminal | Conversation view toggle,
 //!             the pairing / trust / ended screens, the instruction line
@@ -15,14 +18,14 @@
 //! form: top bar, the conversation (questions carry their own controls:
 //! swipe cards for two options, numbered buttons for more), the Data
 //! strip, and at the bottom only Instruct (the instruction line + Send, and
-//! dictation once a device has it: `toggleDictation`). No answer keys at
-//! all there: Esc and Enter live in the Terminal view (the power mode),
-//! which keeps the full answer bar and, in `instruct` mode, the line. The
-//! desk keeps the terminal.
+//! dictation once a device has it: `toggleDictation`), in the Terminal
+//! view too; the panel's key row has the keys a line can't express. The
+//! desk keeps the terminal, with the same bottom (owner's decision,
+//! 2026-11-12): no answer bar, only Instruct.
 //!
 //! Layout (frame.zig): top bar (+ tabs), main slice (a pluggable content
 //! view: the terminal, or the conversation once a device provides one),
-//! Data slice, interaction slice (answers, input box + Send), status line,
+//! Data slice, interaction slice (Instruct, or its panel), status line,
 //! with the device's panels (desk panels, sync panels, ...) as a modal
 //! layer.
 //!
@@ -342,9 +345,10 @@ pub const Shell = struct {
     /// The interaction slice's input line: `text` policy on the desk (full
     /// control), `instruct` checks on devices.
     line: inputline.Line,
-    /// Desk: the input box has the keyboard (a click on it; Esc on an
-    /// empty box or a click elsewhere gives it back to the terminal).
-    /// Devices: the line has it whenever the mode is `instruct`.
+    /// Desk: the instruct panel's line has the keyboard (Instruct, or a
+    /// click on the line; a click elsewhere gives it back to the terminal,
+    /// the panel staying open; Esc on an empty line closes the panel).
+    /// Devices: unused (the line has it whenever the panel is open).
     line_focus: bool = false,
     data: dataview.DataView = .{},
     select: Select = .{},
@@ -355,9 +359,9 @@ pub const Shell = struct {
     conversation: ?frame.ContentView = null,
     /// The last overlay showed the conversation view (its input routing).
     view_shown: bool = false,
-    /// On a device: the instruct panel is open (Instruct; Esc on an empty
-    /// line, Send or Close shut it). Otherwise the bottom is only the
-    /// Instruct button, in both views.
+    /// The instruct panel is open (Instruct; Esc on an empty line, Send
+    /// or Close shut it). Otherwise the bottom is only the Instruct
+    /// button: on the desk and in both of a device's views.
     instructing: bool = false,
     /// Speech-to-text, when the device has it (toggleDictation).
     dictation: ?Dictation = null,
@@ -452,12 +456,13 @@ pub const Shell = struct {
     /// Instruct: opens the instruct panel; its line gets the keyboard (the
     /// touch keyboard on a tablet without one) and dictation starts when
     /// the device has it. Esc on an empty line, Send or Close shut it.
+    /// On the desk (full control) the line also takes the keyboard.
     pub fn startDictation(sh: *Shell) void {
-        if (sh.device != .viewer) return;
-        const mode = sh.mode orelse return;
+        const mode = sh.policy() orelse return;
         if (!mode.acceptsAnswers()) return;
         sh.instructing = true;
         if (!hasLine(mode)) return;
+        if (sh.device == .desk) sh.line_focus = true;
         if (sh.touch.on_screen_keyboard) sh.keyboard = true;
         if (sh.dictating) return;
         if (sh.dictation) |d| {
@@ -474,7 +479,10 @@ pub const Shell = struct {
     }
 
     /// The `toggle_dictation` action (Space with no text field focused,
-    /// the Instruct / Listening button, a headset's media button).
+    /// the Instruct / Listening button, a headset's media button). On the
+    /// desk, Space never is: the terminal has the keyboard whenever the
+    /// panel's line doesn't, so there only the panel's mic button and the
+    /// headset's media key toggle dictation.
     pub fn toggleDictation(sh: *Shell) void {
         if (sh.dictating) sh.stopDictation() else sh.startDictation();
     }
@@ -489,7 +497,15 @@ pub const Shell = struct {
     fn closeInstruct(sh: *Shell) void {
         sh.stopDictation();
         sh.instructing = false;
+        sh.line_focus = false;
         sh.keyboard = false;
+    }
+
+    /// What the instruct panel may do: the desk's own window has full
+    /// control (`text`); a device, the desktop's input mode (null before
+    /// hello).
+    fn policy(sh: *const Shell) ?rules.Policy {
+        return if (sh.device == .desk) .text else sh.mode;
     }
 
     /// The server refused an instruction line ({"t":"rejected"}).
@@ -521,7 +537,7 @@ pub const Shell = struct {
         sh.question_digits = if (card) 0 else @min(st.viewer.question_digits, 9);
         sh.n_tabs = 0;
         sh.shown = null;
-        if (sh.instructing and !(if (sh.mode) |m| m.acceptsAnswers() else false)) sh.closeInstruct();
+        if (sh.instructing and !(if (sh.policy()) |m| m.acceptsAnswers() else false)) sh.closeInstruct();
         // A status panel needs what it shows: System the desk's setting,
         // any of them a connection (devices).
         const sysmon = if (st.activity) |a| a.sysmon else false;
@@ -635,11 +651,6 @@ pub const Shell = struct {
         sh.setInfo(to);
     }
 
-    fn linePane(sh: *Shell, hint: []const u8, focused: bool) []const frame.Pane {
-        sh.bufs.panes[0] = sh.lineField(hint, focused);
-        return sh.bufs.panes[0..1];
-    }
-
     fn lineField(sh: *Shell, hint: []const u8, focused: bool) frame.Pane {
         return .{ .content = .{ .field = .{
             .label = "",
@@ -650,11 +661,12 @@ pub const Shell = struct {
         } }, .send = .{ .label = "Send", .id = ids.send }, .keyboard = if (sh.touch.on_screen_keyboard) .{ .label = "Keyboard", .id = ids.keyboard, .focused = sh.keyboard } else null };
     }
 
-    /// A device's bottom, in both views (owner's decision, 2026-11-12):
-    /// only the Instruct button; pressed, the instruct panel: its controls
-    /// (dictation, Close), the instruction line, and a compact key row for
-    /// what a line can't express (`keyRow`). View only: nothing.
-    fn viewerBottom(sh: *Shell, mode: rules.Policy) []const frame.Pane {
+    /// The bottom of the desk and of a device, in both views (owner's
+    /// decisions, 2026-11-12): only the Instruct button; pressed, the
+    /// instruct panel: its controls (dictation, Close), the instruction
+    /// line, and a compact key row for what a line can't express
+    /// (`keyRow`). View only: nothing.
+    fn instructBottom(sh: *Shell, mode: rules.Policy) []const frame.Pane {
         if (!mode.acceptsAnswers()) return &.{};
         const b = &sh.bufs;
         if (!sh.instructing) {
@@ -678,7 +690,18 @@ pub const Shell = struct {
         b.panes[n] = .{ .content = .{ .buttons = b.row[0..r] } };
         n += 1;
         if (line) {
-            b.panes[n] = sh.lineField(if (sh.dictating) "Listening \u{2014} the text lands here; Send when ready (Esc closes)" else if (sh.dictation != null) "Type, or Dictate (Esc closes)" else "Type an instruction, then Enter or Send (Esc closes)", true);
+            const focused = sh.device == .viewer or sh.line_focus;
+            const hint = if (!focused)
+                "Click here to type (keys go to the terminal)"
+            else if (sh.dictating)
+                "Listening \u{2014} the text lands here; Send when ready (Esc closes)"
+            else if (sh.dictation != null)
+                "Type, or Dictate (Esc closes)"
+            else if (sh.device == .desk)
+                "Type, then Enter or Send: typed into the terminal (Esc closes)"
+            else
+                "Type an instruction, then Enter or Send (Esc closes)";
+            b.panes[n] = sh.lineField(hint, focused);
             n += 1;
         }
         b.panes[n] = .{ .content = .{ .answers = sh.keyRow(mode) } };
@@ -691,16 +714,20 @@ pub const Shell = struct {
     /// The instruct panel's keys: the question's numbers (only while it
     /// offers numbered options and no card shows them), Up / Down (only
     /// while the program waits: rules.showMenuButtons), Esc and Enter.
-    /// `keys` mode has no line, so its panel is the whole answer set.
+    /// `keys` mode has no line, so its panel is the whole answer set. The
+    /// desk is not policy-limited: 1-3 (more for a question with more),
+    /// Up / Down, Esc and Enter, always.
     fn keyRow(sh: *Shell, mode: rules.Policy) []const input.Answer {
         if (!hasLine(mode)) return &input.answers;
         const b = &sh.bufs;
+        const desk = sh.device == .desk;
         var k: usize = 0;
-        for (digit_keys[0..sh.question_digits]) |d| {
+        const digits: usize = if (desk) @max(3, sh.question_digits) else sh.question_digits;
+        for (digit_keys[0..digits]) |d| {
             b.keys[k] = .{ .label = d, .key = d };
             k += 1;
         }
-        if (rules.showMenuButtons(mode, sh.waiting)) for (input.menu_answers) |a| {
+        if (desk or rules.showMenuButtons(mode, sh.waiting)) for (input.menu_answers) |a| {
             b.keys[k] = a;
             k += 1;
         };
@@ -727,11 +754,12 @@ pub const Shell = struct {
             .text => "remote: FULL CONTROL",
         };
         const lv = sh.line.snapshot();
-        const line_note = sh.line_focus and lv.note.len > 0;
+        const line_note = sh.instructing and lv.note.len > 0;
         return .{
             .data = sh.data.slice(ids.data_toggle, ids.data_clear),
-            .show_answers = true,
-            .bottom = sh.linePane(if (sh.line_focus) "Type, then Enter or Send (Esc: back to the terminal)" else "Click here to type an instruction (keys go to the terminal)", sh.line_focus),
+            // Like the devices: only Instruct; its panel has the line and
+            // the keys.
+            .bottom = sh.instructBottom(.text),
             .top_bar = .{
                 .title = d.title,
                 .tabs = sh.tabBar(st, true),
@@ -827,8 +855,8 @@ pub const Shell = struct {
                 o.status.extra_tone = if (mode == .text) .warn else .normal;
                 // Both views: only Instruct, which opens the instruct
                 // panel (questions in the Conversation view carry their
-                // own controls). No answer bar on devices.
-                o.bottom = sh.viewerBottom(mode);
+                // own controls). No answer bar (on the desk neither).
+                o.bottom = sh.instructBottom(mode);
                 if (mode == .instruct) {
                     const lv = sh.line.snapshot();
                     if (lv.note.len > 0) {
@@ -905,7 +933,7 @@ pub const Shell = struct {
 
     fn onAction(ctx: *anyopaque, a: input.Action) void {
         const sh = self(ctx);
-        if (sh.device != .viewer or sh.modalActive() != null) return;
+        if (sh.modalActive() != null) return;
         switch (a) {
             .toggle_dictation => sh.toggleDictation(),
             // A headset's play / pause button: only with its microphone.
@@ -952,8 +980,9 @@ pub const Shell = struct {
         if (key == .tab and mods.ctrl and !mods.alt) return sh.cycleTab(if (mods.shift) -1 else 1);
         const f = sh.focus();
         // The instruct panel: Esc closes it (from the line only once the
-        // line is empty; Esc in a non-empty line clears it first).
-        if (sh.device == .viewer and sh.instructing and key == .escape and (f != .line or sh.line.text().len == 0)) return sh.closeInstruct();
+        // line is empty; Esc in a non-empty line clears it first). On the
+        // desk, an Esc outside the line is the terminal's.
+        if (sh.instructing and key == .escape and (if (f == .line) sh.line.text().len == 0 else sh.device == .viewer)) return sh.closeInstruct();
         // The conversation's navigation: PageUp / PageDown also while the
         // line is open (Home / End then edit the line).
         if (sh.view_shown and (f == .view or (f == .line and (key == .page_up or key == .page_down)))) {
@@ -965,11 +994,6 @@ pub const Shell = struct {
             .wait_screen => if (key == .escape) sh.command(.cancel_pair),
             .view => {},
             .line => {
-                // Desk: Esc on an empty box gives the keyboard back.
-                if (sh.device == .desk and key == .escape and sh.line.text().len == 0) {
-                    sh.line_focus = false;
-                    return;
-                }
                 _ = sh.line.onKey(key, mods, LineSender{ .sh = sh });
                 // Sent: back to the minimal view.
                 if (sh.instructing and key == .enter and sh.line.text().len == 0) sh.closeInstruct();
@@ -1055,11 +1079,11 @@ pub const Shell = struct {
             // A tap on the line: it takes the keyboard (desk), and on a
             // touch device without a keyboard the on-screen one comes up.
             ids.line => {
-                if (sh.device == .desk) sh.line_focus = true;
+                if (sh.device == .desk and sh.instructing) sh.line_focus = true;
                 if (sh.touch.on_screen_keyboard and sh.focus() == .line) sh.keyboard = true;
             },
             ids.keyboard => {
-                if (sh.device == .desk) sh.line_focus = true;
+                if (sh.device == .desk and sh.instructing) sh.line_focus = true;
                 sh.keyboard = !sh.keyboard and sh.focus() == .line;
             },
             // Send: what Enter in the line does.
@@ -1225,7 +1249,6 @@ test "viewer bottom: only Instruct in both views; the panel's key row follows th
         sh.closeInstruct();
         // Closed: one pane, one button (Instruct); no answer bar, no line.
         var o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
-        try testing.expect(!o.show_answers);
         try testing.expectEqual(@as(usize, 1), o.bottom.len);
         try testing.expectEqual(@as(usize, 1), o.bottom[0].content.buttons.len);
         try testing.expectEqual(ids.instruct, o.bottom[0].content.buttons[0].id);
@@ -1305,14 +1328,12 @@ test "viewer per input mode: the same features as the browser" {
     var v: Viewer = .{ .status = .connected, .host = "h", .has_grid = true, .mode = .none };
     // view only: no answer bar, no line, no Instruct.
     var o = sh.overlay(.{ .viewer = v });
-    try testing.expect(!o.show_answers);
     try testing.expectEqual(@as(usize, 0), o.bottom.len);
     try testing.expectEqualStrings("view only", o.status.extra);
     // keys and text: only Instruct; keys go to the terminal.
     for ([_]rules.Policy{ .keys, .text }) |p| {
         v.mode = p;
         o = sh.overlay(.{ .viewer = v });
-        try testing.expect(!o.show_answers);
         try testing.expectEqual(ids.instruct, o.bottom[0].content.buttons[0].id);
         try testing.expectEqual(Focus.terminal, sh.focus());
     }
@@ -1325,7 +1346,6 @@ test "viewer per input mode: the same features as the browser" {
     try testing.expectEqual(Focus.line, sh.focus());
     for ("fix it") |c| Shell.onChar(&sh, c, .{});
     o = sh.overlay(.{ .viewer = v });
-    try testing.expect(!o.show_answers);
     try testing.expectEqualStrings("fix it", o.bottom[1].content.field.value);
     try testing.expect(o.bottom[1].content.field.focused);
     try testing.expectEqual(ids.send, o.bottom[1].send.?.id);
@@ -1413,7 +1433,6 @@ test "viewer: session ended, then desktop offline, are explicit screens" {
     try testing.expectEqualStrings("session ended", ended.status.label);
     try testing.expectEqualStrings("Session ended on the desktop (exit code 1)", ended.screen.message.title);
     try testing.expectEqualStrings("Waiting for the desktop to start a new session.", ended.screen.message.lines[0]);
-    try testing.expect(!ended.show_answers);
     const off = sh.overlay(.{ .viewer = .{ .status = .desktop_offline, .host = "h", .has_grid = true, .exit_code = 1 } });
     try testing.expectEqualStrings("desktop offline", off.status.label);
     try testing.expectEqualStrings("Session ended on the desktop (exit code 1)", off.screen.message.title);
@@ -1426,7 +1445,7 @@ test "viewer: session ended, then desktop offline, are explicit screens" {
     try testing.expectEqualStrings("Network error: network unreachable", net_err.status.extra);
 }
 
-test "desk: tabs with close and +, viewer badge, the input box takes the keyboard on a click" {
+test "desk: tabs with close and +, viewer badge, a tool button, a close box" {
     var r: Rec = .{};
     var sh = Shell.init(testing.allocator, .desk, r.host());
     defer sh.deinit();
@@ -1441,19 +1460,8 @@ test "desk: tabs with close and +, viewer badge, the input box takes the keyboar
     try testing.expectEqualStrings("2 REMOTE VIEWERS WATCHING", tb.right);
     try testing.expect(tb.right_badge);
     try testing.expectEqualStrings("sharing on https://x/", o.status.right);
-    try testing.expect(o.show_answers);
-    // Keys go to the terminal until the box is clicked; Esc on an empty
-    // box gives them back.
-    Shell.onKey(&sh, .enter, .{});
-    try testing.expectEqual(@as(usize, 1), r.keys);
-    Shell.onButton(&sh, ids.line);
-    try testing.expectEqual(Focus.line, sh.focus());
-    for ("/help") |c| Shell.onChar(&sh, c, .{});
-    Shell.onButton(&sh, ids.send);
-    try testing.expectEqualStrings("k:enter", r.lastFrame());
-    try testing.expectEqualStrings("t:/help", r.frames[0][0..r.lens[0]]);
-    Shell.onKey(&sh, .escape, .{});
-    try testing.expectEqual(Focus.terminal, sh.focus());
+    try testing.expectEqualStrings("remote: answer keys only", o.status.extra);
+    try testing.expect(o.data != null);
     // A tool button goes to the host; a tab's close box closes it.
     Shell.onButton(&sh, 11);
     try testing.expectEqual(@as(u32, 11), r.cmds[r.n_cmds - 1].button);
@@ -1464,6 +1472,134 @@ test "desk: tabs with close and +, viewer badge, the input box takes the keyboar
     try testing.expectEqualStrings("1 REMOTE VIEWER WATCHING", viewerText(1, &buf));
 }
 
+test "desk bottom: only Instruct; its panel types with full control and has every key; the keyboard is the terminal's otherwise" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    var kb: [96]u8 = undefined;
+    // Closed: one pane, one button (Instruct); no answer bar, no line.
+    var o = sh.overlay(.{});
+    try testing.expectEqual(@as(usize, 1), o.bottom.len);
+    try testing.expectEqual(@as(usize, 1), o.bottom[0].content.buttons.len);
+    try testing.expectEqual(ids.instruct, o.bottom[0].content.buttons[0].id);
+    try testing.expectEqualStrings("", panelKeys(o, &kb));
+    // Keys and characters (Space too: never dictation here) go to the
+    // terminal; Esc as well.
+    try testing.expectEqual(Focus.terminal, sh.focus());
+    Shell.onKey(&sh, .enter, .{});
+    Shell.onKey(&sh, .escape, .{});
+    Shell.onChar(&sh, ' ', .{});
+    try testing.expectEqual(@as(usize, 2), r.keys);
+    try testing.expectEqual(@as(usize, 1), r.chars);
+    try testing.expect(!sh.instructing);
+
+    // Instruct: the panel (Close, the focused line, the key row), the line
+    // has the keyboard. The desk's key row is not policy-limited.
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.instructing);
+    try testing.expectEqual(Focus.line, sh.focus());
+    o = sh.overlay(.{});
+    try testing.expectEqual(@as(usize, 3), o.bottom.len);
+    try testing.expectEqual(ids.instruct_close, o.bottom[0].content.buttons[0].id);
+    try testing.expect(o.bottom[1].content.field.focused);
+    try testing.expectEqualStrings("1 2 3 up down esc enter", panelKeys(o, &kb));
+    // A question with more options: its numbers.
+    o = sh.overlay(.{ .viewer = .{ .question_digits = 5 } });
+    try testing.expectEqualStrings("1 2 3 4 5 up down esc enter", panelKeys(o, &kb));
+    // A key from the row is pressed (the desk's answer path).
+    Shell.onAnswer(&sh, "up");
+    try testing.expectEqual(@as(usize, 1), r.answers);
+
+    // Send types the line and presses Enter, no line checks (a slash
+    // command is fine at the desk), and closes the panel.
+    for ("/help") |c| Shell.onChar(&sh, c, .{});
+    Shell.onButton(&sh, ids.send);
+    try testing.expectEqualStrings("t:/help", r.frames[0][0..r.lens[0]]);
+    try testing.expectEqualStrings("k:enter", r.lastFrame());
+    try testing.expect(!sh.instructing);
+    try testing.expectEqual(Focus.terminal, sh.focus());
+    try testing.expectEqual(@as(usize, 1), sh.overlay(.{}).bottom.len);
+
+    // An answer word presses its key (Enter in the line), and closes.
+    Shell.onButton(&sh, ids.instruct);
+    for ("yes") |c| Shell.onChar(&sh, c, .{});
+    Shell.onKey(&sh, .enter, .{});
+    try testing.expectEqualStrings("k:y", r.lastFrame());
+    try testing.expect(!sh.instructing);
+
+    // A click elsewhere: the keyboard is the terminal's again (Esc and
+    // Space included), the panel stays open; a click on the line takes it
+    // back; Esc clears a non-empty line, then closes the panel.
+    Shell.onButton(&sh, ids.instruct);
+    Shell.onMouse(&sh, .{ .action = .down, .button = .left, .col = 1, .row = 1, .inside = true });
+    Shell.onMouse(&sh, .{ .action = .up, .button = .left, .col = 1, .row = 1, .inside = true });
+    try testing.expectEqual(Focus.terminal, sh.focus());
+    try testing.expect(sh.instructing);
+    o = sh.overlay(.{});
+    try testing.expect(!o.bottom[1].content.field.focused);
+    const keys = r.keys;
+    const chars = r.chars;
+    Shell.onKey(&sh, .escape, .{});
+    Shell.onChar(&sh, ' ', .{});
+    try testing.expectEqual(keys + 1, r.keys);
+    try testing.expectEqual(chars + 1, r.chars);
+    try testing.expect(sh.instructing);
+    Shell.onButton(&sh, ids.line);
+    try testing.expectEqual(Focus.line, sh.focus());
+    Shell.onChar(&sh, 'x', .{});
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expect(sh.instructing and sh.line.text().len == 0);
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expect(!sh.instructing);
+    try testing.expectEqual(Focus.terminal, sh.focus());
+    // A click on where the line was does nothing while the panel is shut.
+    Shell.onButton(&sh, ids.line);
+    try testing.expectEqual(Focus.terminal, sh.focus());
+
+    // Close shuts it too.
+    Shell.onButton(&sh, ids.instruct);
+    Shell.onButton(&sh, ids.instruct_close);
+    try testing.expect(!sh.instructing);
+    try testing.expectEqual(Focus.terminal, sh.focus());
+}
+
+test "desk dictation: the panel's mic and the headset's media key, never Space" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    var d: DictToggle = .{};
+    sh.dictation = .{ .ctx = &d, .start = DictToggle.start, .stop = DictToggle.stop };
+    // Space with the terminal focused is a space for the terminal.
+    Shell.onChar(&sh, ' ', .{});
+    try testing.expect(!sh.dictating and !sh.instructing);
+    try testing.expectEqual(@as(usize, 1), r.chars);
+    // Instruct: the panel, dictation started, the indicator.
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.dictating and sh.instructing);
+    var o = sh.overlay(.{});
+    try testing.expect(hasLabel(o, "Listening"));
+    // Space in the line types a space; the mic button stops dictation.
+    Shell.onChar(&sh, ' ', .{});
+    try testing.expectEqualStrings(" ", sh.line.text());
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(!sh.dictating and sh.instructing);
+    o = sh.overlay(.{});
+    try testing.expect(hasLabel(o, "Dictate"));
+    Shell.onButton(&sh, ids.instruct_close);
+    // The headset's media key: only with its microphone; it opens the
+    // panel with the line focused.
+    Shell.onAction(&sh, .media_play_pause);
+    try testing.expect(!sh.dictating);
+    sh.headset_mic = .{ .present = DictToggle.yes };
+    Shell.onAction(&sh, .media_play_pause);
+    try testing.expect(sh.dictating and sh.instructing);
+    try testing.expectEqual(Focus.line, sh.focus());
+    Shell.onAction(&sh, .media_play_pause);
+    try testing.expect(!sh.dictating);
+    try testing.expectEqual(@as(usize, 2), d.starts);
+    try testing.expectEqual(@as(usize, 2), d.stops);
+}
+
 test "touch: the keyboard button, the keyboard follows the line's focus" {
     var r: Rec = .{};
     var sh = Shell.init(testing.allocator, .desk, r.host());
@@ -1471,24 +1607,27 @@ test "touch: the keyboard button, the keyboard follows the line's focus" {
     sh.touch = .{ .enabled = true, .on_screen_keyboard = true };
     var o = sh.overlay(.{});
     try testing.expect(o.touch);
-    try testing.expectEqual(ids.keyboard, o.bottom[0].keyboard.?.id);
+    Shell.onButton(&sh, ids.instruct);
+    o = sh.overlay(.{});
+    try testing.expectEqual(ids.keyboard, o.bottom[1].keyboard.?.id);
     Shell.onButton(&sh, ids.line);
     try testing.expect(sh.keyboard and sh.focus() == .line);
     _ = sh.overlay(.{});
     try testing.expect(sh.keyboard);
-    // Esc on the empty line: back to the terminal, the keyboard goes.
-    Shell.onKey(&sh, .escape, .{});
+    // A click elsewhere: back to the terminal, the keyboard goes.
+    Shell.onMouse(&sh, .{ .action = .down, .button = .left, .col = 1, .row = 1, .inside = true });
+    Shell.onMouse(&sh, .{ .action = .up, .button = .left, .col = 1, .row = 1, .inside = true });
     _ = sh.overlay(.{});
     try testing.expect(!sh.keyboard);
     // The button toggles it (and gives the line the keyboard).
     Shell.onButton(&sh, ids.keyboard);
-    try testing.expect(sh.keyboard);
+    try testing.expect(sh.keyboard and sh.focus() == .line);
     Shell.onButton(&sh, ids.keyboard);
     try testing.expect(!sh.keyboard);
     // A hardware keyboard attached: no button.
     sh.touch.on_screen_keyboard = false;
     o = sh.overlay(.{});
-    try testing.expect(o.bottom[0].keyboard == null);
+    try testing.expect(o.bottom[1].keyboard == null);
 }
 
 test "desk: drag selects, right-click copies, Ctrl+Shift+V pastes" {
@@ -1690,7 +1829,6 @@ test "conversation view (devices): the default, no answer keys, only Instruct at
     try testing.expectEqual(MainView.conversation, sh.main);
     try testing.expect(o.screen == .view);
     // Minimal: no answer bar, no line; only Instruct, at the bottom.
-    try testing.expect(!o.show_answers);
     try testing.expectEqual(@as(usize, 1), o.bottom.len);
     const row = o.bottom[0].content.buttons;
     try testing.expectEqual(@as(usize, 1), row.len);
@@ -1725,7 +1863,6 @@ test "conversation view (devices): the default, no answer keys, only Instruct at
         v.mode = m;
         o = sh.overlay(.{ .viewer = v });
         try testing.expectEqual(@as(usize, if (m == .none) 0 else 1), o.bottom.len);
-        try testing.expect(!o.show_answers);
     }
     // keys mode: the panel opens without a line (and without dictation).
     v.mode = .keys;
@@ -1738,7 +1875,7 @@ test "conversation view (devices): the default, no answer keys, only Instruct at
     v.mode = .instruct;
     Shell.onButton(&sh, ids.view_terminal);
     o = sh.overlay(.{ .viewer = v });
-    try testing.expect(o.screen == .grid and !o.show_answers);
+    try testing.expect(o.screen == .grid);
     try testing.expectEqual(ids.instruct, o.bottom[0].content.buttons[0].id);
     try testing.expectEqual(Focus.terminal, sh.focus());
 }

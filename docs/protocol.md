@@ -580,11 +580,12 @@ Shift+Tab is `shift-tab`.
   server's rules first, so a refusal is shown without a round trip;
   `rejected` still covers anything they missed, and the line comes back.
   The browser's answer buttons are Yes, No, 1, 2, 3, Esc, Enter (then ↑ ↓
-  in `instruct` mode while the shown tab waits, section 4), like the
-  desk's answer bar. The native remote viewers (owner's decision,
+  in `instruct` mode while the shown tab waits, section 4). The native
+  remote viewers and the desk's own window (owner's decisions,
   2026-11-12) show only Instruct; its panel has Esc, Enter, ↑ ↓ while
   waiting and the question's number keys while no card shows them
-  (`keys` mode: the whole answer set), docs/layout-design.md.
+  (`keys` mode: the whole answer set; the desk, not policy-limited:
+  1–3, ↑ ↓, Esc, Enter always), docs/layout-design.md.
 
 ## 7. Portal sync (signed packages for paired devices)
 

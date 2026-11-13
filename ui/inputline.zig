@@ -1,5 +1,5 @@
 //! The instruction line (`instruct` mode, the server's
-//! default): a one-line field under the answer bar, the counterpart of the
+//! default): a one-line field in the instruct panel, the counterpart of the
 //! browser's input box. What Enter does with the text, the answer words and
 //! the refusal texts are the shared logic (module "inputrules",
 //! src/inputrules/send.zig), so both clients behave the same:
@@ -13,7 +13,7 @@
 //!   * A line the server refuses ({"t":"rejected"}) comes back into the
 //!     field if nothing new was typed meanwhile.
 //!
-//! The desk's input box is the same line with `policy` set to
+//! The desk's instruct panel has the same line with `policy` set to
 //! `text` (the person at the desk has full control): there Enter types the
 //! text and presses Enter (`t:` then `k:enter`), with no line checks.
 //!

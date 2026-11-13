@@ -12,8 +12,8 @@
 //! a centred notice, or a pluggable content view such as the conversation),
 //! the Data slice (`Overlay.data`: a thin header strip that grows when there
 //! is something to show), the interaction slice (`Overlay.bottom`: stacked
-//! panes such as the answer buttons and the input box with Send, drawn large
-//! enough to read and hit), status line. A modal `Overlay.panel` is drawn as
+//! panes such as Instruct or its panel, the line with Send and a key row,
+//! drawn large enough to read and hit), status line. A modal `Overlay.panel` is drawn as
 //! a layer over all of them.
 //!
 //! Colours come from the theme (shared/theme.zig) only.
@@ -215,8 +215,8 @@ pub const Pane = struct {
     /// devices without a hardware keyboard).
     keyboard: ?PanelButton = null,
     content: union(enum) {
-        /// A row of answer buttons (the desk's: input.answers; a device's
-        /// instruct panel: its compact key row): InputSink.answer.
+        /// A row of answer buttons (the instruct panel's key row; in `keys`
+        /// mode the whole input.answers): InputSink.answer.
         answers: []const input.Answer,
         /// A centred row of buttons: InputSink.button(id).
         buttons: []const PanelButton,
@@ -304,9 +304,6 @@ pub const Overlay = struct {
     data: ?DataSlice = null,
     top_bar: ?TopBar = null,
     selection: ?Selection = null,
-    /// Shorthand for one `.answers` pane (input.answers) at the top of the
-    /// bottom region.
-    show_answers: bool = false,
     /// The bottom region under the main slice (at most `max_panes`).
     bottom: []const Pane = &.{},
     status: StatusLine = .{},
@@ -639,10 +636,6 @@ pub const Frame = struct {
         // more than half the window (the main slice and data keep the rest).
         var panes: [max_panes]Pane = undefined;
         var n_panes: usize = 0;
-        if (overlay.show_answers) {
-            panes[0] = .{ .content = .{ .answers = &input.answers } };
-            n_panes = 1;
-        }
         for (overlay.bottom) |p| if (n_panes < max_panes) {
             panes[n_panes] = p;
             n_panes += 1;
