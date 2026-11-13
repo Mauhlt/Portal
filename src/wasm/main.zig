@@ -27,6 +27,7 @@ const render = @import("render.zig");
 const slices = @import("slices.zig");
 const inputbox = @import("inputbox.zig");
 const data = @import("data.zig");
+const rules = @import("inputrules");
 
 /// Host functions provided by src/web/app.js. This list is the entire
 /// surface between the page and the client; web.zig's tests check the
@@ -195,6 +196,14 @@ fn showTabs() void {
     if (shown_name) |n| setText(.project, n, .neutral);
 }
 
+/// The shown tab's program waits for an answer (its tab `state`): instruct
+/// mode then takes Up/Down (the browser has no Conversation view).
+fn waitingNow() bool {
+    const cur = app.current orelse return false;
+    const i = app.tabs.find(cur) orelse return false;
+    return app.tabs.items[i].state == .waiting;
+}
+
 /// Shows tab `id`: "s:<id>", remembered as this page's choice.
 fn selectTab(id: proto.tabs.Id) void {
     app.chosen = id;
@@ -323,6 +332,8 @@ fn relayoutSlices() void {
     var in = app.vp orelse return;
     in.touch = app.touch;
     in.input = app.policy != .none;
+    const menu = rules.showMenuButtons(app.policy, waitingNow());
+    in.menu = menu;
     in.data_content = data.wantedHeight(&app.feed, in.inner_w);
     in.data_collapsed = app.data_collapsed;
     const s = slices.compute(in);
@@ -335,8 +346,9 @@ fn relayoutSlices() void {
     if (dataVisible() and app.feed.unseen > 0) app.feed.seen();
     showDataSummary();
     var buf: [160]u8 = undefined;
-    const cls = std.fmt.bufPrint(&buf, "viewer mode-{t}{s}{s}{s}{s}{s}{s}", .{
+    const cls = std.fmt.bufPrint(&buf, "viewer mode-{t}{s}{s}{s}{s}{s}{s}{s}", .{
         app.policy,
+        if (menu) " menu" else "",
         if (app.touch) " touch" else "",
         if (s.keyboard) " kb" else "",
         if (s.no_head) " nohead" else "",
@@ -613,6 +625,7 @@ export fn on_ws_message(binary: u32, len: usize) void {
             .tabs => |l| {
                 app.tabs = l;
                 showTabs();
+                relayoutSlices(); // the Up/Down buttons follow the state
             },
             .session => |id| {
                 app.current = id;
@@ -620,6 +633,7 @@ export fn on_ws_message(binary: u32, len: usize) void {
                 app.grid.images.deinit(gpa);
                 app.grid.images = .{};
                 showTabs();
+                relayoutSlices();
             },
             .nosession => repick(null),
             .ended => |id| if (sameId(app.current, id)) repick(id),
@@ -671,7 +685,7 @@ export fn on_key(len: usize, mods: u32) u32 {
     if (!ready) return 0;
     const key = input(len) orelse return 0;
     var cbuf: [4]u8 = undefined;
-    const action = keys.fromKeyboard(app.policy, key, keys.modsFromBits(mods), &cbuf);
+    const action = keys.fromKeyboardAt(app.policy, waitingNow(), key, keys.modsFromBits(mods), &cbuf);
     if (action == .none) return 0;
     send(action);
     return 1;
@@ -702,6 +716,8 @@ export fn on_button(id: u32) void {
         .send => sendBox(),
         else => {
             if (app.policy == .none) return;
+            // Up/Down: only while shown (a stale tap after the state changed).
+            if (inputbox.isMenuButton(b) and !rules.showMenuButtons(app.policy, waitingNow())) return note(inputbox.refusalText(.not_waiting), .bad);
             if (!app.conn.canSend()) return note(inputbox.refusalText(.offline), .bad);
             const k = inputbox.buttonKey(b).?;
             sendFrame("k:", k);

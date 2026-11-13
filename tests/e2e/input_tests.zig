@@ -261,12 +261,18 @@ pub fn runInstruct(h: *proc.Harness, r: *Runner, port: u16) !void {
     v.pump(800);
     _ = r.check("no rejected instruction reached the shell", v.g.find("SHELL-ESCAPE") == null and std.mem.eql(u8, v.cursorLine(), "E2E>"), "'{s}' {s}", .{ v.cursorLine(), v.dump(&dump_buf) });
 
-    // No raw typing or editing keys in instruct mode.
+    // No raw typing or editing keys in instruct mode. Up/Down only while
+    // the program waits for an answer: a shell reports no OSC 7501 state
+    // (unknown), so they are refused, and the viewer is told.
+    const rej0 = v.rejected_count;
     v.send("t:TYPED");
     v.send("k:up");
     v.send("k:ctrl-c");
+    v.send("k:down");
     v.pump(800);
     _ = r.check("instruct mode: t: typing and editing keys dropped", std.mem.eql(u8, v.cursorLine(), "E2E>"), "'{s}'", .{v.cursorLine()});
+    _ = r.check("instruct mode: k:up / k:down refused while not waiting (rejected NotWaiting)", v.rejected_count == rej0 + 2 and
+        std.mem.indexOf(u8, v.rejected[0..v.rejected_len], "NotWaiting") != null, "{d} '{s}'", .{ v.rejected_count - rej0, v.rejected[0..v.rejected_len] });
     // Answer keys still work.
     v.send("k:4");
     v.send("k:2");

@@ -39,7 +39,13 @@ const dom_keys = [_]struct { dom: []const u8, name: []const u8 }{
 
 /// Maps a keydown. Returned slices point into static tables or `buf`.
 pub fn fromKeyboard(policy: Policy, key: []const u8, mods: Mods, buf: *[4]u8) Action {
-    for (dom_keys) |k| if (std.mem.eql(u8, key, k.dom)) return rules.special(policy, k.name, mods);
+    return fromKeyboardAt(policy, false, key, mods, buf);
+}
+
+/// `fromKeyboard`, knowing whether the shown tab's program waits for an
+/// answer: instruct mode then sends ArrowUp / ArrowDown too.
+pub fn fromKeyboardAt(policy: Policy, waiting: bool, key: []const u8, mods: Mods, buf: *[4]u8) Action {
+    for (dom_keys) |k| if (std.mem.eql(u8, key, k.dom)) return rules.specialAt(policy, waiting, k.name, mods);
     // A character key is one code point ("a", "é"); named keys ("Shift",
     // "F5", "Unidentified") are longer and map to nothing.
     const cp = proto.Utf8Iter.single(key) orelse return .none;
@@ -55,6 +61,15 @@ fn expectKey(expected: []const u8, a: Action) !void {
         .key => |k| try testing.expectEqualStrings(expected, k),
         else => return error.TestExpectedEqual,
     }
+}
+
+test "instruct: arrows only while waiting" {
+    var b: [4]u8 = undefined;
+    try expectKey("up", fromKeyboardAt(.instruct, true, "ArrowUp", .{}, &b));
+    try expectKey("down", fromKeyboardAt(.instruct, true, "ArrowDown", .{}, &b));
+    try testing.expectEqual(Action.none, fromKeyboardAt(.instruct, false, "ArrowUp", .{}, &b));
+    try testing.expectEqual(Action.none, fromKeyboardAt(.instruct, true, "ArrowLeft", .{}, &b));
+    try testing.expectEqual(Action.none, fromKeyboardAt(.keys, true, "ArrowUp", .{}, &b));
 }
 
 test "keys mode: answers only, never text" {

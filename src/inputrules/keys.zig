@@ -21,6 +21,9 @@ const std = @import("std");
 ///          escape, no `/` slash commands, no `#` memory shortcut, no control
 ///          characters or line breaks. The agent still asks permission for
 ///          anything it runs; the device answers with the answer keys.
+///          Up/Down (`menu_keys`) only while the program waits for an
+///          answer (`lookupAt`), for arrow-select menus such as the
+///          folder-trust prompt.
 ///   text - FULL REMOTE CONTROL: typed text is an agent prompt, slash
 ///          commands, Shift+Tab mode changes, Ctrl+C. A `!` typed by a device
 ///          at the start of a line is dropped (TextGuard, best effort).
@@ -65,6 +68,26 @@ pub const answer_keys = [_]Key{
     .{ .name = "enter", .bytes = "\r" }, .{ .name = "esc", .bytes = "\x1b" },
 };
 
+/// Accepted in `instruct` mode only while the session program waits for
+/// an answer (`waiting` in `lookupAt`): its OSC 7501 state is `blocked`, or
+/// the Conversation view has an open question. That is how arrow-select
+/// menus (the agent's folder-trust prompt, its permission and question menus)
+/// are answered. Never otherwise: at the agent's input box Up recalls an
+/// earlier prompt from history (a `!` shell command or a slash command
+/// typed at the desk among them) and Enter would submit it, past every
+/// instruction-line check. Not in `keys` mode at all. `text` mode has them
+/// anyway (text_keys).
+pub const menu_keys = [_]Key{
+    .{ .name = "up", .bytes = "\x1b[A" },
+    .{ .name = "down", .bytes = "\x1b[B" },
+};
+
+/// A menu key (`menu_keys`): allowed in `instruct` mode only while waiting.
+pub fn isMenuKey(name: []const u8) bool {
+    for (&menu_keys) |*k| if (std.mem.eql(u8, k.name, name)) return true;
+    return false;
+}
+
 /// Additionally accepted in `text` mode (full remote control).
 pub const text_keys = [_]Key{
     .{ .name = "backspace", .bytes = "\x7f" },
@@ -82,12 +105,36 @@ pub const text_keys = [_]Key{
     .{ .name = "ctrl-c", .bytes = "\x03" },
 };
 
-/// The table entry for key `name` under `policy`, or null if not allowed.
+/// The table entry for key `name` under `policy`, or null if not allowed,
+/// for a program that is not waiting for an answer (see `lookupAt`).
 pub fn lookup(policy: Policy, name: []const u8) ?*const Key {
     if (policy == .none) return null;
     for (&answer_keys) |*k| if (std.mem.eql(u8, k.name, name)) return k;
     if (policy != .text) return null;
     for (&text_keys) |*k| if (std.mem.eql(u8, k.name, name)) return k;
+    return null;
+}
+
+/// `lookup`, knowing whether the session program waits for an answer
+/// (`waiting`): `instruct` mode then also takes the menu keys (Up/Down).
+pub fn lookupAt(policy: Policy, waiting: bool, name: []const u8) ?*const Key {
+    if (lookup(policy, name)) |k| return k;
+    if (policy != .instruct or !waiting) return null;
+    for (&menu_keys) |*k| if (std.mem.eql(u8, k.name, name)) return k;
+    return null;
+}
+
+/// Why the server refused a key it otherwise knows (sent back as
+/// `{"t":"rejected","reason":"NotWaiting"}`): Up/Down in `instruct` mode
+/// while the program is not waiting for an answer.
+pub const KeyError = error{NotWaiting};
+
+/// The server's decision for `k:<name>`: the bytes to write, null for a
+/// name the policy never takes (dropped silently), or error.NotWaiting for
+/// a menu key in `instruct` mode while the program is not waiting.
+pub fn keyBytesAt(policy: Policy, waiting: bool, name: []const u8) KeyError!?[]const u8 {
+    if (lookupAt(policy, waiting, name)) |k| return k.bytes;
+    if (policy == .instruct and isMenuKey(name)) return error.NotWaiting;
     return null;
 }
 
@@ -126,9 +173,16 @@ pub const Action = union(enum) {
 /// Meta combinations send nothing (Ctrl+Enter is not Enter); Shift+Tab is
 /// `shift-tab`; otherwise the key is sent if `policy` allows it.
 pub fn special(policy: Policy, name: []const u8, mods: Mods) Action {
+    return specialAt(policy, false, name, mods);
+}
+
+/// `special`, knowing whether the shown tab's program waits for an answer
+/// (its tab `state` is `waiting`, or the Conversation view has an open
+/// question): `instruct` mode then also sends Up/Down (`menu_keys`).
+pub fn specialAt(policy: Policy, waiting: bool, name: []const u8, mods: Mods) Action {
     if (mods.alt or mods.meta or mods.ctrl) return .none;
     const n = if (mods.shift and std.mem.eql(u8, name, "tab")) "shift-tab" else name;
-    const k = lookup(policy, n) orelse return .none;
+    const k = lookupAt(policy, waiting, n) orelse return .none;
     return .{ .key = k.name };
 }
 
@@ -289,6 +343,39 @@ test "keys mode: answers only" {
     try testing.expect(keyBytes(.keys, "") == null);
 }
 
+test "instruct mode: Up/Down only while the program waits" {
+    // Waiting: the menu keys, and still no other editing key.
+    try testing.expectEqualStrings("\x1b[A", (try keyBytesAt(.instruct, true, "up")).?);
+    try testing.expectEqualStrings("\x1b[B", (try keyBytesAt(.instruct, true, "down")).?);
+    try testing.expectEqualStrings("1", (try keyBytesAt(.instruct, true, "1")).?);
+    for ([_][]const u8{ "left", "right", "backspace", "tab", "shift-tab", "ctrl-c", "home", "pageup", "\x1b[A" }) |k|
+        try testing.expect((try keyBytesAt(.instruct, true, k)) == null);
+    // Not waiting (working, idle, unknown): refused, with a reason.
+    try testing.expectError(error.NotWaiting, keyBytesAt(.instruct, false, "up"));
+    try testing.expectError(error.NotWaiting, keyBytesAt(.instruct, false, "down"));
+    try testing.expectEqualStrings("\r", (try keyBytesAt(.instruct, false, "enter")).?);
+    // keys mode never takes them; text mode always does; none nothing.
+    for ([_]bool{ false, true }) |wt| {
+        try testing.expect((try keyBytesAt(.keys, wt, "up")) == null);
+        try testing.expect((try keyBytesAt(.keys, wt, "down")) == null);
+        try testing.expectEqualStrings("\x1b[A", (try keyBytesAt(.text, wt, "up")).?);
+        try testing.expect((try keyBytesAt(.none, wt, "up")) == null);
+        try testing.expect((try keyBytesAt(.none, wt, "1")) == null);
+    }
+    // The client rule follows the same gate.
+    try testing.expectEqualStrings("up", specialAt(.instruct, true, "up", .{}).key);
+    try testing.expectEqualStrings("down", specialAt(.instruct, true, "down", .{ .shift = true }).key);
+    try testing.expectEqual(Action.none, specialAt(.instruct, true, "up", .{ .ctrl = true }));
+    try testing.expectEqual(Action.none, specialAt(.instruct, false, "up", .{}));
+    try testing.expectEqual(Action.none, specialAt(.keys, true, "up", .{}));
+    try testing.expectEqual(Action.none, specialAt(.instruct, true, "left", .{}));
+    // An arrow resets text mode's line start (it is not a character key).
+    var g: TextGuard = .{};
+    _ = g.filter("x");
+    g.onKey("up");
+    try testing.expectEqualStrings("cmd", g.filter("!cmd"));
+}
+
 test "instruct mode: answer keys only, no editing keys" {
     try testing.expectEqualStrings("1", keyBytes(.instruct, "1").?);
     try testing.expectEqualStrings("\r", keyBytes(.instruct, "enter").?);
@@ -394,6 +481,10 @@ test "client mapping: one rule for every client" {
     for (std.enums.values(Policy)) |p| {
         for (answer_keys ++ text_keys) |k| switch (special(p, k.name, .{})) {
             .key => |n| try testing.expect(keyBytes(p, n) != null),
+            else => {},
+        };
+        for (answer_keys ++ text_keys ++ menu_keys) |k| switch (specialAt(p, true, k.name, .{})) {
+            .key => |n| try testing.expect((keyBytesAt(p, true, n) catch null) != null),
             else => {},
         };
         var cp: u21 = 0;

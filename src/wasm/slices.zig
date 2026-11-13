@@ -40,6 +40,9 @@ pub const Input = struct {
     touch: bool,
     /// The server accepts some input (interaction slice shown).
     input: bool = true,
+    /// The Up/Down buttons are shown too (instruct mode while the shown
+    /// tab waits for an answer: rules.showMenuButtons).
+    menu: bool = false,
     /// What the Data slice's items would like under its header (CSS px;
     /// 0: nothing to show), and the user's collapse toggle.
     data_content: f64 = 0,
@@ -65,6 +68,8 @@ pub const Slices = struct {
     box_h: i32 = 0,
     note_h: i32 = 0,
     btn_h: i32 = 0,
+    /// Buttons in the grid (`button_count`, or `menu_button_count`).
+    buttons: u32 = 0,
     cols: u32 = 0,
     rows: u32 = 0,
     /// Space kept free under the buttons (home indicator); 0 while the
@@ -93,6 +98,8 @@ pub const gap: i32 = 6;
 pub const pane_pad: i32 = 6;
 /// Yes No 1 2 3 Esc Enter Send (inputbox.Button).
 pub const button_count: u32 = 8;
+/// ... then Up and Down, while they are shown (Input.menu).
+pub const menu_button_count: u32 = 10;
 /// Answer buttons: thumb-sized on touch screens, comfortable with a mouse.
 pub const btn_touch: i32 = 52;
 pub const btn_mouse: i32 = 44;
@@ -148,13 +155,14 @@ pub fn compute(in: Input) Slices {
     if (in.input) {
         s.btn_h = if (in.touch) btn_touch else btn_mouse;
         const min_w = if (in.touch) min_btn_touch else min_btn_mouse;
-        const n: f64 = @floatFromInt(button_count);
+        s.buttons = if (in.menu) menu_button_count else button_count;
+        const n: f64 = @floatFromInt(s.buttons);
         const avail = @as(f64, @floatFromInt(W)) - 2 * @as(f64, pane_pad) - (n - 1) * @as(f64, gap);
         if (avail / n >= min_w) {
-            s.cols = button_count;
+            s.cols = s.buttons;
             s.rows = 1;
         } else {
-            s.cols = (button_count + 1) / 2;
+            s.cols = (s.buttons + 1) / 2;
             s.rows = 2;
         }
         s.note_h = note_line;
@@ -255,7 +263,19 @@ fn expectTiles(s: Slices) !void {
     try testing.expectEqual(s.head.w, s.term.w);
     try testing.expectEqual(s.term.w, s.data.w);
     try testing.expectEqual(s.term.w, s.inter.w);
-    if (s.cols > 0) try testing.expectEqual(button_count, s.cols * s.rows);
+    if (s.cols > 0) try testing.expectEqual(s.buttons, s.cols * s.rows);
+}
+
+test "the Up/Down buttons join the grid while shown" {
+    const s = compute(.{ .inner_w = 390, .inner_h = 664, .vv_w = 390, .vv_h = 664, .vv_top = 0, .touch = true, .menu = true });
+    try expectTiles(s);
+    try testing.expectEqual(menu_button_count, s.buttons);
+    try testing.expectEqual(@as(u32, 5), s.cols);
+    const wide = compute(.{ .inner_w = 1400, .inner_h = 800, .vv_w = 1400, .vv_h = 800, .vv_top = 0, .touch = false, .menu = true });
+    try expectTiles(wide);
+    try testing.expectEqual(menu_button_count, wide.cols);
+    const off = compute(.{ .inner_w = 1400, .inner_h = 800, .vv_w = 1400, .vv_h = 800, .vv_top = 0, .touch = false });
+    try testing.expectEqual(button_count, off.cols);
 }
 
 test "iPhones, portrait, keyboard closed: terminal, data strip, interaction pinned at the bottom" {

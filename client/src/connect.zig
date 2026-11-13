@@ -228,6 +228,7 @@ const Host = struct {
                 .trust_error = trust,
                 .exit_code = s.exit_code,
                 .pin_fp = h.pin_fp_buf[0..h.pin_fp_len],
+                .question_open = h.convo_view.newestOpenQuestion() != null,
             },
         });
         h.p.build(&s.grid, o);
@@ -283,7 +284,7 @@ const Host = struct {
     fn onKey(ctx: *anyopaque, k: ui.input.Key, m: ui.input.Mods) void {
         const h = self(ctx);
         var buf: [16]u8 = undefined;
-        if (keys.keyFrame(h.shell.mode, k, m, &buf)) |f| _ = h.client.sendInput(f);
+        if (keys.keyFrameAt(h.shell.mode, h.shell.waiting, k, m, &buf)) |f| _ = h.client.sendInput(f);
     }
 
     fn onChar(ctx: *anyopaque, cp: u21, m: ui.input.Mods) void {
@@ -295,7 +296,7 @@ const Host = struct {
     fn onAnswer(ctx: *anyopaque, key: []const u8) void {
         const h = self(ctx);
         var buf: [16]u8 = undefined;
-        if (keys.answerFrame(h.shell.mode, key, &buf)) |f| _ = h.client.sendInput(f);
+        if (keys.answerFrameAt(h.shell.mode, h.shell.waiting, key, &buf)) |f| _ = h.client.sendInput(f);
     }
 
     /// The instruction line's frames go out on the connection.

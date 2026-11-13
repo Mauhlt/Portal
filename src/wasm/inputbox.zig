@@ -36,13 +36,21 @@ pub fn boxKeySends(key: []const u8, mods: u32) bool {
 // ------------------------------------------------------------ the button row
 
 /// The data-btn ids in index.html: the shared answer buttons in order,
-/// then Send.
-pub const Button = enum(u32) { yes, no, one, two, three, esc, enter, send };
+/// then Send, then the shared Up/Down buttons (class "menu": shown only
+/// while the page has class "menu", rules.showMenuButtons).
+pub const Button = enum(u32) { yes, no, one, two, three, esc, enter, send, up, down };
 
 /// The key a button presses (null for Send).
 pub fn buttonKey(b: Button) ?[]const u8 {
     const i = @intFromEnum(b);
-    return if (i < rules.answer_buttons.len) rules.answer_buttons[i].key else null;
+    if (i < rules.answer_buttons.len) return rules.answer_buttons[i].key;
+    const m = i -% (rules.answer_buttons.len + 1);
+    return if (m < rules.menu_buttons.len) rules.menu_buttons[m].key else null;
+}
+
+/// An Up/Down button (sent only while rules.showMenuButtons).
+pub fn isMenuButton(b: Button) bool {
+    return b == .up or b == .down;
 }
 
 // ------------------------------------------------------------------ tests
@@ -60,9 +68,12 @@ test "box keys and buttons" {
     try testing.expectEqualStrings("esc", buttonKey(.esc).?);
     try testing.expectEqualStrings("enter", buttonKey(.enter).?);
     try testing.expectEqual(@as(?[]const u8, null), buttonKey(.send));
-    // One id per shared answer button, then Send.
-    try testing.expectEqual(rules.answer_buttons.len + 1, std.enums.values(Button).len);
+    // One id per shared answer button, then Send, then Up/Down.
+    try testing.expectEqual(rules.answer_buttons.len + 1 + rules.menu_buttons.len, std.enums.values(Button).len);
     for (rules.answer_buttons, 0..) |a, i| try testing.expectEqualStrings(a.key, buttonKey(@enumFromInt(i)).?);
+    try testing.expectEqualStrings("up", buttonKey(.up).?);
+    try testing.expectEqualStrings("down", buttonKey(.down).?);
+    try testing.expect(isMenuButton(.down) and !isMenuButton(.enter));
 }
 
 test "preview picks the device's help" {

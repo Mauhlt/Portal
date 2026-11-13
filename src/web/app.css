@@ -127,6 +127,11 @@ body.mode-keys #box { background: var(--panel); border-style: dashed; color: var
   touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 #keys button:active { background: var(--accent); color: #fff; }
 #keys .send { background: var(--accent); border-color: var(--accent); color: #fff; }
+/* Up / Down: only while the shown tab's program waits (instruct mode);
+   drawn before Send. */
+body:not(.menu) #keys .menu { display: none; }
+#keys .menu { order: 1; }
+#keys .send { order: 2; }
 body:not(.touch) #keys { grid-template-columns: repeat(var(--cols, 8), minmax(0, 130px)); justify-content: center; }
 @media (pointer: coarse) {
   .ctl button { min-height: 36px; min-width: 44px; }

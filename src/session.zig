@@ -106,10 +106,29 @@ pub const Session = struct {
         if (s.notify_fn) |f| if (s.notify_ctx) |c| f(c);
     }
 
+    /// Whether the program waits for an answer: its OSC 7501 state is
+    /// `blocked`, or the Conversation view has an open question (an
+    /// AskUserQuestion the transcript shows unanswered). Caller holds
+    /// `mutex`. A program that never reports OSC 7501 and asks nothing
+    /// in its transcript is never waiting.
+    fn waitingLocked(s: *const Session) bool {
+        if (s.state == .waiting) return true;
+        const c = s.convo orelse return false;
+        return c.hasOpenQuestion();
+    }
+
     /// A key pressed in a web viewer, by protocol name. Portal generates the
     /// bytes itself (keymap.zig); unknown or disallowed names are dropped.
-    pub fn writeWebKey(s: *Session, name: []const u8, now_ms: i64) void {
-        const bytes = keymap.keyBytes(s.policy, name) orelse return;
+    /// Up/Down in instruct mode go through only while the program waits for
+    /// an answer (keymap.keyBytesAt), decided now, as the key arrives:
+    /// otherwise error.NotWaiting (the viewer is told).
+    pub fn writeWebKey(s: *Session, name: []const u8, now_ms: i64) keymap.KeyError!void {
+        const waiting = if (s.policy == .instruct and keymap.isMenuKey(name)) blk: {
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            break :blk s.waitingLocked();
+        } else false;
+        const bytes = (try keymap.keyBytesAt(s.policy, waiting, name)) orelse return;
         s.input_mutex.lockUncancelable(s.io);
         defer s.input_mutex.unlock(s.io);
         if (!s.input_open) return;
@@ -339,6 +358,93 @@ pub fn escGapDelay(now: i64, last_esc: i64, gap: i64) i64 {
 pub fn withinWindow(now: i64, last: i64, window: i64) bool {
     const dt = now -| last;
     return dt >= 0 and dt < window;
+}
+
+test "instruct: Up/Down only while the program waits (OSC 7501 or an open question)" {
+    const w = @import("win32.zig");
+    const gpa = std.testing.allocator;
+    var rd: w.HANDLE = undefined;
+    var wr: w.HANDLE = undefined;
+    if (w.CreatePipe(&rd, &wr, null, 1 << 16) == 0) return error.SkipZigTest;
+    defer _ = w.CloseHandle(rd);
+    defer _ = w.CloseHandle(wr);
+    var pty: Pty = .{ .hpc = undefined, .in_write = wr, .out_read = undefined, .process = undefined, .job = undefined };
+    var mu: Io.Mutex = .init;
+    var cv: Io.Condition = .init;
+    var s: Session = .{
+        .io = std.testing.io,
+        .mutex = &mu,
+        .cond = &cv,
+        .pty = &pty,
+        .console = undefined,
+        .policy = .instruct,
+        .term = try vt.Terminal.init(gpa, 10, 5),
+        .size = .{ .cols = 10, .rows = 5 },
+    };
+    defer s.term.deinit();
+    const T = struct {
+        fn pending(h: w.HANDLE) usize {
+            var avail: w.DWORD = 0;
+            if (PeekNamedPipe(h, null, 0, null, &avail, null) == 0) return 0;
+            return avail;
+        }
+        fn drain(h: w.HANDLE, buf: []u8) []u8 {
+            var r: w.DWORD = 0;
+            const n = pending(h);
+            if (n == 0) return buf[0..0];
+            _ = w.ReadFile(h, buf.ptr, @intCast(@min(n, buf.len)), &r, null);
+            return buf[0..r];
+        }
+        extern "kernel32" fn PeekNamedPipe(h: w.HANDLE, buf: ?*anyopaque, size: w.DWORD, read: ?*w.DWORD, avail: ?*w.DWORD, left: ?*w.DWORD) callconv(.winapi) w.BOOL;
+    };
+    var buf: [64]u8 = undefined;
+    // Unknown (no OSC 7501 yet): refused.
+    try std.testing.expectError(error.NotWaiting, s.writeWebKey("up", 0));
+    try std.testing.expectEqual(@as(usize, 0), T.pending(rd));
+    // Working and idle: refused.
+    for ([_][]const u8{ "working", "idle" }) |st| {
+        var ob: [64]u8 = undefined;
+        s.appendOutput(try std.fmt.bufPrint(&ob, "\x1b]7501;state={s}\x07", .{st}));
+        try std.testing.expectError(error.NotWaiting, s.writeWebKey("down", 0));
+        try std.testing.expectEqual(@as(usize, 0), T.pending(rd));
+    }
+    // Waiting (blocked): accepted.
+    s.appendOutput("\x1b]7501;state=blocked:kind=permission\x07");
+    try s.writeWebKey("up", 0);
+    try s.writeWebKey("down", 0);
+    try std.testing.expectEqualStrings("\x1b[A\x1b[B", T.drain(rd, &buf));
+    // Still no other editing key.
+    try s.writeWebKey("left", 0);
+    try std.testing.expectEqual(@as(usize, 0), T.pending(rd));
+    // Refused at once after the state leaves waiting.
+    s.appendOutput("\x1b]7501;state=working\x07");
+    try std.testing.expectError(error.NotWaiting, s.writeWebKey("up", 0));
+    try std.testing.expectEqual(@as(usize, 0), T.pending(rd));
+    // An open question in the Conversation view counts as waiting too
+    // (the program reports `working`, or no OSC 7501 at all).
+    var c = convo_model.Convo.init(gpa, .{});
+    defer c.deinit();
+    c.reset(true);
+    s.convo = &c;
+    try std.testing.expectError(error.NotWaiting, s.writeWebKey("up", 0));
+    c.programState(.other);
+    try s.writeWebKey("up", 0);
+    try std.testing.expectEqualStrings("\x1b[A", T.drain(rd, &buf));
+    c.programState(.none);
+    try std.testing.expectError(error.NotWaiting, s.writeWebKey("up", 0));
+    s.convo = null;
+    // Answer keys are untouched by the gate.
+    try s.writeWebKey("1", 0);
+    try std.testing.expectEqualStrings("1", T.drain(rd, &buf));
+    // keys mode never takes them, waiting or not; text mode always does.
+    s.appendOutput("\x1b]7501;state=blocked\x07");
+    s.policy = .keys;
+    try s.writeWebKey("up", 0);
+    try std.testing.expectEqual(@as(usize, 0), T.pending(rd));
+    s.policy = .text;
+    s.appendOutput("\x1b]7501;state=idle\x07");
+    try s.writeWebKey("up", 0);
+    try std.testing.expectEqualStrings("\x1b[A", T.drain(rd, &buf));
 }
 
 test "withinWindow" {

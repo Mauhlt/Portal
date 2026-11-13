@@ -49,9 +49,15 @@ pub fn keyName(key: Key) ?[]const u8 {
 /// Frame for a special key at the terminal, or null if not allowed.
 /// `buf` must hold >= 16 bytes.
 pub fn keyFrame(policy: ?Policy, key: Key, m: Mods, buf: []u8) ?[]const u8 {
+    return keyFrameAt(policy, false, key, m, buf);
+}
+
+/// `keyFrame`, knowing whether the shown tab's program waits for an
+/// answer (Shell.waiting): instruct mode then sends Up/Down too.
+pub fn keyFrameAt(policy: ?Policy, waiting: bool, key: Key, m: Mods, buf: []u8) ?[]const u8 {
     const p = policy orelse return null;
     const name = keyName(key) orelse return null;
-    return rules.frame(buf, rules.special(p, name, mods(m)));
+    return rules.frame(buf, rules.specialAt(p, waiting, name, mods(m)));
 }
 
 /// Frame for a typed character at the terminal, or null. `buf` must hold
@@ -65,9 +71,17 @@ pub fn charFrame(policy: ?Policy, cp: u21, m: Mods, buf: []u8) ?[]const u8 {
 /// Frame for an answer button (`rules.answer_buttons[i].key`), if the
 /// policy accepts it.
 pub fn answerFrame(policy: ?Policy, key: []const u8, buf: []u8) ?[]const u8 {
+    return answerFrameAt(policy, false, key, buf);
+}
+
+/// `answerFrame`, knowing whether the shown tab's program waits for an
+/// answer: the Up/Down buttons (`rules.menu_buttons`) then send too, in
+/// instruct mode.
+pub fn answerFrameAt(policy: ?Policy, waiting: bool, key: []const u8, buf: []u8) ?[]const u8 {
     const p = policy orelse return null;
     if (!p.acceptsAnswers()) return null;
     for (&rules.answer_keys) |*k| if (std.mem.eql(u8, k.name, key)) return rules.frame(buf, .{ .key = k.name });
+    if (rules.showMenuButtons(p, waiting)) for (&rules.menu_keys) |*k| if (std.mem.eql(u8, k.name, key)) return rules.frame(buf, .{ .key = k.name });
     return null;
 }
 
@@ -108,6 +122,19 @@ test "instruct: the answer keys work (the field takes typing, remote.zig)" {
     try testing.expectEqualStrings("k:2", charFrame(.instruct, '2', .{}, &b).?);
     try testing.expectEqualStrings("k:y", answerFrame(.instruct, "y", &b).?);
     try testing.expect(keyFrame(.instruct, .up, .{}, &b) == null);
+}
+
+test "instruct: Up/Down only while the shown tab waits" {
+    var b: [16]u8 = undefined;
+    try testing.expectEqualStrings("k:up", keyFrameAt(.instruct, true, .up, .{}, &b).?);
+    try testing.expectEqualStrings("k:down", keyFrameAt(.instruct, true, .down, .{}, &b).?);
+    try testing.expect(keyFrameAt(.instruct, false, .up, .{}, &b) == null);
+    try testing.expect(keyFrameAt(.instruct, true, .left, .{}, &b) == null);
+    try testing.expect(keyFrameAt(.keys, true, .up, .{}, &b) == null);
+    try testing.expectEqualStrings("k:up", answerFrameAt(.instruct, true, "up", &b).?);
+    try testing.expect(answerFrameAt(.instruct, false, "up", &b) == null);
+    try testing.expect(answerFrameAt(.keys, true, "down", &b) == null);
+    try testing.expect(answerFrameAt(.none, true, "up", &b) == null);
 }
 
 test "view only and unknown send nothing" {

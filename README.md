@@ -44,6 +44,19 @@ Input modes (`--input`, or Remote input in the window's Settings):
   characters or line breaks. The program still asks permission before
   running anything; you answer with the buttons. If the session program is
   a shell, the default is `keys` instead (see below).
+  **Up/Down** (for arrow-select menus without numbers, such as the agent's
+  folder-trust prompt) are accepted only while the shown tab's
+  program waits for an answer: it reports OSC 7501 `state=blocked`, or its
+  Conversation view has an open question. Otherwise Portal refuses them
+  (`rejected` `NotWaiting`), because at an idle prompt Up recalls an older
+  prompt from history (possibly a `!` shell command or a slash command
+  typed at the desk) and Enter would submit it past the line checks.
+  Devices show ↑/↓ buttons only while they would be accepted. A program
+  that never reports OSC 7501 and asks nothing in its transcript (no
+  question open) never gets them; that includes the agent if it does not
+  detect OSC 7501 support in Portal's terminal, and its folder-trust
+  prompt, which comes before any transcript, can then only be answered at
+  the desk.
 * `keys`: digits, y/n, Enter, and a single Esc. Enough to answer
   numbered "1 / 2 / 3" prompts. Be aware that at an idle input prompt
   these keys are typed like any other text, so a device can submit a line
@@ -417,7 +430,9 @@ divider to resize it. The interaction slice:
    Anything else is sent as an instruction line; if it would be refused
    the reason shows under the box and the text stays. In `keys` mode the
    box takes answer words only;
-* **buttons**: Yes, No, 1, 2, 3, Esc, Enter, Send.
+* **buttons**: Yes, No, 1, 2, 3, Esc, Enter, Send; in `instruct` mode
+  also ↑ and ↓ while the shown tab's program waits for an answer (the
+  native client's answer bar too).
 
 On the iPhone, voice is Apple's keyboard dictation into the input box;
 Portal never records or sends audio from the phone.

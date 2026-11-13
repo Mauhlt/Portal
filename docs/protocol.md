@@ -151,7 +151,7 @@ frames must be masked; no fragmentation; no extensions.
 | `exit` | `code` | the last tab's program exited (every tab has ended): Portal stops; stream ends |
 | `logout` | `reason` (optional): `"unpaired"` or `"replaced"` | the session ended. `"unpaired"`: the desktop removed this device (unpaired at the desk, forgotten, revoked): forget this desktop now. `"replaced"`: a re-pair under its name or address replaced it: sign in again, whose answer (`X-Portal-Device: gone` or not) decides. No reason (expired, logged out): sign in again |
 | `updates` | | Portal sync: this device's package index changed (a publish, or a subscription changed at the desk). Fetch `GET /sync/index` (section 7). Devices also look on every connect |
-| `rejected` | `reason` | an `l:` instruction line was refused (e.g. `ShellEscape`, `SlashCommand`, `MemoryShortcut`, `ControlCharacter`, `TooLong`, `Empty`); nothing was typed |
+| `rejected` | `reason` | an `l:` instruction line was refused (e.g. `ShellEscape`, `SlashCommand`, `MemoryShortcut`, `ControlCharacter`, `TooLong`, `Empty`), or a `k:up` / `k:down` in `instruct` mode while the program was not waiting for an answer (`NotWaiting`, section 4); nothing was typed |
 | `convo` | `id`, `on`, `items` | the whole Conversation view of the tab watched (section 3b): after `hello` and every `session`, and whenever the server starts the conversation over. Replaces what the client had |
 | `convo+` | `id`, `items` | new or changed items of that conversation (section 3b) |
 | `activity` | `sysmon`, `tabs` | every open tab's background tasks and token usage (section 3c): after `hello`, then whenever any of it, the tab list or the desk's system-monitor setting changes |
@@ -475,21 +475,44 @@ passed, so the program can't read the pair as Alt+key.
 first, the tab in `hello.session`); while that tab has ended or the last
 `s:` named no open tab, they are dropped.
 
-Key names. `keys` and `instruct` mode accept only the first row; `text`
-mode accepts all (`none` accepts nothing):
+Key names. `keys` mode accepts only the first row, `instruct` the first
+row plus `up` / `down` while the program waits; `text` mode accepts all
+(`none` accepts nothing):
 
 | mode | names |
 |---|---|
 | `keys`, `instruct` | `0` … `9`, `y`, `n`, `enter`, `esc` |
+| `instruct`, only while the tab's program waits for an answer | `up`, `down` |
 | `text` additionally | `backspace`, `tab`, `shift-tab`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `ctrl-c` |
 
+"Waits for an answer" is decided by the server when the key arrives: the
+tab's OSC 7501 state is `waiting` (`state=blocked`), or its Conversation
+view has an open question (section 3b). Working, idle, done or unknown
+(no OSC 7501 seen) is not waiting, so `up` / `down` are refused, answered
+with `{"t":"rejected","reason":"NotWaiting"}`; the first key after the
+state leaves `waiting` is already refused. They exist for arrow-select
+menus without numbers (the agent's folder-trust prompt, its permission
+and question menus). The gate is there because at an idle prompt Up
+recalls an older prompt from history (a `!` shell command or slash command
+typed at the desk among them) and Enter would submit it, past every
+instruction-line check. Residual risk: a program that reports `blocked`
+while its input box is live, or a question left open in the transcript,
+re-opens that window; a program that never reports OSC 7501 and writes no
+question (including the agent when it does not detect OSC 7501 support
+in Portal's terminal; its folder-trust prompt comes before any transcript)
+never gets `up` / `down`, and must be answered at the desk. Clients show
+Up/Down (↑ ↓ after the answer buttons) only while they would be accepted:
+in `instruct` mode while the shown tab's `state` is `waiting` or (native
+client) its conversation has an open question.
+
 The server maps names to the exact bytes the terminal expects, applies the
-session's input policy, and silently drops anything not allowed. Clients
-should still hide controls the current mode doesn't accept. Unknown frames
-are ignored. The tables are defined once, in `src/inputrules/keys.zig`,
-which the server and both Portal clients use; so is the clients' key rule:
-Ctrl, Alt and Meta combinations send nothing (Ctrl+Enter is not Enter),
-except Ctrl+C in `text` mode; Shift+Tab is `shift-tab`.
+session's input policy, and silently drops anything not allowed (except the
+`NotWaiting` case above). Clients should still hide controls the current
+mode doesn't accept. Unknown frames are ignored. The tables are defined
+once, in `src/inputrules/keys.zig`, which the server and both Portal
+clients use; so is the clients' key rule: Ctrl, Alt and Meta combinations
+send nothing (Ctrl+Enter is not Enter), except Ctrl+C in `text` mode;
+Shift+Tab is `shift-tab`.
 
 ## 5. Behaviour clients should implement
 
@@ -512,7 +535,8 @@ except Ctrl+C in `text` mode; Shift+Tab is `shift-tab`.
   `decide` in `src/inputrules/send.zig`). They check lines with the
   server's rules first, so a refusal is shown without a round trip;
   `rejected` still covers anything they missed, and the line comes back.
-  The answer buttons are the same on both: Yes, No, 1, 2, 3, Esc, Enter.
+  The answer buttons are the same on both: Yes, No, 1, 2, 3, Esc, Enter
+  (then ↑ ↓ in `instruct` mode while the shown tab waits, section 4).
 
 ## 7. Portal sync (signed packages for paired devices)
 

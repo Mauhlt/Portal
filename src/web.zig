@@ -2480,7 +2480,14 @@ pub const Server = struct {
                 // while it is open (a closed one drops it: input_open).
                 const s = &(ws.sel orelse return true).session;
                 switch (payload[0]) {
-                    'k' => s.writeWebKey(payload[2..], srv.nowMs()),
+                    'k' => s.writeWebKey(payload[2..], srv.nowMs()) catch |err| {
+                        // Up/Down in instruct mode while the program is not
+                        // waiting (keymap.KeyError: Portal's own names).
+                        srv.log.print("key from {s} rejected: {t}", .{ ws.conn.peer(), err });
+                        var msg: [96]u8 = undefined;
+                        const m = std.fmt.bufPrint(&msg, "{{\"t\":\"rejected\",\"reason\":\"{t}\"}}", .{err}) catch return true;
+                        return ws.send(srv, m, .text);
+                    },
                     't' => s.writeWebText(payload[2..]),
                     'l' => s.writeWebLine(payload[2..]) catch |err| {
                         // Error names are Portal's own (keymap.LineError), so

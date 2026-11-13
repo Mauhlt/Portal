@@ -10,7 +10,9 @@
 //!      on the replies (repeated on every record of one reply, as the agent
 //!      does), and background work: two shells (one finishes at once
 //!      through a queued task notification) and a monitor;
-//!   2. an AskUserQuestion with two options; waits for 1 or 2;
+//!   2. an AskUserQuestion with two options; waits for 1 or 2 (Up/Down
+//!      arriving meanwhile print FAKE-UP-ASKED / FAKE-DOWN-ASKED; at the
+//!      idle prompt of step 5 FAKE-UP-IDLE, in a quiet tab FAKE-UP-QUIET);
 //!   3. a command that needs permission (OSC 7501 kind=permission); waits
 //!      for 1 (allow) or Esc (deny);
 //!   4. the other shell's notification and a TaskStop for the monitor
@@ -64,6 +66,31 @@ fn key() ?u8 {
         return b[0];
     }
 }
+
+/// Reports Up / Down (`ESC [ A` / `ESC [ B`) arriving on the console as
+/// FAKE-UP-<tag> / FAKE-DOWN-<tag>, so the test sees exactly which arrows
+/// got through, and when.
+const Arrows = struct {
+    tag: []const u8,
+    seen: u2 = 0,
+
+    fn feed(a: *Arrows, k: u8) void {
+        switch (a.seen) {
+            0 => {
+                if (k == 0x1b) a.seen = 1;
+            },
+            1 => a.seen = if (k == '[') 2 else if (k == 0x1b) 1 else 0,
+            else => {
+                if (k == 'A' or k == 'B') {
+                    say(if (k == 'A') "FAKE-UP-" else "FAKE-DOWN-");
+                    say(a.tag);
+                    say("\r\n");
+                }
+                a.seen = if (k == 0x1b) 1 else 0;
+            },
+        }
+    }
+};
 
 const Transcript = struct {
     gpa: std.mem.Allocator,
@@ -148,7 +175,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     const quiet = std.mem.indexOf(u8, std.fs.path.basename(cwd), "quiet") != null;
     if (quiet) {
         say("FAKE-QUIET\r\n");
-        while (key()) |_| {}
+        var ar: Arrows = .{ .tag = "QUIET" };
+        while (key()) |k| ar.feed(k);
         return 0;
     }
     const projects = env.get("PORTAL_AGENT_PROJECTS") orelse {
@@ -221,10 +249,14 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
         t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"q1\",\"name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Which fix should I apply in {c}?\",\"header\":\"Fix\",\"multiSelect\":false,\"options\":[{\"label\":\"Alpha\",\"description\":\"d\"},{\"label\":\"Beta in C:\\\\Windows\\\\x\",\"description\":\"d\"}]}]}}]},\"cwd\":\"{c}\"}");
     say("\x1b]7501;state=blocked:kind=question:app=fake\x07FAKE-ASKED\r\n");
     var choice: u8 = 0;
-    while (key()) |k| if (k == '1' or k == '2' or (showcase and k == '3')) {
-        choice = k;
-        break;
-    };
+    var ar: Arrows = .{ .tag = "ASKED" };
+    while (key()) |k| {
+        ar.feed(k);
+        if (k == '1' or k == '2' or (showcase and k == '3')) {
+            choice = k;
+            break;
+        }
+    }
     if (choice == 0) return 0;
     t.rec("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"q1\",\"type\":\"tool_result\",\"content\":\"answered\"}]},\"cwd\":\"{c}\"}");
     if (choice == '2') {
@@ -263,7 +295,11 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
 
     // 5. On 1: `/clear` as the agent does it: the screen first, then a
     // new session file (not the --session-id one) with the next prompt.
-    while (key()) |k| if (k == '1') break;
+    ar = .{ .tag = "IDLE" };
+    while (key()) |k| {
+        ar.feed(k);
+        if (k == '1') break;
+    }
     say("\x1b[2J\x1b[HFAKE-CLEARING\r\n");
     io.random(&rnd);
     var t2 = t;

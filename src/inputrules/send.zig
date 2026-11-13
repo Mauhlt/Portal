@@ -36,6 +36,23 @@ pub const answer_buttons = [_]AnswerButton{
     .{ .label = "Enter", .key = "enter" },
 };
 
+/// Up and Down for arrow-select menus (keys.menu_keys), after the answer
+/// buttons: shown in `instruct` mode only while the shown tab's program
+/// waits for an answer (`showMenuButtons`), since only then does the
+/// server take them. (index.html data-btn 8 and 9, after Send.)
+pub const menu_buttons = [_]AnswerButton{
+    .{ .label = "\u{2191}", .key = "up" },
+    .{ .label = "\u{2193}", .key = "down" },
+};
+
+/// Whether a client shows the Up/Down buttons: `instruct` mode while the
+/// shown tab's program waits for an answer (its tab `state` is `waiting`,
+/// or its Conversation view has an open question). `text` mode has the
+/// keyboard's arrows; `keys` mode never takes them.
+pub fn showMenuButtons(policy: Policy, waiting: bool) bool {
+    return policy == .instruct and waiting;
+}
+
 // ------------------------------------------------------------ answer words
 
 const Word = struct { word: []const u8, key: []const u8 };
@@ -158,6 +175,8 @@ pub fn keyLabel(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "n")) return "No";
     if (std.mem.eql(u8, name, "esc")) return "Esc";
     if (std.mem.eql(u8, name, "enter")) return "Enter";
+    if (std.mem.eql(u8, name, "up")) return "Up";
+    if (std.mem.eql(u8, name, "down")) return "Down";
     return name;
 }
 
@@ -173,6 +192,8 @@ pub const Refusal = enum {
     shell_escape,
     slash_command,
     memory_shortcut,
+    /// Up/Down in `instruct` mode while the program is not waiting.
+    not_waiting,
 };
 
 pub const Decision = union(enum) {
@@ -278,14 +299,17 @@ pub fn refusalText(r: Refusal) []const u8 {
         .shell_escape => "Lines can't start with ! (shell commands are blocked).",
         .slash_command => "Lines can't start with / (slash commands are blocked).",
         .memory_shortcut => "Lines can't start with # (the memory shortcut is blocked).",
+        .not_waiting => "Up/Down only work while Claude is waiting for an answer.",
     };
 }
 
-/// A `{"t":"rejected","reason":...}` reason (a keymap.LineError name).
+/// A `{"t":"rejected","reason":...}` reason (a keymap.LineError or
+/// keymap.KeyError name).
 pub fn serverRefusal(reason: []const u8) ?Refusal {
     inline for (@typeInfo(keymap.LineError).error_set.error_names.?) |name| {
         if (std.mem.eql(u8, name, reason)) return lineRefusal(@field(keymap.LineError, name));
     }
+    if (std.mem.eql(u8, reason, @errorName(error.NotWaiting))) return .not_waiting;
     return null;
 }
 
@@ -479,6 +503,7 @@ test "server rejection reasons and notes" {
     try testing.expectEqual(Refusal.shell_escape, serverRefusal("ShellEscape").?);
     try testing.expectEqual(Refusal.control_character, serverRefusal("ControlCharacter").?);
     try testing.expectEqual(@as(?Refusal, null), serverRefusal("Bogus"));
+    try testing.expectEqual(Refusal.not_waiting, serverRefusal("NotWaiting").?);
     // Every refusal has a message.
     for (std.enums.values(Refusal)) |r| try testing.expect(refusalText(r).len > 0);
     var buf: [256]u8 = undefined;
@@ -501,4 +526,13 @@ test "answer buttons and words press answer keys" {
     };
     for (answer_words) |e| try testing.expect(keymap.keyBytes(.keys, e.key) != null);
     try testing.expectEqualStrings("Yes", keyLabel(answer_buttons[0].key));
+    // The Up/Down buttons show exactly when the server takes their keys.
+    for (menu_buttons) |b| for (std.enums.values(Policy)) |p| for ([_]bool{ false, true }) |wt| {
+        if (showMenuButtons(p, wt)) try testing.expect((try keymap.keyBytesAt(p, wt, b.key)) != null);
+    };
+    try testing.expect(showMenuButtons(.instruct, true));
+    try testing.expect(!showMenuButtons(.instruct, false));
+    try testing.expect(!showMenuButtons(.keys, true));
+    try testing.expect(!showMenuButtons(.text, true));
+    try testing.expectEqualStrings("Up", keyLabel("up"));
 }

@@ -516,6 +516,13 @@ pub const Convo = struct {
         c.synthetic_tool = 0;
     }
 
+    /// A question is open: one from the transcript (AskUserQuestion) or the
+    /// one Portal made from the program's OSC 7501 wait. The server takes
+    /// Up/Down in instruct mode only then (session.zig).
+    pub fn hasOpenQuestion(c: *Convo) bool {
+        return c.openQuestion();
+    }
+
     fn openQuestion(c: *Convo) bool {
         for (0..c.len) |k| {
             const s = c.slotAt(k);
@@ -793,8 +800,10 @@ test "questions: options become answer keys; a result closes them" {
     try testing.expectEqualStrings("2", m.items[0].options[1].key);
     try testing.expect(m.items[1].multi);
     try testing.expectEqual(@as(usize, 3), m.items[1].options.len);
+    try testing.expect(f.c.hasOpenQuestion());
     const rev = f.c.rev;
     try f.feed(result("q1"));
+    try testing.expect(!f.c.hasOpenQuestion());
     var w: std.Io.Writer = .fixed(&sb);
     try testing.expect(try f.c.writeSince(&w, @splat(7), rev));
     m = wire.parse(w.buffered(), &scratch).?;

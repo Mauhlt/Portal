@@ -207,6 +207,9 @@ pub const Viewer = struct {
     exit_code: ?i64 = null,
     /// "AB:CD:..." of the pinned Portal CA ("" without TLS).
     pin_fp: []const u8 = "",
+    /// The shown tab's Conversation view has an open question (the glue
+    /// knows the conversation; the tab's own `state` is in State.tabs).
+    question_open: bool = false,
 };
 
 /// One frame's input from the device glue.
@@ -362,6 +365,10 @@ pub const Shell = struct {
     /// and the one shown.
     status: Status = .starting,
     mode: ?rules.Policy = null,
+    /// The shown tab's program waits for an answer (its tab `state` is
+    /// `waiting`, or its conversation has an open question): instruct mode
+    /// then takes Up/Down (rules.specialAt, rules.showMenuButtons).
+    waiting: bool = false,
     n_tabs: usize = 0,
     shown: ?usize = null,
     /// The status panel open (panels/status.zig), and the tab whose badge
@@ -488,6 +495,7 @@ pub const Shell = struct {
     pub fn overlay(sh: *Shell, st: State) frame.Overlay {
         sh.status = st.viewer.status;
         sh.mode = st.viewer.mode;
+        sh.waiting = shownWaiting(st);
         sh.n_tabs = 0;
         sh.shown = null;
         if (sh.mode != .instruct and sh.instructing) sh.closeInstruct();
@@ -516,6 +524,14 @@ pub const Shell = struct {
         // one is attached).
         if (sh.keyboard and (!sh.touch.on_screen_keyboard or sh.focusFor(st) != .line)) sh.keyboard = false;
         return o;
+    }
+
+    /// Whether the shown tab's program waits for an answer, as of `st`.
+    fn shownWaiting(st: State) bool {
+        if (st.viewer.question_open) return true;
+        const id = st.current orelse return false;
+        for (st.tabs) |*e| if (std.mem.eql(u8, &id, &e.id)) return e.state == .waiting;
+        return false;
     }
 
     /// `focus` as of `st` (without asking the modal: the glue may hold its
@@ -764,6 +780,9 @@ pub const Shell = struct {
                     o.show_answers = false;
                     o.bottom = sh.conversationBottom(mode);
                 }
+                // Up/Down for arrow-select menus (the folder-trust prompt):
+                // only while the server would take them.
+                o.menu_answers = o.show_answers and rules.showMenuButtons(mode, sh.waiting);
                 if (mode == .instruct) {
                     if (!minimal) o.bottom = sh.linePane(rules.placeholder(.instruct), true);
                     const lv = sh.line.snapshot();
@@ -1134,6 +1153,37 @@ test "viewer: waiting shows the request code; trust errors are explained" {
     const n = sh.overlay(.{ .viewer = .{ .status = .retrying, .detail = "refused", .host = "h", .has_grid = true } });
     try testing.expect(n.screen == .grid);
     try testing.expectEqualStrings("refused", n.status.extra);
+}
+
+test "viewer: Up/Down buttons only in instruct mode while the shown tab waits" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .viewer, r.host());
+    defer sh.deinit();
+    sh.main = .terminal;
+    var list: [2]tabs_wire.Entry = .{ .{ .id = @splat(1), .color = 0x3366CC, .state = .working }, .{ .id = @splat(2), .color = 0x10B981, .state = .waiting } };
+    var v: Viewer = .{ .status = .connected, .host = "h", .has_grid = true, .mode = .instruct };
+    // The shown tab waits: the bar has Up/Down; another tab waiting is not enough.
+    var o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+    try testing.expect(o.show_answers and o.menu_answers);
+    try testing.expect(sh.waiting);
+    o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(1) });
+    try testing.expect(o.show_answers and !o.menu_answers);
+    // Working, idle, unknown: none.
+    for ([_]tabs_wire.State{ .idle, .unknown, .working }) |s| {
+        list[1].state = s;
+        o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+        try testing.expect(!o.menu_answers);
+    }
+    // An open question in the conversation counts as waiting.
+    v.question_open = true;
+    o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+    try testing.expect(o.menu_answers);
+    // keys and text mode: never (text has the keyboard's arrows).
+    for ([_]rules.Policy{ .keys, .text }) |p| {
+        v.mode = p;
+        o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+        try testing.expect(o.show_answers and !o.menu_answers);
+    }
 }
 
 test "viewer per input mode: the same features as the browser" {

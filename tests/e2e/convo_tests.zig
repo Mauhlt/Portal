@@ -274,6 +274,12 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     // The system monitor is off: y:on is ignored (and logged at the desk).
     v.send("y:on");
 
+    // Up/Down reach the program while it waits (an arrow-select menu such
+    // as the folder-trust prompt), in instruct mode.
+    v.send("k:up");
+    v.send("k:down");
+    _ = r.check("instruct: k:up / k:down reach the program while it waits for an answer", v.waitFor("FAKE-UP-ASKED", 8000) and v.waitFor("FAKE-DOWN-ASKED", 8000), "{s}", .{v.dump(&dump)});
+
     // Answering uses the ordinary answer keys.
     v.send("k:2");
     _ = r.check("k:2 answers the question (the program got 2)", v.waitFor("FAKE-GOT-2", 8000), "{s}", .{v.dump(&dump)});
@@ -299,6 +305,17 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     _ = r.check("k:1 allows it (the program got 1)", v.waitFor("FAKE-ALLOWED", 8000), "{s}", .{v.dump(&dump)});
     _ = r.check("the permission question closes", waitItem(v, .{ .gpa = gpa, .id = id, .kind = .question, .text = perm, .open = false }, 8000), "", .{});
     _ = r.check("the closing reply arrives", waitItem(v, .{ .gpa = gpa, .id = id, .kind = .assistant, .text = "All done." }, 8000), "", .{});
+    // At the idle prompt (OSC 7501 idle, no open question) Up would recall
+    // history: refused, and the viewer told why.
+    {
+        _ = v.waitFor("FAKE-DONE", 8000);
+        const before = v.countText("\"t\":\"rejected\"");
+        v.send("k:up");
+        const told = v.waitText("\"t\":\"rejected\"", before + 1, 8000) and
+            std.mem.indexOf(u8, v.lastText("\"t\":\"rejected\"") orelse "", "NotWaiting") != null;
+        v.pump(800);
+        _ = r.check("instruct: k:up refused once the program no longer waits (rejected NotWaiting, nothing typed)", told and !v.waitFor("FAKE-UP-IDLE", 1), "{?s} {s}", .{ v.lastText("\"t\":\"rejected\""), v.dump(&dump) });
+    }
     {
         const done = waitActivity(v, .{ .id = id, .shells = 0, .monitors = 0, .tasks = 3 }, 8000);
         var a: act_wire.Activity = undefined;
@@ -337,6 +354,15 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         var c = try Conv.build(gpa, v, qid);
         defer c.deinit();
         _ = r.check("a tab without a transcript: on=false and a status saying so", !c.on and c.snapshots >= 1 and c.items.items.len == 1 and c.items.items[0].kind == .status, "{s}", .{c.dump(&cdump)});
+        // No OSC 7501 and no question there: the state is unknown, so
+        // Up/Down stay refused.
+        {
+            const rb = v.countText("\"t\":\"rejected\"");
+            v.send("k:down");
+            const told = v.waitText("\"t\":\"rejected\"", rb + 1, 8000);
+            v.pump(800);
+            _ = r.check("instruct: k:down refused while the state is unknown", told and !v.waitFor("FAKE-DOWN-QUIET", 1), "{s}", .{v.dump(&dump)});
+        }
         const back = tabs_wire.subscribeFrame(id);
         const before2 = v.countText("\"t\":\"convo\"");
         v.send(&back);
