@@ -306,3 +306,16 @@ test "settings: agent integration is a seventh choice that acts at once (not on 
     var fb: Ui.Bufs = .{};
     try testing.expectEqual(@as(usize, 4), f.panel(&fb, .{}).?.fields.len);
 }
+
+test "setup: the button says Start on first run and Save in Settings" {
+    var b: Ui.Bufs = .{};
+    var first: Ui = .{};
+    first.openSetup(true, "127.0.0.1:8420", "", "", .keys);
+    const p1 = first.panel(&b, .{}).?;
+    try testing.expectEqualStrings("Start", p1.buttons[p1.buttons.len - 1].label);
+    var later: Ui = .{};
+    later.openSetup(false, "127.0.0.1:8420", "cmd.exe", "", .keys);
+    const p2 = later.panel(&b, .{}).?;
+    try testing.expectEqualStrings("Save", p2.buttons[p2.buttons.len - 1].label);
+    try testing.expectEqual(Action.setup_submit, later.button(id.save));
+}

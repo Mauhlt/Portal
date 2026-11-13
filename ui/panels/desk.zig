@@ -43,6 +43,7 @@ pub fn Panels(comptime devices: type) type {
             pub const export_: u32 = 7;
             pub const start: u32 = 8;
             pub const open_pair: u32 = 9;
+            pub const save: u32 = 10;
             /// Text fields: field0 + index.
             pub const field0: u32 = 100;
             /// Device rows' Unpair buttons: row0 + index.
@@ -424,7 +425,7 @@ pub fn Panels(comptime devices: type) type {
                     .none => {},
                     .setup => {
                         if (!ui.setup.first_run) add(out, &n, id.cancel);
-                        add(out, &n, id.start);
+                        add(out, &n, if (ui.setup.first_run) id.start else id.save);
                     },
                     .pair_name => {
                         add(out, &n, id.cancel);
@@ -654,7 +655,7 @@ pub fn Panels(comptime devices: type) type {
                         ui.show(.devices);
                         return .load_devices;
                     } else ui.close(),
-                    id.start => if (ui.screen == .setup) return .setup_submit,
+                    id.start, id.save => if (ui.screen == .setup) return .setup_submit,
                     id.open_pair => if (ui.screen == .pair_name) {
                         if (!devices.validName(ui.name.text())) {
                             ui.setNote(.bad, "Give the device a name: 1-32 characters of a-z, 0-9 and -.", .{});
@@ -744,6 +745,7 @@ pub fn Panels(comptime devices: type) type {
                     id.again => "Try again",
                     id.export_ => "Export",
                     id.start => "Start",
+                    id.save => "Save",
                     id.open_pair => "Open pairing",
                     else => "?",
                 };
