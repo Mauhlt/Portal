@@ -329,9 +329,29 @@ fn fixWide(row: []Cell) void {
 
 /// OSC 7501 program status (docs/tabs-design.md): `ESC ] 7501 ; state=<s>
 /// [:kind=<k>][:app=<name>][:msg=<base64>] ST`, as described at
-/// https://mitchellh.com/writing/program-status-osc7501. Only the state is
-/// kept; kind, app and msg are program-controlled strings and are dropped.
+/// https://mitchellh.com/writing/program-status-osc7501. Only the state and
+/// the kind (as an enum) are kept; app and msg are program-controlled
+/// strings and are dropped.
 pub const ProgramState = enum { unknown, working, waiting, idle, done, failed };
+
+/// What a blocked program waits for (`kind=`): the Conversation view offers
+/// answer buttons for a permission prompt (src/convo/model.zig).
+pub const ProgramKind = enum { none, permission, question, auth, other };
+
+/// The kind in an OSC 7501 payload: `none` without one, `other` for one
+/// Portal does not know.
+pub fn parseProgramKind(payload: []const u8) ProgramKind {
+    var it = std.mem.tokenizeAny(u8, payload, ":;");
+    while (it.next()) |f| {
+        if (!std.mem.startsWith(u8, f, "kind=")) continue;
+        const v = f["kind=".len..];
+        if (std.mem.eql(u8, v, "permission")) return .permission;
+        if (std.mem.eql(u8, v, "question")) return .question;
+        if (std.mem.eql(u8, v, "auth")) return .auth;
+        return .other;
+    }
+    return .none;
+}
 
 /// The state in an OSC 7501 payload (after "7501;"). Fields are separated
 /// by ':' or ';'; an unknown or missing state is `unknown`.
@@ -379,6 +399,7 @@ pub const Terminal = struct {
     /// The program's last OSC 7501 status, and a counter bumped whenever it
     /// changes (see `setProgramState`).
     program_state: ProgramState = .unknown,
+    program_kind: ProgramKind = .none,
     program_state_gen: u64 = 0,
     /// Inline images and their placements (per screen).
     images: gfx.Graphics = .{},
@@ -1097,7 +1118,7 @@ pub const Terminal = struct {
         p.osc_len = 0;
         const semi = std.mem.indexOfScalar(u8, data, ';') orelse return;
         const cmd = data[0..semi];
-        if (std.mem.eql(u8, cmd, "7501")) return t.setProgramState(parseProgramState(data[semi + 1 ..]));
+        if (std.mem.eql(u8, cmd, "7501")) return t.setProgramState(parseProgramState(data[semi + 1 ..]), parseProgramKind(data[semi + 1 ..]));
         if (!std.mem.eql(u8, cmd, "0") and !std.mem.eql(u8, cmd, "2")) return;
         t.setTitle(data[semi + 1 ..]);
     }
@@ -1105,9 +1126,11 @@ pub const Terminal = struct {
     /// OSC 7501 (program status): what the program says it is doing.
     /// Untrusted (any output can contain it): it only changes a tab's
     /// highlight. Not a visible change, so `gen` is not bumped.
-    fn setProgramState(t: *Terminal, s: ProgramState) void {
-        if (s == t.program_state) return;
+    fn setProgramState(t: *Terminal, s: ProgramState, k: ProgramKind) void {
+        const kind: ProgramKind = if (s == .waiting) k else .none;
+        if (s == t.program_state and kind == t.program_kind) return;
         t.program_state = s;
+        t.program_kind = kind;
         t.program_state_gen +%= 1;
     }
 
@@ -2302,11 +2325,13 @@ test "OSC 7501 program state" {
     const g0 = t.gen;
     t.feed("\x1b]7501;state=blocked:kind=permission:app=claude\x07");
     try testing.expectEqual(ProgramState.waiting, t.program_state);
+    try testing.expectEqual(ProgramKind.permission, t.program_kind);
     try testing.expectEqual(@as(u64, 1), t.program_state_gen);
     try testing.expectEqual(g0, t.gen); // not a visible change
     try testing.expectEqualStrings("", t.title()); // nothing leaks into the title
     t.feed("\x1b]7501;state=working\x1b\\");
     try testing.expectEqual(ProgramState.working, t.program_state);
+    try testing.expectEqual(ProgramKind.none, t.program_kind);
     t.feed("\x1b]7501;state=working\x07"); // unchanged: no bump
     try testing.expectEqual(@as(u64, 2), t.program_state_gen);
     t.feed("\x1b]7501;app=x;state=error\x07");
@@ -2316,6 +2341,10 @@ test "OSC 7501 program state" {
     try testing.expectEqual(ProgramState.done, parseProgramState("state=done:msg=aGk="));
     try testing.expectEqual(ProgramState.idle, parseProgramState("state=idle"));
     try testing.expectEqual(ProgramState.unknown, parseProgramState("kind=permission"));
+    try testing.expectEqual(ProgramKind.permission, parseProgramKind("state=blocked:kind=permission:app=claude"));
+    try testing.expectEqual(ProgramKind.question, parseProgramKind("state=blocked;kind=question"));
+    try testing.expectEqual(ProgramKind.other, parseProgramKind("state=blocked:kind=../../etc"));
+    try testing.expectEqual(ProgramKind.none, parseProgramKind("state=blocked"));
     try testing.expectEqual(ProgramState.unknown, parseProgramState(""));
 }
 

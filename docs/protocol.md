@@ -152,6 +152,8 @@ frames must be masked; no fragmentation; no extensions.
 | `logout` | `reason` (optional): `"unpaired"` or `"replaced"` | the session ended. `"unpaired"`: the desktop removed this device (unpaired at the desk, forgotten, revoked): forget this desktop now. `"replaced"`: a re-pair under its name or address replaced it: sign in again, whose answer (`X-Portal-Device: gone` or not) decides. No reason (expired, logged out): sign in again |
 | `updates` | | Portal sync: this device's package index changed (a publish, or a subscription changed at the desk). Fetch `GET /sync/index` (section 7). Devices also look on every connect |
 | `rejected` | `reason` | an `l:` instruction line was refused (e.g. `ShellEscape`, `SlashCommand`, `MemoryShortcut`, `ControlCharacter`, `TooLong`, `Empty`); nothing was typed |
+| `convo` | `id`, `on`, `items` | the whole Conversation view of the tab watched (section 3b): after `hello` and every `session`, and whenever the server starts the conversation over. Replaces what the client had |
+| `convo+` | `id`, `items` | new or changed items of that conversation (section 3b) |
 
 ### 3a. Project tabs (sessions)
 
@@ -178,6 +180,68 @@ and then whatever the viewer chose with `s:<id>` (answered by `session`,
 then a full snapshot). Only the desk opens and closes tabs (the window,
 `portal open <dir>`); no message a client sends can create, start, close
 or reopen one. The shared parser and writer are `shared/tabs.zig`.
+
+### 3b. The Conversation view (`convo`, `convo+`)
+
+Devices show a tab as a conversation by default, not as a terminal: the
+owner's prompts, the program's replies as readable text, tool use as
+one-liners, questions with answer buttons. The terminal (the grid) stays
+available behind a toggle. The desktop builds the conversation from the
+session program's own transcript (the agent's JSONL, followed by change
+notifications; `src/convo/`) and from its OSC 7501 state.
+
+```
+{"t":"convo","id":"<32 hex>","on":true,"items":[ITEM,...]}
+{"t":"convo+","id":"<32 hex>","items":[ITEM,...]}
+
+ITEM = {"n":<u32>,"k":"<kind>","text":"<text>"
+        [,"open":true|false][,"multi":true]
+        [,"options":[{"label":"<text>","key":"<answer key>"},...]]}
+```
+
+* Scoped like grid frames: only the tab the viewer watches, `id` naming
+  it. A `convo` snapshot follows `hello` and every `session` (after the
+  grid snapshot); clients drop messages for any other id.
+* `convo` replaces the client's items. `on` is `false` while the tab has
+  no transcript to read (none yet, or the program keeps none): the client
+  says so (the server also sends a `status` item explaining it) and
+  offers the terminal.
+* `convo+`: an item whose `n` the client has replaces it; any other is
+  appended (`n` only grows). An item with an empty `text` removes item
+  `n` (a note the server took back, e.g. "waiting for your answer" once
+  the transcript shows the real question).
+* Kinds: `user` (the owner's prompt), `assistant` (the program's reply,
+  plain text; Markdown code blocks kept), `tool` (a one-liner: "Edited 2
+  files", "Read 3 files", "Ran a command", "Searched the project",
+  "Looked something up", "Used <tool>"; consecutive uses of one kind
+  merge into one line), `question` (`open` while the program waits for
+  the answer), `error` (one line, e.g. an API error), `status` (a note:
+  "Conversation compacted", "Interrupted", no transcript).
+* Never sent: tool arguments, tool results, file contents, thinking,
+  injected context, subagent transcripts. Every text is scrubbed on the
+  desktop: the tab's folder becomes the tab's name (`acme\src\a.zig`),
+  any other absolute path becomes `[path]` (drive, UNC, `\\?\`, POSIX,
+  `file://`, `~/`, `%VAR%\`, `$HOME/`, URL-encoded), the user's name
+  `[user]` (docs/tabs-design.md, privacy rule 1).
+* **Answering adds no input power.** An option's `key` is one of the
+  answer keys (`0`…`9`, `y`, `n`, `enter`, `esc`); answering is sending
+  `k:<key>` exactly as the answer buttons do, under the same input mode
+  and rules (nothing in view-only `none` mode). Questions from the
+  transcript (the agent's AskUserQuestion) number their options `1`…`9`
+  (`multi`: each key toggles one, `enter` submits); a permission prompt
+  (OSC 7501 `kind=permission`) is "Claude wants to <do something>. Allow
+  it?" with Yes = `1`, No = `esc`; any other wait is a question without
+  options (the terminal shows it). The terminal stays authoritative:
+  options are best effort.
+* Bounds: at most 200 items, 16 KiB of text per item (cut with "…"),
+  256 KiB of text and 400 options per conversation; the oldest items go
+  first. Every message is at most `max_message` bytes (about 720 KB).
+* Strings escape `"`, `\`, line feeds (`\n`), tabs (`\t`) and other
+  controls (`\u00XX`); texts are printable UTF-8 with line feeds and
+  tabs. The shared writer and strict parser are `shared/convo.zig`: a
+  malformed message (unknown kind, bad key, too many items or options,
+  invalid UTF-8, controls) is rejected whole. Unknown scalar fields are
+  ignored.
 
 **Binary frames**: grid updates, always starting with `'G'`, little-endian:
 

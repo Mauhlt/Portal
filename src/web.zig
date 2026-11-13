@@ -2129,6 +2129,12 @@ pub const Server = struct {
         var sent_rows: u16 = 0;
         // `ended` was sent for the tab shown (it closed while others run).
         var ended_sent = false;
+        // The shown tab's conversation (docs/protocol.md section 3b): the
+        // epoch and revision last sent; epoch 0 forces a `convo` snapshot.
+        var convo_epoch: u32 = 0;
+        var convo_rev: u64 = 0;
+        var convo_out: std.Io.Writer.Allocating = .init(srv.gpa);
+        defer convo_out.deinit();
         while (true) {
             ws.writer_wakes +|= 1;
             // Event-driven: wakes on output, resize, a tab list change, a
@@ -2139,7 +2145,8 @@ pub const Server = struct {
             hub.mutex.lockUncancelable(srv.io);
             const cur_closed = if (cur) |c| c.session.closed else false;
             const cur_gen = if (cur) |c| c.session.term.gen else sent_gen;
-            if (!hub.finished and !full and cur_gen == sent_gen and !(cur_closed and !ended_sent) and
+            const convo_changed = if (cur) |c| c.convo.epoch != convo_epoch or c.convo.rev != convo_rev else false;
+            if (!hub.finished and !full and cur_gen == sent_gen and !(cur_closed and !ended_sent) and !convo_changed and
                 ws.want == .none and hub.gen == seen_gen and !ws.dead.load(.acquire) and expires_in > 0 and
                 srv.sync_gen.load(.acquire) == sync_seen)
             {
@@ -2168,6 +2175,7 @@ pub const Server = struct {
                     cur = t;
                     full = true;
                     ended_sent = false;
+                    convo_epoch = 0;
                     images.deinit(srv.gpa);
                     images = .{};
                     answer = .session;
@@ -2219,6 +2227,24 @@ pub const Server = struct {
                 if (encode_ok) images.collect(srv.gpa, t, srv.nowMs()) catch {
                     encode_ok = false;
                 };
+                // The conversation: the whole of it after a switch or a
+                // new start, else what changed.
+                convo_out.clearRetainingCapacity();
+                const cv = &c.convo;
+                if (encode_ok and (cv.epoch != convo_epoch or cv.rev != convo_rev)) {
+                    const cw = &convo_out.writer;
+                    if (cv.epoch != convo_epoch) {
+                        cv.writeSnapshot(cw, c.id) catch {
+                            encode_ok = false;
+                        };
+                    } else {
+                        _ = cv.writeSince(cw, c.id, convo_rev) catch {
+                            encode_ok = false;
+                        };
+                    }
+                    convo_epoch = cv.epoch;
+                    convo_rev = cv.rev;
+                }
             }
             const cur_id: ?tabs.Id = if (cur) |c| c.id else null;
             hub.mutex.unlock(srv.io);
@@ -2249,6 +2275,9 @@ pub const Server = struct {
             }
             var image_frames = images.frames();
             while (image_frames.next()) |f| if (!ws.send(srv, f, .binary)) return;
+            if (convo_out.written().len > 0) {
+                if (!ws.send(srv, convo_out.written(), .text)) return;
+            }
             const gen_now = srv.sync_gen.load(.acquire);
             if (gen_now != sync_seen) {
                 sync_seen = gen_now;
