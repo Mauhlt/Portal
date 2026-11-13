@@ -132,33 +132,9 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Presenter {
         .img = .init(gpa),
     };
     window.setLiveCallback(self, liveThunk);
-    self.setAppIcon();
+    // The window icon comes from the Renderer's window class (the exe's
+    // icon resource 1, docs/brand/portal.ico linked by build.zig).
     return self;
-}
-
-/// Windows: the title bar's and the taskbar's icon from the exe's icon
-/// resource 1 (docs/brand/portal.ico, linked by build.zig), via
-/// WM_SETICON. The Renderer's window class has no icon of its own (the
-/// cleaner fix is `.icon` / `.icon_small` = LoadImageW(hinstance, 1) in its
-/// WNDCLASSEXW). Without the resource (test builds) nothing changes.
-fn setAppIcon(p: *Presenter) void {
-    if (builtin.os.tag != .windows) return;
-    const hwnd = p.nativeHandle() orelse return;
-    const w = struct {
-        extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
-        extern "user32" fn LoadImageW(inst: ?*anyopaque, name: usize, kind: u32, cx: i32, cy: i32, flags: u32) callconv(.winapi) ?*anyopaque;
-        extern "user32" fn GetSystemMetrics(index: i32) callconv(.winapi) i32;
-        extern "user32" fn SendMessageW(wnd: *anyopaque, msg: u32, wp: usize, lp: isize) callconv(.winapi) isize;
-    };
-    const inst = w.GetModuleHandleW(null) orelse return;
-    const image_icon = 1;
-    const wm_seticon = 0x0080;
-    // ICON_BIG (SM_CXICON) and ICON_SMALL (SM_CXSMICON).
-    for ([_][2]i32{ .{ 1, 11 }, .{ 0, 49 } }) |k| {
-        const size = w.GetSystemMetrics(k[1]);
-        const icon = w.LoadImageW(inst, 1, image_icon, size, size, 0) orelse return;
-        _ = w.SendMessageW(hwnd, wm_seticon, @intCast(k[0]), @bitCast(@intFromPtr(icon)));
-    }
 }
 
 pub fn deinit(p: *Presenter) void {
