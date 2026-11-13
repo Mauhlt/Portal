@@ -153,6 +153,8 @@ pub fn modules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
             .{ .name = "portal_ui", .module = ui },
         },
     });
+    // The hero art for the start-up splash (../docs/brand).
+    view.addAnonymousImport("portal_hero", .{ .root_source_file = b.path("../docs/brand/portal-hero-768.png") });
     const m = b.allocator.create(Modules) catch @panic("OOM");
     m.* = .{ .view = view, .ui = ui, .shared = shared, .inputrules = inputrules };
     return m;

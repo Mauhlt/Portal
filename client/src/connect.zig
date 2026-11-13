@@ -185,6 +185,10 @@ const Host = struct {
         var detail_buf: [160]u8 = undefined;
         s.mutex.lockUncancelable(h.client.io);
         const st = s.status;
+        switch (st) {
+            .starting, .connecting, .refreshing => {},
+            else => h.p.splashDone(),
+        }
         const detail = detail_buf[0..s.detail_len];
         @memcpy(detail, s.detail());
         if (s.rejected_gen != h.seen_rejected) {
@@ -393,6 +397,10 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     // The window comes first: a first run, or a server that can't be
     // trusted yet, is answered inside it.
     const tv = Presenter.init(gpa, io, .{ .title = "Portal" }) catch |err| fatal(prog, "cannot open the window: {t}", .{err});
+    // The hero art while connecting and signing in (Presenter.beginSplash:
+    // ends once connected or the user is needed, at any input, or after a
+    // few seconds).
+    tv.beginSplash(view.hero_png);
 
     const ca_buf = gpa.create([x509check.max_cert_len]u8) catch fatal(prog, "out of memory", .{});
     const host_store = gpa.create([64]u8) catch fatal(prog, "out of memory", .{});
@@ -468,7 +476,10 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     host_ui.convo_view.clock = .{ .ctx = host_ui, .now = Host.clockNow };
     {
         var sbuf: [4096]u8 = undefined;
-        if (ui.convoview.parseSwipeSetting(pin_mod.loadDeviceSettings(io, &sbuf))) |side| host_ui.convo_view.yes_side = side;
+        const text = pin_mod.loadDeviceSettings(io, &sbuf);
+        if (ui.convoview.parseSwipeSetting(text)) |side| host_ui.convo_view.yes_side = side;
+        // `background_art = off` hides the faint hero art (on by default).
+        if (ui.convoview.parseOnOffSetting(text, "background_art")) |on| tv.setBackgroundArt(on);
     }
     host_ui.shell.conversation = host_ui.convo_view.contentView();
     // Portal sync (docs/sync-design.md): a worker that runs a pass on
@@ -1024,6 +1035,7 @@ fn runSetup(tv: *Presenter, st: *setup_mod.Setup) bool {
     };
     var ctx: Ctx = .{ .st = st, .tv = tv };
     const sink: ui.input.InputSink = .{ .ctx = &ctx, .vtable = &Ctx.vt };
+    tv.endSplash(); // the first-run screen needs answers
     tv.setTitle("Portal - connect");
     const empty: ui.grid.Grid = .{};
     var bufs: setup_mod.Setup.Bufs = .{};

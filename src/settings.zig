@@ -67,6 +67,9 @@ pub const Settings = struct {
     cwd: Str(max_cwd) = .{},
     /// "Show system monitor" (null: not set, i.e. off).
     system_monitor: ?bool = null,
+    /// "Background art": the hero art, faint, behind the window's content
+    /// (null: not set, i.e. on).
+    background_art: ?bool = null,
     /// Tab colours overriding the one derived from the name.
     colors: [max_colors]ColorEntry = undefined,
     n_colors: usize = 0,
@@ -99,6 +102,8 @@ pub const Settings = struct {
                 _ = s.cwd.set(val);
             } else if (std.mem.eql(u8, key, "system_monitor")) {
                 if (std.ascii.eqlIgnoreCase(val, "on")) s.system_monitor = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.system_monitor = false;
+            } else if (std.mem.eql(u8, key, "background_art")) {
+                if (std.ascii.eqlIgnoreCase(val, "on")) s.background_art = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.background_art = false;
             } else if (std.mem.eql(u8, key, "color")) {
                 // NAME #rrggbb: the name may contain spaces.
                 const sp = std.mem.lastIndexOfScalar(u8, val, ' ') orelse continue;
@@ -122,6 +127,7 @@ pub const Settings = struct {
         if (s.program.get()) |v| try out.print("program = {s}\r\n", .{v});
         if (s.cwd.get()) |v| try out.print("cwd = {s}\r\n", .{v});
         if (s.system_monitor) |v| try out.print("system_monitor = {s}\r\n", .{if (v) "on" else "off"});
+        if (s.background_art) |v| try out.print("background_art = {s}\r\n", .{if (v) "on" else "off"});
         for (s.colors[0..s.n_colors]) |*c| {
             const name = c.name.get() orelse continue;
             try out.print("color = {s} {s}\r\n", .{ name, &tabs_wire.colorHex(c.color) });

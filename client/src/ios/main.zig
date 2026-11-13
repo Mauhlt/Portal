@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init) void {
         .cover_when_inactive = true,
         .cover_when_captured = true,
         .lock_after_background = true,
-        .cover_rgb = .{ 0x20, 0x23, 0x29 },
+        .cover_rgb = view.theme.palette.bg,
     }, entry, null);
 }
 
