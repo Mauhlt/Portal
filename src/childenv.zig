@@ -203,20 +203,20 @@ const L = std.unicode.utf8ToUtf16LeStringLiteral;
 test "verdict: launcher markers and Portal's own go, user configuration stays" {
     @setEvalBranchQuota(1_000_000);
     for ([_][]const u16{
-        L("CLAUDECODE"),                 L("CLAUDE_X"),     L("CLAUDE_CODE_CHILD_SESSION"),
-        L("CLAUDE_X"),     L("CLAUDE_X"),       L("CLAUDE_X"),
-        L("CLAUDE_X"),       L("CLAUDE_X"), L("CLAUDE_X"),
-        L("CLAUDE_X"),              L("CLAUDE_X"),         L("CLAUDE_X"),
-        L("AI_AGENT"),                   L("claudecode"),                 L("Claude_Code_Child_Session"),
+        L("CLAUDECODE"),             L("CLAUDE_X"),       L("CLAUDE_CODE_CHILD_SESSION"),
+        L("CLAUDE_X"), L("CLAUDE_X"),         L("CLAUDE_X"),
+        L("CLAUDE_X"),   L("CLAUDE_X"), L("CLAUDE_X"),
+        L("CLAUDE_X"),          L("CLAUDE_X"),           L("CLAUDE_X"),
+        L("AI_AGENT"),               L("claudecode"),                   L("Claude_Code_Child_Session"),
     }) |n| try testing.expectEqual(Verdict.drop_unless_persistent, verdict(n));
     for ([_][]const u16{ L("PORTAL_VIA_LAUNCHER"), L("PORTAL_AGENT_PROJECTS"), L("PORTAL_TESTING"), L("portal_releases_dir") }) |n|
         try testing.expectEqual(Verdict.drop, verdict(n));
     for ([_][]const u16{
-        L("PATH"),                  L("Path"),                    L("SystemRoot"),        L("USERPROFILE"),
-        L("ANTHROPIC_X"),     L("ANTHROPIC_X"),      L("ANTHROPIC_X"),   L("CLAUDE_CONFIG_DIR"),
-        L("claude_config_dir"),     L("CLAUDE_CODE_GIT_BASH_PATH"), L("CLAUDE_CODE_USE_BEDROCK"), L("CLAUDE_CODE_OAUTH_TOKEN"),
-        L("CLAUDE"),                L("CLAUDEX"),                 L("PORTAL"),            L("=C:"),
-        L("AI_AGENTS"),             L(""),
+        L("PATH"),              L("Path"),                      L("SystemRoot"),              L("USERPROFILE"),
+        L("ANTHROPIC_X"), L("ANTHROPIC_X"),        L("ANTHROPIC_X"),         L("CLAUDE_CONFIG_DIR"),
+        L("claude_config_dir"), L("CLAUDE_CODE_GIT_BASH_PATH"), L("CLAUDE_CODE_USE_BEDROCK"), L("CLAUDE_CODE_OAUTH_TOKEN"),
+        L("CLAUDE"),            L("CLAUDEX"),                   L("PORTAL"),                  L("=C:"),
+        L("AI_AGENTS"),         L(""),
     }) |n| try testing.expectEqual(Verdict.keep, verdict(n));
 }
 

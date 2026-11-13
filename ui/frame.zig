@@ -215,9 +215,9 @@ pub const Pane = struct {
     /// devices without a hardware keyboard).
     keyboard: ?PanelButton = null,
     content: union(enum) {
-        /// The answer buttons (input.answers), then Up/Down
-        /// (input.menu_answers) when true: InputSink.answer.
-        answers: bool,
+        /// A row of answer buttons (the desk's: input.answers; a device's
+        /// instruct panel: its compact key row): InputSink.answer.
+        answers: []const input.Answer,
         /// A centred row of buttons: InputSink.button(id).
         buttons: []const PanelButton,
         /// A text box (e.g. an input line): drawn like a panel field; a
@@ -304,11 +304,9 @@ pub const Overlay = struct {
     data: ?DataSlice = null,
     top_bar: ?TopBar = null,
     selection: ?Selection = null,
-    /// Shorthand for one `.answers` pane at the top of the bottom region.
+    /// Shorthand for one `.answers` pane (input.answers) at the top of the
+    /// bottom region.
     show_answers: bool = false,
-    /// That pane also has Up/Down (input.menu_answers): instruct mode
-    /// while the shown tab's program waits for an answer.
-    menu_answers: bool = false,
     /// The bottom region under the main slice (at most `max_panes`).
     bottom: []const Pane = &.{},
     status: StatusLine = .{},
@@ -642,7 +640,7 @@ pub const Frame = struct {
         var panes: [max_panes]Pane = undefined;
         var n_panes: usize = 0;
         if (overlay.show_answers) {
-            panes[0] = .{ .content = .{ .answers = overlay.menu_answers } };
+            panes[0] = .{ .content = .{ .answers = &input.answers } };
             n_panes = 1;
         }
         for (overlay.bottom) |p| if (n_panes < max_panes) {
@@ -1207,14 +1205,13 @@ pub const Frame = struct {
 
     /// The answer buttons: one row, centred, all the same width (at least
     /// five cells), sized from the pane so they are easy to hit.
-    fn drawAnswerBar(f: *Frame, m: Metrics, y: f32, W: f32, h: f32, s: f32, menu: bool) void {
+    fn drawAnswerBar(f: *Frame, m: Metrics, y: f32, W: f32, h: f32, s: f32, shown: []const input.Answer) void {
         f.rect(0, y, W, h, theme.ui.bar);
         const gap = @round(8 * s);
         const bh = @round(h * 0.78);
         const by = y + @round((h - bh) / 2);
         const cw: f32 = @floatFromInt(m.cell_w);
-        const all = input.answers ++ input.menu_answers;
-        const shown = all[0..if (menu) all.len else input.answers.len];
+        if (shown.len == 0) return;
         var bw: f32 = cw * 5;
         for (shown) |a| bw = @max(bw, textWidth(m, a.label) + 2 * cw);
         const n: f32 = @floatFromInt(shown.len);
@@ -1294,7 +1291,7 @@ pub const Frame = struct {
     fn drawPane(f: *Frame, ui: Metrics, p: Pane, r: Rect, s: f32) void {
         if (r.h < 1) return;
         switch (p.content) {
-            .answers => |menu| f.drawAnswerBar(ui, r.y, r.w, r.h, s, menu),
+            .answers => |list| f.drawAnswerBar(ui, r.y, r.w, r.h, s, list),
             .buttons => |bs| {
                 f.rect(r.x, r.y, r.w, r.h, theme.ui.bar);
                 const gap = @round(6 * s);

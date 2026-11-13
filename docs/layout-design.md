@@ -102,7 +102,7 @@ keeps the terminal. In the Conversation view the window is minimal:
 ├────────────────────────────────────────────┤
 │ ③ Data · nothing yet                       │
 ├────────────────────────────────────────────┤
-│ ② [🎤 Instruct]                            │  only Instruct
+│ ② [🎤 Instruct]                            │  only Instruct (both views)
 ├────────────────────────────────────────────┤
 │ status line                                │
 └────────────────────────────────────────────┘
@@ -140,16 +140,29 @@ keeps the terminal. In the Conversation view the window is minimal:
   (measured from the frame that showed it to the press, no timers; the
   grab feedback is not guarded, answering is); a tap that became a
   drag never presses a button (view buttons fire on release).
-* **No answer keys at all** in the Conversation view (owner decision): no
-  answer bar, no Keys button, no fallback Yes / No buttons. Esc
-  (interrupt) and Enter live in the Terminal view, the power mode. The
-  bottom holds only **Instruct**. The **instruction line is hidden**;
-  **Instruct** opens it with
-  the keyboard (the touch keyboard on a tablet) and calls
-  `Shell.startDictation`'s hook, where speech-to-text plugs in (iPhone: the
-  native text field, Apple dictation one tap away; laptops: "speech coming
-  soon" until Portal's mic → stt pipeline exists). Esc or a sent line
-  closes it again. Without `instruct` mode the bottom is empty.
+* **Only Instruct at the bottom, in both views** (owner decision,
+  2026-11-12, for the native remote viewers: `portal connect` on a laptop
+  or Surface, and the iPhone app; the desk keeps its full bar, the browser
+  its button row): no answer bar, no Yes / No / 1 / 2 / 3 buttons, and the
+  **instruction line is hidden**. **Instruct** opens the **instruct
+  panel** (`Shell.viewerBottom`): a row with Dictate / "● Listening…"
+  (with speech-to-text) and **Close**, the instruction line with Send
+  (it has the keyboard; the touch keyboard on a tablet), and a compact
+  **key row** for what a line can't express (`Shell.keyRow`): **Esc** and
+  **Enter** always; **↑ / ↓** only while the shown tab's program waits for
+  an answer (the server's rule, docs/protocol.md §4: tab state `waiting`
+  or an open question); the **number keys** only while the open question
+  offers numbered options and no card shows them (the Terminal view, or a
+  card answered here already: `convoview.View.questionKeys`). Opening it
+  calls `Shell.startDictation`'s hook, where speech-to-text plugs in
+  (iPhone: the native text field, Apple dictation one tap away; laptops:
+  none until Portal's mic → stt pipeline exists). **Esc** on an empty
+  line (in a non-empty one it clears the text first), **Send** or
+  **Close** shuts the panel: back to Instruct only. In `keys` mode the
+  panel has no line, its key row is the whole answer set (Yes, No, 1–3,
+  Esc, Enter); view only shows nothing. Option labels on cards drop a
+  scrubbed path or name and the joiner word before it ("Beta in [path]"
+  reads "Beta", `convoview.shortLabel`).
 * **Dictation toggles** (owner decision): press to start, press again to
   stop; the text lands in the instruction line for review, the user sends.
   `Shell.toggleDictation` (the input action `toggle_dictation`) calls the
@@ -166,8 +179,9 @@ keeps the terminal. In the Conversation view the window is minimal:
 * While the Conversation view is shown the keyboard does not reach the
   terminal (no stray answers): PageUp / PageDown / Home / End scroll, the
   arrows answer the swipe card.
-* The **Terminal view** keeps the full interaction slice (answer bar, and
-  the instruction line in `instruct` mode).
+* The **Terminal view** has the same bottom (only Instruct, the instruct
+  panel on request); with the panel closed the keyboard goes to the
+  terminal, filtered by the input mode as everywhere.
 * Scrolling: wheel, vertical drag, PageUp / PageDown / Home / End. On the
   iPhone one finger is the pointer (the window reports touches as
   down / move / up, `Frame.touch`): a sideways drag swipes the card, a

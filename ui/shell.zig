@@ -71,9 +71,11 @@ pub const ids = struct {
     pub const cancel_pair: u32 = 908;
     /// The interaction bar's on-screen keyboard button (touch).
     pub const keyboard: u32 = 909;
-    /// The Conversation view's bottom row: open the instruction line (and
-    /// dictation), show the full answer bar.
+    /// A device's bottom (both views): Instruct opens the instruct panel
+    /// (the instruction line, dictation, a compact key row); in the panel
+    /// it toggles dictation. instruct_close closes the panel.
     pub const instruct: u32 = 910;
+    pub const instruct_close: u32 = 911;
     /// The content view's own buttons (ui/convoview.zig ids).
     pub const view0: u32 = 1300;
     pub const view_last: u32 = 1399;
@@ -210,6 +212,12 @@ pub const Viewer = struct {
     /// The shown tab's Conversation view has an open question (the glue
     /// knows the conversation; the tab's own `state` is in State.tabs).
     question_open: bool = false,
+    /// That question's numbered options ("1".."n"; 0: none), and whether
+    /// its card in the Conversation view answers it (a swipe card or
+    /// option buttons): the instruct panel's number keys come only when
+    /// no card is shown (convoview.View.questionKeys).
+    question_digits: u8 = 0,
+    question_card: bool = false,
 };
 
 /// One frame's input from the device glue.
@@ -347,8 +355,9 @@ pub const Shell = struct {
     conversation: ?frame.ContentView = null,
     /// The last overlay showed the conversation view (its input routing).
     view_shown: bool = false,
-    /// Conversation view on a device: the instruction line is open
-    /// (Instruct).
+    /// On a device: the instruct panel is open (Instruct; Esc on an empty
+    /// line, Send or Close shut it). Otherwise the bottom is only the
+    /// Instruct button, in both views.
     instructing: bool = false,
     /// Speech-to-text, when the device has it (toggleDictation).
     dictation: ?Dictation = null,
@@ -369,6 +378,9 @@ pub const Shell = struct {
     /// `waiting`, or its conversation has an open question): instruct mode
     /// then takes Up/Down (rules.specialAt, rules.showMenuButtons).
     waiting: bool = false,
+    /// The number keys the instruct panel offers now (Viewer.question_digits,
+    /// 0 while the Conversation view shows the question's card).
+    question_digits: u8 = 0,
     n_tabs: usize = 0,
     shown: ?usize = null,
     /// The status panel open (panels/status.zig), and the tab whose badge
@@ -385,8 +397,9 @@ pub const Shell = struct {
         title: [48]u8 = undefined,
         extra: [256]u8 = undefined,
         right: [128]u8 = undefined,
-        panes: [2]frame.Pane = undefined,
+        panes: [frame.max_panes]frame.Pane = undefined,
         row: [2]frame.PanelButton = undefined,
+        keys: [16]input.Answer = undefined,
         top_tabs: [tabs_wire.max_tabs]frame.TopTab = undefined,
         buttons: [8]frame.TopButton = undefined,
         badges: [tabs_wire.max_tabs][8]u8 = undefined,
@@ -426,17 +439,25 @@ pub const Shell = struct {
     }
 
     fn viewerFocus(conversation: bool, st: Status, mode: ?rules.Policy, instructing: bool) Focus {
-        if (conversation) return if (st == .connected and mode == .instruct and instructing) .line else .view;
-        if (st == .connected and mode == .instruct) return .line;
-        return .terminal;
+        if (st == .connected and instructing and mode != null and hasLine(mode.?)) return .line;
+        return if (conversation) .view else .terminal;
     }
 
-    /// Instruct: opens the instruction line with the keyboard (the touch
-    /// keyboard on a tablet without one) and starts dictation when the
-    /// device has it. Esc, or a sent line, closes it again.
+    /// The instruct panel has the instruction line in this mode (`keys`
+    /// mode takes answer keys only: its panel is the answer keys).
+    fn hasLine(mode: rules.Policy) bool {
+        return mode == .instruct or mode == .text;
+    }
+
+    /// Instruct: opens the instruct panel; its line gets the keyboard (the
+    /// touch keyboard on a tablet without one) and dictation starts when
+    /// the device has it. Esc on an empty line, Send or Close shut it.
     pub fn startDictation(sh: *Shell) void {
-        if (sh.device != .viewer or sh.mode != .instruct) return;
+        if (sh.device != .viewer) return;
+        const mode = sh.mode orelse return;
+        if (!mode.acceptsAnswers()) return;
         sh.instructing = true;
+        if (!hasLine(mode)) return;
         if (sh.touch.on_screen_keyboard) sh.keyboard = true;
         if (sh.dictating) return;
         if (sh.dictation) |d| {
@@ -496,9 +517,11 @@ pub const Shell = struct {
         sh.status = st.viewer.status;
         sh.mode = st.viewer.mode;
         sh.waiting = shownWaiting(st);
+        const card = sh.main == .conversation and sh.conversation != null and st.viewer.question_card;
+        sh.question_digits = if (card) 0 else @min(st.viewer.question_digits, 9);
         sh.n_tabs = 0;
         sh.shown = null;
-        if (sh.mode != .instruct and sh.instructing) sh.closeInstruct();
+        if (sh.instructing and !(if (sh.mode) |m| m.acceptsAnswers() else false)) sh.closeInstruct();
         // A status panel needs what it shows: System the desk's setting,
         // any of them a connection (devices).
         const sysmon = if (st.activity) |a| a.sysmon else false;
@@ -627,33 +650,63 @@ pub const Shell = struct {
         } }, .send = .{ .label = "Send", .id = ids.send }, .keyboard = if (sh.touch.on_screen_keyboard) .{ .label = "Keyboard", .id = ids.keyboard, .focused = sh.keyboard } else null };
     }
 
-    /// The Conversation view's bottom (devices): the Instruct button, or
-    /// the open instruction line (with its dictation toggle).
-    fn conversationBottom(sh: *Shell, mode: rules.Policy) []const frame.Pane {
+    /// A device's bottom, in both views (owner's decision, 2026-11-12):
+    /// only the Instruct button; pressed, the instruct panel: its controls
+    /// (dictation, Close), the instruction line, and a compact key row for
+    /// what a line can't express (`keyRow`). View only: nothing.
+    fn viewerBottom(sh: *Shell, mode: rules.Policy) []const frame.Pane {
+        if (!mode.acceptsAnswers()) return &.{};
         const b = &sh.bufs;
-        if (sh.instructing and mode == .instruct) {
-            var n: usize = 0;
-            // With speech-to-text: its toggle, and the recording indicator.
-            if (sh.dictation != null) {
-                b.row[0] = if (sh.dictating)
-                    .{ .label = "\u{25CF} Listening\u{2026}  (stop)", .id = ids.instruct, .tone = .bad }
-                else
-                    .{ .label = "\u{1F3A4} Dictate", .id = ids.instruct, .tone = .good };
-                b.panes[n] = .{ .content = .{ .buttons = b.row[0..1] } };
-                n += 1;
-            }
-            b.panes[n] = sh.lineField(if (sh.dictating) "Listening \u{2014} the text lands here; Send when ready (Esc closes)" else if (sh.dictation != null) "Type, or Dictate (Esc closes)" else "Type an instruction, then Enter or Send (Esc closes) \u{00B7} speech coming soon", true);
-            n += 1;
-            return b.panes[0..n];
+        if (!sh.instructing) {
+            b.row[0] = .{ .label = "\u{1F3A4} Instruct", .id = ids.instruct, .tone = .good };
+            b.panes[0] = .{ .content = .{ .buttons = b.row[0..1] } };
+            return b.panes[0..1];
         }
+        const line = hasLine(mode);
+        var r: usize = 0;
+        // With speech-to-text: its toggle, and the recording indicator.
+        if (line and sh.dictation != null) {
+            b.row[r] = if (sh.dictating)
+                .{ .label = "\u{25CF} Listening\u{2026}  (stop)", .id = ids.instruct, .tone = .bad }
+            else
+                .{ .label = "\u{1F3A4} Dictate", .id = ids.instruct, .tone = .good };
+            r += 1;
+        }
+        b.row[r] = .{ .label = "Close", .id = ids.instruct_close };
+        r += 1;
         var n: usize = 0;
-        if (mode == .instruct) {
-            b.row[n] = .{ .label = "\u{1F3A4} Instruct", .id = ids.instruct, .tone = .good };
+        b.panes[n] = .{ .content = .{ .buttons = b.row[0..r] } };
+        n += 1;
+        if (line) {
+            b.panes[n] = sh.lineField(if (sh.dictating) "Listening \u{2014} the text lands here; Send when ready (Esc closes)" else if (sh.dictation != null) "Type, or Dictate (Esc closes)" else "Type an instruction, then Enter or Send (Esc closes)", true);
             n += 1;
         }
-        if (n == 0) return &.{};
-        b.panes[0] = .{ .content = .{ .buttons = b.row[0..n] } };
-        return b.panes[0..1];
+        b.panes[n] = .{ .content = .{ .answers = sh.keyRow(mode) } };
+        n += 1;
+        return b.panes[0..n];
+    }
+
+    const digit_keys = [_][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9" };
+
+    /// The instruct panel's keys: the question's numbers (only while it
+    /// offers numbered options and no card shows them), Up / Down (only
+    /// while the program waits: rules.showMenuButtons), Esc and Enter.
+    /// `keys` mode has no line, so its panel is the whole answer set.
+    fn keyRow(sh: *Shell, mode: rules.Policy) []const input.Answer {
+        if (!hasLine(mode)) return &input.answers;
+        const b = &sh.bufs;
+        var k: usize = 0;
+        for (digit_keys[0..sh.question_digits]) |d| {
+            b.keys[k] = .{ .label = d, .key = d };
+            k += 1;
+        }
+        if (rules.showMenuButtons(mode, sh.waiting)) for (input.menu_answers) |a| {
+            b.keys[k] = a;
+            k += 1;
+        };
+        b.keys[k] = .{ .label = "Esc", .key = "esc" };
+        b.keys[k + 1] = .{ .label = "Enter", .key = "enter" };
+        return b.keys[0 .. k + 2];
     }
 
     fn noteTone(t: rules.Tone) frame.Tone {
@@ -770,21 +823,13 @@ pub const Shell = struct {
                 return o;
             },
             .connected => if (v.mode) |mode| {
-                o.show_answers = mode.acceptsAnswers();
                 o.status.extra = mode.label();
                 o.status.extra_tone = if (mode == .text) .warn else .normal;
-                // The Conversation view: questions carry their own controls;
-                // the answer bar and the line come on request.
-                const minimal = sh.main == .conversation and sh.conversation != null and v.has_grid;
-                if (minimal) {
-                    o.show_answers = false;
-                    o.bottom = sh.conversationBottom(mode);
-                }
-                // Up/Down for arrow-select menus (the folder-trust prompt):
-                // only while the server would take them.
-                o.menu_answers = o.show_answers and rules.showMenuButtons(mode, sh.waiting);
+                // Both views: only Instruct, which opens the instruct
+                // panel (questions in the Conversation view carry their
+                // own controls). No answer bar on devices.
+                o.bottom = sh.viewerBottom(mode);
                 if (mode == .instruct) {
-                    if (!minimal) o.bottom = sh.linePane(rules.placeholder(.instruct), true);
                     const lv = sh.line.snapshot();
                     if (lv.note.len > 0) {
                         o.status.extra = std.fmt.bufPrint(&b.extra, "{s}: {s}", .{ mode.label(), lv.note }) catch mode.label();
@@ -906,6 +951,9 @@ pub const Shell = struct {
         // keyboard is (a terminal program gets nothing for Ctrl+Tab anyway).
         if (key == .tab and mods.ctrl and !mods.alt) return sh.cycleTab(if (mods.shift) -1 else 1);
         const f = sh.focus();
+        // The instruct panel: Esc closes it (from the line only once the
+        // line is empty; Esc in a non-empty line clears it first).
+        if (sh.device == .viewer and sh.instructing and key == .escape and (f != .line or sh.line.text().len == 0)) return sh.closeInstruct();
         // The conversation's navigation: PageUp / PageDown also while the
         // line is open (Home / End then edit the line).
         if (sh.view_shown and (f == .view or (f == .line and (key == .page_up or key == .page_down)))) {
@@ -922,8 +970,6 @@ pub const Shell = struct {
                     sh.line_focus = false;
                     return;
                 }
-                // The Conversation view's line: Esc closes it.
-                if (sh.device == .viewer and sh.instructing and key == .escape) return sh.closeInstruct();
                 _ = sh.line.onKey(key, mods, LineSender{ .sh = sh });
                 // Sent: back to the minimal view.
                 if (sh.instructing and key == .enter and sh.line.text().len == 0) sh.closeInstruct();
@@ -1029,6 +1075,7 @@ pub const Shell = struct {
             },
             ids.view_conversation => sh.main = .conversation,
             ids.instruct => if (sh.instructing) sh.toggleDictation() else sh.startDictation(),
+            ids.instruct_close => sh.closeInstruct(),
             ids.view0...ids.view_last => if (sh.conversation) |c| if (c.button) |f| {
                 _ = f(c.ctx, id);
             },
@@ -1155,35 +1202,98 @@ test "viewer: waiting shows the request code; trust errors are explained" {
     try testing.expectEqualStrings("refused", n.status.extra);
 }
 
-test "viewer: Up/Down buttons only in instruct mode while the shown tab waits" {
+/// The keys of the instruct panel's key row (the last pane), joined by
+/// spaces; "" without one.
+fn panelKeys(o: frame.Overlay, buf: []u8) []const u8 {
+    if (o.bottom.len == 0 or o.bottom[o.bottom.len - 1].content != .answers) return "";
+    var w: std.Io.Writer = .fixed(buf);
+    for (o.bottom[o.bottom.len - 1].content.answers, 0..) |a, i| w.print("{s}{s}", .{ if (i > 0) " " else "", a.key }) catch {};
+    return w.buffered();
+}
+
+test "viewer bottom: only Instruct in both views; the panel's key row follows the question and the wait" {
     var r: Rec = .{};
     var sh = Shell.init(testing.allocator, .viewer, r.host());
     defer sh.deinit();
-    sh.main = .terminal;
+    var sv: StubView = .{};
+    sh.conversation = sv.view();
     var list: [2]tabs_wire.Entry = .{ .{ .id = @splat(1), .color = 0x3366CC, .state = .working }, .{ .id = @splat(2), .color = 0x10B981, .state = .waiting } };
     var v: Viewer = .{ .status = .connected, .host = "h", .has_grid = true, .mode = .instruct };
-    // The shown tab waits: the bar has Up/Down; another tab waiting is not enough.
+    var kb: [64]u8 = undefined;
+    for ([_]MainView{ .terminal, .conversation }) |view| {
+        sh.main = view;
+        sh.closeInstruct();
+        // Closed: one pane, one button (Instruct); no answer bar, no line.
+        var o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+        try testing.expect(!o.show_answers);
+        try testing.expectEqual(@as(usize, 1), o.bottom.len);
+        try testing.expectEqual(@as(usize, 1), o.bottom[0].content.buttons.len);
+        try testing.expectEqual(ids.instruct, o.bottom[0].content.buttons[0].id);
+        try testing.expectEqual(if (view == .terminal) Focus.terminal else Focus.view, sh.focus());
+        // Open: controls (Close), the line (focused), the key row.
+        Shell.onButton(&sh, ids.instruct);
+        o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+        try testing.expectEqual(@as(usize, 3), o.bottom.len);
+        try testing.expectEqual(ids.instruct_close, o.bottom[0].content.buttons[0].id);
+        try testing.expect(o.bottom[1].content == .field and o.bottom[1].content.field.focused);
+        try testing.expectEqual(Focus.line, sh.focus());
+        // The shown tab waits: Up / Down, then Esc and Enter.
+        try testing.expectEqualStrings("up down esc enter", panelKeys(o, &kb));
+        // Another tab waiting is not enough; working, idle, unknown: none.
+        o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(1) });
+        try testing.expectEqualStrings("esc enter", panelKeys(o, &kb));
+        for ([_]tabs_wire.State{ .idle, .unknown, .working }) |s| {
+            list[1].state = s;
+            o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+            try testing.expectEqualStrings("esc enter", panelKeys(o, &kb));
+        }
+        // An open question with numbered options: waiting, and its numbers
+        // unless its card shows them (the Conversation view's cards).
+        v.question_open = true;
+        v.question_digits = 3;
+        v.question_card = true;
+        o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+        try testing.expectEqualStrings(if (view == .terminal) "1 2 3 up down esc enter" else "up down esc enter", panelKeys(o, &kb));
+        v.question_card = false;
+        o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+        try testing.expectEqualStrings("1 2 3 up down esc enter", panelKeys(o, &kb));
+        v.question_open = false;
+        v.question_digits = 0;
+        list[1].state = .waiting;
+        // Close: back to Instruct only.
+        Shell.onButton(&sh, ids.instruct_close);
+        o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+        try testing.expectEqual(@as(usize, 1), o.bottom.len);
+        try testing.expect(!sh.instructing);
+    }
+    // keys mode: the panel has no line, its keys are the whole answer set;
+    // Esc closes it.
+    sh.main = .terminal;
+    v.mode = .keys;
+    _ = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+    Shell.onButton(&sh, ids.instruct);
     var o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
-    try testing.expect(o.show_answers and o.menu_answers);
-    try testing.expect(sh.waiting);
-    o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(1) });
-    try testing.expect(o.show_answers and !o.menu_answers);
-    // Working, idle, unknown: none.
-    for ([_]tabs_wire.State{ .idle, .unknown, .working }) |s| {
-        list[1].state = s;
-        o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
-        try testing.expect(!o.menu_answers);
-    }
-    // An open question in the conversation counts as waiting.
-    v.question_open = true;
+    try testing.expectEqual(@as(usize, 2), o.bottom.len);
+    try testing.expectEqualStrings("y n 1 2 3 esc enter", panelKeys(o, &kb));
+    try testing.expectEqual(Focus.terminal, sh.focus());
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expect(!sh.instructing);
+    // text mode: the line, Esc and Enter (the keyboard has the arrows).
+    v.mode = .text;
+    _ = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+    Shell.onButton(&sh, ids.instruct);
     o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
-    try testing.expect(o.menu_answers);
-    // keys and text mode: never (text has the keyboard's arrows).
-    for ([_]rules.Policy{ .keys, .text }) |p| {
-        v.mode = p;
-        o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
-        try testing.expect(o.show_answers and !o.menu_answers);
-    }
+    try testing.expectEqualStrings("esc enter", panelKeys(o, &kb));
+    // View only: nothing at the bottom, and the panel closes.
+    v.mode = .none;
+    o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+    try testing.expectEqual(@as(usize, 0), o.bottom.len);
+    try testing.expect(!sh.instructing);
+    // A key row press goes out as an answer.
+    v.mode = .instruct;
+    _ = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+    Shell.onAnswer(&sh, "up");
+    try testing.expectEqual(@as(usize, 1), r.answers);
 }
 
 test "viewer per input mode: the same features as the browser" {
@@ -1193,36 +1303,45 @@ test "viewer per input mode: the same features as the browser" {
     // The Terminal view (the Conversation view's rules: further down).
     sh.main = .terminal;
     var v: Viewer = .{ .status = .connected, .host = "h", .has_grid = true, .mode = .none };
-    // view only: no answer bar, no line.
+    // view only: no answer bar, no line, no Instruct.
     var o = sh.overlay(.{ .viewer = v });
     try testing.expect(!o.show_answers);
     try testing.expectEqual(@as(usize, 0), o.bottom.len);
     try testing.expectEqualStrings("view only", o.status.extra);
-    // keys and text: the answer bar, no line.
+    // keys and text: only Instruct; keys go to the terminal.
     for ([_]rules.Policy{ .keys, .text }) |p| {
         v.mode = p;
         o = sh.overlay(.{ .viewer = v });
-        try testing.expect(o.show_answers);
-        try testing.expectEqual(@as(usize, 0), o.bottom.len);
+        try testing.expect(!o.show_answers);
+        try testing.expectEqual(ids.instruct, o.bottom[0].content.buttons[0].id);
         try testing.expectEqual(Focus.terminal, sh.focus());
     }
-    // instruct (the default): answer bar plus the instruction line, which
-    // has the keyboard; its note shows in the status line.
+    // instruct (the default): Instruct opens the line, which has the
+    // keyboard; its note shows in the status line; Send closes the panel.
     v.mode = .instruct;
     _ = sh.overlay(.{ .viewer = v });
+    try testing.expectEqual(Focus.terminal, sh.focus());
+    Shell.onButton(&sh, ids.instruct);
     try testing.expectEqual(Focus.line, sh.focus());
     for ("fix it") |c| Shell.onChar(&sh, c, .{});
     o = sh.overlay(.{ .viewer = v });
-    try testing.expect(o.show_answers);
-    try testing.expectEqual(@as(usize, 1), o.bottom.len);
-    try testing.expectEqualStrings("fix it", o.bottom[0].content.field.value);
-    try testing.expect(o.bottom[0].content.field.focused);
-    try testing.expectEqual(ids.send, o.bottom[0].send.?.id);
+    try testing.expect(!o.show_answers);
+    try testing.expectEqualStrings("fix it", o.bottom[1].content.field.value);
+    try testing.expect(o.bottom[1].content.field.focused);
+    try testing.expectEqual(ids.send, o.bottom[1].send.?.id);
+    // Esc in a non-empty line clears it; on the empty line it closes.
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expect(sh.instructing and sh.line.text().len == 0);
+    for ("fix it") |c| Shell.onChar(&sh, c, .{});
     Shell.onButton(&sh, ids.send);
     try testing.expectEqualStrings("l:fix it", r.lastFrame());
+    try testing.expect(!sh.instructing);
     o = sh.overlay(.{ .viewer = v });
     try testing.expectEqualStrings("instructions: Sent.", o.status.extra);
     try testing.expectEqual(frame.Tone.good, o.status.extra_tone);
+    Shell.onButton(&sh, ids.instruct);
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expect(!sh.instructing);
     // Not connected: the terminal (keys go nowhere useful), pairing screens.
     v.status = .retrying;
     _ = sh.overlay(.{ .viewer = v });
@@ -1459,7 +1578,7 @@ test "status panels: open from a badge, the status line or the top bar; Esc clos
     try testing.expectEqualStrings("", sh.line.text());
     Shell.onKey(&sh, .escape, .{});
     try testing.expect(sh.overlay(st).panel == null);
-    try testing.expectEqual(Focus.line, sh.focus());
+    try testing.expectEqual(Focus.terminal, sh.focus()); // the instruct panel is closed
     // The status line's summary opens it too; its Close button closes.
     Shell.onButton(&sh, ids.tasks);
     try testing.expect(sh.overlay(st).panel != null);
@@ -1586,8 +1705,9 @@ test "conversation view (devices): the default, no answer keys, only Instruct at
     try testing.expectEqual(@as(usize, 1), dict.started);
     o = sh.overlay(.{ .viewer = v });
     try testing.expectEqual(Focus.line, sh.focus());
-    const line = o.bottom[o.bottom.len - 1];
+    const line = o.bottom[1];
     try testing.expect(line.content == .field and line.content.field.focused);
+    try testing.expect(o.bottom[2].content == .answers); // the key row
     // Esc closes it; Send closes it after sending.
     Shell.onKey(&sh, .escape, .{});
     try testing.expect(!sh.instructing);
@@ -1600,25 +1720,27 @@ test "conversation view (devices): the default, no answer keys, only Instruct at
     o = sh.overlay(.{ .viewer = v });
     try testing.expectEqual(ids.instruct, o.bottom[0].content.buttons[0].id);
     try testing.expectEqualStrings("instructions: Sent.", o.status.extra);
-    // keys / text / view-only modes: no Instruct, nothing at the bottom,
-    // never the answer bar.
+    // keys / text: only Instruct, never the answer bar; view only: nothing.
     for ([_]rules.Policy{ .keys, .text, .none }) |m| {
         v.mode = m;
         o = sh.overlay(.{ .viewer = v });
-        try testing.expectEqual(@as(usize, 0), o.bottom.len);
+        try testing.expectEqual(@as(usize, if (m == .none) 0 else 1), o.bottom.len);
         try testing.expect(!o.show_answers);
     }
+    // keys mode: the panel opens without a line (and without dictation).
     v.mode = .keys;
     _ = sh.overlay(.{ .viewer = v });
+    const started = dict.started;
     sh.startDictation();
-    try testing.expect(!sh.instructing);
-    // The Terminal view keeps the full bar and the line.
+    try testing.expect(sh.instructing and !sh.dictating and dict.started == started);
+    sh.closeInstruct();
+    // The Terminal view: the same bottom, only Instruct.
     v.mode = .instruct;
     Shell.onButton(&sh, ids.view_terminal);
     o = sh.overlay(.{ .viewer = v });
-    try testing.expect(o.screen == .grid and o.show_answers);
-    try testing.expect(o.bottom[0].content == .field);
-    try testing.expectEqual(Focus.line, sh.focus());
+    try testing.expect(o.screen == .grid and !o.show_answers);
+    try testing.expectEqual(ids.instruct, o.bottom[0].content.buttons[0].id);
+    try testing.expectEqual(Focus.terminal, sh.focus());
 }
 
 test "conversation view input: navigation keys, scroll, a swipe's and a card key's answer through the answer path" {
@@ -1702,7 +1824,7 @@ test "dictation toggles: Space only without a focused field, the media key only 
     try testing.expectEqual(@as(usize, 1), d.starts);
     o = sh.overlay(.{ .viewer = v });
     try testing.expect(hasLabel(o, "Listening"));
-    try testing.expectEqual(@as(usize, 2), o.bottom.len);
+    try testing.expectEqual(@as(usize, 3), o.bottom.len);
     try testing.expect(o.bottom[1].content == .field);
     // The line has the keyboard now: Space types a space.
     Shell.onChar(&sh, 'a', .{});
@@ -1716,9 +1838,12 @@ test "dictation toggles: Space only without a focused field, the media key only 
     o = sh.overlay(.{ .viewer = v });
     try testing.expect(!hasLabel(o, "Listening") and hasLabel(o, "Dictate"));
     try testing.expectEqualStrings("a ", sh.line.text());
-    // Esc closes the line (stopping dictation if it ran).
+    // Esc clears the line, then closes the panel (stopping dictation if
+    // it ran).
     Shell.onButton(&sh, ids.instruct);
     try testing.expect(sh.dictating);
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expect(sh.dictating and sh.instructing and sh.line.text().len == 0);
     Shell.onKey(&sh, .escape, .{});
     try testing.expect(!sh.dictating and !sh.instructing);
     try testing.expectEqual(@as(usize, 2), d.stops);

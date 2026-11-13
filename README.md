@@ -51,7 +51,8 @@ Input modes (`--input`, or Remote input in the window's Settings):
   (`rejected` `NotWaiting`), because at an idle prompt Up recalls an older
   prompt from history (possibly a `!` shell command or a slash command
   typed at the desk) and Enter would submit it past the line checks.
-  Devices show ↑/↓ buttons only while they would be accepted. A program
+  Devices show ↑/↓ only while they would be accepted (the browser's
+  button row; the native viewers' instruct panel). A program
   that never reports OSC 7501 and asks nothing in its transcript (no
   question open) never gets them; that includes the agent if it does not
   detect OSC 7501 support in Portal's terminal, and its folder-trust
@@ -446,8 +447,10 @@ divider to resize it. The interaction slice:
    the reason shows under the box and the text stays. In `keys` mode the
    box takes answer words only;
 * **buttons**: Yes, No, 1, 2, 3, Esc, Enter, Send; in `instruct` mode
-  also ↑ and ↓ while the shown tab's program waits for an answer (the
-  native client's answer bar too).
+  also ↑ and ↓ while the shown tab's program waits for an answer. (The
+  native remote viewers, `portal connect` and the iPhone app, show only
+  an Instruct button; its panel holds the line and a compact key row, see
+  docs/layout-design.md.)
 
 On the iPhone, voice is Apple's keyboard dictation into the input box;
 Portal never records or sends audio from the phone.

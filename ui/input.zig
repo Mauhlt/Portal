@@ -80,7 +80,7 @@ pub const Action = enum {
 /// key name (docs/protocol.md section 4).
 pub const Answer = rules.AnswerButton;
 pub const answers = rules.answer_buttons;
-/// Up / Down after them, while they would be accepted (Overlay.menu_answers).
+/// Up / Down (the instruct panel's key row, while they would be accepted).
 pub const menu_answers = rules.menu_buttons;
 
 /// Where the frame's hit-testing sends input. All callbacks run on the UI

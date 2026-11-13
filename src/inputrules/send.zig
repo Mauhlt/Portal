@@ -25,7 +25,8 @@ pub const Policy = keymap.Policy;
 pub const AnswerButton = struct { label: []const u8, key: []const u8 };
 
 /// The answer buttons, in order, on every client: the browser's button row
-/// (index.html data-btn 0..6, then Send) and the native answer bar.
+/// (index.html data-btn 0..6, then Send) and the desk's answer bar (the
+/// native remote viewers: their instruct panel in keys mode).
 pub const answer_buttons = [_]AnswerButton{
     .{ .label = "Yes", .key = "y" },
     .{ .label = "No", .key = "n" },

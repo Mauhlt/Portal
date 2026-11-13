@@ -501,9 +501,10 @@ re-opens that window; a program that never reports OSC 7501 and writes no
 question (including the agent when it does not detect OSC 7501 support
 in Portal's terminal; its folder-trust prompt comes before any transcript)
 never gets `up` / `down`, and must be answered at the desk. Clients show
-Up/Down (↑ ↓ after the answer buttons) only while they would be accepted:
-in `instruct` mode while the shown tab's `state` is `waiting` or (native
-client) its conversation has an open question.
+Up/Down only while they would be accepted: in `instruct` mode while the
+shown tab's `state` is `waiting` or (native client) its conversation has
+an open question (the browser: ↑ ↓ after the answer buttons; the native
+client: in its instruct panel's key row, docs/layout-design.md).
 
 The server maps names to the exact bytes the terminal expects, applies the
 session's input policy, and silently drops anything not allowed (except the
@@ -530,13 +531,17 @@ Shift+Tab is `shift-tab`.
   it is still open, else the first.
 * Both Portal clients send instruction lines from an input line (the
   browser's text box, so phone dictation works; the native client's field
-  under the answer bar) and map answer words to keys before sending
+  in its instruct panel) and map answer words to keys before sending
   ("Yes." → `k:y`, "two" → `k:2`, "OK" → `k:enter`; one shared table and
   `decide` in `src/inputrules/send.zig`). They check lines with the
   server's rules first, so a refusal is shown without a round trip;
   `rejected` still covers anything they missed, and the line comes back.
-  The answer buttons are the same on both: Yes, No, 1, 2, 3, Esc, Enter
-  (then ↑ ↓ in `instruct` mode while the shown tab waits, section 4).
+  The browser's answer buttons are Yes, No, 1, 2, 3, Esc, Enter (then ↑ ↓
+  in `instruct` mode while the shown tab waits, section 4), like the
+  desk's answer bar. The native remote viewers (owner's decision,
+  2026-11-12) show only Instruct; its panel has Esc, Enter, ↑ ↓ while
+  waiting and the question's number keys while no card shows them
+  (`keys` mode: the whole answer set), docs/layout-design.md.
 
 ## 7. Portal sync (signed packages for paired devices)
 

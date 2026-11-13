@@ -415,6 +415,33 @@ fn normalize(gpa: std.mem.Allocator, t: []const u8) ![]u8 {
     return out;
 }
 
+/// An option's label for a card header or button: cut at the first scrub
+/// placeholder ("[path]", "[user]": the desktop removed a path or name
+/// there, and "Beta in [path]" reads as noise), then without trailing
+/// joiner words ("in", "at", "for", "from", "to", "on", "of") and
+/// punctuation. Nothing left: the label as it was.
+pub fn shortLabel(label: []const u8) []const u8 {
+    var end = label.len;
+    for ([_][]const u8{ "[path]", "[user]" }) |mark| {
+        if (std.mem.indexOf(u8, label[0..end], mark)) |i| end = i;
+    }
+    if (end == label.len) return label;
+    var s = label[0..end];
+    const joiners = [_][]const u8{ "in", "at", "for", "from", "to", "on", "of", "by", "with" };
+    while (true) {
+        const before = s.len;
+        s = std.mem.trimEnd(u8, s, " \t,;:.-()\"'");
+        const sp = std.mem.lastIndexOfScalar(u8, s, ' ');
+        const word = std.mem.trimStart(u8, if (sp) |k| s[k + 1 ..] else s, "(\"'");
+        for (joiners) |w| if (std.ascii.eqlIgnoreCase(word, w)) {
+            s = s[0 .. sp orelse 0];
+            break;
+        };
+        if (s.len == before) break;
+    }
+    return if (s.len == 0) label else s;
+}
+
 fn copyEntry(gpa: std.mem.Allocator, it: wire.Item) !Entry {
     const text = try normalize(gpa, it.text);
     errdefer gpa.free(text);
@@ -428,7 +455,7 @@ fn copyEntry(gpa: std.mem.Allocator, it: wire.Item) !Entry {
         gpa.free(opts);
     }
     for (it.options) |o| {
-        const label = try gpa.dupe(u8, o.label);
+        const label = try gpa.dupe(u8, shortLabel(o.label));
         errdefer gpa.free(label);
         opts[k] = .{ .label = label, .key = try gpa.dupe(u8, o.key) };
         k += 1;
@@ -644,6 +671,22 @@ pub const View = struct {
             if (e.kind == .question and e.open) return e.n;
         }
         return null;
+    }
+
+    /// The newest open question's numbered options ("1".."9" keys, from
+    /// the first; 0 without one), and whether its card answers it on
+    /// screen (a swipe card or option buttons). The shell's instruct
+    /// panel offers the number keys only when no card does.
+    pub fn questionKeys(v: *const View) struct { digits: u8, card: bool } {
+        const n = v.newestOpenQuestion() orelse return .{ .digits = 0, .card = false };
+        const e = &v.entries.items[v.find(n) orelse return .{ .digits = 0, .card = false }];
+        var d: u8 = 0;
+        for (e.options) |o| {
+            if (o.key.len != 1 or o.key[0] != '1' + d or d == 9) break;
+            d += 1;
+        }
+        const card = v.answers and v.sent_n != n and (swipeMap(e.*) != null or v.showsButtons(e));
+        return .{ .digits = d, .card = card };
     }
 
     /// Item `n` can be swiped now: the newest open question, two options,
@@ -1955,4 +1998,61 @@ test "drawing a held card: tinted, enlarged, no text stamp, opaque" {
     try testing.expect(tinted);
     // The border's top edge: the card's width, enlarged.
     try testing.expect(widest > v.colw);
+}
+
+test "option labels: cut at a scrub placeholder, no trailing joiner words" {
+    try testing.expectEqualStrings("Beta", shortLabel("Beta in [path]"));
+    try testing.expectEqualStrings("Ask", shortLabel("Ask [user]"));
+    try testing.expectEqualStrings("Copy the file", shortLabel("Copy the file from [path] to [path]"));
+    try testing.expectEqualStrings("Open it", shortLabel("Open it, at: [path]"));
+    try testing.expectEqualStrings("Save", shortLabel("Save to (in [path])"));
+    // No placeholder: unchanged, joiner words and all.
+    try testing.expectEqualStrings("Log in", shortLabel("Log in"));
+    try testing.expectEqualStrings("Alpha", shortLabel("Alpha"));
+    // Nothing left: the label as it was.
+    try testing.expectEqualStrings("[path]", shortLabel("[path]"));
+    try testing.expectEqualStrings("in [path]", shortLabel("in [path]"));
+    // The card header uses the short labels.
+    const gpa = testing.allocator;
+    var c: convo.Conversation = .{};
+    defer c.deinit(gpa);
+    var v = View.init(gpa);
+    defer v.deinit();
+    const opts = [_]wire.Option{ .{ .label = "Alpha", .key = "1" }, .{ .label = "Beta in [path]", .key = "2" } };
+    try testConvo(gpa, &c, true, &.{.{ .n = 1, .kind = .question, .text = "Which?", .open = true, .options = &opts }});
+    v.sync(&c);
+    try testing.expectEqualStrings("Beta", v.entries.items[0].options[1].label);
+    const sm = swipeMap(v.entries.items[0]).?;
+    try testing.expectEqualStrings("Beta", sm.no_label);
+}
+
+test "questionKeys: numbered options, and whether a card answers them" {
+    const gpa = testing.allocator;
+    var c: convo.Conversation = .{};
+    defer c.deinit(gpa);
+    var v = View.init(gpa);
+    defer v.deinit();
+    try testing.expectEqual(@as(u8, 0), v.questionKeys().digits);
+    const three = [_]wire.Option{ .{ .label = "A", .key = "1" }, .{ .label = "B", .key = "2" }, .{ .label = "C", .key = "3" } };
+    const perm = [_]wire.Option{ .{ .label = "Yes", .key = "1" }, .{ .label = "No", .key = "esc" } };
+    try testConvo(gpa, &c, true, &.{.{ .n = 1, .kind = .question, .text = "Pick", .open = true, .options = &three }});
+    v.sync(&c);
+    var q = v.questionKeys();
+    try testing.expectEqual(@as(u8, 3), q.digits);
+    try testing.expect(q.card); // option buttons on the card
+    v.answers = false; // view only: no card answers
+    try testing.expect(!v.questionKeys().card);
+    v.answers = true;
+    // A permission prompt: one numbered option ("1"), a swipe card.
+    try testConvo(gpa, &c, true, &.{.{ .n = 2, .kind = .question, .text = "Allow?", .open = true, .options = &perm }});
+    v.sync(&c);
+    q = v.questionKeys();
+    try testing.expectEqual(@as(u8, 1), q.digits);
+    try testing.expect(q.card);
+    // A wait without options: nothing numbered, no card controls.
+    try testConvo(gpa, &c, true, &.{.{ .n = 3, .kind = .question, .text = "Waiting", .open = true }});
+    v.sync(&c);
+    q = v.questionKeys();
+    try testing.expectEqual(@as(u8, 0), q.digits);
+    try testing.expect(!q.card);
 }

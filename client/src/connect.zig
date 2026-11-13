@@ -215,6 +215,7 @@ const Host = struct {
         // the network thread replaces Shared's.
         h.activity = s.activity;
         if (s.has_sys) h.sys = s.sys;
+        const qk = h.convo_view.questionKeys();
         const o = h.shell.overlay(.{
             .tabs = if (st == .connected) h.tabs.slice() else &.{},
             .current = s.current,
@@ -233,6 +234,8 @@ const Host = struct {
                 .exit_code = s.exit_code,
                 .pin_fp = h.pin_fp_buf[0..h.pin_fp_len],
                 .question_open = h.convo_view.newestOpenQuestion() != null,
+                .question_digits = qk.digits,
+                .question_card = qk.card,
             },
         });
         h.p.build(&s.grid, o);
