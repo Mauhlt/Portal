@@ -334,7 +334,7 @@ pub const Program = struct {
     cmdline: [:0]const u16,
     /// For log lines only.
     command_name: []const u8,
-    /// The agent without a session chosen in its arguments: each tab's
+    /// the agent without a session chosen in its arguments: each tab's
     /// launch gets its own `--session-id <uuid>` (cmdline.wantsSessionId).
     session_id: bool = false,
 };
@@ -349,7 +349,7 @@ pub const Hub = struct {
     program: Program,
     /// Tab colours chosen in settings.txt (`color = NAME #rrggbb`).
     colors: []const ColorChoice = &.{},
-    /// The agent's transcript folder (`...\.claude\projects`), read for
+    /// the agent's transcript folder (`...\.claude\projects`), read for
     /// each tab's Conversation view; null: no conversations (the view says
     /// there is no transcript).
     convo_projects: ?[]const u8 = null,

@@ -553,9 +553,9 @@ pub const Convo = struct {
             const p: ?Pending = if (c.n_pending > 0) c.pending[c.n_pending - 1] else null;
             var pb: [96]u8 = undefined;
             const text = if (p) |pp|
-                std.fmt.bufPrint(&buf, "Claude wants to {s}. Allow it?", .{transcript.permissionPhrase(&pb, pp.cat, pp.tool[0..pp.tool_len])}) catch "Claude needs your permission to continue."
+                std.fmt.bufPrint(&buf, "The agent wants to {s}. Allow it?", .{transcript.permissionPhrase(&pb, pp.cat, pp.tool[0..pp.tool_len])}) catch "The agent needs your permission to continue."
             else
-                "Claude needs your permission to continue.";
+                "The agent needs your permission to continue.";
             c.makeRoom(text.len, 2);
             const s = try c.pushStatic(.question, text);
             s.open = true;
@@ -575,7 +575,7 @@ pub const Convo = struct {
             c.synthetic_tool = if (p) |pp| pp.id else 0;
             return;
         }
-        const s = try c.pushStatic(.question, "Claude is waiting for your answer. The terminal shows the question.");
+        const s = try c.pushStatic(.question, "The agent is waiting for your answer. The terminal shows the question.");
         s.open = true;
         c.synthetic_n = s.n;
         c.synthetic_tool = 0;
@@ -822,18 +822,18 @@ test "program state: permission prompts become Yes/No, other waits a plain quest
     try f.feed(toolLine("b1", "Bash", "{\"command\":\"rm -rf C:\\\\\"}"));
     f.c.programState(.permission);
     var buf: [1024]u8 = undefined;
-    try testing.expectEqualStrings("tool:Ran a command|question:Claude wants to run a command. Allow it?(open)|", try f.texts(&buf));
+    try testing.expectEqualStrings("tool:Ran a command|question:The agent wants to run a command. Allow it?(open)|", try f.texts(&buf));
     const q = f.c.last().?;
     try testing.expectEqualStrings("1", q.options[0].key);
     try testing.expectEqualStrings("esc", q.options[1].key);
     f.c.programState(.permission); // no duplicate
     f.c.programState(.none);
-    try testing.expectEqualStrings("tool:Ran a command|question:Claude wants to run a command. Allow it?|", try f.texts(&buf));
+    try testing.expectEqualStrings("tool:Ran a command|question:The agent wants to run a command. Allow it?|", try f.texts(&buf));
     // A generic wait; then the transcript's question takes its place
     // (the note is removed: viewers get it as an empty item).
     f.c.programState(.other);
     const n = f.c.last().?.n;
-    try testing.expectEqualStrings("Claude is waiting for your answer. The terminal shows the question.", f.c.last().?.text);
+    try testing.expectEqualStrings("The agent is waiting for your answer. The terminal shows the question.", f.c.last().?.text);
     const rev = f.c.rev;
     try f.feed(toolLine("q2", "AskUserQuestion", "{\"questions\":[{\"question\":\"Go?\",\"options\":[{\"label\":\"Yes\"}]}]}"));
     try testing.expect(n != f.c.last().?.n);
@@ -866,9 +866,9 @@ test "the program's wait seen before the transcript catches up: Portal's questio
     f.c.programState(.none);
     f.c.programState(.permission); // the record of the tool is not read yet
     var buf: [1024]u8 = undefined;
-    try testing.expectEqualStrings("user:go|question:Claude needs your permission to continue.(open)|", try f.texts(&buf));
+    try testing.expectEqualStrings("user:go|question:The agent needs your permission to continue.(open)|", try f.texts(&buf));
     try f.feed(toolLine("b2", "Bash", "{\"command\":\"x\"}"));
-    try testing.expectEqualStrings("user:go|tool:Ran a command|question:Claude wants to run a command. Allow it?(open)|", try f.texts(&buf));
+    try testing.expectEqualStrings("user:go|tool:Ran a command|question:The agent wants to run a command. Allow it?(open)|", try f.texts(&buf));
     // A question still open from the transcript when the program says it
     // waits; its result arrives later: Portal asks then.
     f.c.programState(.none);
@@ -877,7 +877,7 @@ test "the program's wait seen before the transcript catches up: Portal's questio
     try f.feed(result("q3"));
     try f.feed(toolLine("b3", "Bash", "{\"command\":\"y\"}"));
     try testing.expect(f.c.last().?.open);
-    try testing.expectEqualStrings("Claude wants to run a command. Allow it?", f.c.last().?.text);
+    try testing.expectEqualStrings("The agent wants to run a command. Allow it?", f.c.last().?.text);
 }
 
 test "bounded: items, bytes and options; oldest go first" {

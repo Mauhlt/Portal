@@ -311,7 +311,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
 
     // A permission prompt, known only from the program's OSC 7501 state.
     _ = r.check("the fake program asks for permission", v.waitFor("FAKE-PERMISSION", 8000), "{s}", .{v.dump(&dump)});
-    const perm = "Claude wants to run a command. Allow it?";
+    const perm = "The agent wants to run a command. Allow it?";
     const got_perm = waitItem(v, .{ .gpa = gpa, .id = id, .kind = .question, .text = perm, .open = true }, 8000);
     {
         var c = try Conv.build(gpa, v, id);

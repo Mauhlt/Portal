@@ -444,7 +444,7 @@ test "usage: each reply once, today by day, latest model, reset" {
     try f.feed(reply("r2", "2025-11-12T09:00:00Z", "model-large-4-1", "3", "7"));
     // The same reply's next record repeats its usage: not counted twice.
     try f.feed(reply("r2", "2025-11-12T09:00:01Z", "model-large-4-1", "3", "7"));
-    // The agent's own notes have a model of "<synthetic>": not a model.
+    // the agent's own notes have a model of "<synthetic>": not a model.
     try f.feed(reply("r3", "2025-11-12T09:00:02Z", "<synthetic>", "0", "0"));
     try testing.expectEqual(@as(u64, 13), f.a.usage.input);
     try testing.expectEqual(@as(u64, 12), f.a.usage.output);

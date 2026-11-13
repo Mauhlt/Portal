@@ -1175,7 +1175,7 @@ pub const View = struct {
         if (!v.on) return .{
             .title = "No conversation log for this tab \u{2014} use Terminal",
             .title_tone = .muted,
-            .lines = &.{"Portal shows the conversation of Claude Code sessions; this tab has none to read."},
+            .lines = &.{"Portal shows the conversation of agent sessions; this tab has none to read."},
             .button = .{ .label = "Terminal", .id = ids.terminal },
         };
         if (v.entries.items.len == 0) return .{ .title = "No messages yet", .title_tone = .muted, .lines = &.{"The conversation appears here as it happens."} };
