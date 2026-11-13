@@ -43,6 +43,7 @@ const follow = @import("convo/follow.zig");
 const transcript = @import("convo/transcript.zig");
 const cmdline = @import("cmdline.zig");
 const childenv = @import("childenv.zig");
+const hookmsg = @import("hookmsg.zig");
 
 pub const Id = wire.Id;
 pub const State = wire.State;
@@ -105,6 +106,10 @@ pub const Tab = struct {
     /// The `--session-id` Portal gave the agent for this launch (its
     /// transcript's name), if it gave one. Desktop-only.
     session_uuid: ?[36]u8 = null,
+    /// This launch's PORTAL_TAB (random, 128 bits, not the tab's `id`):
+    /// how `portalctl hook` names the tab (hookmsg.zig). Desktop-only:
+    /// never logged, never sent to devices.
+    hook_key: hookmsg.Key = undefined,
 
     child_code: std.atomic.Value(u32) = .init(1),
     child_done: std.atomic.Value(bool) = .init(false),
@@ -244,9 +249,23 @@ pub const Tab = struct {
         t.activity.applyRecord(rec);
         const act = t.activity.rev != rev;
         if (act) h.activity_gen +%= 1;
+        // A state from a hook that the transcript shows is over.
+        var moved = false;
+        if (rec.rtype == .user and !rec.sidechain and !rec.history) {
+            var result = false;
+            var interrupted = false;
+            for (rec.blockSlice()) |*b| switch (b.kind) {
+                .tool_result => result = true,
+                .text => if (transcript.interruptPrompt(b.text)) {
+                    interrupted = true;
+                },
+                else => {},
+            };
+            moved = t.session.transcriptMovedOnLocked(result, interrupted);
+        }
         h.mutex.unlock(h.io);
         h.cond.broadcast(h.io);
-        if (act) h.notify();
+        if (act or moved) h.notify();
     }
 
     fn convoReset(ctx: *anyopaque, on: bool) void {
@@ -380,6 +399,10 @@ pub const Hub = struct {
     last_code: u32 = 0,
     finished_event: Io.Event = .unset,
 
+    /// When a hook message for no open tab was last logged (awake ms).
+    /// Guarded by `mutex`.
+    hook_unknown_logged_ms: i64 = std.math.minInt(i64),
+
     viewers: u32 = 0,
     /// Viewer sockets not yet closed: a viewer counts here from its
     /// upgrade until its socket is closed (after the exit notice and the
@@ -481,6 +504,12 @@ pub const Hub = struct {
             h.io.randomSecure(&rnd) catch h.io.random(&rnd);
             t.session_uuid = cmdline.uuidV4(rnd);
         }
+        // The hook key, passed to the program (and so to the agent's
+        // hooks) as PORTAL_TAB, added after childenv's filter.
+        while (true) {
+            h.io.randomSecure(&t.hook_key) catch h.io.random(&t.hook_key);
+            if (!std.mem.allEqual(u8, &t.hook_key, 0)) break;
+        }
         const line = (if (t.session_uuid) |*u| cmdline.withSessionId(h.gpa, h.program.cmdline, u) else h.gpa.dupeSentinel(u16, h.program.cmdline, 0)) catch {
             t.session.term.deinit();
             h.gpa.destroy(t);
@@ -490,7 +519,13 @@ pub const Hub = struct {
         // Its own environment: Portal's, without what leaks the context
         // Portal was started from (a parent agent session's markers,
         // PORTAL_*): childenv.zig.
-        const env_block = childenv.forSession(h.gpa) catch |err| {
+        var tab_var: [hookmsg.env_name.len + 1 + 32]u16 = undefined;
+        {
+            const hex = hookmsg.keyHex(t.hook_key);
+            for (hookmsg.env_name ++ "=", 0..) |c, i| tab_var[i] = c;
+            for (hex, 0..) |c, i| tab_var[hookmsg.env_name.len + 1 + i] = c;
+        }
+        const env_block = childenv.forSessionWith(h.gpa, &.{&tab_var}) catch |err| {
             h.log.print("tab '{s}': could not prepare the environment: {t}", .{ t.name(), err });
             t.session.term.deinit();
             h.gpa.destroy(t);
@@ -679,6 +714,34 @@ pub const Hub = struct {
         h.mutex.unlock(h.io);
         h.cond.broadcast(h.io);
         h.notify();
+    }
+
+    /// A message from `portalctl hook` (hookpipe.zig's server thread).
+    /// Only an open tab's own key counts; anything else changes nothing
+    /// and is logged at most once a minute, without its contents.
+    pub fn applyHook(h: *Hub, m: *const hookmsg.Message) void {
+        const e = hookmsg.effect(m) orelse return;
+        h.mutex.lockUncancelable(h.io);
+        var found: ?*Tab = null;
+        for (h.tabs[0..h.n]) |t| if (std.crypto.timing_safe.eql(hookmsg.Key, t.hook_key, m.key)) {
+            t.acquire();
+            found = t;
+        };
+        var log_it = false;
+        if (found == null) {
+            const now = Io.Clock.awake.now(h.io).toMilliseconds();
+            if (!session_mod.withinWindow(now, h.hook_unknown_logged_ms, 60_000)) {
+                h.hook_unknown_logged_ms = now;
+                log_it = true;
+            }
+        }
+        h.mutex.unlock(h.io);
+        const t = found orelse {
+            if (log_it) h.log.print("hooks: a message for no open tab was ignored (further ones within a minute are not logged)", .{});
+            return;
+        };
+        defer t.release();
+        t.session.setHookState(e);
     }
 
     pub fn setDeskActive(h: *Hub, t: *Tab) void {

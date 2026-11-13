@@ -12,6 +12,7 @@ const keymap = @import("keymap.zig");
 const Policy = keymap.Policy;
 const convo_model = @import("convo/model.zig");
 const Poke = @import("convo/follow.zig").Poke;
+const hookmsg = @import("hookmsg.zig");
 
 pub const Session = struct {
     io: Io,
@@ -44,10 +45,17 @@ pub const Session = struct {
     size: Size,
     closed: bool = false,
     exit_code: u32 = 0,
-    /// The program's OSC 7501 state as last seen (term.program_state),
-    /// and the tab list's generation, bumped when it changes (tabs.Hub.gen;
-    /// null outside a hub).
+    /// The program's state: from OSC 7501 (term.program_state) or from
+    /// an agent hook (setHookState), whichever changed last; and the
+    /// tab list's generation, bumped when it changes (tabs.Hub.gen; null
+    /// outside a hub).
     state: vt.ProgramState = .unknown,
+    /// The OSC 7501 state and kind as last seen, so a hook's state stays
+    /// until the program reports a new one of its own.
+    osc_state: vt.ProgramState = .unknown,
+    osc_kind: vt.ProgramKind = .none,
+    /// `state` was set by a hook (hookmsg.zig), not by OSC 7501.
+    hook_state: bool = false,
     list_gen: ?*u64 = null,
     /// The tab's Conversation view (tabs.Tab.convo; null outside a hub):
     /// told when the program starts or stops waiting for an answer.
@@ -92,20 +100,61 @@ pub const Session = struct {
         // for by the program's own output, so it goes in like the desktop's
         // own input (writeInput), never through a device's policy.
         const reply = s.term.takeReplies(&reply_buf);
-        if (s.term.program_state != s.state) {
-            s.state = s.term.program_state;
-            if (s.list_gen) |g| g.* +%= 1;
-        }
-        const wait: convo_model.Wait = if (s.term.program_state != .waiting) .none else if (s.term.program_kind == .permission) .permission else .other;
-        if (wait != s.wait) {
-            s.wait = wait;
-            if (s.convo) |c| c.programState(wait);
+        if (s.term.program_state != s.osc_state or s.term.program_kind != s.osc_kind) {
+            s.osc_state = s.term.program_state;
+            s.osc_kind = s.term.program_kind;
+            s.hook_state = false;
+            const wait: convo_model.Wait = if (s.osc_state != .waiting) .none else if (s.osc_kind == .permission) .permission else .other;
+            _ = s.setStateLocked(s.osc_state, wait);
         }
         s.mutex.unlock(s.io);
         if (reply.len > 0) s.writeInput(reply);
         s.cond.broadcast(s.io);
         s.notify();
         if (s.convo_poke) |p| p.poke();
+    }
+
+    /// Caller holds `mutex`. True if anything changed.
+    fn setStateLocked(s: *Session, state: vt.ProgramState, wait: convo_model.Wait) bool {
+        var changed = false;
+        if (state != s.state) {
+            s.state = state;
+            if (s.list_gen) |g| g.* +%= 1;
+            changed = true;
+        }
+        if (wait != s.wait) {
+            s.wait = wait;
+            if (s.convo) |c| c.programState(wait);
+            changed = true;
+        }
+        return changed;
+    }
+
+    /// An agent hook reported the program's state (tabs.Hub.applyHook,
+    /// hookmsg.effect). The same paths as OSC 7501: the tab list's
+    /// generation, the Conversation view's question, every viewer and the
+    /// window woken.
+    pub fn setHookState(s: *Session, e: hookmsg.Effect) void {
+        s.mutex.lockUncancelable(s.io);
+        s.hook_state = true;
+        if (e.cat) |cat| if (s.convo) |c| c.permissionHint(cat);
+        _ = s.setStateLocked(e.state, e.wait);
+        s.mutex.unlock(s.io);
+        s.cond.broadcast(s.io);
+        s.notify();
+    }
+
+    /// Caller holds `mutex`. The transcript shows the program went on
+    /// after a hook said it waits for a permission answer (a tool result:
+    /// the prompt was answered), or that the owner interrupted it (no Stop
+    /// hook follows an interrupt). Hooks report no "working again" of
+    /// their own here (PreToolUse/PostToolUse are not used: too chatty).
+    /// True if the state changed.
+    pub fn transcriptMovedOnLocked(s: *Session, tool_result: bool, interrupted: bool) bool {
+        if (!s.hook_state) return false;
+        if (interrupted) return s.setStateLocked(.idle, .none);
+        if (tool_result and s.state == .waiting and s.wait == .permission) return s.setStateLocked(.working, .none);
+        return false;
     }
 
     fn notify(s: *Session) void {
@@ -587,4 +636,68 @@ test "writeLocal stops at the next chunk once shutdown begins" {
     var avail: w.DWORD = 0;
     try std.testing.expect(w.PeekNamedPipe(rd, null, 0, null, &avail, null) != 0);
     try std.testing.expectEqual(@as(w.DWORD, 0), avail);
+}
+
+test "hook states: same generation and convo paths as OSC 7501; OSC wins only when it changes" {
+    const w = @import("win32.zig");
+    const gpa = std.testing.allocator;
+    var rd: w.HANDLE = undefined;
+    var wr: w.HANDLE = undefined;
+    if (w.CreatePipe(&rd, &wr, null, 1 << 16) == 0) return error.SkipZigTest;
+    defer _ = w.CloseHandle(rd);
+    defer _ = w.CloseHandle(wr);
+    var pty: Pty = .{ .hpc = undefined, .in_write = wr, .out_read = undefined, .process = undefined, .job = undefined };
+    var mu: Io.Mutex = .init;
+    var cv: Io.Condition = .init;
+    var gen: u64 = 1;
+    var c = convo_model.Convo.init(gpa, .{});
+    defer c.deinit();
+    c.reset(true);
+    var s: Session = .{
+        .io = std.testing.io,
+        .mutex = &mu,
+        .cond = &cv,
+        .pty = &pty,
+        .console = undefined,
+        .policy = .instruct,
+        .term = try vt.Terminal.init(gpa, 10, 5),
+        .size = .{ .cols = 10, .rows = 5 },
+        .list_gen = &gen,
+        .convo = &c,
+    };
+    defer s.term.deinit();
+    s.setHookState(.{ .state = .working, .wait = .none });
+    try std.testing.expectEqual(vt.ProgramState.working, s.state);
+    try std.testing.expectEqual(@as(u64, 2), gen);
+    // Output without OSC 7501 leaves the hook's state alone.
+    s.appendOutput("hello");
+    try std.testing.expectEqual(vt.ProgramState.working, s.state);
+    // PermissionRequest: waiting, the permission card, Up/Down allowed.
+    s.setHookState(.{ .state = .waiting, .wait = .permission, .cat = .edit });
+    try std.testing.expectEqual(@as(u64, 3), gen);
+    try std.testing.expect(c.hasOpenQuestion());
+    try std.testing.expectEqualStrings("Claude wants to edit a file. Allow it?", c.last().?.text);
+    try s.writeWebKey("up", 0);
+    // The transcript shows a tool result: the prompt was answered.
+    mu.lockUncancelable(std.testing.io);
+    try std.testing.expect(s.transcriptMovedOnLocked(true, false));
+    mu.unlock(std.testing.io);
+    try std.testing.expectEqual(vt.ProgramState.working, s.state);
+    try std.testing.expect(!c.hasOpenQuestion());
+    try std.testing.expectError(error.NotWaiting, s.writeWebKey("up", 0));
+    // Stop, then an OSC 7501 report takes over.
+    s.setHookState(.{ .state = .done, .wait = .none });
+    try std.testing.expectEqual(vt.ProgramState.done, s.state);
+    s.appendOutput("\x1b]7501;state=working\x07");
+    try std.testing.expectEqual(vt.ProgramState.working, s.state);
+    try std.testing.expect(!s.hook_state);
+    mu.lockUncancelable(std.testing.io);
+    try std.testing.expect(!s.transcriptMovedOnLocked(false, true)); // not a hook state
+    mu.unlock(std.testing.io);
+    // A hook after it wins again; an interrupt in the transcript is idle.
+    s.setHookState(.{ .state = .waiting, .wait = .permission });
+    mu.lockUncancelable(std.testing.io);
+    try std.testing.expect(s.transcriptMovedOnLocked(false, true));
+    mu.unlock(std.testing.io);
+    try std.testing.expectEqual(vt.ProgramState.idle, s.state);
 }

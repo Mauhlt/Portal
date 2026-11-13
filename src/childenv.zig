@@ -27,6 +27,12 @@
 //! the user's configuration; the agent does not set them for its
 //! children). Windows wants the block sorted by name, case-insensitively:
 //! `build` sorts it.
+//!
+//! Added after the filter, on purpose: the tab's own `extra` entries
+//! (tabs.zig: `PORTAL_TAB=<this launch's hook key>`, for `portalctl hook`,
+//! hookmsg.zig). They replace any inherited entry of the same name, so an
+//! inherited PORTAL_TAB (Portal started from inside another Portal tab)
+//! never survives, while the tab's own always does.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -76,6 +82,12 @@ fn upper(c: u16) u16 {
 fn eqlAscii(name: []const u16, s: []const u8) bool {
     if (name.len != s.len) return false;
     for (name, s) |a, b| if (upper(a) != b) return false;
+    return true;
+}
+
+fn eqlName(a: []const u16, b: []const u16) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (upper(x) != upper(y)) return false;
     return true;
 }
 
@@ -131,6 +143,12 @@ pub const Persistent = struct {
 /// each NUL-terminated, then one more NUL), as a block for CreateProcessW
 /// with CREATE_UNICODE_ENVIRONMENT. Caller frees.
 pub fn build(gpa: Allocator, source: [*:0]const u16, persistent: Persistent) Allocator.Error![:0]u16 {
+    return buildWith(gpa, source, persistent, &.{});
+}
+
+/// `build`, plus `extra` (`NAME=value` entries, without NULs) added after
+/// the filter; an extra entry replaces a kept one of the same name.
+pub fn buildWith(gpa: Allocator, source: [*:0]const u16, persistent: Persistent, extra: []const []const u16) Allocator.Error![:0]u16 {
     var entries: std.ArrayList([]const u16) = .empty;
     defer entries.deinit(gpa);
     var i: usize = 0;
@@ -144,8 +162,16 @@ pub fn build(gpa: Allocator, source: [*:0]const u16, persistent: Persistent) All
             .drop_unless_persistent => persistent.f(persistent.ctx, entryName(entry)),
         };
         if (!keep) continue;
+        const replaced = for (extra) |x| {
+            if (eqlName(entryName(x), entryName(entry))) break true;
+        } else false;
+        if (replaced) continue;
         try entries.append(gpa, entry);
         total += entry.len + 1;
+    }
+    for (extra) |x| {
+        try entries.append(gpa, x);
+        total += x.len + 1;
     }
     std.mem.sort([]const u16, entries.items, {}, nameLess);
     // An empty block still needs two NULs.
@@ -190,9 +216,14 @@ fn inRegistry(_: ?*anyopaque, name: []const u16) bool {
 /// is now (with Portal's own changes, such as the PATH prepend). Caller
 /// frees.
 pub fn forSession(gpa: Allocator) error{ OutOfMemory, NoEnvironment }![:0]u16 {
+    return forSessionWith(gpa, &.{});
+}
+
+/// forSession plus the tab's own `extra` entries (see buildWith).
+pub fn forSessionWith(gpa: Allocator, extra: []const []const u16) error{ OutOfMemory, NoEnvironment }![:0]u16 {
     const src = GetEnvironmentStringsW() orelse return error.NoEnvironment;
     defer _ = FreeEnvironmentStringsW(src);
-    return build(gpa, src, .{ .f = inRegistry });
+    return buildWith(gpa, src, .{ .f = inRegistry }, extra);
 }
 
 // ------------------------------------------------------------------ tests
@@ -285,6 +316,29 @@ test "build: filtered and sorted case-insensitively; persistent CLAUDE names kep
     defer testing.allocator.free(none);
     var it = std.mem.splitScalar(u16, none, 0);
     while (it.next()) |e| try testing.expect(!std.mem.startsWith(u16, e, L("CLAUDE_MY")));
+}
+
+test "buildWith: the tab's PORTAL_TAB is added after the filter; inherited PORTAL_* still go" {
+    @setEvalBranchQuota(1_000_000);
+    const src = block(&.{
+        "Path=C:/bin",
+        "PORTAL_TAB=inherited0000000000000000000000",
+        "portal_tab=lower",
+        "PORTAL_VIA_LAUNCHER=1",
+        "PORTAL_TESTING=1",
+        "Zeta=z",
+    });
+    const got = try buildWith(testing.allocator, src, .never, &.{L("PORTAL_TAB=0123456789abcdef0123456789abcdef")});
+    defer testing.allocator.free(got);
+    try expectBlock(&.{
+        "Path=C:/bin",
+        "PORTAL_TAB=0123456789abcdef0123456789abcdef",
+        "Zeta=z",
+    }, got);
+    // An extra entry also replaces a kept entry of the same name.
+    const got2 = try buildWith(testing.allocator, src, .never, &.{L("path=C:/other")});
+    defer testing.allocator.free(got2);
+    try expectBlock(&.{ "path=C:/other", "Zeta=z" }, got2);
 }
 
 test "build: an empty result is still a valid block" {

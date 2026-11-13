@@ -44,6 +44,9 @@ const Session = @import("session.zig").Session;
 const tabs = @import("tabs.zig");
 const tabs_wire = @import("shared").tabs;
 const openreq = @import("openreq.zig");
+const hookmsg = @import("hookmsg.zig");
+const hookpipe = @import("hookpipe.zig");
+const agenthooks = @import("agenthooks.zig");
 const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
 const fsutil = @import("fsutil.zig");
@@ -157,6 +160,18 @@ const usage =
     \\      never the path. In the window: Ctrl+Shift+T. Devices can switch
     \\      between open tabs but can never open or close one.
     \\
+    \\  portalctl hooks install [--exe PATH] | uninstall | status
+    \\      Claude Code integration: add (or remove) Portal's hooks in
+    \\      Claude Code's settings.json (%CLAUDE_CONFIG_DIR% or
+    \\      %USERPROFILE%\.claude). Each hook runs `portalctl hook`, which
+    \\      tells the running Portal over a local, current-user-only pipe
+    \\      when Claude in a tab works, waits for an answer or is done.
+    \\      Everything else in the file stays as it is; a backup is kept
+    \\      next to it. In the window: Settings, "Claude Code integration".
+    \\  portalctl hook
+    \\      Run by Claude Code (reads the hook's JSON on stdin); does nothing
+    \\      outside a Portal tab.
+    \\
     \\  portalctl ca [show]
     \\      Show the private CA that signs Portal's HTTPS certificate.
     \\  portalctl ca init [--permit CIDR]... [--permit-dns NAME]... [--force]
@@ -240,6 +255,14 @@ pub fn main(init: std.process.Init) !void {
     if (gui_app) return guiMain(gpa, io, init.environ_map, args);
     if (args.len == 0) return printUsage();
     const cmd = args[0];
+    // Run by the agent for each hook event: never prints, always exits
+    // 0, and does nothing outside a Portal tab (hookpipe.hookCommand).
+    if (std.mem.eql(u8, cmd, "hook")) {
+        const dir = dataDir(gpa, init.environ_map) catch null;
+        hookpipe.hookCommand(init.environ_map.get(hookmsg.env_name), dir);
+        std.process.exit(0);
+    }
+    if (std.mem.eql(u8, cmd, "hooks")) std.process.exit(agenthooks.command(gpa, io, init.environ_map, args[1..]));
     if (std.mem.eql(u8, cmd, "pair")) return cmdPair(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "devices")) return cmdDevices(gpa, io, init.environ_map);
     if (std.mem.eql(u8, cmd, "unpair")) return cmdUnpair(gpa, io, init.environ_map, args[1..]);
@@ -1549,6 +1572,42 @@ const OpenWatch = struct {
     }
 };
 
+/// Agent hooks (`portalctl hook`, hookpipe.zig) for the open tabs.
+const HookWatch = struct {
+    fn message(ctx: *anyopaque, m: *const hookmsg.Message) void {
+        const hub: *tabs.Hub = @ptrCast(@alignCast(ctx));
+        hub.applyHook(m);
+    }
+
+    /// Starts the pipe server thread; logs (and runs without hooks) if it
+    /// can't.
+    fn start(gpa: Allocator, hub: *tabs.Hub, log: *Log, data_dir: []const u8) void {
+        var nb: [80:0]u16 = undefined;
+        const name = hookpipe.pipeNameW(&nb, data_dir) orelse {
+            log.print("hooks: cannot determine this user's SID; Claude Code hooks are not listened to", .{});
+            return;
+        };
+        const ev = hookpipe.Server.events() catch {
+            log.print("hooks: cannot create events; Claude Code hooks are not listened to", .{});
+            return;
+        };
+        const srv = gpa.create(hookpipe.Server) catch return;
+        srv.* = .{ .stop = ev[0], .conn_ev = ev[1], .read_ev = ev[2], .ctx = hub, .on_message = message };
+        srv.init(name) catch |err| {
+            log.print("hooks: cannot create the hook pipe ({s}); Claude Code hooks are not listened to", .{switch (err) {
+                error.NameTaken => "another process holds its name: another Portal with the same data folder?",
+                else => @errorName(err),
+            }});
+            return;
+        };
+        const t = std.Thread.spawn(.{}, hookpipe.Server.run, .{srv}) catch |err| {
+            log.print("hooks: cannot start the hook pipe thread: {t}", .{err});
+            return;
+        };
+        t.detach();
+    }
+};
+
 /// The agent's transcript folder, read (never written) for each tab's
 /// Conversation view (src/convo/follow.zig): %PORTAL_AGENT_PROJECTS%
 /// (tests point it at a scratch folder), else %CLAUDE_CONFIG_DIR%\projects,
@@ -1973,6 +2032,8 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         const ot = std.Thread.spawn(.{}, openreq.Watch.run, .{owt}) catch |err|
             fatal("cannot start the open-request watcher thread: {t}", .{err});
         ot.detach();
+        // Agent hooks: a current-user-only local pipe.
+        HookWatch.start(gpa, hub, &log, dir);
     }
 
     // Two ways Portal ends, kept apart:
@@ -2061,6 +2122,9 @@ test {
     _ = @import("session.zig");
     _ = @import("tabs.zig");
     _ = @import("openreq.zig");
+    _ = @import("hookmsg.zig");
+    _ = @import("hookpipe.zig");
+    _ = @import("agenthooks.zig");
     _ = @import("log.zig");
     _ = @import("devices.zig");
     _ = @import("vt.zig");
