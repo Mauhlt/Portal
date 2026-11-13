@@ -32,6 +32,8 @@ pub const Pty = struct {
         app: [:0]const u16,
         cmdline: [:0]u16,
         cwd: ?[:0]const u16,
+        /// The child's environment block (childenv.zig; sorted, WTF-16).
+        env: [:0]const u16,
         size: Size,
         attr_buf: []align(@alignOf(usize)) u8,
     ) !Pty {
@@ -85,7 +87,7 @@ pub const Pty = struct {
             null,
             0,
             w.EXTENDED_STARTUPINFO_PRESENT | w.CREATE_SUSPENDED | w.CREATE_UNICODE_ENVIRONMENT,
-            null,
+            @ptrCast(@constCast(env.ptr)),
             if (cwd) |c| c.ptr else null,
             &si,
             &pi,

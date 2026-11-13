@@ -36,8 +36,8 @@ pub fn viaLauncher(value: ?[]const u8, parent_pid: ?u32) bool {
 
 /// Reads the launcher variable (`value`, from the startup environment),
 /// verifies it against the real parent process id, and deletes it from
-/// this process's environment (so CreateProcessW with a null environment,
-/// as conpty.zig uses, does not pass it on). Call once, before spawning
+/// this process's environment (childenv.zig drops PORTAL_* from the
+/// session's block as well). Call once, before spawning
 /// the child.
 pub fn takeLauncherFlag(value: ?[]const u8) bool {
     const ok = viaLauncher(value, parentPid());

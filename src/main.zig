@@ -1634,7 +1634,7 @@ fn childCwd(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, data_di
 
 
 /// Puts the folder of this exe first on PATH in Portal's own environment,
-/// which the session inherits (conpty.zig passes no environment block), so
+/// which each session's block is built from (childenv.forSession), so
 /// `portal-show` (installed next to portal.exe and portalctl.exe) is found
 /// inside the session. Only this process and its children see the change.
 fn prependOwnDirToPath(gpa: Allocator) void {
@@ -2056,6 +2056,7 @@ test {
     _ = @import("guard.zig");
     _ = @import("netlisten.zig");
     _ = @import("cmdline.zig");
+    _ = @import("childenv.zig");
     _ = @import("console.zig");
     _ = @import("session.zig");
     _ = @import("tabs.zig");

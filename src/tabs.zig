@@ -42,6 +42,7 @@ const activity_wire = @import("shared").activity;
 const follow = @import("convo/follow.zig");
 const transcript = @import("convo/transcript.zig");
 const cmdline = @import("cmdline.zig");
+const childenv = @import("childenv.zig");
 
 pub const Id = wire.Id;
 pub const State = wire.State;
@@ -486,7 +487,17 @@ pub const Hub = struct {
             return error.OutOfMemory;
         };
         defer h.gpa.free(line);
-        t.pty = conpty.Pty.spawn(h.program.app, line, cwd, size, &t.attr_buf) catch |err| {
+        // Its own environment: Portal's, without what leaks the context
+        // Portal was started from (a parent agent session's markers,
+        // PORTAL_*): childenv.zig.
+        const env_block = childenv.forSession(h.gpa) catch |err| {
+            h.log.print("tab '{s}': could not prepare the environment: {t}", .{ t.name(), err });
+            t.session.term.deinit();
+            h.gpa.destroy(t);
+            return error.SpawnFailed;
+        };
+        defer h.gpa.free(env_block);
+        t.pty = conpty.Pty.spawn(h.program.app, line, cwd, env_block, size, &t.attr_buf) catch |err| {
             h.log.print("tab '{s}': could not start '{s}': {t}", .{ t.name(), h.program.command_name, err });
             t.session.term.deinit();
             h.gpa.destroy(t);
