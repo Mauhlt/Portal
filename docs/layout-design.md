@@ -95,26 +95,30 @@ keeps the terminal. In the Conversation view the window is minimal:
 │ │ zig build test                         │ │  colour, clipped not wrapped
 │ └────────────────────────────────────────┘ │
 │ ▸ Edited 2 files                           │  tool one-liners: small, dim
-│ ┏ Question · swipe left for Yes … ━━━ [⋯] ┓ │  Yes/No: a swipe card
+│ ┏ Question · swipe left for Yes, right … ━┓ │  two options: a swipe card
 │ ┃ Run npm test?                           ┃ │
 │ ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ │
 │             [↓ New messages]               │  only when scrolled up
 ├────────────────────────────────────────────┤
 │ ③ Data · nothing yet                       │
 ├────────────────────────────────────────────┤
-│ ② [🎤 Instruct]  [Keys]                    │  one row
+│ ② [🎤 Instruct]                            │  only Instruct
 ├────────────────────────────────────────────┤
 │ status line                                │
 └────────────────────────────────────────────┘
 ```
 
-* **Questions carry their own controls.** A Yes/No question (exactly two
-  options reading yes / no; a permission prompt is Yes = `1`, No = `esc`)
-  is a **swipe card**: by default swipe **left = Yes, right = No** (the
+* **Questions carry their own controls.** A question with exactly **two
+  options** is a **swipe card** and has no buttons at all. A Yes/No one
+  (options reading yes / no; a permission prompt is Yes = `1`, No = `esc`)
+  answers by default **left = Yes, right = No** (the
   owner is left-handed; one device setting, `swipe = left-yes | right-yes`
   in the device's settings.txt next to its pinned servers, e.g.
   `%APPDATA%\Portal\settings.txt`), with touch or a mouse drag; the Left /
-  Right arrows follow the same mapping. Pressed, the card is grabbed: it
+  Right arrows follow the same mapping. Any other pair is a choice: the
+  first option on the Yes side, the second on the other, the card's header
+  says which ("swipe left: Postgres · right: SQLite"), and it tints towards
+  the neutral `swipe_choice` blue on both sides. Pressed, the card is grabbed: it
   grows slightly (about 4.5 %, eased in over 120 ms) with a short decaying
   shake (three swings of 2 degrees over 180 ms) and a light haptic on the
   iPhone (`View.haptic`), and stays enlarged while held. Dragged, it
@@ -124,10 +128,11 @@ keeps the terminal. In the Conversation view the window is minimal:
   only: no text stamp, no transparency). Released past the threshold it
   flies off (from its enlarged size) and the answer key goes out through
   the answer path (`k:<key>`); earlier it springs back to its place and
-  size.
-  Its "⋯" reveals explicit Yes / No buttons. Other questions show their
-  options as large buttons (the answer bar's hit-target height). Answered
-  cards keep their text; their controls go.
+  size. Questions with **more than two options** show them as large
+  numbered buttons (the answer bar's hit-target height); a multi-choice
+  shows its options plus Done (Enter). Answered cards keep their text;
+  their controls go. A question without options says to answer it in the
+  Terminal view.
 * **Swipe safety** (accidental approvals): only the newest open question;
   only past 40 % of the card width and at least 96 logical px; only when the
   horizontal movement dominates (twice the vertical; anything else scrolls
@@ -135,14 +140,16 @@ keeps the terminal. In the Conversation view the window is minimal:
   (measured from the frame that showed it to the press, no timers; the
   grab feedback is not guarded, answering is); a tap that became a
   drag never presses a button (view buttons fire on release).
-* **The answer bar is hidden**; **Keys** shows it (Esc to interrupt,
-  Enter). The **instruction line is hidden**; **Instruct** opens it with
+* **No answer keys at all** in the Conversation view (owner decision): no
+  answer bar, no Keys button, no fallback Yes / No buttons. Esc
+  (interrupt) and Enter live in the Terminal view, the power mode. The
+  bottom holds only **Instruct**. The **instruction line is hidden**;
+  **Instruct** opens it with
   the keyboard (the touch keyboard on a tablet) and calls
   `Shell.startDictation`'s hook, where speech-to-text plugs in (iPhone: the
   native text field, Apple dictation one tap away; laptops: "speech coming
   soon" until Portal's mic → stt pipeline exists). Esc or a sent line
-  closes it again. In `keys` mode only Keys is offered, in view-only mode
-  neither.
+  closes it again. Without `instruct` mode the bottom is empty.
 * **Dictation toggles** (owner decision): press to start, press again to
   stop; the text lands in the instruction line for review, the user sends.
   `Shell.toggleDictation` (the input action `toggle_dictation`) calls the
@@ -163,8 +170,9 @@ keeps the terminal. In the Conversation view the window is minimal:
   bottom the list follows new items; scrolled up it stays anchored on the
   item at the top and a pill offers the newest. A tab without a transcript
   shows "No conversation log for this tab — use Terminal".
-* Event-driven: frames on conversation changes, input and resizes only; a
-  fly-off / spring-back (≤ 180 ms) sets a frame deadline while it runs.
+* Event-driven: frames on conversation changes, input and resizes only; the
+  grab feedback (≤ 180 ms) and a fly-off / spring-back (≤ 180 ms) set frame
+  deadlines while they run.
 
 ## Terminal scaling (viewers)
 

@@ -13,11 +13,12 @@
 //!
 //! Devices open on the Conversation view (ui/convoview.zig) in its minimal
 //! form: top bar, the conversation (questions carry their own controls:
-//! option buttons, Yes/No swipe cards), the Data strip, and one bottom row
-//! with Instruct (the instruction line + Send, and dictation once a device
-//! has it: `startDictation`) and Keys (the full answer bar, for Esc and
-//! Enter). The Terminal view keeps the full answer bar and, in `instruct`
-//! mode, the line. The desk keeps the terminal.
+//! swipe cards for two options, numbered buttons for more), the Data
+//! strip, and at the bottom only Instruct (the instruction line + Send, and
+//! dictation once a device has it: `toggleDictation`). No answer keys at
+//! all there: Esc and Enter live in the Terminal view (the power mode),
+//! which keeps the full answer bar and, in `instruct` mode, the line. The
+//! desk keeps the terminal.
 //!
 //! Layout (frame.zig): top bar (+ tabs), main slice (a pluggable content
 //! view: the terminal, or the conversation once a device provides one),
@@ -61,7 +62,6 @@ pub const ids = struct {
     /// The Conversation view's bottom row: open the instruction line (and
     /// dictation), show the full answer bar.
     pub const instruct: u32 = 910;
-    pub const keys: u32 = 911;
     /// The content view's own buttons (ui/convoview.zig ids).
     pub const view0: u32 = 1300;
     pub const view_last: u32 = 1399;
@@ -311,9 +311,8 @@ pub const Shell = struct {
     /// The last overlay showed the conversation view (its input routing).
     view_shown: bool = false,
     /// Conversation view on a device: the instruction line is open
-    /// (Instruct), the full answer bar is shown (Keys).
+    /// (Instruct).
     instructing: bool = false,
-    keys_open: bool = false,
     /// Speech-to-text, when the device has it (toggleDictation).
     dictation: ?Dictation = null,
     /// Dictation is running (the bottom row shows "Listening…").
@@ -506,8 +505,8 @@ pub const Shell = struct {
         } }, .send = .{ .label = "Send", .id = ids.send }, .keyboard = if (sh.touch.on_screen_keyboard) .{ .label = "Keyboard", .id = ids.keyboard, .focused = sh.keyboard } else null };
     }
 
-    /// The Conversation view's bottom (devices): Instruct and Keys in one
-    /// row, or the open instruction line.
+    /// The Conversation view's bottom (devices): the Instruct button, or
+    /// the open instruction line (with its dictation toggle).
     fn conversationBottom(sh: *Shell, mode: rules.Policy) []const frame.Pane {
         const b = &sh.bufs;
         if (sh.instructing and mode == .instruct) {
@@ -528,10 +527,6 @@ pub const Shell = struct {
         var n: usize = 0;
         if (mode == .instruct) {
             b.row[n] = .{ .label = "\u{1F3A4} Instruct", .id = ids.instruct, .tone = .good };
-            n += 1;
-        }
-        if (mode.acceptsAnswers()) {
-            b.row[n] = .{ .label = if (sh.keys_open) "Hide keys" else "Keys", .id = ids.keys, .focused = sh.keys_open };
             n += 1;
         }
         if (n == 0) return &.{};
@@ -658,7 +653,7 @@ pub const Shell = struct {
                 // the answer bar and the line come on request.
                 const minimal = sh.main == .conversation and sh.conversation != null and v.has_grid;
                 if (minimal) {
-                    o.show_answers = mode.acceptsAnswers() and sh.keys_open;
+                    o.show_answers = false;
                     o.bottom = sh.conversationBottom(mode);
                 }
                 if (mode == .instruct) {
@@ -901,7 +896,6 @@ pub const Shell = struct {
             },
             ids.view_conversation => sh.main = .conversation,
             ids.instruct => if (sh.instructing) sh.toggleDictation() else sh.startDictation(),
-            ids.keys => sh.keys_open = !sh.keys_open,
             ids.view0...ids.view_last => if (sh.conversation) |c| if (c.button) |f| {
                 _ = f(c.ctx, id);
             },
@@ -1261,7 +1255,7 @@ const DictRec = struct {
     fn stop(_: *anyopaque) void {}
 };
 
-test "conversation view (devices): the default, minimal bottom row, Keys and Instruct on request" {
+test "conversation view (devices): the default, no answer keys, only Instruct at the bottom" {
     var r: Rec = .{};
     var sh = Shell.init(testing.allocator, .viewer, r.host());
     defer sh.deinit();
@@ -1273,24 +1267,17 @@ test "conversation view (devices): the default, minimal bottom row, Keys and Ins
     var o = sh.overlay(.{ .viewer = v });
     try testing.expectEqual(MainView.conversation, sh.main);
     try testing.expect(o.screen == .view);
-    // Minimal: no answer bar, no line; one row with Instruct and Keys.
+    // Minimal: no answer bar, no line; only Instruct, at the bottom.
     try testing.expect(!o.show_answers);
     try testing.expectEqual(@as(usize, 1), o.bottom.len);
     const row = o.bottom[0].content.buttons;
-    try testing.expectEqual(@as(usize, 2), row.len);
+    try testing.expectEqual(@as(usize, 1), row.len);
     try testing.expectEqual(ids.instruct, row[0].id);
-    try testing.expectEqual(ids.keys, row[1].id);
     try testing.expectEqual(Focus.view, sh.focus());
     // Typing reaches nothing from the view (no stray answers).
     Shell.onChar(&sh, 'y', .{});
     Shell.onKey(&sh, .enter, .{});
     try testing.expectEqual(@as(usize, 0), r.chars + r.keys + r.answers + r.n_frames);
-    // Keys: the full answer bar, and back.
-    Shell.onButton(&sh, ids.keys);
-    o = sh.overlay(.{ .viewer = v });
-    try testing.expect(o.show_answers);
-    Shell.onButton(&sh, ids.keys);
-    try testing.expect(!sh.overlay(.{ .viewer = v }).show_answers);
     // Instruct: the line with the keyboard, dictation started.
     Shell.onButton(&sh, ids.instruct);
     try testing.expectEqual(@as(usize, 1), dict.started);
@@ -1310,16 +1297,18 @@ test "conversation view (devices): the default, minimal bottom row, Keys and Ins
     o = sh.overlay(.{ .viewer = v });
     try testing.expectEqual(ids.instruct, o.bottom[0].content.buttons[0].id);
     try testing.expectEqualStrings("instructions: Sent.", o.status.extra);
-    // keys mode: Keys only; view only: no row, no Instruct.
+    // keys / text / view-only modes: no Instruct, nothing at the bottom,
+    // never the answer bar.
+    for ([_]rules.Policy{ .keys, .text, .none }) |m| {
+        v.mode = m;
+        o = sh.overlay(.{ .viewer = v });
+        try testing.expectEqual(@as(usize, 0), o.bottom.len);
+        try testing.expect(!o.show_answers);
+    }
     v.mode = .keys;
-    o = sh.overlay(.{ .viewer = v });
-    try testing.expectEqual(@as(usize, 1), o.bottom[0].content.buttons.len);
-    try testing.expectEqual(ids.keys, o.bottom[0].content.buttons[0].id);
+    _ = sh.overlay(.{ .viewer = v });
     sh.startDictation();
     try testing.expect(!sh.instructing);
-    v.mode = .none;
-    o = sh.overlay(.{ .viewer = v });
-    try testing.expectEqual(@as(usize, 0), o.bottom.len);
     // The Terminal view keeps the full bar and the line.
     v.mode = .instruct;
     Shell.onButton(&sh, ids.view_terminal);

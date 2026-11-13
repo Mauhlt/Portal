@@ -9,15 +9,19 @@
 //!   tool       a small dim one-liner after a "▸"
 //!   error      red, after a "×"
 //!   status     small, dim, italic, centred
-//!   question   a card: the question, then its options as large buttons
+//!   question   a card. A question with exactly two options is a swipe
+//!              card and has no buttons at all: Yes/No ones answer Yes on
+//!              one side and No on the other (by default left: Yes, right:
+//!              No, the owner being left-handed; `yes_side`, the device
+//!              setting `swipe = left-yes | right-yes`), other pairs choose
+//!              the first option on the Yes side, the second on the other
+//!              (the card says which); the Left / Right arrows follow the
+//!              same mapping. More than two options (or a multi-choice,
+//!              which also gets Done = Enter) show large numbered buttons
 //!              (the interaction bar's hit-target height) that answer with
 //!              the option's key through the answer path (Host.answer,
-//!              "k:<key>" and nothing else); a Yes/No question instead is a
-//!              swipe card (by default left: Yes, right: No, the owner
-//!              being left-handed; `yes_side`, the device setting
-//!              `swipe = left-yes | right-yes`; the Left / Right arrows
-//!              follow it) with a small "⋯" that reveals its two buttons;
-//!              once answered the text stays and the controls go
+//!              "k:<key>" and nothing else). Once answered the text stays
+//!              and the controls go
 //!
 //! A tab without a transcript ("on": false) shows a friendly empty state
 //! with a way to the terminal.
@@ -33,8 +37,8 @@
 //! pointer with a slight tilt, its colour moving from the held yellow
 //! towards green (the Yes side) or red (the No side), full at the threshold
 //! (`swipeTint`; colour only, no text, no transparency). Guarded against
-//! accidental approvals: only the newest open question, only Yes/No ones
-//! (`yesNo`), only a drag whose horizontal movement dominates (`classify`;
+//! accidental approvals: only the newest open question, only two-option
+//! ones (`swipeMap`), only a drag whose horizontal movement dominates (`classify`;
 //! vertical ones scroll), not within `swipe_guard_ms` of the card really
 //! appearing on screen (`presented`), and only past 40% of the card width
 //! and `swipe_min_px` (`commitSide`). Released earlier the card springs
@@ -60,11 +64,10 @@ const Rgb = theme.Rgb;
 const Kind = wire.Kind;
 const textWidth = frame.textWidth;
 
-/// The view's own button ids (shell.ids.view0 ..): the pill, a card's "⋯".
+/// The view's own button ids (shell.ids.view0 ..): the new-messages pill.
 pub const ids = struct {
     pub const base: u32 = 1300;
     pub const pill: u32 = base;
-    pub const reveal: u32 = base + 1;
     /// The empty state's Terminal button (shell.ids.view_terminal).
     pub const terminal: u32 = 905;
 };
@@ -144,6 +147,35 @@ pub fn yesNo(it: anytype) ?struct { yes: []const u8, no: []const u8 } {
     if (a == .yes and b == .no) return .{ .yes = it.options[0].key, .no = it.options[1].key };
     if (a == .no and b == .yes) return .{ .yes = it.options[1].key, .no = it.options[0].key };
     return null;
+}
+
+/// What a swipe card's two sides answer: `yes` on the Yes side, `no` on
+/// the other. A Yes/No question maps its Yes and No options; any other
+/// two-option question its first option to the Yes side, its second to the
+/// other (`yes_no` false: shown as a choice, not as approval). Null: not a
+/// swipe card (no options, one, more than two, or a multi-choice).
+pub const SwipeMap = struct {
+    yes: []const u8,
+    no: []const u8,
+    yes_label: []const u8,
+    no_label: []const u8,
+    yes_no: bool,
+};
+
+pub fn swipeMap(it: anytype) ?SwipeMap {
+    if (it.kind != .question or it.multi or it.options.len != 2) return null;
+    const o = it.options;
+    if (yesNo(it)) |yn| {
+        const first_yes = std.mem.eql(u8, yn.yes, o[0].key);
+        return .{ .yes = yn.yes, .no = yn.no, .yes_label = if (first_yes) o[0].label else o[1].label, .no_label = if (first_yes) o[1].label else o[0].label, .yes_no = true };
+    }
+    return .{ .yes = o[0].key, .no = o[1].key, .yes_label = o[0].label, .no_label = o[1].label, .yes_no = false };
+}
+
+/// The key of option button `opt` of `e` (one past the options: Done =
+/// Enter, a multi-choice's submit).
+fn optionKey(e: anytype, opt: u8) []const u8 {
+    return if (opt < e.options.len) e.options[opt].key else "enter";
 }
 
 const Word = enum { yes, no, other };
@@ -232,10 +264,10 @@ pub fn grabShake(since: i64) f32 {
 /// yellow at rest, towards green on the Yes side and red on the No side,
 /// fully there at the threshold. Opaque: colour only.
 pub const Tint = struct { border: Rgb, fill: Rgb };
-pub fn swipeTint(offset: f32, need: f32, ys: YesSide) Tint {
+pub fn swipeTint(offset: f32, need: f32, ys: YesSide, yes_no: bool) Tint {
     const hold = theme.ui.swipe_hold;
     const k = if (offset == 0 or !(need > 0)) 0 else std.math.clamp(@abs(offset) / need, 0, 1);
-    const target: Rgb = if (ys.answer(if (offset > 0) .right else .left) == .yes) theme.ui.swipe_yes else theme.ui.swipe_no;
+    const target: Rgb = if (!yes_no) theme.ui.swipe_choice else if (ys.answer(if (offset > 0) .right else .left) == .yes) theme.ui.swipe_yes else theme.ui.swipe_no;
     const border = mix(hold, target, k);
     return .{ .border = border, .fill = mix(border, theme.palette.bg, 0.8) };
 }
@@ -292,7 +324,7 @@ const Box = struct {
     w: f32,
     h: f32,
     color: Rgb,
-    kind: enum { fill, outline, card, option, reveal } = .fill,
+    kind: enum { fill, outline, card, option } = .fill,
     opt: u8 = 0,
 };
 
@@ -309,6 +341,8 @@ const Entry = struct {
     boxes: std.ArrayList(Box) = .empty,
     height: f32 = 0,
     laid: bool = false,
+    /// A question card's header line (owned; laid out with it).
+    head: []u8 = &.{},
     /// Top in the content (set each prepare).
     y: f32 = 0,
 
@@ -319,6 +353,7 @@ const Entry = struct {
             gpa.free(o.key);
         }
         gpa.free(e.options);
+        gpa.free(e.head);
         e.lines.deinit(gpa);
         e.boxes.deinit(gpa);
     }
@@ -483,8 +518,6 @@ pub const View = struct {
     /// A card whose answer was sent here (its controls go until the
     /// desktop updates it).
     sent_n: ?u32 = null,
-    /// A swipe card whose "⋯" revealed its buttons.
-    revealed_n: ?u32 = null,
     /// The device's grab haptic (hapticGrab), if any.
     haptic: ?Haptic = null,
 
@@ -541,7 +574,6 @@ pub const View = struct {
             v.unseen = false;
             v.swipe = .{};
             v.sent_n = null;
-            v.revealed_n = null;
         }
         const old_max: ?u32 = if (v.entries.items.len > 0) v.entries.items[v.entries.items.len - 1].n else null;
         var next: std.ArrayList(Entry) = .empty;
@@ -591,21 +623,20 @@ pub const View = struct {
         return null;
     }
 
-    /// Item `n` can be swiped now: the newest open question, Yes/No, its
-    /// answer not sent yet, answers accepted.
+    /// Item `n` can be swiped now: the newest open question, two options,
+    /// its answer not sent yet, answers accepted.
     fn isSwipeable(v: *const View, n: u32) bool {
         if (!v.answers or v.sent_n == n) return false;
         if (v.newestOpenQuestion() != n) return false;
         const i = v.find(n) orelse return false;
-        return yesNo(v.entries.items[i]) != null;
+        return swipeMap(v.entries.items[i]) != null;
     }
 
     /// Whether card `e` shows option buttons: open, not answered here, and
-    /// not a swipe card (unless its "⋯" revealed them).
+    /// not a swipe card (two options never get buttons).
     fn showsButtons(v: *const View, e: *const Entry) bool {
         if (e.kind != .question or !e.open or e.options.len == 0 or v.sent_n == e.n) return false;
-        if (yesNo(e.*) != null and v.revealed_n != e.n) return false;
-        return true;
+        return swipeMap(e.*) == null;
     }
 
     // ------------------------------------------------------------ layout
@@ -711,19 +742,25 @@ pub const View = struct {
     fn layoutQuestion(v: *View, e: *Entry, f: Fonts, g: Geo) void {
         const W = v.colw;
         const inner = @max(1, W - 2 * g.qpad);
-        const binary = yesNo(e.*) != null;
+        const map = swipeMap(e.*);
         e.boxes.append(v.gpa, .{ .x = 0, .y = 0, .w = W, .h = 0, .color = if (e.open) colors.card else colors.card_closed, .kind = .card }) catch {};
         e.boxes.append(v.gpa, .{ .x = 0, .y = 0, .w = W, .h = 0, .color = if (e.open) theme.ui.attention else theme.ui.border, .kind = .outline }) catch {};
         var y = g.qpad;
-        const head: []const u8 = if (!e.open) "Question \u{00B7} answered" else if (binary) (if (v.yes_side == .left) "Question \u{00B7} swipe left for Yes, right for No" else "Question \u{00B7} swipe right for Yes, left for No") else "Question \u{00B7} waiting for your answer";
-        e.lines.append(v.gpa, .{ .str = frame.clipText(f.small, head, inner - 4 * @as(f32, @floatFromInt(f.small.cell_w)), false), .x = g.qpad, .y = y, .font = .small, .color = if (e.open) theme.ui.attention else theme.ui.dim, .bold = true }) catch {};
-        // The "⋯" of a swipe card (reveals its Yes / No buttons).
-        if (e.open and binary) {
-            const rw = @as(f32, @floatFromInt(4 * f.small.cell_w));
-            const rh = g.slh + g.cpad;
-            e.boxes.append(v.gpa, .{ .x = W - g.qpad + @round(4 * g.s) - rw, .y = g.qpad - @round(g.cpad / 2), .w = rw, .h = rh, .color = theme.ui.button, .kind = .reveal }) catch {};
-            e.lines.append(v.gpa, .{ .str = "\u{2026}", .x = W - g.qpad + @round(4 * g.s) - rw + @round((rw - @as(f32, @floatFromInt(f.small.cell_w))) / 2), .y = g.qpad, .font = .small, .color = theme.ui.text, .bold = true }) catch {};
-        }
+        // The header: what the card is waiting for (a swipe card says which
+        // way gives which answer).
+        v.gpa.free(e.head);
+        e.head = &.{};
+        const yes_dir: []const u8 = if (v.yes_side == .left) "left" else "right";
+        const no_dir: []const u8 = if (v.yes_side == .left) "right" else "left";
+        e.head = if (!e.open)
+            v.gpa.dupe(u8, "Question \u{00B7} answered") catch &.{}
+        else if (map) |sm| (if (sm.yes_no)
+            std.fmt.allocPrint(v.gpa, "Question \u{00B7} swipe {s} for Yes, {s} for No", .{ yes_dir, no_dir }) catch &.{}
+        else
+            std.fmt.allocPrint(v.gpa, "Question \u{00B7} swipe {s}: {s} \u{00B7} {s}: {s}", .{ yes_dir, sm.yes_label, no_dir, sm.no_label }) catch &.{})
+        else
+            v.gpa.dupe(u8, "Question \u{00B7} waiting for your answer") catch &.{};
+        e.lines.append(v.gpa, .{ .str = frame.clipText(f.small, e.head, inner, false), .x = g.qpad, .y = y, .font = .small, .color = if (e.open) theme.ui.attention else theme.ui.dim, .bold = true }) catch {};
         y += g.slh + @round(4 * g.s);
         y += v.layoutText(e, f, g, e.text, g.qpad, y, inner, theme.ui.text, .body, false).h;
         if (e.open and e.multi) {
@@ -734,7 +771,10 @@ pub const View = struct {
             y += g.bgap;
             const cw: f32 = @floatFromInt(f.act.cell_w);
             var x = g.qpad;
-            for (e.options, 0..) |o, i| {
+            // A multi-choice submits with Done (Enter).
+            const n_buttons = e.options.len + @intFromBool(e.multi);
+            for (0..n_buttons) |i| {
+                const o: wire.Option = if (i < e.options.len) e.options[i] else .{ .label = "Done", .key = "enter" };
                 const w = @min(inner, @max(textWidth(f.act, o.label) + 4 * cw, 6 * cw));
                 if (x + w > g.qpad + inner + 0.5 and x > g.qpad) {
                     x = g.qpad;
@@ -748,7 +788,7 @@ pub const View = struct {
             }
             y += g.bh;
         } else if (e.open and e.options.len == 0) {
-            e.lines.append(v.gpa, .{ .str = "Answer with Keys (below) or in the Terminal.", .x = g.qpad, .y = y + @round(4 * g.s), .font = .small, .color = theme.ui.dim }) catch {};
+            e.lines.append(v.gpa, .{ .str = "Answer it in the Terminal view.", .x = g.qpad, .y = y + @round(4 * g.s), .font = .small, .color = theme.ui.dim }) catch {};
             y += g.slh + @round(4 * g.s);
         }
         y += g.qpad;
@@ -867,7 +907,7 @@ pub const View = struct {
     pub fn keyAnswer(v: *const View, r: KeyResult) ?[]const u8 {
         const n = v.sent_n orelse return null;
         const i = v.find(n) orelse return null;
-        const yn = yesNo(v.entries.items[i]) orelse return null;
+        const yn = swipeMap(v.entries.items[i]) orelse return null;
         return switch (r) {
             .answer_yes => yn.yes,
             .answer_no => yn.no,
@@ -878,12 +918,6 @@ pub const View = struct {
     pub fn button(v: *View, id: u32) bool {
         switch (id) {
             ids.pill => v.jumpToBottom(),
-            ids.reveal => {
-                const n = v.newestOpenQuestion() orelse return true;
-                v.invalidate(v.revealed_n);
-                v.invalidate(n);
-                v.revealed_n = if (v.revealed_n == n) null else n;
-            },
             else => return false,
         }
         return true;
@@ -905,10 +939,8 @@ pub const View = struct {
 
     fn fly(v: *View, to: f32) void {
         const n = v.swipe.n orelse return;
-        v.invalidate(v.revealed_n);
         v.invalidate(n);
         v.sent_n = n;
-        v.revealed_n = null;
         v.swipe.phase = .flying;
         v.swipe.from = v.swipe.offset;
         v.swipe.to = to;
@@ -968,7 +1000,7 @@ pub const View = struct {
                     // press, and still the newest open Yes/No card?
                     const shown = guardPassed(if (v.appear_n == n) v.appear_ms else null, v.swipe.grab_t0);
                     if (dir != null and shown and v.isSwipeable(n)) {
-                        const yn = yesNo(v.entries.items[v.find(n).?]).?;
+                        const yn = swipeMap(v.entries.items[v.find(n).?]).?;
                         v.fly(if (dir.? == .right) v.rect.w else -v.rect.w);
                         return if (v.yes_side.answer(dir.?) == .yes) yn.yes else yn.no;
                     }
@@ -1110,8 +1142,7 @@ pub const View = struct {
             for (e.boxes.items) |b| {
                 const r: frame.Rect = .{ .x = ox + b.x, .y = oy + b.y, .w = b.w, .h = b.h };
                 if (!r.contains(x, y)) continue;
-                if (b.kind == .option and v.answers and v.showsButtons(e)) return .{ .answer = e.options[b.opt].key };
-                if (b.kind == .reveal and v.answers and e.open and v.sent_n != e.n) return .{ .button = ids.reveal };
+                if (b.kind == .option and v.answers and v.showsButtons(e)) return .{ .answer = optionKey(e, b.opt) };
             }
         }
         return null;
@@ -1137,7 +1168,7 @@ pub const View = struct {
                 const fk: Fonts = if (k == 1) f else .{ .body = p.metrics(body_em * k), .small = p.metrics(small_em * k), .act = p.metrics(frame.action_em * k), .s = f.s };
                 const need = @max(v.colw * swipe_share, swipe_min_px * f.s);
                 const tilt = std.math.clamp(offset / @max(1, v.colw), -1.5, 1.5) * 0.12 + shake;
-                v.paintEntry(p, e, fk, v.col_x, r.y + e.y - v.top, .{ .dx = offset, .tilt = tilt, .k = k, .cx = v.colw / 2, .cy = e.height / 2, .tint = swipeTint(offset, need, v.yes_side) });
+                v.paintEntry(p, e, fk, v.col_x, r.y + e.y - v.top, .{ .dx = offset, .tilt = tilt, .k = k, .cx = v.colw / 2, .cy = e.height / 2, .tint = swipeTint(offset, need, v.yes_side, if (swipeMap(e.*)) |sm| sm.yes_no else true) });
             } else {
                 v.paintEntry(p, e, f, v.col_x, r.y + e.y - v.top, .{});
             }
@@ -1156,7 +1187,6 @@ pub const View = struct {
         const plain = xf.plain() and xf.tint == null;
         for (e.boxes.items) |b| {
             if (b.kind == .option and !buttons) continue;
-            if (b.kind == .reveal and (!e.open or v.sent_n == e.n or !v.answers)) continue;
             var c = b.color;
             if (xf.tint) |t| switch (b.kind) {
                 .card => c = t.fill,
@@ -1184,8 +1214,7 @@ pub const View = struct {
                 slices(p, ox, oy, b.x, b.y, b.w, b.h, xf, c, f.s);
             }
             if (!plain) continue;
-            if (b.kind == .option and v.answers) p.tapAnswer(ox + b.x, oy + b.y, b.w, b.h, e.options[b.opt].key);
-            if (b.kind == .reveal) p.tapButton(ox + b.x, oy + b.y, b.w, b.h, ids.reveal);
+            if (b.kind == .option and v.answers) p.tapAnswer(ox + b.x, oy + b.y, b.w, b.h, optionKey(e, b.opt));
         }
         for (e.lines.items) |l| {
             if (l.opt != null and !buttons) continue;
@@ -1561,7 +1590,7 @@ test "swipe (left-yes default): left answers Yes past the threshold, springs bac
     const card = v.cardRect(1);
     const cx = card.x + card.w / 2;
     const cy = card.y + card.h / 2;
-    // A swipe card shows no Yes/No buttons, only "⋯".
+    // A swipe card shows no Yes/No buttons.
     try testing.expect(!v.showsButtons(&v.entries.items[1]));
     // Too early after the card appeared: a sideways drag does nothing.
     clk.t = 1300;
@@ -1670,7 +1699,7 @@ test "swipe: right answers No; only the newest open question; not off the card; 
     try testing.expectEqual(View.KeyResult.ignored, kn); // answered: no more
 }
 
-test "the reveal button shows a swipe card's Yes / No buttons" {
+test "two options never get buttons (Yes/No or a choice); more than two do; multi-choice gets Done" {
     const gpa = testing.allocator;
     var c: convo.Conversation = .{};
     defer c.deinit(gpa);
@@ -1678,41 +1707,55 @@ test "the reveal button shows a swipe card's Yes / No buttons" {
     defer v.deinit();
     var clk: TestClock = .{};
     const r = try swipeSetup(gpa, &c, &v, &clk);
-    const e = &v.entries.items[1];
-    var reveal: ?Box = null;
-    for (e.boxes.items) |b| if (b.kind == .reveal) {
-        reveal = b;
-    };
-    const rb = reveal.?;
-    try testing.expectEqual(ids.reveal, v.hitAt(v.col_x + rb.x + 2, r.y + e.y - v.top + rb.y + 2).?.button);
-    // Hidden buttons take no room.
-    for (e.boxes.items) |b| try testing.expect(b.kind != .option);
-    try testing.expect(v.button(ids.reveal));
-    try testing.expect(v.showsButtons(e));
+    const yn = &v.entries.items[1];
+    for (yn.boxes.items) |b| try testing.expect(b.kind != .option);
+    try testing.expect(!v.showsButtons(yn));
+    // A two-option choice: a swipe card too, first option on the Yes side.
+    const db = [_]wire.Option{ .{ .label = "Postgres", .key = "1" }, .{ .label = "SQLite", .key = "2" } };
+    const three = [_]wire.Option{ .{ .label = "A", .key = "1" }, .{ .label = "B", .key = "2" }, .{ .label = "C", .key = "3" } };
+    const multi = [_]wire.Option{ .{ .label = "X", .key = "1" }, .{ .label = "Y", .key = "2" } };
+    try testConvo(gpa, &c, false, &.{
+        .{ .n = 3, .kind = .question, .text = "Which DB?", .open = true, .options = &db },
+        .{ .n = 4, .kind = .question, .text = "Pick", .open = true, .options = &three },
+        .{ .n = 5, .kind = .question, .text = "Any?", .open = true, .multi = true, .options = &multi },
+    });
+    v.sync(&c);
     v.prepare(r, tm.fonts);
-    var n_opts: usize = 0;
-    for (e.boxes.items) |b| n_opts += @intFromBool(b.kind == .option);
-    try testing.expectEqual(@as(usize, 2), n_opts);
-    for (e.boxes.items) |b| if (b.kind == .option) {
-        try testing.expect(v.hitAt(v.col_x + b.x + 2, r.y + e.y - v.top + b.y + 2) != null);
-    };
+    const sm = swipeMap(v.entries.items[2]).?;
+    try testing.expect(!sm.yes_no);
+    try testing.expectEqualStrings("1", sm.yes);
+    try testing.expectEqualStrings("Postgres", sm.yes_label);
+    try testing.expectEqualStrings("Question \u{00B7} swipe left: Postgres \u{00B7} right: SQLite", v.entries.items[2].head);
+    for (v.entries.items[2].boxes.items) |b| try testing.expect(b.kind != .option);
+    // Its tint is the neutral choice colour on both sides.
+    try testing.expectEqual(theme.ui.swipe_choice, swipeTint(-300, 200, .left, false).border);
+    try testing.expectEqual(theme.ui.swipe_choice, swipeTint(300, 200, .left, false).border);
+    var count = [_]usize{ 0, 0 };
+    for (v.entries.items[3].boxes.items) |b| count[0] += @intFromBool(b.kind == .option);
+    for (v.entries.items[4].boxes.items) |b| count[1] += @intFromBool(b.kind == .option);
+    try testing.expectEqual(@as(usize, 3), count[0]);
+    try testing.expectEqual(@as(usize, 3), count[1]); // X, Y, Done
+    // Done sends Enter.
+    const e5 = &v.entries.items[4];
+    const done = e5.boxes.items[e5.boxes.items.len - 1];
+    try testing.expectEqualStrings("enter", v.hitAt(v.col_x + done.x + 2, r.y + e5.y - v.top + done.y + 2).?.answer);
 }
 
 test "swipe tint: yellow held, towards green on the Yes side, red on the No side, full at the threshold" {
     const need: f32 = 200;
     const hold = theme.ui.swipe_hold;
-    try testing.expectEqual(hold, swipeTint(0, need, .left).border);
+    try testing.expectEqual(hold, swipeTint(0, need, .left, true).border);
     // left-yes: left goes green, right goes red.
-    try testing.expectEqual(mix(hold, theme.ui.swipe_yes, 0.5), swipeTint(-100, need, .left).border);
-    try testing.expectEqual(theme.ui.swipe_yes, swipeTint(-200, need, .left).border);
-    try testing.expectEqual(theme.ui.swipe_yes, swipeTint(-500, need, .left).border);
-    try testing.expectEqual(mix(hold, theme.ui.swipe_no, 0.5), swipeTint(100, need, .left).border);
-    try testing.expectEqual(theme.ui.swipe_no, swipeTint(200, need, .left).border);
+    try testing.expectEqual(mix(hold, theme.ui.swipe_yes, 0.5), swipeTint(-100, need, .left, true).border);
+    try testing.expectEqual(theme.ui.swipe_yes, swipeTint(-200, need, .left, true).border);
+    try testing.expectEqual(theme.ui.swipe_yes, swipeTint(-500, need, .left, true).border);
+    try testing.expectEqual(mix(hold, theme.ui.swipe_no, 0.5), swipeTint(100, need, .left, true).border);
+    try testing.expectEqual(theme.ui.swipe_no, swipeTint(200, need, .left, true).border);
     // right-yes: the other way round.
-    try testing.expectEqual(theme.ui.swipe_yes, swipeTint(200, need, .right).border);
-    try testing.expectEqual(theme.ui.swipe_no, swipeTint(-200, need, .right).border);
+    try testing.expectEqual(theme.ui.swipe_yes, swipeTint(200, need, .right, true).border);
+    try testing.expectEqual(theme.ui.swipe_no, swipeTint(-200, need, .right, true).border);
     // The fill is the border mixed into the background (opaque).
-    try testing.expectEqual(mix(theme.ui.swipe_no, theme.palette.bg, 0.8), swipeTint(200, need, .left).fill);
+    try testing.expectEqual(mix(theme.ui.swipe_no, theme.palette.bg, 0.8), swipeTint(200, need, .left, true).fill);
 }
 
 test "grab: scaled and shaking at once, enlarged while held, springs back to 1, flies off from the enlarged size" {
@@ -1809,7 +1852,7 @@ test "drawing a held card: tinted, enlarged, no text stamp, opaque" {
     _ = v.drag(.{ .phase = .move, .x = card.x + 40 - 100, .y = card.y + 20 });
     fr.build(&fonts, .{ 1200, 600 }, 1, &g, o);
     const need = @max(v.colw * swipe_share, swipe_min_px);
-    const want = swipeTint(-100, need, .left).border;
+    const want = swipeTint(-100, need, .left, true).border;
     var tinted = false;
     var widest: f32 = 0;
     for (fr.list.cmds.items) |cmd| switch (cmd) {

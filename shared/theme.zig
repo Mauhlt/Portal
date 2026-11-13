@@ -191,6 +191,9 @@ pub const ui = struct {
     pub const swipe_hold = palette.yellow_warmer;
     pub const swipe_yes = palette.green;
     pub const swipe_no = palette.red;
+    /// A swipe card choosing between two options that are not Yes / No:
+    /// both sides move towards this (neither is "good" or "bad").
+    pub const swipe_choice = palette.blue;
     pub const tab_text = palette.fg;
     pub const tab_text_inactive = palette.dim;
     /// The modal layer's dimming of what is behind it (alpha).
