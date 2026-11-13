@@ -171,10 +171,12 @@ screen. A session entry is
 * `name`: desk-assigned (the folder's name or `--project`), printable,
   at most 64 bytes, escaped like `project`. Never a path.
 * `color`: the tab colour.
-* `state`: what the program reports through OSC 7501: `unknown`,
+* `state`: what the program reports through OSC 7501, or what the agent's
+  hooks report (below), whichever changed last: `unknown`,
   `working`, `waiting` (it needs an answer: highlight the tab), `idle`,
-  `done`, `error`. Untrusted (any program output can contain it): it only
-  changes a highlight.
+  `done`, `error`. Untrusted (any program output can contain it, and the
+  tab's program can run the hook): it only changes a highlight (and
+  instruct's Up/Down gate, section 4).
 
 At most 12 tabs. Grid, image and placement frames always belong to the tab
 the viewer watches, which is the desk's tab at connect (`hello.session`)
@@ -222,8 +224,36 @@ reply it accepts).
   the live check nothing of it reached its prompt or its dialogs).
   Until the agent waits for the OSC 7501 reply past its DA sentinel (or
   offers a way to say the terminal supports it), `state` stays `unknown`
-  for agent tabs, and only the Conversation view's open questions
-  make a tab "waiting".
+  for agent tabs unless the hooks below are installed, and
+  otherwise only the Conversation view's open questions make a tab
+  "waiting".
+
+#### Program status from agent hooks, desk side
+
+Also not a client message. With the integration installed (`portalctl
+hooks install`, or the desk's Settings; nothing installs it by itself),
+the agent runs `portalctl hook` for six hook events.
+Each tab's program has `PORTAL_TAB=<32 hex>` in its environment (random
+per tab launch, not the tab's `id`, never sent to a device); the hook
+sends that, the event and at most a tool name and a notification type
+over a local named pipe that only the current Windows user can open and
+that refuses remote clients. Mapping:
+
+| hook event | `state` |
+|---|---|
+| `UserPromptSubmit` | `working` |
+| `PermissionRequest` | `waiting`; the Conversation view's permission question (section 3b), its phrase picked by the tool's category (never the tool's name) |
+| `Notification` with `notification_type` `permission_prompt` | `waiting` |
+| `Notification` with `notification_type` `idle_prompt` | `idle` |
+| `Stop` | `done` |
+| `StopFailure` | `error` |
+| `SessionEnd` | `idle` |
+
+After a hook's permission wait, a tool result or an interrupt in the
+tab's transcript ends it (`working`, `idle`): no hook fires then. A
+message for no open tab changes nothing. Details, the pipe's security and
+the settings.json entries: docs/tabs-design.md, "Detecting the agent is
+waiting", fallback 2.
 
 ### 3b. The Conversation view (`convo`, `convo+`)
 
@@ -528,8 +558,9 @@ row plus `up` / `down` while the program waits; `text` mode accepts all
 | `text` additionally | `backspace`, `tab`, `shift-tab`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`, `ctrl-c` |
 
 "Waits for an answer" is decided by the server when the key arrives: the
-tab's OSC 7501 state is `waiting` (`state=blocked`), or its Conversation
-view has an open question (section 3b). Working, idle, done or unknown
+tab's state is `waiting` (OSC 7501 `state=blocked`, or an agent
+hook's permission prompt, section 3a), or its Conversation view has an
+open question (section 3b). Working, idle, done or unknown
 (no OSC 7501 seen) is not waiting, so `up` / `down` are refused, answered
 with `{"t":"rejected","reason":"NotWaiting"}`; the first key after the
 state leaves `waiting` is already refused. They exist for arrow-select
@@ -541,8 +572,9 @@ instruction-line check. Residual risk: a program that reports `blocked`
 while its input box is live, or a question left open in the transcript,
 re-opens that window; a program that never reports OSC 7501 and writes no
 question (including the agent, which does not detect OSC 7501 support
-under ConPTY: see "Program status (OSC 7501)" in section 3a; its
-folder-trust prompt comes before any transcript)
+under ConPTY: see "Program status (OSC 7501)" in section 3a, unless its
+hooks are installed; its folder-trust prompt comes before any transcript
+and any hook)
 never gets `up` / `down`, and must be answered at the desk. Clients show
 Up/Down only while they would be accepted: in `instruct` mode while the
 shown tab's `state` is `waiting` or (native client) its conversation has
