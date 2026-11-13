@@ -242,7 +242,9 @@ const AdapterDesc1 = extern struct {
     luid_high: i32,
     flags: u32,
 };
-const ComObj = extern struct { vtbl: [*]const ?*const anyopaque };
+/// A COM object: its first field points at the vtable, whose entries are
+/// function pointers (typed as such so the casts keep their alignment).
+const ComObj = extern struct { vtbl: [*]const ?*const fn () callconv(.winapi) void };
 
 const MemoryStatusEx = extern struct {
     len: u32 = @sizeOf(MemoryStatusEx),
@@ -285,7 +287,10 @@ const ProcessMemory = extern struct {
 
 extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn FreeLibrary(m: *anyopaque) callconv(.winapi) w.BOOL;
-extern "kernel32" fn GetProcAddress(m: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+/// FARPROC: a function pointer, so casts to the typed pointers below keep
+/// their alignment (an `*const anyopaque` result fails to cast on aarch64,
+/// where function pointers are 4-aligned).
+extern "kernel32" fn GetProcAddress(m: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*const fn () callconv(.winapi) isize;
 extern "kernel32" fn GetSystemTimes(idle: *w.FILETIME, kernel: *w.FILETIME, user: *w.FILETIME) callconv(.winapi) w.BOOL;
 extern "kernel32" fn GlobalMemoryStatusEx(m: *MemoryStatusEx) callconv(.winapi) w.BOOL;
 extern "kernel32" fn QueryInformationJobObject(job: w.HANDLE, class: c_int, info: *anyopaque, len: u32, ret: ?*u32) callconv(.winapi) w.BOOL;
