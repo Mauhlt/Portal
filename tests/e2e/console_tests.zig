@@ -44,7 +44,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
 
 /// Runs this exe as a detached helper: `--inject <pid> <cols> <rows> [text]`.
 /// cols/rows 0 = don't resize.
-fn inject(gpa: std.mem.Allocator, pid: u32, cols: i16, rows: i16, text: ?[]const u8) bool {
+pub fn inject(gpa: std.mem.Allocator, pid: u32, cols: i16, rows: i16, text: ?[]const u8) bool {
     var self_buf: [1024]u16 = undefined;
     const n = w.GetModuleFileNameW(null, &self_buf, self_buf.len);
     if (n == 0 or n >= self_buf.len) return false;

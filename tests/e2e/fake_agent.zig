@@ -19,6 +19,16 @@
 //!      id of its own, as the agent does); then idles until its
 //!      console closes.
 //!
+//! Answers are read strictly (`answer`): a read that is exactly the key,
+//! nothing else; any other input is reported as FAKE-STRAY. Every byte
+//! read is logged to `e2e-input` in the working folder, so the e2e checks
+//! that nothing but the answers sent ever reaches the program. (A visual
+//! run once saw "unexplained" `1`s: that desk's console had been started
+//! minimized with Start-Process, which activates it, so the owner's own
+//! Numpad-1 presses meant for another window went to `portalctl run
+//! --console`, which types its console's keys into the tab by design.
+//! Start such consoles hidden or with SW_SHOWMINNOACTIVE.)
+//!
 //! A tab whose folder's name contains "quiet" writes no transcript at all.
 //! With PORTAL_E2E_SHOWCASE set (manual visual checks only, never the e2e
 //! suite) the reply carries a code block and the question a third option.
@@ -41,6 +51,7 @@ const BOOL = c_int;
 extern "kernel32" fn GetStdHandle(which: DWORD) callconv(.winapi) ?HANDLE;
 extern "kernel32" fn SetConsoleMode(h: HANDLE, mode: DWORD) callconv(.winapi) BOOL;
 extern "kernel32" fn ReadFile(h: HANDLE, buf: [*]u8, len: DWORD, read: ?*DWORD, overlapped: ?*anyopaque) callconv(.winapi) BOOL;
+extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: DWORD, share: DWORD, sa: ?*anyopaque, disposition: DWORD, flags: DWORD, template: ?HANDLE) callconv(.winapi) HANDLE;
 extern "kernel32" fn WriteFile(h: HANDLE, buf: [*]const u8, len: DWORD, written: ?*DWORD, overlapped: ?*anyopaque) callconv(.winapi) BOOL;
 const STD_INPUT_HANDLE: DWORD = @bitCast(@as(i32, -10));
 const STD_OUTPUT_HANDLE: DWORD = @bitCast(@as(i32, -11));
@@ -54,15 +65,54 @@ fn say(s: []const u8) void {
     if (out_h) |h| _ = WriteFile(h, s.ptr, @intCast(s.len), &n, null);
 }
 
-/// The next key byte from the console, or null at its end.
-fn key() ?u8 {
+/// Every byte read from the console is appended to `e2e-input` in the
+/// working folder, so a test sees exactly what reached the program.
+var log_h: ?HANDLE = null;
+
+/// One read of console input: what one key press (or one write by
+/// Portal) delivered, logged; null at the input's end.
+fn chunk(buf: []u8) ?[]const u8 {
     const h = in_h orelse return null;
-    var b: [1]u8 = undefined;
     var n: DWORD = 0;
-    while (true) {
-        if (ReadFile(h, &b, 1, &n, null) == 0 or n == 0) return null;
-        return b[0];
+    if (ReadFile(h, buf.ptr, @intCast(buf.len), &n, null) == 0 or n == 0) return null;
+    if (log_h) |l| {
+        var wn: DWORD = 0;
+        _ = WriteFile(l, buf.ptr, n, &wn, null);
     }
+    return buf[0..n];
+}
+
+/// Strict, unlike a byte-at-a-time reader: an answer is a read that is
+/// exactly one of `accept` (one whole key, as a person presses it).
+/// Anything else (a stray key, a `1` inside a longer sequence such as a
+/// terminal reply or a win32-input-mode record, two keys at once) answers
+/// nothing and is reported on screen as FAKE-STRAY, which the e2e checks
+/// never appears. Returns the index in `accept`; null at the input's end.
+fn answer(accept: []const []const u8) ?usize {
+    var buf: [256]u8 = undefined;
+    while (chunk(&buf)) |got| {
+        for (accept, 0..) |a, i| if (std.mem.eql(u8, got, a)) return i;
+        say("FAKE-STRAY\r\n");
+    }
+    return null;
+}
+
+/// Reads and logs until the input ends.
+fn drain() void {
+    var buf: [256]u8 = undefined;
+    while (chunk(&buf)) |_| {}
+}
+
+/// Opens `e2e-input` in `cwd` for appending (shared: the test reads it
+/// while the program runs).
+fn openInputLog(gpa: std.mem.Allocator, cwd: []const u8) void {
+    const path = std.fs.path.join(gpa, &.{ cwd, "e2e-input" }) catch return;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(gpa, path) catch return;
+    const FILE_APPEND_DATA: DWORD = 0x0004;
+    const FILE_SHARE_ALL: DWORD = 0x7;
+    const OPEN_ALWAYS: DWORD = 4;
+    const h = CreateFileW(wide.ptr, FILE_APPEND_DATA, FILE_SHARE_ALL, null, OPEN_ALWAYS, 0x80, null);
+    if (@intFromPtr(h) != std.math.maxInt(usize)) log_h = h;
 }
 
 const Transcript = struct {
@@ -144,16 +194,17 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     if (in_h) |h| _ = SetConsoleMode(h, ENABLE_VIRTUAL_TERMINAL_INPUT);
     say("FAKE-START\r\n");
     const cwd = std.process.currentPathAlloc(io, gpa) catch return 2;
+    openInputLog(gpa, cwd);
     if (session_id) |s| say(if (validUuid(s)) "FAKE-SESSION-ID\r\n" else "FAKE-BAD-SESSION-ID\r\n") else say("FAKE-NO-SESSION-ID\r\n");
     const quiet = std.mem.indexOf(u8, std.fs.path.basename(cwd), "quiet") != null;
     if (quiet) {
         say("FAKE-QUIET\r\n");
-        while (key()) |_| {}
+        drain();
         return 0;
     }
     const projects = env.get("PORTAL_AGENT_PROJECTS") orelse {
         say("FAKE-NO-ROOT\r\n");
-        while (key()) |_| {}
+        drain();
         return 3;
     };
     const folder = gpa.alloc(u8, cwd.len) catch return 2;
@@ -220,12 +271,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     else
         t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"q1\",\"name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Which fix should I apply in {c}?\",\"header\":\"Fix\",\"multiSelect\":false,\"options\":[{\"label\":\"Alpha\",\"description\":\"d\"},{\"label\":\"Beta in C:\\\\Windows\\\\x\",\"description\":\"d\"}]}]}}]},\"cwd\":\"{c}\"}");
     say("\x1b]7501;state=blocked:kind=question:app=fake\x07FAKE-ASKED\r\n");
-    var choice: u8 = 0;
-    while (key()) |k| if (k == '1' or k == '2' or (showcase and k == '3')) {
-        choice = k;
-        break;
-    };
-    if (choice == 0) return 0;
+    const options: []const []const u8 = if (showcase) &.{ "1", "2", "3" } else &.{ "1", "2" };
+    const choice: u8 = '1' + @as(u8, @intCast(answer(options) orelse return 0));
     t.rec("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"q1\",\"type\":\"tool_result\",\"content\":\"answered\"}]},\"cwd\":\"{c}\"}");
     if (choice == '2') {
         t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m3\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"You chose Beta.\"}]},\"cwd\":\"{c}\"}");
@@ -239,14 +286,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     // prompt itself is only on screen and in the OSC 7501 state).
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m4\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"p1\",\"name\":\"Bash\",\"input\":{\"command\":\"del {c}\"}}]},\"cwd\":\"{c}\"}");
     say("\x1b]7501;state=blocked:kind=permission:app=fake\x07FAKE-PERMISSION\r\n");
-    var allowed = false;
-    while (key()) |k| {
-        if (k == '1') {
-            allowed = true;
-            break;
-        }
-        if (k == 0x1b) break;
-    }
+    // 1 allows, a lone Esc denies.
+    const allowed = (answer(&.{ "1", "\x1b" }) orelse return 0) == 0;
     t.rec("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"p1\",\"type\":\"tool_result\",\"content\":\"ok\"}]},\"cwd\":\"{c}\"}");
     say("\x1b]7501;state=working\x07");
     say(if (allowed) "FAKE-ALLOWED\r\n" else "FAKE-DENIED\r\n");
@@ -263,7 +304,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
 
     // 5. On 1: `/clear` as the agent does it: the screen first, then a
     // new session file (not the --session-id one) with the next prompt.
-    while (key()) |k| if (k == '1') break;
+    _ = answer(&.{"1"}) orelse return 0;
     say("\x1b[2J\x1b[HFAKE-CLEARING\r\n");
     io.random(&rnd);
     var t2 = t;
@@ -271,6 +312,6 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     t2.rec("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"AFTER-CLEAR prompt\"},\"cwd\":\"{c}\",\"sessionId\":\"y\"}");
     t2.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m6\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Fresh start.\"}]},\"cwd\":\"{c}\"}");
     say("FAKE-CLEARED\r\n");
-    while (key()) |_| {}
+    drain();
     return 0;
 }
