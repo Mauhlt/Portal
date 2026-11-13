@@ -96,7 +96,7 @@ pub const Harness = struct {
     /// would set (CLAUDECODE, CLAUDE_CODE_CHILD_SESSION, AI_AGENT) and a
     /// Portal-internal variable, which no session program may inherit, and
     /// a user setting (ANTHROPIC_E2E_KEEP) that it must.
-    fn envBlock(h: *Harness, local_app_data: []const u8) ![:0]const u16 {
+    fn envBlock(h: *Harness, local_app_data: []const u8, extra: []const EnvSet) ![:0]const u16 {
         var m = try h.env.clone(h.gpa);
         defer m.deinit();
         _ = m.swapRemove("ZIG_PROGRESS");
@@ -114,7 +114,13 @@ pub const Harness = struct {
         try m.put("CLAUDE_CODE_CHILD_SESSION", "1");
         try m.put("AI_AGENT", "e2e-parent");
         try m.put("PORTAL_E2E_MARK", "leaked");
+        // As if Portal itself ran inside another Portal's tab: no tab's
+        // program may inherit it (it gets its own, src/childenv.zig).
+        try m.put("PORTAL_TAB", inherited_tab);
         try m.put("ANTHROPIC_E2E_KEEP", "kept");
+        for (extra) |e| if (e.value) |v| try m.put(e.name, v) else {
+            _ = m.swapRemove(e.name);
+        };
         const block = try m.createWindowsBlock(h.gpa, .{});
         return block.slice;
     }
@@ -125,6 +131,12 @@ pub const Harness = struct {
         h.live.append(h.gpa, inst) catch {};
     }
 };
+
+/// An environment change for one child: set, or remove (null).
+pub const EnvSet = struct { name: []const u8, value: ?[]const u8 };
+
+/// The PORTAL_TAB every Portal in the suite inherits (envBlock).
+pub const inherited_tab = "ffffffffffffffffffffffffffffffff";
 
 /// Absolute form of `path` (the build passes a cwd-relative exe path, and
 /// children run in their own directory).
@@ -164,6 +176,10 @@ const SpawnMode = union(enum) {
 };
 
 fn spawn(h: *Harness, argv: []const []const u8, local_app_data: []const u8, mode: SpawnMode) !w.PROCESS_INFORMATION {
+    return spawnEnv(h, argv, local_app_data, mode, &.{});
+}
+
+fn spawnEnv(h: *Harness, argv: []const []const u8, local_app_data: []const u8, mode: SpawnMode, extra: []const EnvSet) !w.PROCESS_INFORMATION {
     const gpa = h.gpa;
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(gpa);
@@ -178,7 +194,7 @@ fn spawn(h: *Harness, argv: []const []const u8, local_app_data: []const u8, mode
     defer gpa.free(line_w);
     const cwd_w = try std.unicode.wtf8ToWtf16LeAllocZ(gpa, local_app_data);
     defer gpa.free(cwd_w);
-    const env = try h.envBlock(local_app_data);
+    const env = try h.envBlock(local_app_data, extra);
     defer gpa.free(env);
 
     var si: w.STARTUPINFOEXW = .{ .StartupInfo = .{ .cb = @sizeOf(w.STARTUPINFOEXW) } };
@@ -289,6 +305,11 @@ pub const LiveCli = struct {
     code: ?u32 = null,
 
     pub fn start(h: *Harness, local_app_data: []const u8, args: []const []const u8) !*LiveCli {
+        return startEnv(h, local_app_data, args, &.{});
+    }
+
+    /// `start` with environment changes for this child.
+    pub fn startEnv(h: *Harness, local_app_data: []const u8, args: []const []const u8, extra: []const EnvSet) !*LiveCli {
         var sa: w.SECURITY_ATTRIBUTES = .{ .bInheritHandle = 1 };
         var out_rd: w.HANDLE = undefined;
         var out_wr: w.HANDLE = undefined;
@@ -298,7 +319,7 @@ pub const LiveCli = struct {
         var in_wr: w.HANDLE = undefined;
         if (w.CreatePipe(&in_rd, &in_wr, &sa, 4096) == 0) return error.PipeFailed;
         _ = w.SetHandleInformation(in_wr, w.HANDLE_FLAG_INHERIT, 0);
-        const pi = spawn(h, args, local_app_data, .{ .capture = .{ .out = out_wr, .in = in_rd } }) catch |err| {
+        const pi = spawnEnv(h, args, local_app_data, .{ .capture = .{ .out = out_wr, .in = in_rd } }, extra) catch |err| {
             for ([_]w.HANDLE{ out_rd, out_wr, in_rd, in_wr }) |x| _ = w.CloseHandle(x);
             return err;
         };
