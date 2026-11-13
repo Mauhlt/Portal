@@ -137,6 +137,15 @@ const Host = struct {
     sync_bufs: sync.ui.Ui.Bufs = .{},
     /// Whether the OS touch keyboard was last asked to show.
     keyboard_shown: bool = false,
+    /// The Conversation view (the devices' default main view): its own
+    /// copy of Shared.convo, synced under the lock each frame.
+    convo_view: ui.convoview.View = undefined,
+
+    /// The view's clock (swipe guard, animations): the awake clock.
+    fn clockNow(ctx: ?*anyopaque) i64 {
+        const h: *Host = @ptrCast(@alignCast(ctx.?));
+        return watchdog.nowMs(h.client.io);
+    }
 
     fn uiStatus(st: client_mod.Status) shell_mod.Status {
         return switch (st) {
@@ -160,6 +169,9 @@ const Host = struct {
         }
         // The Data slice: new blobs from the terminal.
         _ = h.shell.data.sync(h.client.gpa, &s.grid.images);
+        // The conversation (copied when it changed) and whether answers go.
+        h.convo_view.sync(&s.convo);
+        h.convo_view.answers = if (s.mode) |m| m.acceptsAnswers() else false;
         // The tabs: what the top bar draws and what its clicks mean.
         h.tabs = s.tabs;
         var pbuf: [64]u8 = undefined;
@@ -194,6 +206,8 @@ const Host = struct {
         // for a moment (sync/ui.zig, "No accidental approvals").
         // (h.sync.mutex is still held here: the defer above.)
         if (panel != null) h.sync.ui.presented(watchdog.nowMs(h.client.io));
+        // The same idea for swipe cards: their guard starts on screen.
+        h.convo_view.presented(watchdog.nowMs(h.client.io));
         h.drawn_version = version;
         // The on-screen keyboard follows the input line (touch, no keyboard).
         if (h.shell.keyboard != h.keyboard_shown) {
@@ -412,6 +426,13 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     host_ui.* = .{ .p = tv, .shared = shared, .client = client, .sync = sync_state };
     host_ui.shell = ui.Shell.init(gpa, .viewer, host_ui.uiHost());
     host_ui.shell.modal = sync_state.modal();
+    host_ui.convo_view = ui.convoview.View.init(gpa);
+    host_ui.convo_view.clock = .{ .ctx = host_ui, .now = Host.clockNow };
+    {
+        var sbuf: [4096]u8 = undefined;
+        if (ui.convoview.parseSwipeSetting(pin_mod.loadDeviceSettings(io, &sbuf))) |side| host_ui.convo_view.yes_side = side;
+    }
+    host_ui.shell.conversation = host_ui.convo_view.contentView();
     // Portal sync (docs/sync-design.md): a worker that runs a pass on
     // every (re)connect and {"t":"updates"}; only over TLS, where the
     // release key was pinned at pairing.
@@ -463,10 +484,13 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
             report("{s}: {s}", .{ prog, sync_state.dropped_msg_buf[0..sync_state.dropped_msg_len] });
             std.process.exit(0);
         }
-        if (tv.needsRedraw() or shared.version.load(.acquire) != host_ui.drawn_version) host_ui.frame();
+        const animating = host_ui.convo_view.frameTimeout();
+        if (tv.needsRedraw() or shared.version.load(.acquire) != host_ui.drawn_version or animating != null) host_ui.frame();
         // Event-driven: the network thread wakes us on every Shared change
-        // (Client.notify), input wakes us too; no idle polling.
-        tv.waitEvents(Presenter.forever);
+        // (Client.notify), input wakes us too; no idle polling. Only a
+        // swipe card's fly-off / spring-back (at most ~200 ms) sets a
+        // frame deadline.
+        tv.waitEvents(host_ui.convo_view.frameTimeout() orelse Presenter.forever);
     }
     tv.deinit();
     std.process.exit(0);

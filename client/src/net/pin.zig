@@ -68,6 +68,22 @@ pub fn lastServerPath(out: *[max_path]u8) Error![]const u8 {
     return std.fmt.bufPrint(out, "{s}" ++ std.fs.path.sep_str ++ "last-server.txt", .{parent}) catch error.PathTooLong;
 }
 
+/// The device's settings (next to the servers directory), e.g.
+/// `swipe = left-yes` (ui/convoview.zig parseSwipeSetting).
+pub fn deviceSettingsPath(out: *[max_path]u8) Error![]const u8 {
+    var dir_buf: [max_path]u8 = undefined;
+    const sdir = try serversDir(&dir_buf);
+    const parent = std.fs.path.dirname(sdir) orelse return error.NoConfigDir;
+    return std.fmt.bufPrint(out, "{s}" ++ std.fs.path.sep_str ++ "settings.txt", .{parent}) catch error.PathTooLong;
+}
+
+/// The device's settings text (empty if there is no file), into `buf`.
+pub fn loadDeviceSettings(io: Io, buf: []u8) []const u8 {
+    var pbuf: [max_path]u8 = undefined;
+    const p = deviceSettingsPath(&pbuf) catch return "";
+    return Io.Dir.cwd().readFile(io, p, buf) catch "";
+}
+
 /// The remembered server ("IP:PORT"), if any.
 pub fn loadLastServer(io: Io, out: *[64]u8) ?[]const u8 {
     var pbuf: [max_path]u8 = undefined;
