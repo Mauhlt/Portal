@@ -12,7 +12,9 @@
 //!     65535 each. `feed` allocates only for inline images (vt_gfx.zig:
 //!     kitty graphics, stored as PNG bytes under hard limits, never decoded
 //!     here); an allocation failure there drops the image, nothing else.
-//!   * Nothing is ever written back: no DSR/DA replies, no answerback.
+//!   * Nothing is written back except the fixed OSC 7501 feature-detection
+//!     reply (`takeReplies`): no DSR/DA replies, no answerback, nothing that
+//!     echoes any byte of the stream.
 //!
 //! The parser is Paul Williams' DEC ANSI state machine
 //! (https://vt100.net/emu/dec_ansi_parser) with UTF-8 decoding in the ground
@@ -332,6 +334,21 @@ fn fixWide(row: []Cell) void {
 /// https://mitchellh.com/writing/program-status-osc7501. Only the state and
 /// the kind (as an enum) are kept; app and msg are program-controlled
 /// strings and are dropped.
+///
+/// Feature detection (spec revision 0.4, "Feature detection",
+/// https://www.superlogical.com/rex/docs/build/program-status): the program
+/// sends `OSC 7501 ; ? ST` (the agent sends `ESC ] 7501 ; ? BEL`, followed
+/// by a primary device attributes request `CSI c` as a sentinel: if the DA
+/// reply arrives first, it treats the protocol as unsupported and never
+/// reports its state; under ConPTY conhost answers that DA itself, at once,
+/// so it always does: docs/protocol.md, "Program status (OSC 7501)").
+/// A supporting terminal MUST reply `OSC 7501 ; ? ST`; it
+/// MAY add `:states=...:kinds=...`, and a reply without them means exactly
+/// idle, working, done, blocked, error and permission, question, auth,
+/// which is what Portal understands, so the reply is just `?`. The reply is
+/// fixed bytes (`status_reply_bel` / `status_reply_st`, echoing the query's
+/// terminator as xterm does for its own queries) and carries nothing from
+/// the stream; under ConPTY it is typed as key records (`takeReplies`).
 pub const ProgramState = enum { unknown, working, waiting, idle, done, failed };
 
 /// What a blocked program waits for (`kind=`): the Conversation view offers
@@ -370,6 +387,28 @@ pub fn parseProgramState(payload: []const u8) ProgramState {
     return .unknown;
 }
 
+/// The OSC 7501 feature-detection reply (see above), per query terminator.
+pub const status_reply_bel = "\x1b]7501;?\x07";
+pub const status_reply_st = "\x1b]7501;?\x1b\\";
+/// Feature-detection queries answered per `takeReplies` call at most: a
+/// program has no reason to ask twice in one read, and output it merely
+/// relays (a file it prints) cannot make Portal type more than this.
+pub const max_pending_replies = 2;
+/// One input byte as win32-input-mode key records (see `takeReplies`):
+/// a key down and a key up, `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _` each.
+const max_win32_record_bytes = 2 * "\x1b[0;0;255;1;0;1_".len;
+/// Room for `max_pending_replies` replies, encoded either way.
+pub const max_reply_bytes = max_pending_replies * status_reply_st.len * max_win32_record_bytes;
+
+/// Appends `byte` as typed by a key (no virtual key, no scan code: just the
+/// character), key down then key up, in win32-input-mode form.
+fn putWin32Key(out: []u8, n: *usize, byte: u8) void {
+    for ([_]u8{ 1, 0 }) |down| {
+        const s = std.fmt.bufPrint(out[n.*..], "\x1b[0;0;{d};{d};0;1_", .{ byte, down }) catch return; // sized by max_reply_bytes
+        n.* += s.len;
+    }
+}
+
 pub const Terminal = struct {
     gpa: Allocator,
     cols: u16,
@@ -401,6 +440,17 @@ pub const Terminal = struct {
     program_state: ProgramState = .unknown,
     program_kind: ProgramKind = .none,
     program_state_gen: u64 = 0,
+    /// OSC 7501 feature-detection queries (`OSC 7501 ; ? ST`) seen since
+    /// the last `takeReplies`, with each one's terminator (true: ST,
+    /// false: BEL); at most `max_pending_replies`, later ones dropped.
+    pending_replies: u8 = 0,
+    pending_reply_st: [max_pending_replies]bool = @splat(false),
+    /// DECSET 9001 (win32-input-mode): ConPTY's conhost asks for it when
+    /// it starts and then reads every input sequence it does not know (an
+    /// OSC, such as the reply above) as nothing at all. Input written while
+    /// it is on must be key records instead. Not cleared by RIS: conhost,
+    /// not the program, owns the input side.
+    win32_input: bool = false,
     /// Inline images and their placements (per screen).
     images: gfx.Graphics = .{},
 
@@ -535,6 +585,27 @@ pub const Terminal = struct {
         const after = t.cursor();
         if (before.x != after.x or before.y != after.y or before.visible != after.visible or images_before != t.images.gen)
             t.bumpGen();
+    }
+
+    /// The bytes to write into the program's input in answer to the OSC
+    /// 7501 feature-detection queries fed since the last call (empty if
+    /// there were none), and forgets them. Only ever the fixed reply, as
+    /// is, or (while conhost has win32-input-mode on) typed key by key as
+    /// win32-input-mode records, which conhost hands to the program as the
+    /// same bytes.
+    pub fn takeReplies(t: *Terminal, buf: *[max_reply_bytes]u8) []const u8 {
+        var n: usize = 0;
+        for (t.pending_reply_st[0..t.pending_replies]) |st| {
+            const r = if (st) status_reply_st else status_reply_bel;
+            if (t.win32_input) {
+                for (r) |b| putWin32Key(buf, &n, b);
+            } else {
+                @memcpy(buf[n..][0..r.len], r);
+                n += r.len;
+            }
+        }
+        t.pending_replies = 0;
+        return buf[0..n];
     }
 
     /// Keeps content anchored top-left; clamps the cursor; resets margins.
@@ -782,7 +853,7 @@ pub const Terminal = struct {
                 return;
             },
             0x1B => {
-                if (p.state == .osc_string) t.oscEnd();
+                if (p.state == .osc_string) t.oscEnd(true);
                 if (p.state == .gfx_string) t.gfxEnd();
                 p.clear();
                 p.state = .escape;
@@ -935,7 +1006,7 @@ pub const Terminal = struct {
             },
             .osc_string => switch (b) {
                 0x07 => {
-                    t.oscEnd();
+                    t.oscEnd(false);
                     p.state = .ground;
                 },
                 0x00...0x06, 0x08...0x1F => {},
@@ -1112,15 +1183,27 @@ pub const Terminal = struct {
         t.cur.x = @intCast(@min(@as(u32, placed.col) + placed.cols, @as(u32, t.cols) - 1));
     }
 
-    fn oscEnd(t: *Terminal) void {
+    /// `st`: the string ended with ESC (ST) rather than BEL.
+    fn oscEnd(t: *Terminal, st: bool) void {
         const p = &t.parser;
         const data = p.osc[0..p.osc_len];
         p.osc_len = 0;
         const semi = std.mem.indexOfScalar(u8, data, ';') orelse return;
         const cmd = data[0..semi];
-        if (std.mem.eql(u8, cmd, "7501")) return t.setProgramState(parseProgramState(data[semi + 1 ..]), parseProgramKind(data[semi + 1 ..]));
+        if (std.mem.eql(u8, cmd, "7501")) {
+            const body = data[semi + 1 ..];
+            if (std.mem.eql(u8, body, "?")) return t.statusQuery(st);
+            return t.setProgramState(parseProgramState(body), parseProgramKind(body));
+        }
         if (!std.mem.eql(u8, cmd, "0") and !std.mem.eql(u8, cmd, "2")) return;
         t.setTitle(data[semi + 1 ..]);
+    }
+
+    /// OSC 7501 feature detection: queue the fixed reply (`takeReplies`).
+    fn statusQuery(t: *Terminal, st: bool) void {
+        if (t.pending_replies >= max_pending_replies) return;
+        t.pending_reply_st[t.pending_replies] = st;
+        t.pending_replies += 1;
     }
 
     /// OSC 7501 (program status): what the program says it is doing.
@@ -1406,7 +1489,8 @@ pub const Terminal = struct {
                 t.restoreCursor();
             },
             2004 => t.bracketed_paste = on,
-            else => {}, // 1004 focus, 9001 win32-input, mouse...
+            9001 => t.win32_input = on,
+            else => {}, // 1004 focus, mouse...
         }
     }
 
@@ -2630,6 +2714,55 @@ test "fuzz: split points never change the result" {
         }
         try expectSameState(&a, &b);
     }
+}
+
+test "OSC 7501 feature detection: the probe gets the fixed reply" {
+    var t = try newTerm(20, 3);
+    defer t.deinit();
+    var buf: [max_reply_bytes]u8 = undefined;
+    try testing.expectEqualStrings("", t.takeReplies(&buf)); // nothing unasked
+    // The agent's probe: BEL-terminated, then a DA1 sentinel (never answered).
+    t.feed("\x1b]7501;?\x07\x1b[c");
+    try testing.expectEqualStrings("\x1b]7501;?\x07", t.takeReplies(&buf));
+    try testing.expectEqualStrings("", t.takeReplies(&buf)); // answered once
+    // ST-terminated: the reply ends with ST too.
+    t.feed("\x1b]7501;?\x1b\\");
+    try testing.expectEqualStrings("\x1b]7501;?\x1b\\", t.takeReplies(&buf));
+    // Split across chunks at every byte.
+    const probe = "ab\x1b]7501;?\x1b\\cd";
+    for (1..probe.len) |cut| {
+        t.feed(probe[0..cut]);
+        t.feed(probe[cut..]);
+        try testing.expectEqualStrings(status_reply_st, t.takeReplies(&buf));
+    }
+    // Not a probe: reports, other OSCs, near misses, a probe inside a title.
+    t.feed("\x1b]7501;state=working\x07\x1b]7501;??\x07\x1b]7501;? \x07\x1b]7501;\x07");
+    t.feed("\x1b]0;7501;?\x07\x1b]75011;?\x07\x1b]7501?\x07 ]7501;? \x1bP7501;?\x1b\\");
+    try testing.expectEqualStrings("", t.takeReplies(&buf));
+    t.feed("\x1b]7501;state=working\x07\x1b]7501;?\x07"); // the probe is no state
+    try testing.expectEqual(ProgramState.working, t.program_state);
+    try testing.expectEqualStrings(status_reply_bel, t.takeReplies(&buf));
+    // A flood is capped: at most max_pending_replies per take.
+    for (0..50) |_| t.feed("\x1b]7501;?\x07");
+    try testing.expectEqualStrings(status_reply_bel ++ status_reply_bel, t.takeReplies(&buf));
+    try testing.expectEqual(2, max_pending_replies);
+    // The reply never echoes the stream: only these fixed bytes exist.
+    try testing.expectEqualStrings("\x1b]7501;?\x1b\\", status_reply_st);
+    // Under ConPTY (conhost turned win32-input-mode on): the same bytes,
+    // typed as key records (key down, key up), split or not.
+    t.feed("\x1b[?9001h\x1b]75");
+    t.feed("01;?\x07");
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(testing.allocator);
+    for (status_reply_bel) |b| try want.print(testing.allocator, "\x1b[0;0;{d};1;0;1_\x1b[0;0;{d};0;0;1_", .{ b, b });
+    try testing.expectEqualStrings(want.items, t.takeReplies(&buf));
+    try testing.expectEqualStrings("\x1b[0;0;27;1;0;1_\x1b[0;0;27;0;0;1_\x1b[0;0;93;1;0;1_", want.items[0..45]);
+    // The largest possible take fits.
+    for (0..3) |_| t.feed("\x1b]7501;?\x1b\\");
+    const most = t.takeReplies(&buf);
+    try testing.expect(std.mem.count(u8, most, "_") == 2 * 2 * status_reply_st.len and most.len <= max_reply_bytes);
+    t.feed("\x1b[?9001l\x1b]7501;?\x07");
+    try testing.expectEqualStrings(status_reply_bel, t.takeReplies(&buf));
 }
 
 test "realistic ConPTY-style redraw corpus" {

@@ -85,8 +85,13 @@ pub const Session = struct {
     input_closing: std.atomic.Value(bool) = .init(false),
 
     pub fn appendOutput(s: *Session, data: []const u8) void {
+        var reply_buf: [vt.max_reply_bytes]u8 = undefined;
         s.mutex.lockUncancelable(s.io);
         s.term.feed(data);
+        // The OSC 7501 feature-detection reply (vt.zig): fixed bytes, asked
+        // for by the program's own output, so it goes in like the desktop's
+        // own input (writeInput), never through a device's policy.
+        const reply = s.term.takeReplies(&reply_buf);
         if (s.term.program_state != s.state) {
             s.state = s.term.program_state;
             if (s.list_gen) |g| g.* +%= 1;
@@ -97,6 +102,7 @@ pub const Session = struct {
             if (s.convo) |c| c.programState(wait);
         }
         s.mutex.unlock(s.io);
+        if (reply.len > 0) s.writeInput(reply);
         s.cond.broadcast(s.io);
         s.notify();
         if (s.convo_poke) |p| p.poke();
@@ -514,6 +520,44 @@ test "LocalInput writes queued items whole and in order, on its own thread" {
     // After close, input is dropped.
     s.writeInput("x");
     try std.testing.expectEqual(@as(usize, 0), l.lens.items.len);
+}
+
+test "an OSC 7501 probe in the output is answered on the PTY input, nothing else is" {
+    const w = @import("win32.zig");
+    const gpa = std.testing.allocator;
+    var rd: w.HANDLE = undefined;
+    var wr: w.HANDLE = undefined;
+    if (w.CreatePipe(&rd, &wr, null, 1 << 16) == 0) return error.SkipZigTest;
+    defer _ = w.CloseHandle(rd);
+    defer _ = w.CloseHandle(wr);
+    var pty: Pty = .{ .hpc = undefined, .in_write = wr, .out_read = undefined, .process = undefined, .job = undefined };
+    var mu: Io.Mutex = .init;
+    var cv: Io.Condition = .init;
+    var s: Session = .{
+        .io = std.testing.io,
+        .mutex = &mu,
+        .cond = &cv,
+        .pty = &pty,
+        .console = undefined,
+        .policy = .text,
+        .term = try vt.Terminal.init(gpa, 20, 5),
+        .size = .{ .cols = 20, .rows = 5 },
+    };
+    defer s.term.deinit();
+    s.appendOutput("hello\x1b]7501;state=idle\x07\x1b[c"); // no probe: nothing written
+    s.appendOutput("\x1b]7501;"); // the probe, split across reads
+    s.appendOutput("?\x07\x1b[c");
+    // A device can't make one: web text and lines drop the control bytes.
+    s.writeWebText("\x1b]7501;?\x07");
+    try std.testing.expectError(error.ControlCharacter, s.writeWebLine("\x1b]7501;?\x07"));
+    var got: [64]u8 = undefined;
+    var avail: w.DWORD = 0;
+    try std.testing.expect(w.PeekNamedPipe(rd, null, 0, null, &avail, null) != 0);
+    var r: w.DWORD = 0;
+    try std.testing.expect(w.ReadFile(rd, &got, avail, &r, null) != 0);
+    // The reply, then whatever printable text the web filters let through.
+    try std.testing.expect(std.mem.startsWith(u8, got[0..r], vt.status_reply_bel));
+    try std.testing.expect(std.mem.indexOfScalar(u8, got[vt.status_reply_bel.len..r], 0x1b) == null);
 }
 
 test "writeLocal stops at the next chunk once shutdown begins" {

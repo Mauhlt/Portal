@@ -17,11 +17,13 @@ and the hooks / terminal-bell fallbacks for "waiting". What exists:
   (`portal connect`, the browser) draw the same top bar and switch tabs;
   neither can open or close one.
 * OSC 7501 is parsed per session (`src/vt.zig`, `parseProgramState`) and
-  only highlights a tab (`waiting` = `state=blocked`). **Not confirmed**
-  that the agent emits it inside Portal's ConPTY without a capability
-  probe; if it doesn't, nothing is highlighted and the hook below is where
-  a fallback would plug in (Session.state / Hub.gen). No agent settings
-  were changed.
+  only highlights a tab (`waiting` = `state=blocked`). Portal answers the
+  feature-detection query (docs/protocol.md, "Program status (OSC
+  7501)"), but the agent (2.1.323) still never reports its state inside
+  ConPTY: conhost answers its DA1 sentinel before any terminal's reply can
+  arrive. Checked live 2026-11-12: the probe arrived, Portal replied, no
+  `state=` report followed. The hook below (Session.state / Hub.gen) is
+  where a fallback would plug in. No agent settings were changed.
 * Privacy rules 1, 2, 3, 5, 6 and 7 are covered by `tests/e2e/privacy.zig`
   and `tests/e2e/tabs_tests.zig` (no paths in hello/tabs/session/ended,
   unknown, malformed and closed ids all get the same `nosession`, rejected
@@ -49,9 +51,10 @@ never open or close projects. That stays desk-only: Ctrl+T folder picker, or
      `ESC ] 7501 ; state=<s>[:kind=<k>][:app=<name>][:msg=<base64>] ST`.
    * States: idle, working, blocked (kind permission / question / auth),
      done, error.
-   * The capability probe is undocumented. **Capture real ConPTY output to
-     confirm the format and whether the agent emits it unprompted** before
-     relying on it.
+   * The agent reports only after its capability probe (`ESC ] 7501 ; ?
+     BEL`, then `ESC [ c` as a sentinel) got a reply; see docs/protocol.md,
+     "Program status (OSC 7501)", for the format, Portal's reply and why it
+     cannot win the race against conhost's own DA reply.
    * Treat the message as untrusted. Program output can contain anything, so
      a hostile file the agent prints could fake a status. It only changes a
      highlight; it never grants input.

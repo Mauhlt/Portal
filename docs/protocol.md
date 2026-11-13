@@ -183,6 +183,48 @@ then a full snapshot). Only the desk opens and closes tabs (the window,
 `portal open <dir>`); no message a client sends can create, start, close
 or reopen one. The shared parser and writer are `shared/tabs.zig`.
 
+#### Program status (OSC 7501), desk side
+
+Not a client message: how the desk learns `state`. The program reports
+`ESC ] 7501 ; state=<s>[:kind=<k>][:app=<name>][:msg=<base64>]... ST`
+(ST is `ESC \` or BEL), and may first ask whether the terminal supports it.
+Sources: the spec, https://www.superlogical.com/rex/docs/build/program-status
+(revision 0.4, 2026-10-10, sections Syntax and Feature detection), linked
+from https://mitchellh.com/writing/program-status-osc7501; the agent
+2.1.323 as shipped (read only for interoperability: its probe and the
+reply it accepts).
+
+* Query: `ESC ] 7501 ; ? ST`. The agent sends `ESC ] 7501 ; ? BEL`, then
+  a primary device attributes request `ESC [ c` as its sentinel, and
+  accepts any `OSC 7501` reply whose body starts with `?`.
+* Reply: a supporting terminal MUST answer `OSC 7501 ; ? ST`; it MAY add
+  `:states=â€¦:kinds=â€¦`, and a reply without them means exactly the states
+  idle, working, done, blocked, error and the kinds permission, question,
+  auth, which is what Portal understands. Portal answers exactly
+  `ESC ] 7501 ; ? ` and the query's own terminator (BEL or `ESC \`),
+  nothing else: fixed bytes, never anything from the stream.
+* Where it goes: into that tab's PTY input, like the desk's own keys
+  (`Session.writeInput`), never through a device's policy. Only a query in
+  the program's own output triggers it (`src/vt.zig`, at most two replies
+  per read of output); devices can't send the bytes themselves (`l:`
+  rejects control characters, `k:` takes key names only). ConPTY's conhost
+  turns on win32-input-mode (`ESC [ ? 9001 h`) and then drops an OSC in
+  its input, so while that mode is on the reply is typed as
+  win32-input-mode key records (`ESC [ 0 ; 0 ; <byte> ; 1|0 ; 0 ; 1 _`,
+  key down and up per byte), which conhost hands to the program as the
+  same bytes.
+* **Limit, Windows-wide:** conhost answers the DA1 sentinel itself, at
+  once, while the OSC 7501 query has to travel to the terminal and back.
+  The DA reply therefore always arrives first, and the agent (2.1.323)
+  settles "unsupported" on it and never reports its state, in Portal as in
+  any ConPTY terminal. Portal's reply still arrives (the e2e `probe` group
+  checks it); the agent takes the late reply as a terminal response (in
+  the live check nothing of it reached its prompt or its dialogs).
+  Until the agent waits for the OSC 7501 reply past its DA sentinel (or
+  offers a way to say the terminal supports it), `state` stays `unknown`
+  for agent tabs, and only the Conversation view's open questions
+  make a tab "waiting".
+
 ### 3b. The Conversation view (`convo`, `convo+`)
 
 Devices show a tab as a conversation by default, not as a terminal: the
@@ -498,8 +540,9 @@ typed at the desk among them) and Enter would submit it, past every
 instruction-line check. Residual risk: a program that reports `blocked`
 while its input box is live, or a question left open in the transcript,
 re-opens that window; a program that never reports OSC 7501 and writes no
-question (including the agent when it does not detect OSC 7501 support
-in Portal's terminal; its folder-trust prompt comes before any transcript)
+question (including the agent, which does not detect OSC 7501 support
+under ConPTY: see "Program status (OSC 7501)" in section 3a; its
+folder-trust prompt comes before any transcript)
 never gets `up` / `down`, and must be answered at the desk. Clients show
 Up/Down only while they would be accepted: in `instruct` mode while the
 shown tab's `state` is `waiting` or (native client) its conversation has

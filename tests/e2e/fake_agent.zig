@@ -33,6 +33,8 @@
 //! Start such consoles hidden or with SW_SHOWMINNOACTIVE.)
 //!
 //! A tab whose folder's name contains "quiet" writes no transcript at all.
+//! A tab whose folder's name contains "probe" only does OSC 7501 feature
+//! detection (`probe`; the probe group, tests/e2e/probe_tests.zig).
 //! In a folder whose name contains "showcase" (manual visual checks only,
 //! never the e2e suite) the reply carries a code block and the question a
 //! third option. (Not a PORTAL_* variable: Portal keeps those from its
@@ -121,6 +123,35 @@ fn arrow(got: []const u8, tag: []const u8) bool {
 fn drain(tag: []const u8) void {
     var buf: [256]u8 = undefined;
     while (chunk(&buf)) |got| _ = arrow(got, tag);
+}
+
+/// OSC 7501 feature detection as the agent does it (docs/protocol.md,
+/// "Program status (OSC 7501)"): the query, then a primary device attributes request
+/// (the agent's sentinel: whichever reply comes first decides). Reads
+/// until Portal's reply has arrived, then prints FAKE-PROBE-REPLY and
+/// which came first: FAKE-PROBE-REPLY-FIRST or FAKE-PROBE-DA-FIRST (under
+/// ConPTY conhost answers DA1 itself, at once, so its reply comes first).
+/// Then it reports a permission wait, as the agent does once it knows,
+/// and reads (and logs) until its input ends.
+fn probe() void {
+    say("\x1b]7501;?\x07\x1b[c");
+    const reply = "\x1b]7501;?\x07";
+    var acc: [1024]u8 = undefined;
+    var n: usize = 0;
+    var buf: [256]u8 = undefined;
+    while (std.mem.indexOf(u8, acc[0..n], reply) == null) {
+        const got = chunk(&buf) orelse return;
+        const k = @min(got.len, acc.len - n);
+        @memcpy(acc[n..][0..k], got[0..k]);
+        n += k;
+        if (n == acc.len) return;
+    }
+    const at = std.mem.indexOf(u8, acc[0..n], reply).?;
+    const da_first = std.mem.indexOf(u8, acc[0..at], "\x1b[?") != null;
+    say(if (da_first) "FAKE-PROBE-DA-FIRST\r\n" else "FAKE-PROBE-REPLY-FIRST\r\n");
+    say("FAKE-PROBE-REPLY\r\n");
+    say("\x1b]7501;state=blocked:kind=permission:app=fake\x07FAKE-PROBE-BLOCKED\r\n");
+    drain("PROBE");
 }
 
 /// Opens `e2e-input` in `cwd` for appending (shared: the test reads it
@@ -220,6 +251,10 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     if (quiet) {
         say("FAKE-QUIET\r\n");
         drain("QUIET");
+        return 0;
+    }
+    if (std.mem.indexOf(u8, std.fs.path.basename(cwd), "probe") != null) {
+        probe();
         return 0;
     }
     const config = env.get("CLAUDE_CONFIG_DIR") orelse {
