@@ -26,7 +26,9 @@ const wcwidth = Font.wcwidth;
 const fontset = Font.fontset;
 const Atlas = Font.atlas.Atlas;
 const images = @import("images.zig");
+const imgdec = @import("imgdec");
 const input = ui.input;
+const theme = ui.theme;
 const draw = ui.draw;
 
 /// The texture: glyph atlas in rows 0..2047, inline images below it.
@@ -43,6 +45,7 @@ pub const Options = struct {
 };
 
 gpa: std.mem.Allocator,
+io: std.Io,
 window: *Window.Window,
 /// Null after releaseGpu().
 renderer: ?*Instanced2D,
@@ -75,6 +78,8 @@ native_len: usize = 0,
 native_supported: bool = true,
 /// Scroll notches not yet turned into whole grid rows.
 scroll_acc: f32 = 0,
+/// The start-up splash (beginSplash) while it shows.
+splash: ?*Splash = null,
 
 /// Grid rows per scroll notch: a notch is 16 pt of finger travel on a
 /// touch screen, a wheel detent elsewhere.
@@ -98,6 +103,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Presenter {
     atlas.tex_h = tex_h;
     self.* = .{
         .gpa = gpa,
+        .io = io,
         .window = window,
         .renderer = renderer,
         .fonts = fonts,
@@ -106,10 +112,37 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Presenter {
         .img = .init(gpa),
     };
     window.setLiveCallback(self, liveThunk);
+    self.setAppIcon();
     return self;
 }
 
+/// Windows: the title bar's and the taskbar's icon from the exe's icon
+/// resource 1 (docs/brand/portal.ico, linked by build.zig), via
+/// WM_SETICON. The Renderer's window class has no icon of its own (the
+/// cleaner fix is `.icon` / `.icon_small` = LoadImageW(hinstance, 1) in its
+/// WNDCLASSEXW). Without the resource (test builds) nothing changes.
+fn setAppIcon(p: *Presenter) void {
+    if (builtin.os.tag != .windows) return;
+    const hwnd = p.nativeHandle() orelse return;
+    const w = struct {
+        extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+        extern "user32" fn LoadImageW(inst: ?*anyopaque, name: usize, kind: u32, cx: i32, cy: i32, flags: u32) callconv(.winapi) ?*anyopaque;
+        extern "user32" fn GetSystemMetrics(index: i32) callconv(.winapi) i32;
+        extern "user32" fn SendMessageW(wnd: *anyopaque, msg: u32, wp: usize, lp: isize) callconv(.winapi) isize;
+    };
+    const inst = w.GetModuleHandleW(null) orelse return;
+    const image_icon = 1;
+    const wm_seticon = 0x0080;
+    // ICON_BIG (SM_CXICON) and ICON_SMALL (SM_CXSMICON).
+    for ([_][2]i32{ .{ 1, 11 }, .{ 0, 49 } }) |k| {
+        const size = w.GetSystemMetrics(k[1]);
+        const icon = w.LoadImageW(inst, 1, image_icon, size, size, 0) orelse return;
+        _ = w.SendMessageW(hwnd, wm_seticon, @intCast(k[0]), @bitCast(@intFromPtr(icon)));
+    }
+}
+
 pub fn deinit(p: *Presenter) void {
+    p.endSplash();
     p.releaseGpu();
     p.window.deinit();
     p.atlas.deinit();
@@ -157,7 +190,11 @@ pub const forever = Window.forever;
 /// Sleeps until window input, a wake() from any thread, or the timeout
 /// (`forever`: no timeout). Returns at once if a redraw is pending.
 pub fn waitEvents(p: *Presenter, timeout_ms: u32) void {
-    p.window.waitEvents(if (p.dirty and !p.suspended) 0 else timeout_ms);
+    var t = timeout_ms;
+    if (p.splash) |sp| if (sp.deadline(p.nowMs())) |left| {
+        t = @min(t, left);
+    };
+    p.window.waitEvents(if (p.dirty and !p.suspended) 0 else t);
 }
 
 /// Tears down the swapchain and GPU device cleanly (waits for the GPU to go
@@ -214,7 +251,18 @@ fn button(b: Window.MouseButton) input.MouseButton {
 /// Returns false once the user closed the window.
 pub fn pollEvents(p: *Presenter, sink: input.InputSink) bool {
     var open = true;
+    p.splashTick();
     while (p.nextEvent()) |e| {
+        // Input during the splash ends it (and is not passed on: nothing
+        // the user could aim at is on screen yet).
+        if (p.splash != null) switch (e) {
+            .key, .char, .mouse_down, .mouse_move, .mouse_up, .text_input => {
+                if (e != .mouse_move) p.endSplash();
+                p.dirty = true;
+                continue;
+            },
+            else => {},
+        };
         switch (e) {
             .close => open = false,
             .key => |k| {
@@ -288,6 +336,12 @@ pub fn build(p: *Presenter, grid: *const ui.grid.Grid, overlay: ui.Overlay) void
     const ins = p.window.insets();
     p.frame.insets = .{ .left = ins.left, .top = ins.top, .right = ins.right, .bottom = ins.bottomClear() };
     p.frame.build(&p.fonts, p.window.framebufferSize(), p.window.scale(), grid, overlay);
+    // The splash replaces the frame's picture (its layout still counts:
+    // capacity reports, the PTY size).
+    if (p.splash) |sp| {
+        p.buildSplash(sp);
+        return;
+    }
     p.resolve();
     if (p.atlas_full or p.img.full) {
         // Out of atlas / image space: start over with only what is on
@@ -320,6 +374,192 @@ pub fn present(p: *Presenter) void {
     }, p.instances.items) catch |err| std.log.warn("draw failed: {t}", .{err});
     p.dirty = false;
     p.syncNativeField();
+}
+
+// ------------------------------------------------------------ splash
+
+/// The start-up splash: the hero art (a PNG), centred and scaled to fit on
+/// the theme's background, shown instead of the UI while the app starts.
+///
+/// Never blocks start-up: the PNG is decoded on its own thread (which
+/// wakes the window when done); until then the frame is the bare
+/// background. Event-driven: it is drawn when something asks for a frame
+/// and has at most two real deadlines (below), no animation. It ends when
+///   - the host calls `splashDone` (the app is ready) and the art has shown
+///     for at least `splash_min_ms` (so it never just flickers),
+///   - `splash_max_ms` after it began, whatever the host is doing,
+///   - the user presses a key, clicks or touches,
+///   - the PNG can't be decoded (it is skipped).
+pub const Splash = struct {
+    png: []const u8,
+    thread: ?std.Thread = null,
+    /// Written by the decode thread before `done` is set.
+    decoded: ?imgdec.Rgba = null,
+    done: std.atomic.Value(bool) = .init(false),
+    window: *Window.Window,
+    gpa: std.mem.Allocator,
+    begun_ms: i64,
+    /// When the art was first drawn (null: not yet).
+    shown_ms: ?i64 = null,
+    ready: bool = false,
+    /// The side the art is uploaded at (0: not uploaded).
+    side: u32 = 0,
+
+    fn decode(sp: *Splash) void {
+        sp.decoded = imgdec.decode(sp.gpa, sp.png, .{ .budget = 64 << 20, .max_side = 2048 }) catch null;
+        sp.done.store(true, .release);
+        sp.window.wake();
+    }
+
+    /// Milliseconds until the splash must be looked at again.
+    fn deadline(sp: *const Splash, now: i64) ?u32 {
+        var at = sp.begun_ms + splash_max_ms;
+        if (sp.ready) if (sp.shown_ms) |t| {
+            at = @min(at, t + splash_min_ms);
+        };
+        return @intCast(std.math.clamp(at - now, 0, splash_max_ms));
+    }
+};
+
+pub const splash_min_ms: i64 = 900;
+pub const splash_max_ms: i64 = 4000;
+
+fn nowMs(p: *const Presenter) i64 {
+    return std.Io.Clock.awake.now(p.io).toMilliseconds();
+}
+
+/// Starts the splash with `png` (which must outlive it: an embedded
+/// file). Call right after init; the next frames show it.
+pub fn beginSplash(p: *Presenter, png: []const u8) void {
+    if (p.splash != null) return;
+    const sp = p.gpa.create(Splash) catch return;
+    sp.* = .{ .png = png, .window = p.window, .gpa = p.gpa, .begun_ms = p.nowMs() };
+    sp.thread = std.Thread.spawn(.{}, Splash.decode, .{sp}) catch {
+        p.gpa.destroy(sp);
+        return;
+    };
+    p.splash = sp;
+    p.dirty = true;
+}
+
+/// The host is ready (connected, the session started): the splash ends
+/// once the art has shown for a moment.
+pub fn splashDone(p: *Presenter) void {
+    const sp = p.splash orelse return;
+    if (sp.ready) return;
+    sp.ready = true;
+    p.splashTick();
+}
+
+/// Ends the splash now (e.g. before a screen the user must answer).
+pub fn endSplash(p: *Presenter) void {
+    const sp = p.splash orelse return;
+    if (sp.thread) |t| t.join(); // a bounded decode
+    if (sp.decoded) |*d| d.deinit(p.gpa);
+    p.gpa.destroy(sp);
+    p.splash = null;
+    // The image region's pixels at (0, 0) were the splash's.
+    p.img.wipe();
+    p.dirty = true;
+}
+
+pub fn splashActive(p: *const Presenter) bool {
+    return p.splash != null;
+}
+
+/// Applies the splash's deadlines and the decode result.
+fn splashTick(p: *Presenter) void {
+    const sp = p.splash orelse return;
+    const now = p.nowMs();
+    const done = sp.done.load(.acquire);
+    if (done and sp.decoded == null) return p.endSplash(); // undecodable: skip it
+    if (now - sp.begun_ms >= splash_max_ms) return p.endSplash();
+    if (sp.ready) {
+        // Ready before the art ever showed: no reason to wait for it.
+        const t = sp.shown_ms orelse return p.endSplash();
+        if (now - t >= splash_min_ms) return p.endSplash();
+    }
+    if (done and sp.shown_ms == null) p.dirty = true;
+}
+
+/// The splash frame: the background, and the art once decoded.
+fn buildSplash(p: *Presenter, sp: *Splash) void {
+    p.instances.clearRetainingCapacity();
+    p.frame.list.clear = theme.palette.bg;
+    p.frame.text_slot = null;
+    if (!sp.done.load(.acquire)) return;
+    const src = sp.decoded orelse return;
+    const fb = p.window.framebufferSize();
+    const room = @min(fb[0], fb[1]);
+    if (room < 16) return;
+    const side: u32 = @min(@as(u32, @intFromFloat(@as(f32, @floatFromInt(room)) * 0.92)), images.region_w, images.region_h);
+    if (side != sp.side) {
+        const px = scaleArt(p.gpa, src, side) orelse return;
+        p.img.clearUploads();
+        p.img.uploads.append(p.gpa, .{ .x = 0, .y = 0, .w = side, .h = side, .px = px }) catch {
+            p.gpa.free(px);
+            return;
+        };
+        sp.side = side;
+    }
+    const fw: f32 = @floatFromInt(tex_w);
+    const fh: f32 = @floatFromInt(tex_h);
+    const sf: f32 = @floatFromInt(side);
+    const x = @round((@as(f32, @floatFromInt(fb[0])) - sf) / 2);
+    const y = @round((@as(f32, @floatFromInt(fb[1])) - sf) / 2);
+    const ry: f32 = @floatFromInt(images.region_y);
+    p.push(x, y, sf, sf, .{ 0, ry / fh, sf / fw, (ry + sf) / fh }, .{ 255, 255, 255, 255 });
+    if (sp.shown_ms == null) sp.shown_ms = p.nowMs();
+}
+
+/// `src` scaled to `side x side` RGBA8: box-filtered down (imgdec.scale),
+/// bilinear up (the texture sampler is nearest-neighbour). Null without
+/// memory.
+fn scaleArt(gpa: std.mem.Allocator, src: imgdec.Rgba, side: u32) ?[]u8 {
+    if (side <= src.w and side <= src.h) {
+        const r = imgdec.scale(gpa, src, side, side) catch return null;
+        return r.px;
+    }
+    const out = gpa.alloc(u8, @as(usize, side) * side * 4) catch return null;
+    const sx = @as(f32, @floatFromInt(src.w)) / @as(f32, @floatFromInt(side));
+    const sy = @as(f32, @floatFromInt(src.h)) / @as(f32, @floatFromInt(side));
+    for (0..side) |oy| {
+        const fy = @max(0, (@as(f32, @floatFromInt(oy)) + 0.5) * sy - 0.5);
+        const y0: usize = @min(@as(usize, @intFromFloat(fy)), src.h - 1);
+        const y1 = @min(y0 + 1, src.h - 1);
+        const ty = fy - @as(f32, @floatFromInt(y0));
+        for (0..side) |ox| {
+            const fx = @max(0, (@as(f32, @floatFromInt(ox)) + 0.5) * sx - 0.5);
+            const x0: usize = @min(@as(usize, @intFromFloat(fx)), src.w - 1);
+            const x1 = @min(x0 + 1, src.w - 1);
+            const tx = fx - @as(f32, @floatFromInt(x0));
+            const o = out[(oy * side + ox) * 4 ..][0..4];
+            for (0..4) |k| {
+                const a: f32 = @floatFromInt(src.px[(y0 * src.w + x0) * 4 + k]);
+                const b: f32 = @floatFromInt(src.px[(y0 * src.w + x1) * 4 + k]);
+                const c: f32 = @floatFromInt(src.px[(y1 * src.w + x0) * 4 + k]);
+                const d: f32 = @floatFromInt(src.px[(y1 * src.w + x1) * 4 + k]);
+                const top = a + (b - a) * tx;
+                const bot = c + (d - c) * tx;
+                o[k] = @intFromFloat(@round(top + (bot - top) * ty));
+            }
+        }
+    }
+    return out;
+}
+
+test "splash art scaling: down box, up bilinear" {
+    const gpa = std.testing.allocator;
+    var px: [2 * 2 * 4]u8 = .{ 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255 };
+    const src: imgdec.Rgba = .{ .w = 2, .h = 2, .px = &px };
+    const up = scaleArt(gpa, src, 4).?;
+    defer gpa.free(up);
+    try std.testing.expectEqual(@as(u8, 0), up[0]);
+    try std.testing.expect(up[4] > 0 and up[4] < 255); // blended
+    try std.testing.expectEqual(@as(u8, 255), up[3 * 4]);
+    const down = scaleArt(gpa, src, 1).?;
+    defer gpa.free(down);
+    try std.testing.expect(down[0] > 100 and down[0] < 155);
 }
 
 // ------------------------------------------------------ native text field

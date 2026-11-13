@@ -175,6 +175,9 @@ pub const LocalHost = struct {
             .sizing = .{ .fixed_em = font_em },
         });
         errdefer p.deinit();
+        // The hero art while the session starts (ends at the first output
+        // of the shown tab, or at any input; Presenter.beginSplash).
+        p.beginSplash(view.hero_png);
         const h = try gpa.create(LocalHost);
         h.* = .{ .gpa = gpa, .io = io, .p = p };
         h.shell = ui.Shell.init(gpa, .desk, .{ .ctx = h, .vtable = &host_vtable });
@@ -230,6 +233,7 @@ pub const LocalHost = struct {
     /// configuration could not be used): runs its own event-driven loop
     /// until the desk submits it, or returns null if the window is closed.
     pub fn runSetup(h: *LocalHost, in: SetupInput) ?SetupValues {
+        h.p.endSplash(); // the panel needs answers
         h.ui.openSetup(in.first_run, in.listen, in.program, in.project, in.policy);
         if (in.problem.len > 0) h.ui.setNote(.bad, "{s}", .{in.problem});
         h.setup_submitted = false;
@@ -374,6 +378,8 @@ pub const LocalHost = struct {
         if (changed) _ = h.shell.data.sync(h.gpa, &h.grid.images);
 
         if (changed) h.shell.clampSelection(h.grid.cols, h.grid.rows);
+        // The session shows something: the splash may end.
+        if (changed and h.shown != null) h.p.splashDone();
         h.shell.touch = client.touchkbd.query();
         if (!force and !changed and !list_changed and !act_changed and old == null and !h.p.needsRedraw() and h.viewers == h.drawn_viewers) return;
         h.drawn_viewers = h.viewers;
