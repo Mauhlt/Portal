@@ -87,8 +87,10 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{ .name = "portal", .root_module = gui_root.root });
     exe.subsystem = .windows; // no console window, ever
+    addAppIcon(b, exe);
     b.installArtifact(exe);
     const ctl_exe = b.addExecutable(.{ .name = "portalctl", .root_module = ctl_root.root });
+    addAppIcon(b, ctl_exe);
     b.installArtifact(ctl_exe);
     const show_exe = b.addExecutable(.{ .name = "portal-show", .root_module = showModule(b, target, optimize, gui_root.gui.imgcheck) });
     b.installArtifact(show_exe);
@@ -117,8 +119,10 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(release_exe);
     const launcher_exe = b.addExecutable(.{ .name = "portal-launcher", .root_module = launcherModule(b, target, optimize, true) });
     launcher_exe.subsystem = .windows;
+    addAppIcon(b, launcher_exe);
     b.installArtifact(launcher_exe);
     const launcher_con = b.addExecutable(.{ .name = "portal-launcher-console", .root_module = launcherModule(b, target, optimize, false) });
+    addAppIcon(b, launcher_con);
     b.installArtifact(launcher_con);
 
     // `zig build release` tests and promotes with the compiler running this
@@ -196,7 +200,54 @@ pub fn build(b: *std.Build) void {
 
     addE2e(b, target, optimize, gui_mods, ctl_exe, show_exe);
     addIos(b, optimize, test_step);
+    addBrand(b, test_step);
 }
+
+/// Windows: links docs/brand/portal.ico as icon resource 1 (Explorer,
+/// the taskbar; the window sets it from there with WM_SETICON). The
+/// one-line resource script is generated here, next to a copy of the icon.
+fn addAppIcon(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    if (exe.rootModuleTarget().os.tag != .windows) return;
+    const wf = b.addWriteFiles();
+    _ = wf.addCopyFile(b.path("docs/brand/portal.ico"), "portal.ico");
+    const rc = wf.add("portal.rc", "1 ICON \"portal.ico\"\n");
+    exe.root_module.addWin32ResourceFile(.{ .file = rc });
+}
+
+/// `zig build brand`: regenerates docs/brand's raster assets (the icon
+/// PNGs, portal.ico, the embedded hero PNG) with src/tools/brand.zig. Its
+/// outputs are committed; normal builds only read them.
+fn addBrand(b: *std.Build, test_step: *std.Build.Step) void {
+    const host = b.graph.host;
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/brand.zig"),
+        .target = host,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "Image", .module = b.dependency("Image", .{ .target = host, .optimize = .ReleaseFast }).module("Image") }},
+    });
+    const tool = b.addExecutable(.{ .name = "portal-brand", .root_module = mod });
+    const step = b.step("brand", "Regenerate docs/brand's icon PNGs, portal.ico and the embedded hero PNG");
+    const icons = b.addRunArtifact(tool);
+    icons.addArgs(&.{ "icons", "docs/brand" });
+    icons.setCwd(b.path("."));
+    icons.has_side_effects = true;
+    step.dependOn(&icons.step);
+    const hero = b.addRunArtifact(tool);
+    hero.addArgs(&.{ "hero", "docs/brand/portal-hero.jpg", hero_png, b.fmt("{d}", .{hero_side}) });
+    hero.setCwd(b.path("."));
+    hero.has_side_effects = true;
+    step.dependOn(&hero.step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/brand.zig"),
+        .target = host,
+        .optimize = .Debug,
+        .imports = &.{.{ .name = "Image", .module = b.dependency("Image", .{ .target = host, .optimize = .Debug }).module("Image") }},
+    }) })).step);
+}
+
+/// The hero art Portal embeds (splash, About), made by `zig build brand`.
+const hero_png = "docs/brand/portal-hero-768.png";
+const hero_side = 768;
 
 /// The laptop client's executable (as client/build.zig builds it) for `t`.
 fn laptopClientCheck(b: *std.Build, t: std.Build.ResolvedTarget) *std.Build.Step.Compile {
@@ -426,6 +477,8 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
             .{ .name = "portal_ui", .module = ui },
         },
     });
+    // The hero art for the start-up splash (docs/brand, `zig build brand`).
+    view.addAnonymousImport("portal_hero", .{ .root_source_file = b.path(hero_png) });
     const client = b.createModule(.{
         .root_source_file = b.path("client/src/connect.zig"),
         .target = target,
@@ -504,7 +557,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
         .imports = &.{.{ .name = "WireGuard", .module = b.dependency("WireGuard", .{ .target = b.graph.host, .optimize = .Debug }).module("WireGuard") }},
     }) })).step);
 
-    // Placeholder icon and the tools' own tests.
+    // The app icon (drawn by src/tools/icon_art.zig) and the tools' own tests.
     const icon_tool = b.addExecutable(.{ .name = "ios-icon", .root_module = b.createModule(.{
         .root_source_file = b.path("src/tools/ios_icon.zig"),
         .target = b.graph.host,

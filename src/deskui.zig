@@ -229,7 +229,7 @@ test "settings: Show system monitor is a fifth choice (not on the first run), of
     try testing.expect(!s.setup.sysmon);
     var b2: Ui.Bufs = .{};
     const p = s.panel(&b2, .{}).?;
-    try testing.expectEqual(@as(usize, 5), p.fields.len);
+    try testing.expectEqual(@as(usize, 6), p.fields.len);
     try testing.expectEqualStrings("Off", p.fields[4].value);
     // A click focuses it, a second click flips it; Left/Right and space too.
     _ = s.button(id.field0 + 4);
@@ -241,7 +241,24 @@ test "settings: Show system monitor is a fifth choice (not on the first run), of
     _ = s.char(' ', .{});
     try testing.expect(s.setup.sysmon);
     try testing.expectEqual(rules.Policy.keys, s.setup.input); // the policy is untouched
+    // Enter: on to "Background art", then submit.
+    try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.setup_submit, s.key(.enter, .{}));
+}
+
+test "settings: Background art is a sixth choice, on by default" {
+    var s: Ui = .{};
+    s.openSetup(false, "a", "b", "c", .keys);
+    try testing.expect(s.setup.bg_art);
+    var b: Ui.Bufs = .{};
+    const p = s.panel(&b, .{}).?;
+    try testing.expect(std.mem.startsWith(u8, p.fields[5].value, "On"));
+    _ = s.button(id.field0 + 5);
+    _ = s.button(id.field0 + 5);
+    try testing.expect(!s.setup.bg_art);
+    _ = s.key(.right, .{});
+    try testing.expect(s.setup.bg_art);
+    try testing.expect(s.setup.sysmon == false); // the monitor is untouched
 }
 
 test "export: needs a folder" {

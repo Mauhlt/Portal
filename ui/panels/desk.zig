@@ -115,6 +115,9 @@ pub fn Panels(comptime devices: type) type {
             /// "Show system monitor" (Settings only, not the first run):
             /// the System button and its sampling (src/sysmon.zig).
             sysmon: bool = false,
+            /// "Background art" (Settings only): the hero art, faint,
+            /// behind the window's content.
+            bg_art: bool = true,
         };
 
         pub const Ui = struct {
@@ -373,7 +376,7 @@ pub fn Panels(comptime devices: type) type {
             /// Fields of the current screen, in focus order (fields come first).
             fn fieldCount(ui: *const Ui) u8 {
                 return switch (ui.screen) {
-                    .setup => if (ui.setup.first_run) 4 else 5,
+                    .setup => if (ui.setup.first_run) 4 else 6,
                     .pair_name, .export_form => 1,
                     else => 0,
                 };
@@ -505,6 +508,8 @@ pub fn Panels(comptime devices: type) type {
                             ui.setup.input = cyclePolicy(ui.setup.input, k == .right);
                         } else if (ui.screen == .setup and ui.focus.index == 4) {
                             ui.setup.sysmon = !ui.setup.sysmon;
+                        } else if (ui.screen == .setup and ui.focus.index == 5) {
+                            ui.setup.bg_art = !ui.setup.bg_art;
                         } else if (ui.focusedField() == null) {
                             if (k == .left) ui.focus.prev() else ui.focus.next();
                         }
@@ -533,7 +538,7 @@ pub fn Panels(comptime devices: type) type {
                     switch (f) {
                         .text => |t| _ = t.insert_cp(t.ctx, cp),
                         .choice => if (cp == ' ') {
-                            if (ui.focus.index == 4) ui.setup.sysmon = !ui.setup.sysmon else ui.setup.input = cyclePolicy(ui.setup.input, true);
+                            if (ui.focus.index == 4) ui.setup.sysmon = !ui.setup.sysmon else if (ui.focus.index == 5) ui.setup.bg_art = !ui.setup.bg_art else ui.setup.input = cyclePolicy(ui.setup.input, true);
                         },
                     }
                     return .none;
@@ -554,6 +559,7 @@ pub fn Panels(comptime devices: type) type {
                     const i: u8 = @intCast(b - id.field0);
                     if (ui.screen == .setup and i == 3 and ui.focus.index == 3) ui.setup.input = cyclePolicy(ui.setup.input, true);
                     if (ui.screen == .setup and i == 4 and ui.focus.index == 4) ui.setup.sysmon = !ui.setup.sysmon;
+                    if (ui.screen == .setup and i == 5 and ui.focus.index == 5) ui.setup.bg_art = !ui.setup.bg_art;
                     ui.focus.index = i;
                     return .none;
                 }
@@ -680,7 +686,7 @@ pub fn Panels(comptime devices: type) type {
                 lines: [14]frame.PanelText = undefined,
                 after: [6]frame.PanelText = undefined,
                 rows: [@max(devices.max_devices, max_pkgs)]frame.PanelRow = undefined,
-                fields: [5]frame.PanelField = undefined,
+                fields: [6]frame.PanelField = undefined,
                 buttons: [4]frame.PanelButton = undefined,
                 txt: [14][200]u8 = undefined,
                 row_txt: [@max(devices.max_devices, max_pkgs)][120]u8 = undefined,
@@ -768,7 +774,8 @@ pub fn Panels(comptime devices: type) type {
                         p.fields = bufs.fields[0..4];
                         if (!ui.setup.first_run) {
                             bufs.fields[4] = .{ .label = "Show system monitor (Left/Right to change; applies now)", .value = if (ui.setup.sysmon) "On: a System button shows CPU, memory, GPU and each tab's load" else "Off", .id = id.field0 + 4, .focused = f == 4, .choice = true };
-                            p.fields = bufs.fields[0..5];
+                            bufs.fields[5] = .{ .label = "Background art (Left/Right to change; applies now)", .value = if (ui.setup.bg_art) "On: the Portal art, faint, behind the terminal" else "Off", .id = id.field0 + 5, .focused = f == 5, .choice = true };
+                            p.fields = bufs.fields[0..6];
                         }
                         L.add(&bufs.after, &na, .{ .text = policyHelp(ui.setup.input), .tone = if (ui.setup.input == .text) .bad else .muted });
                         if (ui.setup.sysmon and !ui.setup.first_run) L.add(&bufs.after, &na, .{ .text = "The monitor measures only while a System panel is open (once a second); off, it never measures." });
