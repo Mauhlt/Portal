@@ -1976,6 +1976,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .tls_dir = tls_dir,
             .saved = saved,
             .open_ctx = env,
+            .env = env,
             .open_fn = deskOpen,
         });
         server.pairing_notify_ctx = h;

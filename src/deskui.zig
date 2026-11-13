@@ -18,6 +18,7 @@ pub const max_pkgs = P.max_pkgs;
 pub const PairResult = P.PairResult;
 pub const Setup = P.Setup;
 pub const Ui = P.Ui;
+pub const AgentHooks = P.AgentHooks;
 pub const cyclePolicy = P.cyclePolicy;
 pub const policyLabel = P.policyLabel;
 pub const ago = P.ago;
@@ -229,7 +230,7 @@ test "settings: Show system monitor is a fifth choice (not on the first run), of
     try testing.expect(!s.setup.sysmon);
     var b2: Ui.Bufs = .{};
     const p = s.panel(&b2, .{}).?;
-    try testing.expectEqual(@as(usize, 6), p.fields.len);
+    try testing.expectEqual(@as(usize, 7), p.fields.len);
     try testing.expectEqualStrings("Off", p.fields[4].value);
     // A click focuses it, a second click flips it; Left/Right and space too.
     _ = s.button(id.field0 + 4);
@@ -241,7 +242,8 @@ test "settings: Show system monitor is a fifth choice (not on the first run), of
     _ = s.char(' ', .{});
     try testing.expect(s.setup.sysmon);
     try testing.expectEqual(rules.Policy.keys, s.setup.input); // the policy is untouched
-    // Enter: on to "Background art", then submit.
+    // Enter: on to "Background art", "Claude Code integration", then submit.
+    try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.setup_submit, s.key(.enter, .{}));
 }
@@ -279,4 +281,28 @@ test "ago" {
     try testing.expectEqualStrings("3 h ago", ago(3 * 3600 + 10, 10, &b));
     try testing.expectEqualStrings("4 days ago", ago(4 * 86400 + 10, 10, &b));
     try testing.expectEqualStrings("never", ago(100, 0, &b));
+}
+
+test "settings: agent integration is a seventh choice that acts at once (not on the first run)" {
+    var s: Ui = .{};
+    s.openSetup(false, "a", "b", "c", .keys);
+    s.setup.agent = .not_installed;
+    var b: Ui.Bufs = .{};
+    var p = s.panel(&b, .{}).?;
+    try testing.expect(std.mem.indexOf(u8, p.fields[6].value, "Not installed") != null);
+    // The first click focuses it, the second asks the glue to act.
+    try testing.expectEqual(Action.none, s.button(id.field0 + 6));
+    try testing.expectEqual(Action.agent_hooks, s.button(id.field0 + 6));
+    try testing.expectEqual(Action.agent_hooks, s.key(.right, .{}));
+    try testing.expectEqual(Action.agent_hooks, s.char(' ', .{}));
+    s.setup.agent = .installed;
+    p = s.panel(&b, .{}).?;
+    try testing.expect(std.mem.indexOf(u8, p.fields[6].value, "Remove") != null);
+    // Nothing else changed.
+    try testing.expect(!s.setup.sysmon and s.setup.bg_art);
+    // Not on the first run.
+    var f: Ui = .{};
+    f.openSetup(true, "a", "b", "c", .keys);
+    var fb: Ui.Bufs = .{};
+    try testing.expectEqual(@as(usize, 4), f.panel(&fb, .{}).?.fields.len);
 }

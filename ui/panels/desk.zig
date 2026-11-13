@@ -82,7 +82,14 @@ pub fn Panels(comptime devices: type) type {
             setup_cancel,
             /// Read the clipboard and call `paste`.
             paste,
+            /// "Claude Code integration": install Portal's hooks in the agent's
+            /// settings.json, or remove them when installed
+            /// (src/agenthooks.zig); the glue sets `ui.setup.agent`.
+            agent_hooks,
         };
+
+        /// What the desk found in the agent's settings.json.
+        pub const AgentHooks = enum { unknown, not_installed, installed, partly, other_exe, unreadable };
 
         pub const DevRow = struct {
             name: devices.Text = .{},
@@ -118,6 +125,9 @@ pub fn Panels(comptime devices: type) type {
             /// "Background art" (Settings only): the hero art, faint,
             /// behind the window's content.
             bg_art: bool = true,
+            /// "Claude Code integration" (Settings only): applies at once
+            /// (Action.agent_hooks), not with the other settings.
+            agent: AgentHooks = .unknown,
         };
 
         pub const Ui = struct {
@@ -376,7 +386,7 @@ pub fn Panels(comptime devices: type) type {
             /// Fields of the current screen, in focus order (fields come first).
             fn fieldCount(ui: *const Ui) u8 {
                 return switch (ui.screen) {
-                    .setup => if (ui.setup.first_run) 4 else 6,
+                    .setup => if (ui.setup.first_run) 4 else 7,
                     .pair_name, .export_form => 1,
                     else => 0,
                 };
@@ -510,6 +520,8 @@ pub fn Panels(comptime devices: type) type {
                             ui.setup.sysmon = !ui.setup.sysmon;
                         } else if (ui.screen == .setup and ui.focus.index == 5) {
                             ui.setup.bg_art = !ui.setup.bg_art;
+                        } else if (ui.screen == .setup and ui.focus.index == 6) {
+                            return .agent_hooks;
                         } else if (ui.focusedField() == null) {
                             if (k == .left) ui.focus.prev() else ui.focus.next();
                         }
@@ -538,6 +550,7 @@ pub fn Panels(comptime devices: type) type {
                     switch (f) {
                         .text => |t| _ = t.insert_cp(t.ctx, cp),
                         .choice => if (cp == ' ') {
+                            if (ui.focus.index == 6) return .agent_hooks;
                             if (ui.focus.index == 4) ui.setup.sysmon = !ui.setup.sysmon else if (ui.focus.index == 5) ui.setup.bg_art = !ui.setup.bg_art else ui.setup.input = cyclePolicy(ui.setup.input, true);
                         },
                     }
@@ -560,8 +573,9 @@ pub fn Panels(comptime devices: type) type {
                     if (ui.screen == .setup and i == 3 and ui.focus.index == 3) ui.setup.input = cyclePolicy(ui.setup.input, true);
                     if (ui.screen == .setup and i == 4 and ui.focus.index == 4) ui.setup.sysmon = !ui.setup.sysmon;
                     if (ui.screen == .setup and i == 5 and ui.focus.index == 5) ui.setup.bg_art = !ui.setup.bg_art;
+                    const act: Action = if (ui.screen == .setup and i == 6 and ui.focus.index == 6) .agent_hooks else .none;
                     ui.focus.index = i;
-                    return .none;
+                    return act;
                 }
                 if (b >= id.pkg0 and b < id.pkg0 + ui.n_pkgs and ui.screen == .dev_packages) {
                     ui.focus.index = @intCast(b - id.pkg0);
@@ -686,7 +700,7 @@ pub fn Panels(comptime devices: type) type {
                 lines: [14]frame.PanelText = undefined,
                 after: [6]frame.PanelText = undefined,
                 rows: [@max(devices.max_devices, max_pkgs)]frame.PanelRow = undefined,
-                fields: [6]frame.PanelField = undefined,
+                fields: [7]frame.PanelField = undefined,
                 buttons: [4]frame.PanelButton = undefined,
                 txt: [14][200]u8 = undefined,
                 row_txt: [@max(devices.max_devices, max_pkgs)][120]u8 = undefined,
@@ -743,6 +757,17 @@ pub fn Panels(comptime devices: type) type {
                 };
             }
 
+            fn agentLabel(c: AgentHooks) []const u8 {
+                return switch (c) {
+                    .unknown => "Unknown",
+                    .not_installed => "Not installed: [Install]",
+                    .installed => "Installed: tabs show when Claude works, waits or is done [Remove]",
+                    .partly => "Partly installed: [Install] completes it",
+                    .other_exe => "Installed for another Portal: [Install] points it here",
+                    .unreadable => "Claude Code's settings.json could not be read (see the note)",
+                };
+            }
+
             /// The panel to draw now, or null. Strings live in `bufs` and `ui`.
             pub fn panel(ui: *const Ui, bufs: *Bufs, c: Ctx) ?frame.Panel {
                 bufs.n_txt = 0;
@@ -775,9 +800,11 @@ pub fn Panels(comptime devices: type) type {
                         if (!ui.setup.first_run) {
                             bufs.fields[4] = .{ .label = "Show system monitor (Left/Right to change; applies now)", .value = if (ui.setup.sysmon) "On: a System button shows CPU, memory, GPU and each tab's load" else "Off", .id = id.field0 + 4, .focused = f == 4, .choice = true };
                             bufs.fields[5] = .{ .label = "Background art (Left/Right to change; applies now)", .value = if (ui.setup.bg_art) "On: the Portal art, faint, behind the terminal" else "Off", .id = id.field0 + 5, .focused = f == 5, .choice = true };
-                            p.fields = bufs.fields[0..6];
+                            bufs.fields[6] = .{ .label = "Claude Code integration (Left/Right or click to install or remove; applies now)", .value = agentLabel(ui.setup.agent), .id = id.field0 + 6, .focused = f == 6, .choice = true };
+                            p.fields = bufs.fields[0..7];
                         }
                         L.add(&bufs.after, &na, .{ .text = policyHelp(ui.setup.input), .tone = if (ui.setup.input == .text) .bad else .muted });
+                        if (!ui.setup.first_run and f == 6) L.add(&bufs.after, &na, .{ .text = "Adds Portal's hooks to Claude Code's settings.json (a backup is kept next to it): each runs `portalctl hook`, which tells this Portal, over a pipe only you can open, when Claude in a tab works, waits for an answer or is done. Nothing is sent outside this computer." });
                         if (ui.setup.sysmon and !ui.setup.first_run) L.add(&bufs.after, &na, .{ .text = "The monitor measures only while a System panel is open (once a second); off, it never measures." });
                     },
                     .pair_name => {
