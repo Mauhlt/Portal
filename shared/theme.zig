@@ -185,6 +185,12 @@ pub const ui = struct {
     pub const selected_row = palette.inactive;
     /// A tab whose program waits for an answer.
     pub const attention = palette.warn_fg;
+    /// A swipe card (Yes/No question) while held: its neutral colour, and
+    /// the colours it moves towards on the Yes and the No side (full at the
+    /// answer threshold). Its fill is the colour mixed into the background.
+    pub const swipe_hold = palette.yellow_warmer;
+    pub const swipe_yes = palette.green;
+    pub const swipe_no = palette.red;
     pub const tab_text = palette.fg;
     pub const tab_text_inactive = palette.dim;
     /// The modal layer's dimming of what is behind it (alpha).

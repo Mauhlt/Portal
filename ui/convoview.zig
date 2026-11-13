@@ -27,7 +27,12 @@
 //! up it keeps its place (anchored on the item at the top) and a pill
 //! offers to jump to the newest.
 //!
-//! Swiping (the owner's "Tinder for agent questions"), guarded against
+//! Swiping (the owner's "Tinder for agent questions"): a press on the card
+//! grabs it (it grows to `grab_scale` and gives a short shake, plus a light
+//! haptic through `haptic` on the iPhone); dragged sideways it follows the
+//! pointer with a slight tilt, its colour moving from the held yellow
+//! towards green (the Yes side) or red (the No side), full at the threshold
+//! (`swipeTint`; colour only, no text, no transparency). Guarded against
 //! accidental approvals: only the newest open question, only Yes/No ones
 //! (`yesNo`), only a drag whose horizontal movement dominates (`classify`;
 //! vertical ones scroll), not within `swipe_guard_ms` of the card really
@@ -75,6 +80,12 @@ pub const fly_ms: i64 = 180;
 pub const spring_ms: i64 = 160;
 /// An animation frame's deadline (about the display rate).
 pub const anim_frame_ms: u32 = 16;
+/// Grab feedback: the held card's size, reached in `grab_in_ms`, and a
+/// shake of three small rotations (`shake_deg`) decaying over `shake_ms`.
+pub const grab_scale: f32 = 1.045;
+pub const grab_in_ms: i64 = 120;
+pub const shake_ms: i64 = 180;
+pub const shake_deg: f32 = 2;
 /// Text sizes (logical px): the conversation and its small lines.
 pub const body_em: f32 = 14;
 pub const small_em: f32 = 12;
@@ -201,6 +212,32 @@ pub fn commitSide(offset: f32, card_w: f32, s: f32) ?Dir {
     if (offset >= need) return .right;
     if (offset <= -need) return .left;
     return null;
+}
+
+/// The held card's scale `since` ms after the grab (eased in).
+pub fn grabScale(since: i64) f32 {
+    const t = std.math.clamp(@as(f32, @floatFromInt(since)) / @as(f32, @floatFromInt(grab_in_ms)), 0, 1);
+    return 1 + (grab_scale - 1) * (1 - (1 - t) * (1 - t));
+}
+
+/// The grab shake's rotation (radians) `since` ms after the grab: three
+/// quick swings, decaying to nothing at `shake_ms`.
+pub fn grabShake(since: i64) f32 {
+    if (since <= 0 or since >= shake_ms) return 0;
+    const t = @as(f32, @floatFromInt(since)) / @as(f32, @floatFromInt(shake_ms));
+    return shake_deg * std.math.pi / 180 * @sin(2 * std.math.pi * 3 * t) * (1 - t);
+}
+
+/// A held swipe card's colours at `offset` px (threshold `need` px):
+/// yellow at rest, towards green on the Yes side and red on the No side,
+/// fully there at the threshold. Opaque: colour only.
+pub const Tint = struct { border: Rgb, fill: Rgb };
+pub fn swipeTint(offset: f32, need: f32, ys: YesSide) Tint {
+    const hold = theme.ui.swipe_hold;
+    const k = if (offset == 0 or !(need > 0)) 0 else std.math.clamp(@abs(offset) / need, 0, 1);
+    const target: Rgb = if (ys.answer(if (offset > 0) .right else .left) == .yes) theme.ui.swipe_yes else theme.ui.swipe_no;
+    const border = mix(hold, target, k);
+    return .{ .border = border, .fill = mix(border, theme.palette.bg, 0.8) };
 }
 
 /// Swipes are allowed `swipe_guard_ms` after the card appeared.
@@ -388,6 +425,20 @@ const Swipe = struct {
     from: f32 = 0,
     to: f32 = 0,
     t0: i64 = 0,
+    /// When the card was grabbed (its feedback; the answer guard counts
+    /// from the card's appearance to this press).
+    grab_t0: i64 = 0,
+    /// The card's scale when released: a fly-off keeps it, a spring-back
+    /// returns from it.
+    rel_k: f32 = 1,
+};
+
+/// A light haptic tap on grabbing a card (the iPhone's
+/// UIImpactFeedbackGenerator .light, through the device's window layer);
+/// none on desktops.
+pub const Haptic = struct {
+    ctx: ?*anyopaque = null,
+    grab: *const fn (ctx: ?*anyopaque) void,
 };
 
 pub const Hit = union(enum) { answer: []const u8, button: u32 };
@@ -434,6 +485,8 @@ pub const View = struct {
     sent_n: ?u32 = null,
     /// A swipe card whose "⋯" revealed its buttons.
     revealed_n: ?u32 = null,
+    /// The device's grab haptic (hapticGrab), if any.
+    haptic: ?Haptic = null,
 
     pub fn init(gpa: std.mem.Allocator) View {
         return .{ .gpa = gpa };
@@ -669,7 +722,7 @@ pub const View = struct {
             const rw = @as(f32, @floatFromInt(4 * f.small.cell_w));
             const rh = g.slh + g.cpad;
             e.boxes.append(v.gpa, .{ .x = W - g.qpad + @round(4 * g.s) - rw, .y = g.qpad - @round(g.cpad / 2), .w = rw, .h = rh, .color = theme.ui.button, .kind = .reveal }) catch {};
-            e.lines.append(v.gpa, .{ .str = "\u{22EF}", .x = W - g.qpad + @round(4 * g.s) - rw + @round((rw - @as(f32, @floatFromInt(f.small.cell_w))) / 2), .y = g.qpad, .font = .small, .color = theme.ui.text, .bold = true }) catch {};
+            e.lines.append(v.gpa, .{ .str = "\u{2026}", .x = W - g.qpad + @round(4 * g.s) - rw + @round((rw - @as(f32, @floatFromInt(f.small.cell_w))) / 2), .y = g.qpad, .font = .small, .color = theme.ui.text, .bold = true }) catch {};
         }
         y += g.slh + @round(4 * g.s);
         y += v.layoutText(e, f, g, e.text, g.qpad, y, inner, theme.ui.text, .body, false).h;
@@ -677,8 +730,7 @@ pub const View = struct {
             e.lines.append(v.gpa, .{ .str = "Choose any, then Enter.", .x = g.qpad, .y = y, .font = .small, .color = theme.ui.dim }) catch {};
             y += g.slh;
         }
-        if (e.open and e.options.len > 0) {
-            // Laid out always; drawn only while shown (showsButtons).
+        if (v.showsButtons(e)) {
             y += g.bgap;
             const cw: f32 = @floatFromInt(f.act.cell_w);
             var x = g.qpad;
@@ -695,7 +747,7 @@ pub const View = struct {
                 x += w + g.bgap;
             }
             y += g.bh;
-        } else if (e.open) {
+        } else if (e.open and e.options.len == 0) {
             e.lines.append(v.gpa, .{ .str = "Answer with Keys (below) or in the Terminal.", .x = g.qpad, .y = y + @round(4 * g.s), .font = .small, .color = theme.ui.dim }) catch {};
             y += g.slh + @round(4 * g.s);
         }
@@ -828,6 +880,8 @@ pub const View = struct {
             ids.pill => v.jumpToBottom(),
             ids.reveal => {
                 const n = v.newestOpenQuestion() orelse return true;
+                v.invalidate(v.revealed_n);
+                v.invalidate(n);
                 v.revealed_n = if (v.revealed_n == n) null else n;
             },
             else => return false,
@@ -843,8 +897,16 @@ pub const View = struct {
         return .{ .x = v.col_x, .y = v.rect.y + e.y - v.top, .w = v.colw, .h = e.height };
     }
 
+    /// Item `n` is laid out again (its controls changed).
+    fn invalidate(v: *View, n: ?u32) void {
+        const i = v.find(n orelse return) orelse return;
+        v.entries.items[i].laid = false;
+    }
+
     fn fly(v: *View, to: f32) void {
         const n = v.swipe.n orelse return;
+        v.invalidate(v.revealed_n);
+        v.invalidate(n);
         v.sent_n = n;
         v.revealed_n = null;
         v.swipe.phase = .flying;
@@ -858,15 +920,16 @@ pub const View = struct {
     pub fn drag(v: *View, d: input.Drag) ?[]const u8 {
         switch (d.phase) {
             .down => {
-                if (v.swipe.phase == .flying or v.swipe.phase == .springing) v.swipe = .{};
                 v.swipe = .{ .phase = .pending, .x0 = d.x, .y0 = d.y, .last_y = d.y };
-                // On the newest open Yes/No card, shown long enough?
+                // On the newest open Yes/No card: grab it (the feedback
+                // comes at once; the guard applies to answering).
                 const n = v.newestOpenQuestion() orelse return null;
                 if (!v.isSwipeable(n)) return null;
-                if (!guardPassed(if (v.appear_n == n) v.appear_ms else null, v.clock.ms())) return null;
                 const i = v.find(n).?;
                 if (!v.cardRect(i).contains(d.x, d.y)) return null;
                 v.swipe.n = n;
+                v.swipe.grab_t0 = v.clock.ms();
+                v.hapticGrab();
                 return null;
             },
             .move => switch (v.swipe.phase) {
@@ -899,22 +962,72 @@ pub const View = struct {
                 .swiping => {
                     v.swipe.offset = d.x - v.swipe.x0;
                     const n = v.swipe.n.?;
+                    v.swipe.rel_k = v.cardScale();
                     const dir = commitSide(v.swipe.offset, v.colw, d.scale);
-                    // Still the newest open Yes/No card?
-                    if (dir != null and v.isSwipeable(n)) {
+                    // Past the threshold, shown long enough before the
+                    // press, and still the newest open Yes/No card?
+                    const shown = guardPassed(if (v.appear_n == n) v.appear_ms else null, v.swipe.grab_t0);
+                    if (dir != null and shown and v.isSwipeable(n)) {
                         const yn = yesNo(v.entries.items[v.find(n).?]).?;
                         v.fly(if (dir.? == .right) v.rect.w else -v.rect.w);
                         return if (v.yes_side.answer(dir.?) == .yes) yn.yes else yn.no;
                     }
-                    v.swipe.phase = .springing;
-                    v.swipe.from = v.swipe.offset;
-                    v.swipe.to = 0;
-                    v.swipe.t0 = v.clock.ms();
+                    v.springBack();
+                },
+                // Grabbed and let go without a drag: back to size.
+                .pending => if (v.swipe.n != null) {
+                    v.swipe.rel_k = v.cardScale();
+                    v.springBack();
+                } else {
+                    v.swipe = .{};
                 },
                 else => v.swipe = .{},
             },
         }
         return null;
+    }
+
+    fn springBack(v: *View) void {
+        v.swipe.phase = .springing;
+        v.swipe.from = v.swipe.offset;
+        v.swipe.to = 0;
+        v.swipe.t0 = v.clock.ms();
+    }
+
+    /// The device's grab haptic, if it has one.
+    pub fn hapticGrab(v: *const View) void {
+        if (v.haptic) |h| h.grab(h.ctx);
+    }
+
+    /// The grabbed card is held (pressed, maybe dragging).
+    pub fn held(v: *const View) bool {
+        return v.swipe.n != null and (v.swipe.phase == .pending or v.swipe.phase == .swiping);
+    }
+
+    fn animT(v: *const View) f32 {
+        const dur = if (v.swipe.phase == .flying) fly_ms else spring_ms;
+        return std.math.clamp(@as(f32, @floatFromInt(v.clock.ms() - v.swipe.t0)) / @as(f32, @floatFromInt(dur)), 0, 1);
+    }
+
+    /// The grabbed card's scale now: growing while held, kept by a fly-off,
+    /// back to 1 with a spring-back.
+    pub fn cardScale(v: *const View) f32 {
+        if (v.swipe.n == null) return 1;
+        return switch (v.swipe.phase) {
+            .pending, .swiping => grabScale(v.clock.ms() - v.swipe.grab_t0),
+            .flying => v.swipe.rel_k,
+            .springing => blk: {
+                const t = v.animT();
+                break :blk v.swipe.rel_k + (1 - v.swipe.rel_k) * (1 - (1 - t) * (1 - t));
+            },
+            else => 1,
+        };
+    }
+
+    /// The grab shake's rotation now (radians).
+    pub fn cardShake(v: *const View) f32 {
+        if (v.swipe.n == null or v.swipe.phase == .idle or v.swipe.phase == .scrolling) return 0;
+        return grabShake(v.clock.ms() - v.swipe.grab_t0);
     }
 
     /// The swiped card's offset now (animations advance with the clock and
@@ -941,6 +1054,8 @@ pub const View = struct {
     pub fn frameTimeout(v: *const View) ?u32 {
         return switch (v.swipe.phase) {
             .flying, .springing => anim_frame_ms,
+            // The grab's scale-in and shake; then frames follow the pointer.
+            .pending, .swiping => if (v.swipe.n != null and v.clock.ms() - v.swipe.grab_t0 < @max(grab_in_ms, shake_ms)) anim_frame_ms else null,
             else => null,
         };
     }
@@ -1011,12 +1126,21 @@ pub const View = struct {
         defer p.clip = saved;
         p.clip = .{ r.x, r.y, r.x + r.w, r.y + r.h };
         const offset = v.swipeOffset();
+        const k = v.cardScale();
+        const shake = v.cardShake();
         const newest_q = v.newestOpenQuestion();
         for (v.entries.items) |*e| {
             if (!v.visible(e.*)) continue;
             if (newest_q == e.n) v.shown_q = e.n;
-            const swiped = v.swipe.n == e.n and offset != 0;
-            v.paintEntry(p, e, f, v.col_x, r.y + e.y - v.top, if (swiped) offset else 0);
+            if (v.swipe.n == e.n and (v.held() or offset != 0 or k != 1)) {
+                // The grabbed card: moved, tilted, scaled, tinted.
+                const fk: Fonts = if (k == 1) f else .{ .body = p.metrics(body_em * k), .small = p.metrics(small_em * k), .act = p.metrics(frame.action_em * k), .s = f.s };
+                const need = @max(v.colw * swipe_share, swipe_min_px * f.s);
+                const tilt = std.math.clamp(offset / @max(1, v.colw), -1.5, 1.5) * 0.12 + shake;
+                v.paintEntry(p, e, fk, v.col_x, r.y + e.y - v.top, .{ .dx = offset, .tilt = tilt, .k = k, .cx = v.colw / 2, .cy = e.height / 2, .tint = swipeTint(offset, need, v.yes_side) });
+            } else {
+                v.paintEntry(p, e, f, v.col_x, r.y + e.y - v.top, .{});
+            }
         }
         if (v.pillRect()) |pl| {
             p.fill(pl.r.x, pl.r.y, pl.r.w, pl.r.h, theme.ui.button_active);
@@ -1026,84 +1150,95 @@ pub const View = struct {
         }
     }
 
-    /// Paints item `e` at (ox, oy); a swiped card moves by `dx` and tilts
-    /// (a shear about its centre, rows shifted in proportion), tints towards
-    /// its side and shows the YES / NO stamp.
-    fn paintEntry(v: *View, p: *frame.Painter, e: *Entry, f: Fonts, ox: f32, oy: f32, dx: f32) void {
-        const g = Geo.of(f);
+    /// Paints item `e` at (ox, oy), transformed by `xf` (the grabbed card).
+    fn paintEntry(v: *View, p: *frame.Painter, e: *Entry, f: Fonts, ox: f32, oy: f32, xf: Xform) void {
         const buttons = v.showsButtons(e);
-        const tilt = if (dx == 0) 0 else std.math.clamp(dx / @max(1, v.colw), -1.5, 1.5) * 0.12;
-        const cy = e.height / 2;
-        const k = if (dx == 0) 0 else std.math.clamp(@abs(dx) / @max(1, @max(v.colw * swipe_share, swipe_min_px * f.s)), 0, 1);
-        const towards: Side = v.yes_side.answer(if (dx > 0) .right else .left);
-        const side_c: Rgb = if (towards == .yes) colors.yes else colors.no;
-        const shift = struct {
-            fn at(d: f32, t: f32, c: f32, y: f32) f32 {
-                return @round(d + t * (y - c));
-            }
-        }.at;
+        const plain = xf.plain() and xf.tint == null;
         for (e.boxes.items) |b| {
             if (b.kind == .option and !buttons) continue;
             if (b.kind == .reveal and (!e.open or v.sent_n == e.n or !v.answers)) continue;
             var c = b.color;
-            if (b.kind == .card and dx != 0) c = mix(c, side_c, k * 0.45);
+            if (xf.tint) |t| switch (b.kind) {
+                .card => c = t.fill,
+                .outline => c = t.border,
+                else => {},
+            };
             if (b.kind == .outline) {
-                const t = @max(1, @round(f.s * (if (e.open) @as(f32, 2) else 1)));
-                const oc = if (dx != 0) mix(c, side_c, k) else c;
-                if (dx == 0) {
-                    p.frameRect(ox + b.x, oy + b.y, b.w, b.h, t, oc);
+                const th = @max(1, @round(f.s * (if (e.open) @as(f32, 2) else 1)));
+                if (xf.plain()) {
+                    p.frameRect(ox + b.x, oy + b.y, b.w, b.h, th, c);
                 } else {
-                    p.fill(ox + b.x + shift(dx, tilt, cy, b.y), oy + b.y, b.w, t, oc);
-                    p.fill(ox + b.x + shift(dx, tilt, cy, b.y + b.h), oy + b.y + b.h - t, b.w, t, oc);
-                    v.slices(p, ox + b.x, oy, b.y, t, b.h, dx, tilt, cy, oc, f.s);
-                    v.slices(p, ox + b.x + b.w - t, oy, b.y, t, b.h, dx, tilt, cy, oc, f.s);
+                    const y0 = xf.ty(b.y);
+                    const y1 = xf.ty(b.y + b.h);
+                    p.fill(ox + xf.tx(b.x, y0), oy + y0, b.w * xf.k, th, c);
+                    p.fill(ox + xf.tx(b.x, y1), oy + y1 - th, b.w * xf.k, th, c);
+                    slices(p, ox, oy, b.x, b.y, th / xf.k, b.h, xf, c, f.s);
+                    slices(p, ox, oy, b.x + b.w - th / xf.k, b.y, th / xf.k, b.h, xf, c, f.s);
                 }
                 continue;
             }
-            if (dx == 0) {
+            if (xf.plain()) {
                 p.fill(ox + b.x, oy + b.y, b.w, b.h, c);
                 if (b.kind == .option and !v.answers) p.frameRect(ox + b.x, oy + b.y, b.w, b.h, @max(1, @round(f.s)), theme.ui.border);
             } else {
-                v.slices(p, ox + b.x, oy, b.y, b.w, b.h, dx, tilt, cy, c, f.s);
+                slices(p, ox, oy, b.x, b.y, b.w, b.h, xf, c, f.s);
             }
-            if (b.kind == .option and v.answers and dx == 0) p.tapAnswer(ox + b.x, oy + b.y, b.w, b.h, e.options[b.opt].key);
-            if (b.kind == .reveal and dx == 0) p.tapButton(ox + b.x, oy + b.y, b.w, b.h, ids.reveal);
+            if (!plain) continue;
+            if (b.kind == .option and v.answers) p.tapAnswer(ox + b.x, oy + b.y, b.w, b.h, e.options[b.opt].key);
+            if (b.kind == .reveal) p.tapButton(ox + b.x, oy + b.y, b.w, b.h, ids.reveal);
         }
         for (e.lines.items) |l| {
             if (l.opt != null and !buttons) continue;
             const m = metricsOf(f, l.font);
-            const sx = if (dx == 0) 0 else shift(dx, tilt, cy, l.y + @as(f32, @floatFromInt(m.cell_h)) / 2);
             const color = if (l.opt != null and !v.answers) theme.ui.dim else l.color;
-            _ = p.run(m, ox + l.x + sx, oy + l.y, l.str, color, l.bold, l.italic, if (l.x1) |x1| ox + x1 + sx else null);
-        }
-        // The stamp.
-        if (dx != 0 and e.kind == .question) {
-            const big = p.metrics(22);
-            const word: []const u8 = if (towards == .yes) "YES" else "NO";
-            const a: u8 = @intFromFloat(@round(255 * k));
-            const sw = textWidth(big, word) + 2 * @as(f32, @floatFromInt(big.cell_w));
-            const sh = @as(f32, @floatFromInt(big.cell_h)) + @round(10 * f.s);
-            const sy = g.qpad + g.slh + @round(4 * f.s);
-            const sx = if (dx > 0) g.qpad else v.colw - g.qpad - sw;
-            const x = ox + sx + shift(dx, tilt, cy, sy + sh / 2);
-            const fade = mix(theme.palette.bg, side_c, @as(f32, @floatFromInt(a)) / 255);
-            p.fill(x, oy + sy, sw, sh, mix(colors.card, theme.palette.bg, 0.3));
-            p.frameRect(x, oy + sy, sw, sh, @max(2, @round(3 * f.s)), fade);
-            _ = p.run(big, x + @as(f32, @floatFromInt(big.cell_w)), oy + sy + @round((sh - @as(f32, @floatFromInt(big.cell_h))) / 2), word, fade, true, false, null);
-        }
-    }
-
-    /// A box drawn as horizontal strips, each shifted by the tilt at its
-    /// height (a rotation's look with axis-aligned rectangles).
-    fn slices(_: *View, p: *frame.Painter, x: f32, oy: f32, y0: f32, w: f32, h: f32, dx: f32, tilt: f32, cy: f32, c: Rgb, s: f32) void {
-        const step = @max(2, @round(3 * s));
-        var y = y0;
-        while (y < y0 + h) : (y += step) {
-            const sh = @min(step, y0 + h - y);
-            p.fill(x + @round(dx + tilt * (y + sh / 2 - cy)), oy + y, w, sh, c);
+            if (xf.plain()) {
+                _ = p.run(m, ox + l.x, oy + l.y, l.str, color, l.bold, l.italic, if (l.x1) |x1| ox + x1 else null);
+                continue;
+            }
+            const y = xf.ty(l.y);
+            const mid = y + @as(f32, @floatFromInt(m.cell_h)) / 2;
+            _ = p.run(m, @round(ox + xf.tx(l.x, mid)), @round(oy + y), l.str, color, l.bold, l.italic, if (l.x1) |x1| ox + xf.tx(x1, mid) else null);
         }
     }
 };
+
+/// The grabbed card's transform, in item coordinates (x from the column's
+/// left, y from the item's top): scaled by `k` about (cx, cy), moved by
+/// `dx`, tilted (rows shifted in proportion to their height: a small
+/// rotation's look with axis-aligned rectangles), tinted.
+const Xform = struct {
+    dx: f32 = 0,
+    tilt: f32 = 0,
+    k: f32 = 1,
+    cx: f32 = 0,
+    cy: f32 = 0,
+    tint: ?Tint = null,
+
+    fn plain(t: Xform) bool {
+        return t.dx == 0 and t.tilt == 0 and t.k == 1;
+    }
+    /// A y after the transform.
+    fn ty(t: Xform, y: f32) f32 {
+        return t.cy + (y - t.cy) * t.k;
+    }
+    /// An x after the transform, on the (transformed) row `y_t`.
+    fn tx(t: Xform, x: f32, y_t: f32) f32 {
+        return t.cx + (x - t.cx) * t.k + t.dx + t.tilt * (y_t - t.cy);
+    }
+};
+
+/// A box (item coordinates) drawn transformed, as horizontal strips each
+/// shifted by the tilt at its height.
+fn slices(p: *frame.Painter, ox: f32, oy: f32, x: f32, y: f32, w: f32, h: f32, xf: Xform, c: Rgb, s: f32) void {
+    const step = @max(2, @round(3 * s));
+    const y0 = xf.ty(y);
+    const y1 = xf.ty(y + h);
+    var yy = y0;
+    while (yy < y1) : (yy += step) {
+        const sh = @min(step, y1 - yy);
+        p.fill(@round(ox + xf.tx(x, yy + sh / 2)), @round(oy + yy), @round(w * xf.k), sh, c);
+    }
+}
 
 // ------------------------------------------------------------------ tests
 
@@ -1550,9 +1685,149 @@ test "the reveal button shows a swipe card's Yes / No buttons" {
     };
     const rb = reveal.?;
     try testing.expectEqual(ids.reveal, v.hitAt(v.col_x + rb.x + 2, r.y + e.y - v.top + rb.y + 2).?.button);
+    // Hidden buttons take no room.
+    for (e.boxes.items) |b| try testing.expect(b.kind != .option);
     try testing.expect(v.button(ids.reveal));
     try testing.expect(v.showsButtons(e));
+    v.prepare(r, tm.fonts);
+    var n_opts: usize = 0;
+    for (e.boxes.items) |b| n_opts += @intFromBool(b.kind == .option);
+    try testing.expectEqual(@as(usize, 2), n_opts);
     for (e.boxes.items) |b| if (b.kind == .option) {
         try testing.expect(v.hitAt(v.col_x + b.x + 2, r.y + e.y - v.top + b.y + 2) != null);
     };
+}
+
+test "swipe tint: yellow held, towards green on the Yes side, red on the No side, full at the threshold" {
+    const need: f32 = 200;
+    const hold = theme.ui.swipe_hold;
+    try testing.expectEqual(hold, swipeTint(0, need, .left).border);
+    // left-yes: left goes green, right goes red.
+    try testing.expectEqual(mix(hold, theme.ui.swipe_yes, 0.5), swipeTint(-100, need, .left).border);
+    try testing.expectEqual(theme.ui.swipe_yes, swipeTint(-200, need, .left).border);
+    try testing.expectEqual(theme.ui.swipe_yes, swipeTint(-500, need, .left).border);
+    try testing.expectEqual(mix(hold, theme.ui.swipe_no, 0.5), swipeTint(100, need, .left).border);
+    try testing.expectEqual(theme.ui.swipe_no, swipeTint(200, need, .left).border);
+    // right-yes: the other way round.
+    try testing.expectEqual(theme.ui.swipe_yes, swipeTint(200, need, .right).border);
+    try testing.expectEqual(theme.ui.swipe_no, swipeTint(-200, need, .right).border);
+    // The fill is the border mixed into the background (opaque).
+    try testing.expectEqual(mix(theme.ui.swipe_no, theme.palette.bg, 0.8), swipeTint(200, need, .left).fill);
+}
+
+test "grab: scaled and shaking at once, enlarged while held, springs back to 1, flies off from the enlarged size" {
+    const gpa = testing.allocator;
+    var c: convo.Conversation = .{};
+    defer c.deinit(gpa);
+    var v = View.init(gpa);
+    defer v.deinit();
+    var clk: TestClock = .{};
+    _ = try swipeSetup(gpa, &c, &v, &clk);
+    const Hap = struct {
+        var n: usize = 0;
+        fn grab(_: ?*anyopaque) void {
+            n += 1;
+        }
+    };
+    v.haptic = .{ .grab = Hap.grab };
+    // Grabbed within the guard: the feedback comes anyway.
+    clk.t = 1100;
+    const card = v.cardRect(1);
+    const cx = card.x + card.w / 2;
+    const cy = card.y + card.h / 2;
+    _ = v.drag(.{ .phase = .down, .x = cx, .y = cy });
+    try testing.expect(v.held());
+    try testing.expectEqual(@as(usize, 1), Hap.n);
+    try testing.expectEqual(@as(f32, 1), v.cardScale());
+    try testing.expectEqual(@as(?u32, anim_frame_ms), v.frameTimeout());
+    clk.t += 40;
+    try testing.expect(v.cardScale() > 1 and v.cardScale() < grab_scale);
+    try testing.expect(v.cardShake() != 0 and @abs(v.cardShake()) <= shake_deg * std.math.pi / 180);
+    clk.t += 200;
+    try testing.expectEqual(grab_scale, v.cardScale());
+    try testing.expectEqual(@as(f32, 0), v.cardShake());
+    try testing.expect(v.frameTimeout() == null); // held still: no frames
+    // Dragged past the threshold but pressed too early: springs back.
+    _ = v.drag(.{ .phase = .move, .x = cx - 50, .y = cy });
+    try testing.expect(v.drag(.{ .phase = .up, .x = cx - 300, .y = cy }) == null);
+    try testing.expectEqual(grab_scale, v.cardScale());
+    clk.t += spring_ms / 2;
+    try testing.expect(v.cardScale() > 1 and v.cardScale() < grab_scale);
+    clk.t += spring_ms;
+    _ = v.swipeOffset();
+    try testing.expectEqual(@as(f32, 1), v.cardScale());
+    try testing.expect(v.frameTimeout() == null);
+    // A tap on the card (no drag): grows, then back to size.
+    _ = v.drag(.{ .phase = .down, .x = cx, .y = cy });
+    clk.t += 150;
+    try testing.expect(v.drag(.{ .phase = .up, .x = cx, .y = cy }) == null);
+    try testing.expect(v.frameTimeout() != null);
+    clk.t += spring_ms;
+    _ = v.swipeOffset();
+    try testing.expectEqual(@as(f32, 1), v.cardScale());
+    // Later: below the threshold springs back, past it flies off enlarged.
+    _ = v.drag(.{ .phase = .down, .x = cx, .y = cy });
+    clk.t += 150;
+    _ = v.drag(.{ .phase = .move, .x = cx - 50, .y = cy });
+    try testing.expect(v.drag(.{ .phase = .up, .x = cx - 120, .y = cy }) == null);
+    clk.t += spring_ms;
+    _ = v.swipeOffset();
+    try testing.expect(!v.held() and v.cardScale() == 1);
+    _ = v.drag(.{ .phase = .down, .x = cx, .y = cy });
+    clk.t += 150;
+    _ = v.drag(.{ .phase = .move, .x = cx - 50, .y = cy });
+    try testing.expectEqualStrings("1", v.drag(.{ .phase = .up, .x = cx - 400, .y = cy }).?);
+    try testing.expectEqual(grab_scale, v.cardScale());
+    clk.t += fly_ms / 2;
+    try testing.expectEqual(grab_scale, v.cardScale());
+    try testing.expectEqual(@as(usize, 4), Hap.n);
+}
+
+test "drawing a held card: tinted, enlarged, no text stamp, opaque" {
+    const gpa = testing.allocator;
+    var fonts = Font.fontset.FontSet.load(gpa, testing.io) catch return error.SkipZigTest;
+    defer fonts.deinit();
+    var c: convo.Conversation = .{};
+    defer c.deinit(gpa);
+    var v = View.init(gpa);
+    defer v.deinit();
+    var clk: TestClock = .{};
+    const perm = [_]wire.Option{ .{ .label = "Yes", .key = "1" }, .{ .label = "No", .key = "esc" } };
+    try testConvo(gpa, &c, true, &.{.{ .n = 2, .kind = .question, .text = "Run npm test?", .open = true, .options = &perm }});
+    v.clock = clk.clock();
+    v.sync(&c);
+    var fr = frame.Frame.init(gpa, .fit_grid);
+    defer fr.deinit();
+    var g: @import("grid.zig").Grid = .{};
+    const o: frame.Overlay = .{ .screen = .{ .view = v.contentView() } };
+    fr.build(&fonts, .{ 1200, 600 }, 1, &g, o);
+    v.presented(0);
+    const card = v.cardRect(0);
+    clk.t = 2000;
+    _ = v.drag(.{ .phase = .down, .x = card.x + 40, .y = card.y + 20 });
+    clk.t += 300;
+    _ = v.drag(.{ .phase = .move, .x = card.x + 40 - 100, .y = card.y + 20 });
+    fr.build(&fonts, .{ 1200, 600 }, 1, &g, o);
+    const need = @max(v.colw * swipe_share, swipe_min_px);
+    const want = swipeTint(-100, need, .left).border;
+    var tinted = false;
+    var widest: f32 = 0;
+    for (fr.list.cmds.items) |cmd| switch (cmd) {
+        .rect => |r| {
+            try testing.expectEqual(@as(u8, 255), r.color[3]);
+            if (r.color[0] == want[0] and r.color[1] == want[1] and r.color[2] == want[2]) {
+                tinted = true;
+                widest = @max(widest, r.w);
+            }
+        },
+        .text => |t| {
+            try testing.expectEqual(@as(u8, 255), t.color[3]);
+            const str = fr.list.textOf(t);
+            try testing.expect(!std.mem.eql(u8, str, "YES") and !std.mem.eql(u8, str, "NO"));
+        },
+        else => {},
+    };
+    try testing.expect(tinted);
+    // The border's top edge: the card's width, enlarged.
+    try testing.expect(widest > v.colw);
 }

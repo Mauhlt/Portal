@@ -114,10 +114,17 @@ keeps the terminal. In the Conversation view the window is minimal:
   owner is left-handed; one device setting, `swipe = left-yes | right-yes`
   in the device's settings.txt next to its pinned servers, e.g.
   `%APPDATA%\Portal\settings.txt`), with touch or a mouse drag; the Left /
-  Right arrows follow the same mapping. The card follows the pointer with a
-  slight tilt, tints towards the side's colour and fades in a green YES or
-  red NO stamp; released past the threshold it flies off and the answer key
-  goes out through the answer path (`k:<key>`), earlier it springs back.
+  Right arrows follow the same mapping. Pressed, the card is grabbed: it
+  grows slightly (about 4.5 %, eased in over 120 ms) with a short decaying
+  shake (three swings of 2 degrees over 180 ms) and a light haptic on the
+  iPhone (`View.haptic`), and stays enlarged while held. Dragged, it
+  follows the pointer with a slight tilt, its colour moving from the held
+  yellow towards green on the Yes side and red on the No side, full at the
+  threshold (theme roles `swipe_hold` / `swipe_yes` / `swipe_no`; colour
+  only: no text stamp, no transparency). Released past the threshold it
+  flies off (from its enlarged size) and the answer key goes out through
+  the answer path (`k:<key>`); earlier it springs back to its place and
+  size.
   Its "⋯" reveals explicit Yes / No buttons. Other questions show their
   options as large buttons (the answer bar's hit-target height). Answered
   cards keep their text; their controls go.
@@ -125,7 +132,8 @@ keeps the terminal. In the Conversation view the window is minimal:
   only past 40 % of the card width and at least 96 logical px; only when the
   horizontal movement dominates (twice the vertical; anything else scrolls
   the list); not within 600 ms of the card really reaching the screen
-  (measured from the frame that showed it, no timers); a tap that became a
+  (measured from the frame that showed it to the press, no timers; the
+  grab feedback is not guarded, answering is); a tap that became a
   drag never presses a button (view buttons fire on release).
 * **The answer bar is hidden**; **Keys** shows it (Esc to interrupt,
   Enter). The **instruction line is hidden**; **Instruct** opens it with
