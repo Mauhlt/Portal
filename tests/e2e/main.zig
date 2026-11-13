@@ -10,7 +10,7 @@
 //! portal-show.exe must sit next to portalctl.exe (the build arranges it).
 //!
 //! Groups: pairing, grid, keys, text, transport, privacy, images, instruct,
-//! console, idle, tls, sync, webinput, ended, tabs (default: all).
+//! console, idle, tls, sync, webinput, ended, tabs, convo (default: all).
 
 const std = @import("std");
 const net = @import("net.zig");
@@ -30,6 +30,7 @@ const webinput = @import("webinput.zig");
 const sync_tests = @import("sync_tests.zig");
 const ended = @import("ended.zig");
 const tabs_tests = @import("tabs_tests.zig");
+const convo_tests = @import("convo_tests.zig");
 
 /// Each run picks its own base port (a multiple of 200 in 20000..59800),
 /// so concurrent runs don't collide; `--base-port N` fixes it. Portal binds
@@ -66,6 +67,7 @@ const groups = [_]Group{
     .{ .name = "webinput", .run = webinput.run, .port_offset = 120 },
     .{ .name = "ended", .run = ended.run, .port_offset = 130 },
     .{ .name = "tabs", .run = tabs_tests.run, .port_offset = 140 },
+    .{ .name = "convo", .run = convo_tests.run, .port_offset = 150 },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -79,6 +81,9 @@ pub fn main(init: std.process.Init) !void {
     // Helper mode for the console group (see console_tests.inject).
     if (args.items.len >= 1 and std.mem.eql(u8, args.items[0], "--inject"))
         @import("win.zig").ExitProcess(console_tests.injectMain(args.items[1..]));
+    // The fake session program of the convo group (see fake_agent.zig).
+    if (args.items.len >= 1 and std.mem.eql(u8, args.items[0], "--fake-agent"))
+        @import("win.zig").ExitProcess(@import("fake_agent.zig").main(gpa, io, init.environ_map));
     if (args.items.len < 1) {
         std.debug.print("usage: e2e <portalctl.exe> [--base-port N] [group...]\n", .{});
         std.process.exit(2);
