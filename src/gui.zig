@@ -50,6 +50,8 @@ const sync_manifest = client.sync.manifest;
 const rules = @import("inputrules");
 const activity_wire = @import("shared").activity;
 const sysinfo = @import("shared").sysinfo;
+const subtabs_wire = @import("shared").subtabs;
+const convo_wire = @import("shared").convo;
 
 /// Font size of the local terminal, in logical pixels (zoom with Ctrl+= / -).
 pub const font_em: f32 = 15;
@@ -168,6 +170,17 @@ pub const LocalHost = struct {
     sys_sub: bool = false,
     sys: sysinfo.Snapshot = .{},
     sys_gen: u64 = 0,
+    /// The shown tab's subagent sub-tabs (section 3e) as of `subs_gen`,
+    /// and the one shown instead of the terminal (null: none): its
+    /// read-only conversation, copied the way a device gets it (the same
+    /// `convo` writer and parser) into the desk's Conversation view.
+    subs: subtabs_wire.List = .{},
+    subs_gen: u64 = 0,
+    sub_shown: ?subtabs_wire.Id = null,
+    sub_epoch: u32 = 0,
+    sub_rev: u64 = 0,
+    sub_convo: ui.convo.Conversation = .{},
+    convo_view: ui.convoview.View = undefined,
 
     const title_max = title.max_title_bytes;
 
@@ -186,6 +199,10 @@ pub const LocalHost = struct {
         h.* = .{ .gpa = gpa, .io = io, .p = p };
         h.shell = ui.Shell.init(gpa, .desk, .{ .ctx = h, .vtable = &host_vtable });
         h.shell.modal = .{ .ctx = h, .active = panelActive, .key = panelKey, .char = panelChar, .button = panelButton };
+        // Sub-tabs only: the desk's main slice is the terminal otherwise.
+        h.convo_view = ui.convoview.View.init(gpa);
+        h.convo_view.answers = false;
+        h.shell.conversation = h.convo_view.contentView();
         return h;
     }
 
@@ -281,7 +298,10 @@ pub const LocalHost = struct {
             if (h.allEnded()) break .finished;
             const changed = h.checkPairing();
             h.frame(changed);
-            h.p.waitEvents(h.waitMs());
+            // A sub-tab's conversation may animate (scrolling to new
+            // items): its real deadline, else the pairing window's.
+            const anim: u32 = if (h.sub_shown != null) (h.convo_view.frameTimeout() orelse Presenter.forever) else Presenter.forever;
+            h.p.waitEvents(@min(h.waitMs(), anim));
             h.wakeups += 1;
         };
         h.hide();
@@ -358,6 +378,9 @@ pub const LocalHost = struct {
             h.grid.deinit(h.gpa);
             h.grid = .{};
             h.shell.select = .{};
+            // Its own sub-tabs; none shown.
+            h.subs_gen = 0;
+            h.sub_shown = null;
         };
         var list_changed = false;
         if (hub.gen != h.list_gen) {
@@ -366,6 +389,37 @@ pub const LocalHost = struct {
             list_changed = true;
         }
         const changed = if (h.shown) |t| h.sync.sync(h.gpa, &h.grid, &t.session.term) else false;
+        // The sub-tabs, and the conversation of the one shown.
+        var sub_changed = false;
+        var sub_msg: std.Io.Writer.Allocating = .init(h.gpa);
+        defer sub_msg.deinit();
+        if (h.shown) |t| {
+            if (t.subs.gen != h.subs_gen) {
+                t.subs.entries(t.id, &h.subs);
+                h.subs_gen = t.subs.gen;
+                sub_changed = true;
+            }
+            if (h.sub_shown) |id| {
+                if (t.subs.byId(id)) |s| {
+                    const cv = &s.convo;
+                    if (cv.epoch != h.sub_epoch) {
+                        cv.writeSnapshot(&sub_msg.writer, s.id) catch {};
+                    } else if (cv.rev != h.sub_rev) {
+                        _ = cv.writeSince(&sub_msg.writer, s.id, h.sub_rev) catch {};
+                    }
+                    h.sub_epoch = cv.epoch;
+                    h.sub_rev = cv.rev;
+                } else {
+                    // It went (the tab's conversation started over).
+                    h.sub_shown = null;
+                    sub_changed = true;
+                }
+            }
+        } else if (h.subs.len > 0 or h.sub_shown != null) {
+            h.subs = .{};
+            h.sub_shown = null;
+            sub_changed = true;
+        }
         h.viewers = hub.viewers;
         var act_changed = false;
         if (hub.activity_gen != h.act_gen or list_changed) {
@@ -379,6 +433,10 @@ pub const LocalHost = struct {
             act_changed = true;
         };
         if (old) |o| o.release();
+        if (sub_msg.written().len > 0) {
+            h.applySubConvo(sub_msg.written());
+            sub_changed = true;
+        }
         // New images become Data items (h.grid is ours: no lock needed).
         if (changed) _ = h.shell.data.sync(h.gpa, &h.grid.images);
 
@@ -386,18 +444,39 @@ pub const LocalHost = struct {
         // The session shows something: the splash may end.
         if (changed and h.shown != null) h.p.splashDone();
         h.shell.touch = client.touchkbd.query();
-        if (!force and !changed and !list_changed and !act_changed and old == null and !h.p.needsRedraw() and h.viewers == h.drawn_viewers) return;
+        if (!force and !changed and !list_changed and !act_changed and !sub_changed and old == null and !h.p.needsRedraw() and h.viewers == h.drawn_viewers) return;
         h.drawn_viewers = h.viewers;
         h.updateTitle();
 
         h.p.build(&h.grid, h.overlay());
         h.p.present();
         h.presents += 1;
+        h.convo_view.presented(std.Io.Clock.awake.now(h.io).toMilliseconds());
         // The on-screen keyboard follows the input box (touch, no keyboard).
         if (h.shell.keyboard != h.keyboard_shown) {
             h.keyboard_shown = h.shell.keyboard;
             client.touchkbd.setVisible(h.p.nativeHandle(), h.keyboard_shown);
         }
+    }
+
+    /// A `convo` / `convo+` message of the sub-tab shown (written under
+    /// the hub's lock from its model): parsed and kept like a device does.
+    fn applySubConvo(h: *LocalHost, msg: []const u8) void {
+        const scratch = h.gpa.create(convo_wire.Scratch) catch return;
+        defer h.gpa.destroy(scratch);
+        scratch.text = h.gpa.alloc(u8, msg.len) catch return;
+        defer h.gpa.free(scratch.text);
+        const m = convo_wire.parse(msg, scratch) orelse return;
+        h.sub_convo.apply(h.gpa, m) catch {};
+        h.convo_view.sync(&h.sub_convo);
+    }
+
+    /// Shows sub-tab `i` of the shown tab (null: its terminal again).
+    fn selectSub(h: *LocalHost, i: ?usize) void {
+        h.sub_shown = if (i) |j| (if (j < h.subs.len) h.subs.items[j].id else null) else null;
+        h.sub_epoch = 0;
+        h.sub_rev = 0;
+        h.frame(true);
     }
 
     /// This frame's state for the shell: the tabs, the panel, the
@@ -407,6 +486,8 @@ pub const LocalHost = struct {
         return h.shell.overlay(.{
             .tabs = h.list.slice(),
             .current = if (h.shown) |t| t.id else null,
+            .subs = h.subs.slice(),
+            .sub_shown = h.sub_shown,
             .panel = h.ui.panel(&h.bufs, .{
                 .fingerprint = if (d) |x| x.fingerprint else null,
                 .url = h.opts.url,
@@ -831,6 +912,7 @@ pub const LocalHost = struct {
         const h = self(ctx);
         switch (c) {
             .select_tab => |i| h.selectTab(i),
+            .select_sub => |i| h.selectSub(i),
             .close_tab => |i| h.closeTab(i),
             .open_tab => h.openTab(),
             .copy => |sel| h.copySelection(sel),

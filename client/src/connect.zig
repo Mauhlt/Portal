@@ -152,6 +152,8 @@ const Host = struct {
     /// Copies of the tab list for this frame (built outside the lock's
     /// writers: the network thread replaces Shared.tabs).
     tabs: client_mod.TabList = .{},
+    /// This frame's copy of the shown tab's sub-tabs (Shared.subs).
+    subs: client_mod.SubList = .{},
     pin_fp_buf: [95]u8 = undefined,
     pin_fp_len: usize = 0,
     sync: *SyncState,
@@ -199,7 +201,9 @@ const Host = struct {
         _ = h.shell.data.sync(h.client.gpa, &s.grid.images);
         // The conversation (copied when it changed) and whether answers go.
         h.convo_view.sync(&s.convo);
-        h.convo_view.answers = if (s.mode) |m| m.acceptsAnswers() else false;
+        // A sub-tab is read-only: its conversation offers no answers.
+        h.convo_view.answers = s.sub_shown == null and (if (s.mode) |m| m.acceptsAnswers() else false);
+        h.subs = s.subs;
         // The tabs: what the top bar draws and what its clicks mean.
         h.tabs = s.tabs;
         var pbuf: [64]u8 = undefined;
@@ -219,6 +223,8 @@ const Host = struct {
         const o = h.shell.overlay(.{
             .tabs = if (st == .connected) h.tabs.slice() else &.{},
             .current = s.current,
+            .subs = if (st == .connected) h.subs.slice() else &.{},
+            .sub_shown = s.sub_shown,
             .panel = panel,
             .activity = if (s.has_activity) &h.activity else null,
             .sys = if (s.has_sys) &h.sys else null,
@@ -315,6 +321,9 @@ const Host = struct {
         const h = self(ctx);
         switch (c) {
             .select_tab => |i| if (i < h.tabs.len) h.client.selectTab(h.tabs.items[i].id),
+            .select_sub => |i| if (i) |j| {
+                if (j < h.subs.len) h.client.showSub(h.subs.items[j].id);
+            } else h.client.showSub(null),
             .pair => h.client.requestPairing(),
             .cancel_pair => h.client.cancelPairing(),
             // A device opens and closes no tabs, has no selection yet, and

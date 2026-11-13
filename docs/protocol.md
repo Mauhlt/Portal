@@ -155,6 +155,7 @@ frames must be masked; no fragmentation; no extensions.
 | `convo` | `id`, `on`, `items` | the whole Conversation view of the tab watched (section 3b): after `hello` and every `session`, and whenever the server starts the conversation over. Replaces what the client had |
 | `convo+` | `id`, `items` | new or changed items of that conversation (section 3b) |
 | `activity` | `sysmon`, `tabs` | every open tab's background tasks and token usage (section 3c): after `hello`, then whenever any of it, the tab list or the desk's system-monitor setting changes |
+| `subtabs` | `id`, `subs` | the subagent sub-tabs of the tab watched (section 3e): after every `session` (and after hello), and whenever they change |
 | `sys` | `cpu`, `mem`, `gpus`, `tabs` | a system monitor sample (section 3d): only to a viewer whose System panel is open (`y:on`), only while the desk's setting is on, about once a second |
 
 ### 3a. Project tabs (sessions)
@@ -248,6 +249,7 @@ that refuses remote clients. Mapping:
 | `Stop` | `done` |
 | `StopFailure` | `error` |
 | `SessionEnd` | `idle` |
+| `SubagentStart`, `SubagentStop` (`agent_id`) | no state: the tab's sub-tabs (section 3e) |
 
 After a hook's permission wait, a tool result or an interrupt in the
 tab's transcript ends it (`working`, `idle`): no hook fires then. A
@@ -325,7 +327,8 @@ ITEM = {"n":<u32>,"k":"<kind>","text":"<text>"
   the answer), `error` (one line, e.g. an API error), `status` (a note:
   "Conversation compacted", "Interrupted", no transcript).
 * Never sent: tool arguments, tool results, file contents, thinking,
-  injected context, subagent transcripts. Every text is scrubbed on the
+  injected context. Subagents' conversations are never mixed in: each
+  is its own read-only sub-tab (section 3e). Every text is scrubbed on the
   desktop: the tab's folder becomes the tab's name (`acme\src\a.zig`),
   any other absolute path becomes `[path]` (drive, UNC, `\\?\`, POSIX,
   `file://`, `~/`, `%VAR%\`, `$HOME/`, URL-encoded), the user's name
@@ -427,6 +430,50 @@ being event-driven, scoped to "a System panel is visible".
 * Numbers and tab ids only: never process names, command lines, paths or
   user names. Sent only to viewers that asked (`y:on`) and only after a
   new sample. Strict parser and writer: `shared/sysinfo.zig`.
+
+### 3e. Subagent sub-tabs (`subtabs`, `a:`)
+
+When the session program in a tab (the agent) starts subagents, each
+is shown as a read-only sub-tab under that tab: its own conversation,
+built on the desktop exactly like the tab's (section 3b, the same
+reader and model) from the subagent's own transcript, which the program
+keeps next to the session's (`<session>\subagents\agent-<id>.jsonl`,
+with `agent-<id>.meta.json` holding its description and, once it ended,
+`finished`; docs/tabs-design.md, "Subagent sub-tabs"). Found by change
+notifications on that folder (and the tab's output, as for the main
+transcript), and by the `SubagentStart` / `SubagentStop` hooks when they
+are installed (section 3a); nothing is polled.
+
+```
+{"t":"subtabs","id":"<tab, 32 hex>","subs":[SUB,...]}
+SUB = {"id":"<32 hex>","name":"<description>","done":true|false}
+```
+
+* Scoped like `convo`: only the tab the viewer watches (`id`); sent after
+  `hello`, after every `session`, and whenever the list changes. At most
+  16 per tab, in the order they appeared.
+* `id`: random, 128 bits, Portal's own: never the subagent's id in the
+  program, never reused while the desktop runs.
+* `name`: the description the session gave the subagent, scrubbed like
+  conversation texts (the tab's folder becomes its name, other paths
+  `[path]`, the user's name `[user]`), one printable line of at most 64
+  bytes, escaped like tab names; `Subagent` until it is known.
+* `done`: the subagent finished. A finished sub-tab stays, read-only,
+  until the tab's conversation starts over (`/clear`, `/resume`: the
+  list empties) or room is needed (the oldest finished one goes first;
+  with 16 running, a new one gets no sub-tab). Subagents that had already
+  finished when the tab took over an earlier session (`/resume`) get none.
+* `a:<sub id>` (client → server, every input mode) shows that sub-tab's
+  conversation: a `convo` snapshot with the sub-tab's `id`, then `convo+`
+  for it. `a:` shows the tab's own again. An id that is not a current
+  sub-tab of the tab watched is the same as `a:` (nothing echoed or told
+  apart); `s:` always shows the new tab's own conversation. A sub-tab
+  that goes while shown falls back the same way (a `convo` snapshot with
+  the tab's id).
+* **Read-only.** While a sub-tab is shown, `k:`, `t:` and `l:` from that
+  viewer are dropped; clients show no Instruct and no answer controls
+  there. Grid frames stay the tab's.
+* Strict parser and writer: `shared/subtabs.zig`.
 
 **Binary frames**: grid updates, always starting with `'G'`, little-endian:
 
@@ -541,6 +588,7 @@ passed, so the program can't read the pair as Alt+key.
 | `t:<utf8>` | type text (only when `input` is `"text"`; a `!` typed at the start of a line is dropped, where "start of a line" means after any key other than the character keys `0`…`9`, `y`, `n`: Enter, Esc, Ctrl+C, Backspace, the arrows, Home, End…) |
 | `l:<line>` | an instruction line (`"instruct"` and `"text"`): Portal rejects a leading `!` (shell), `/` (slash command) or `#` (memory), control characters, line breaks and bidi controls, max 2000 bytes; otherwise it types the line (as a bracketed paste when the program enabled it) and presses Enter |
 | `s:<id>` | watch the open tab `id` (32 hex digits; in every input mode, `none` included). Input sent after it goes to that tab. Answered by `session` (and a snapshot) or, for anything that is not an open tab, `nosession`; rejected ids are logged at the desk, rate limited, never echoed |
+| `a:<sub id>`, `a:` | show that sub-tab of the tab watched (read-only), or the tab's own conversation again (section 3e; every input mode). While a sub-tab is shown, `k:`, `t:` and `l:` are dropped |
 | `y:on`, `y:off` | this viewer's System panel opened / closed (section 3d; every input mode: it is read-only). While the desk's "Show system monitor" is off, `y:on` is ignored and logged at the desk. Closing the connection counts as `y:off` |
 
 `k:`, `t:` and `l:` go to the tab the viewer last chose with `s:` (at

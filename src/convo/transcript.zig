@@ -8,7 +8,8 @@
 //!   unit that is not an ASCII letter or digit replaced by `-`
 //!   (`C:\code\acme` → `C--code-acme`; names over 200 characters are cut
 //!   and get a hash suffix, matched by prefix). Subagent transcripts live
-//!   in `<sessionId>\subagents\` and are not read.
+//!   in `<sessionId>\subagents\` (subagents.zig: each a sub-tab of its
+//!   own, never mixed into the session's view).
 //! * One JSON object per line, appended as the session goes. Records with
 //!   `type` `user`, `assistant` or `system` carry `sessionId`, `cwd`,
 //!   `timestamp`, `uuid`, `isSidechain`; other types (`mode`,

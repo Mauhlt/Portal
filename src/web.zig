@@ -68,6 +68,7 @@ const title = @import("title.zig");
 const win32 = @import("win32.zig");
 const activity_wire = @import("shared").activity;
 const sysinfo = @import("shared").sysinfo;
+const subtabs_wire = @import("shared").subtabs;
 const sysmon = @import("sysmon.zig");
 
 
@@ -1946,6 +1947,12 @@ pub const Server = struct {
         want: Want = .none,
         /// Reader only: unknown-session log lines (rate limited).
         unknown_ids: u32 = 0,
+        /// Guarded by hub.mutex: the conversation the reader asks the
+        /// writer to show (`a:<sub id>` / `a:`, section 3e).
+        sub_want: SubWant = .none,
+        /// Reader only: a sub-tab is shown, which takes no input (k:, t:
+        /// and l: are dropped until `a:` or `s:`).
+        sub_view: bool = false,
         /// The viewer's System panel is open (`y:on`) and the monitor
         /// accepted it: the writer sends `sys` after every sample.
         sys_on: std.atomic.Value(bool) = .init(false),
@@ -1955,6 +1962,7 @@ pub const Server = struct {
         writer_wakes: u32 = 0,
 
         const Want = union(enum) { none, tab: *tabs.Tab, unknown };
+        const SubWant = union(enum) { none, main, sub: tabs.Id };
 
         /// Returns false if the connection should end. Cancelable: the
         /// supervisor can always tear down a sender stuck behind another.
@@ -2089,6 +2097,9 @@ pub const Server = struct {
         } else ws.want = .unknown;
         const old_sel = ws.sel;
         ws.sel = t;
+        // A switch shows the new tab's own conversation.
+        ws.sub_want = .none;
+        ws.sub_view = false;
         hub.mutex.unlock(srv.io);
         hub.cond.broadcast(srv.io);
         if (old_sel) |o| o.release();
@@ -2097,6 +2108,23 @@ pub const Server = struct {
             if (ws.unknown_ids <= 3 or std.math.isPowerOfTwo(ws.unknown_ids))
                 srv.notePreAuth(&srv.input_log, "viewer from {s} asked for a session that is not open ({d} so far)", .{ ws.conn.peer(), ws.unknown_ids });
         }
+    }
+
+    /// `a:<sub id>` from the viewer (reader task): show that sub-tab of the
+    /// tab watched instead of the tab's own conversation; `a:` goes back.
+    /// Anything that is not a current sub-tab of the tab watched (gone,
+    /// another tab's, malformed) is the same as `a:` (nothing echoed or
+    /// told apart). While a sub-tab is shown the viewer's input is dropped:
+    /// sub-tabs are read-only.
+    fn viewSub(srv: *Server, ws: *WsConn, text: []const u8) void {
+        const hub = srv.hub;
+        const id = tabs_wire.parseId(text);
+        hub.mutex.lockUncancelable(srv.io);
+        const ok = if (id) |i| (if (ws.sel) |t| t.subs.byId(i) != null else false) else false;
+        ws.sub_want = if (ok) .{ .sub = id.? } else .main;
+        ws.sub_view = ok;
+        hub.mutex.unlock(srv.io);
+        hub.cond.broadcast(srv.io);
     }
 
     /// `y:on` / `y:off`: the viewer's System panel opened or closed. Only
@@ -2120,6 +2148,16 @@ pub const Server = struct {
         }
         ws.sys_on.store(true, .release);
         srv.hub.broadcast();
+    }
+
+    const Shown = struct { convo: *@import("convo/model.zig").Convo, id: tabs.Id, gone: bool = false };
+
+    /// The conversation a viewer of tab `c` sees: sub-tab `sub`'s, or (no
+    /// sub-tab, or it went: `gone`) the tab's own. Hub lock held.
+    fn shownConvo(c: *tabs.Tab, sub: ?tabs.Id) Shown {
+        const id = sub orelse return .{ .convo = &c.convo, .id = c.id };
+        const s = c.subs.byId(id) orelse return .{ .convo = &c.convo, .id = c.id, .gone = true };
+        return .{ .convo = &s.convo, .id = s.id };
     }
 
     fn wsWriteLoop(srv: *Server, ws: *WsConn, initial: ?*tabs.Tab) void {
@@ -2171,6 +2209,15 @@ pub const Server = struct {
         var convo_rev: u64 = 0;
         var convo_out: std.Io.Writer.Allocating = .init(srv.gpa);
         defer convo_out.deinit();
+        // The shown tab's sub-tabs (section 3e): the list's generation
+        // last sent (0: send it), and the sub-tab whose conversation is
+        // shown instead of the tab's (null: the tab's own).
+        var subs_gen: u64 = 0;
+        var sub_shown: ?tabs.Id = null;
+        const subs_list = srv.gpa.create(subtabs_wire.List) catch return;
+        defer srv.gpa.destroy(subs_list);
+        var subs_out: std.Io.Writer.Allocating = .init(srv.gpa);
+        defer subs_out.deinit();
         // Every tab's background tasks and usage (section 3c): after hello,
         // then whenever any of it (or the tab list) changes.
         var activity_seen: u64 = 0;
@@ -2190,11 +2237,14 @@ pub const Server = struct {
             hub.mutex.lockUncancelable(srv.io);
             const cur_closed = if (cur) |c| c.session.closed else false;
             const cur_gen = if (cur) |c| c.session.term.gen else sent_gen;
-            const convo_changed = if (cur) |c| c.convo.epoch != convo_epoch or c.convo.rev != convo_rev else false;
+            const convo_changed = if (cur) |c| blk: {
+                const cv = shownConvo(c, sub_shown).convo;
+                break :blk cv.epoch != convo_epoch or cv.rev != convo_rev or c.subs.gen != subs_gen;
+            } else false;
             const sys_due = if (srv.sysmon) |m| ws.sys_on.load(.acquire) and m.gen.load(.acquire) != sys_seen else false;
             if (!hub.finished and !full and cur_gen == sent_gen and !(cur_closed and !ended_sent) and !convo_changed and
                 hub.activity_gen == activity_seen and !sys_due and
-                ws.want == .none and hub.gen == seen_gen and !ws.dead.load(.acquire) and expires_in > 0 and
+                ws.want == .none and ws.sub_want == .none and hub.gen == seen_gen and !ws.dead.load(.acquire) and expires_in > 0 and
                 srv.sync_gen.load(.acquire) == sync_seen)
             {
                 hub.cond.waitTimeout(srv.io, &hub.mutex, .{ .duration = .{
@@ -2223,6 +2273,8 @@ pub const Server = struct {
                     full = true;
                     ended_sent = false;
                     convo_epoch = 0;
+                    subs_gen = 0;
+                    sub_shown = null;
                     images.deinit(srv.gpa);
                     images = .{};
                     answer = .session;
@@ -2230,6 +2282,19 @@ pub const Server = struct {
                 .unknown => answer = .nosession,
             }
             ws.want = .none;
+            // The conversation the reader asked for (`a:`).
+            switch (ws.sub_want) {
+                .none => {},
+                .main => {
+                    sub_shown = null;
+                    convo_epoch = 0;
+                },
+                .sub => |id| {
+                    sub_shown = id;
+                    convo_epoch = 0;
+                },
+            }
+            ws.sub_want = .none;
             const list_changed = hub.gen != seen_gen;
             if (list_changed) {
                 hub.entriesLocked(&list);
@@ -2274,18 +2339,34 @@ pub const Server = struct {
                 if (encode_ok) images.collect(srv.gpa, t, srv.nowMs()) catch {
                     encode_ok = false;
                 };
+                // The sub-tabs, when they changed (before the
+                // conversation, which may be one of them).
+                subs_out.clearRetainingCapacity();
+                if (encode_ok and c.subs.gen != subs_gen) {
+                    c.subs.entries(c.id, subs_list);
+                    subtabs_wire.write(&subs_out.writer, c.id, subs_list.slice()) catch {
+                        encode_ok = false;
+                    };
+                    subs_gen = c.subs.gen;
+                }
                 // The conversation: the whole of it after a switch or a
-                // new start, else what changed.
+                // new start, else what changed. A sub-tab that went (the
+                // tab's conversation started over) shows the tab's own.
                 convo_out.clearRetainingCapacity();
-                const cv = &c.convo;
+                const shown = shownConvo(c, sub_shown);
+                if (shown.gone) {
+                    sub_shown = null;
+                    convo_epoch = 0;
+                }
+                const cv = shown.convo;
                 if (encode_ok and (cv.epoch != convo_epoch or cv.rev != convo_rev)) {
                     const cw = &convo_out.writer;
                     if (cv.epoch != convo_epoch) {
-                        cv.writeSnapshot(cw, c.id) catch {
+                        cv.writeSnapshot(cw, shown.id) catch {
                             encode_ok = false;
                         };
                     } else {
-                        _ = cv.writeSince(cw, c.id, convo_rev) catch {
+                        _ = cv.writeSince(cw, shown.id, convo_rev) catch {
                             encode_ok = false;
                         };
                     }
@@ -2330,6 +2411,9 @@ pub const Server = struct {
             }
             var image_frames = images.frames();
             while (image_frames.next()) |f| if (!ws.send(srv, f, .binary)) return;
+            if (subs_out.written().len > 0) {
+                if (!ws.send(srv, subs_out.written(), .text)) return;
+            }
             if (convo_out.written().len > 0) {
                 if (!ws.send(srv, convo_out.written(), .text)) return;
             }
@@ -2470,6 +2554,14 @@ pub const Server = struct {
                     srv.subscribe(ws, payload[2..]);
                     return true;
                 }
+                // Showing a sub-tab (or the tab's own conversation again)
+                // is not input either.
+                if (payload[0] == 'a') {
+                    srv.viewSub(ws, payload[2..]);
+                    return true;
+                }
+                // A sub-tab is read-only: nothing typed while it is shown.
+                if (ws.sub_view) return true;
                 // The System panel (read-only, every mode): "y:on" / "y:off".
                 if (payload[0] == 'y') {
                     srv.sysPanel(ws, payload[2..]);
