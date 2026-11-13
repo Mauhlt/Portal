@@ -188,7 +188,20 @@ owner's prompts, the program's replies as readable text, tool use as
 one-liners, questions with answer buttons. The terminal (the grid) stays
 available behind a toggle. The desktop builds the conversation from the
 session program's own transcript (the agent's JSONL, followed by change
-notifications; `src/convo/`) and from its OSC 7501 state.
+notifications and by the program's output; `src/convo/`) and from its
+OSC 7501 state.
+
+Which transcript is a tab's: when the session program is the agent
+(`claude`, `claude.exe`, `claude.cmd`) and its configured arguments pick no
+session (`--session-id`, `--resume`/`-r`, `--continue`/`-c`), Portal starts
+each tab's program with its own `--session-id <random v4 UUID>` and follows
+exactly `<projects>\<encoded folder>\<uuid>.jsonl` (waiting for it to
+appear); another session's transcript in the same folder is not the tab's.
+After it, a new or growing transcript in that folder whose `cwd` is the
+tab's folder and that no other tab follows takes over (`/clear`,
+`/resume` inside the session). Without an id (the arguments chose a
+session) only that rule applies. The UUID never leaves the desktop: it is
+not logged with paths and not sent; viewers only see Portal's own tab ids.
 
 ```
 {"t":"convo","id":"<32 hex>","on":true,"items":[ITEM,...]}

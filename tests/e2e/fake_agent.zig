@@ -14,6 +14,12 @@
 //!
 //! A tab whose folder's name contains "quiet" writes no transcript at all.
 //!
+//! Run as `claude.exe` (a copy of portal-e2e), so Portal treats it as
+//! the agent and passes `--session-id <uuid>`: the transcript is then
+//! `<uuid>.jsonl` and the terminal shows FAKE-SESSION-ID (never the id).
+//! Before writing anything it waits for `e2e-go` in its folder, so the
+//! test can put another session's transcript next to it first.
+//!
 //! The folder name follows the agent's rule (every byte that is not an
 //! ASCII letter or digit becomes '-'), written independently of Portal's
 //! own src/convo/transcript.zig so the e2e checks it.
@@ -87,12 +93,26 @@ const Transcript = struct {
     }
 };
 
-pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) u32 {
+fn validUuid(s: []const u8) bool {
+    if (s.len != 36) return false;
+    for (s, 0..) |c, i| switch (i) {
+        8, 13, 18, 23 => if (c != '-') return false,
+        else => if (!std.ascii.isHex(c)) return false,
+    };
+    return true;
+}
+
+pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, args: []const []const u8) u32 {
+    var session_id: ?[]const u8 = null;
+    for (args, 0..) |a, i| if (std.mem.eql(u8, a, "--session-id") and i + 1 < args.len) {
+        session_id = args[i + 1];
+    };
     out_h = GetStdHandle(STD_OUTPUT_HANDLE);
     in_h = GetStdHandle(STD_INPUT_HANDLE);
     if (in_h) |h| _ = SetConsoleMode(h, ENABLE_VIRTUAL_TERMINAL_INPUT);
     say("FAKE-START\r\n");
     const cwd = std.process.currentPathAlloc(io, gpa) catch return 2;
+    if (session_id) |s| say(if (validUuid(s)) "FAKE-SESSION-ID\r\n" else "FAKE-BAD-SESSION-ID\r\n") else say("FAKE-NO-SESSION-ID\r\n");
     const quiet = std.mem.indexOf(u8, std.fs.path.basename(cwd), "quiet") != null;
     if (quiet) {
         say("FAKE-QUIET\r\n");
@@ -108,9 +128,25 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     for (cwd, folder) |c, *o| o.* = if (std.ascii.isAlphanumeric(c)) c else '-';
     const dir = std.fmt.allocPrint(gpa, "{s}\\{s}", .{ projects, folder }) catch return 2;
     std.Io.Dir.cwd().createDirPath(io, dir) catch return 4;
+    // Tell the test (only) which id it got, so it can check that the id
+    // never reaches a device.
+    if (session_id) |s| {
+        const sid = std.fmt.allocPrint(gpa, "{s}\\e2e-sid", .{cwd}) catch return 2;
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sid, .data = s }) catch {};
+    }
+    // Wait for the test's go-ahead (test code: polling is fine here).
+    const go = std.fmt.allocPrint(gpa, "{s}\\e2e-go", .{cwd}) catch return 2;
+    var waited: u32 = 0;
+    while (waited < 200) : (waited += 1) {
+        std.Io.Dir.cwd().access(io, go, .{}) catch {
+            io.sleep(.fromMilliseconds(50), .awake) catch {};
+            continue;
+        };
+        break;
+    }
     var rnd: [6]u8 = undefined;
     io.random(&rnd);
-    const stem = std.fmt.allocPrint(gpa, "e2e00000-0000-4000-8000-{x}", .{&rnd}) catch return 2;
+    const stem = if (session_id) |s| s else std.fmt.allocPrint(gpa, "e2e00000-0000-4000-8000-{x}", .{&rnd}) catch return 2;
     var t: Transcript = .{
         .gpa = gpa,
         .io = io,

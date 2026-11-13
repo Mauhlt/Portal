@@ -39,6 +39,7 @@ const w32 = @import("win32.zig");
 const Convo = @import("convo/model.zig").Convo;
 const follow = @import("convo/follow.zig");
 const transcript = @import("convo/transcript.zig");
+const cmdline = @import("cmdline.zig");
 
 pub const Id = wire.Id;
 pub const State = wire.State;
@@ -91,6 +92,13 @@ pub const Tab = struct {
     convo_claimed: bool = false,
     /// Set when the tab leaves the list: its transcript follower stops.
     convo_stop: ?w32.HANDLE = null,
+    /// Poked on the program's output (session.zig): the follower then
+    /// checks the transcript's size (appends through a handle kept open
+    /// are not always reported by the directory).
+    convo_poke: ?follow.Poke = null,
+    /// The `--session-id` Portal gave the agent for this launch (its
+    /// transcript's name), if it gave one. Desktop-only.
+    session_uuid: ?[36]u8 = null,
 
     child_code: std.atomic.Value(u32) = .init(1),
     child_done: std.atomic.Value(bool) = .init(false),
@@ -127,6 +135,7 @@ pub const Tab = struct {
         t.convo.deinit();
         gpa.free(t.cwd);
         if (t.convo_stop) |e| _ = w32.CloseHandle(e);
+        if (t.convo_poke) |*p| p.deinit();
         t.session.term.deinit();
         t.local.deinit();
         t.pty.release();
@@ -216,7 +225,8 @@ pub const Tab = struct {
         const stop = t.convo_stop orelse return;
         var f = follow.Follower.init(h.gpa, .{ .ctx = t, .apply = convoApply, .reset = convoReset, .claim = convoClaim }, projects, t.cwd) catch return;
         defer f.deinit();
-        f.run(stop);
+        f.expected = t.session_uuid;
+        f.run(stop, if (t.convo_poke) |*p| p else null);
     }
 
     fn convoApply(ctx: *anyopaque, rec: *const transcript.Record) void {
@@ -286,6 +296,9 @@ pub const Program = struct {
     cmdline: [:0]const u16,
     /// For log lines only.
     command_name: []const u8,
+    /// The agent without a session chosen in its arguments: each tab's
+    /// launch gets its own `--session-id <uuid>` (cmdline.wantsSessionId).
+    session_id: bool = false,
 };
 
 pub const Hub = struct {
@@ -416,7 +429,15 @@ pub const Hub = struct {
         @memcpy(t.name_buf[0..nl], name[0..nl]);
         t.name_len = @intCast(nl);
 
-        const line = h.gpa.dupeSentinel(u16, h.program.cmdline, 0) catch {
+        // The agent gets this launch's own session id, so the tab's
+        // transcript is exactly `<id>.jsonl`. Never logged, never sent:
+        // viewers only ever see Portal's own tab ids.
+        if (h.program.session_id) {
+            var rnd: [16]u8 = undefined;
+            h.io.randomSecure(&rnd) catch h.io.random(&rnd);
+            t.session_uuid = cmdline.uuidV4(rnd);
+        }
+        const line = (if (t.session_uuid) |*u| cmdline.withSessionId(h.gpa, h.program.cmdline, u) else h.gpa.dupeSentinel(u16, h.program.cmdline, 0)) catch {
             t.session.term.deinit();
             h.gpa.destroy(t);
             return error.OutOfMemory;
@@ -433,7 +454,11 @@ pub const Hub = struct {
         t.session.local = &t.local;
         t.convo = Convo.init(h.gpa, .{ .root = t.cwd, .name = t.name(), .user = h.user_name });
         t.session.convo = &t.convo;
-        if (h.convo_projects != null) t.convo_stop = w32.validHandle(w32.CreateEventW(null, 1, 0, null));
+        if (h.convo_projects != null) {
+            t.convo_stop = w32.validHandle(w32.CreateEventW(null, 1, 0, null));
+            t.convo_poke = follow.Poke.init();
+            if (t.convo_poke) |*p| t.session.convo_poke = p;
+        }
 
         // The list's reference is the initial one; each thread takes its own.
         const threads = .{ Tab.outputThread, Tab.inputThread, Tab.supervise, Tab.convoThread };

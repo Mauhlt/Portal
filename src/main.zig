@@ -1804,7 +1804,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .log = &log,
         .console = &console,
         .policy = cfg.policy,
-        .program = .{ .app = resolved.app, .cmdline = resolved.cmdline, .command_name = std.fs.path.basename(command[0]) },
+        .program = .{ .app = resolved.app, .cmdline = resolved.cmdline, .command_name = std.fs.path.basename(command[0]), .session_id = cmdline.wantsSessionId(command) },
         .colors = saved.colorChoices(&colors_buf),
         .convo_projects = convoProjects(gpa, env),
         .user_name = env.get("USERNAME"),
