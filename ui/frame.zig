@@ -344,15 +344,33 @@ const Hit = struct {
 };
 
 /// A press in a content view: a tap on one of its buttons, or a drag that
-/// scrolls it.
+/// scrolls it. On a touch screen (`Frame.touch`) every press: a tap on any
+/// button, or a drag (the grid's rows scroll under it).
 const Press = struct {
     active: bool = false,
     x0: f32 = 0,
     y0: f32 = 0,
     moved: bool = false,
+    /// It began over the content view (its drags go to InputSink.drag).
+    in_view: bool = true,
+    /// Touch, begun over the grid: its drags scroll the rows (the last y,
+    /// and rows not yet scrolled).
+    pan: bool = false,
+    last_y: f32 = 0,
+    pan_acc: f32 = 0,
     /// What the press began on (answer keys copied: the view's strings may
     /// change before the release).
     action: union(enum) { none, answer: struct { buf: [16]u8 = undefined, len: u8 = 0 }, button: u32 } = .none,
+
+    fn setAction(pr: *Press, a: @FieldType(Hit, "action")) void {
+        switch (a) {
+            .answer => |k| if (k.len <= 16) {
+                pr.action = .{ .answer = .{ .len = @intCast(k.len) } };
+                @memcpy(pr.action.answer.buf[0..k.len], k);
+            },
+            .button => |id| pr.action = .{ .button = id },
+        }
+    }
 };
 
 fn toneColor(t: Tone) Rgb {
@@ -435,6 +453,11 @@ pub const Frame = struct {
     /// Pixels one wheel notch scrolls (three lines of the chrome font).
     wheel_px: f32 = 48,
     press: Press = .{},
+    /// A touch screen (iOS; the window delivers one finger as the
+    /// pointer): nothing acts on a press, every button is a tap (fires on
+    /// release if the finger did not move off it or drag), and a drag over
+    /// the grid scrolls its rows.
+    touch: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, sizing: Sizing) Frame {
         return .{ .gpa = gpa, .sizing = sizing };
@@ -471,6 +494,14 @@ pub const Frame = struct {
     pub fn pointerDown(f: *Frame, x: f32, y: f32, button: input.MouseButton, mods: input.Mods, sink: input.InputSink) void {
         f.press = .{};
         const hit = if (button == .left) f.hitFull(x, y) else null;
+        if (f.touch and button == .left) {
+            const in_view = f.view_shown and f.regions.terminal.contains(x, y);
+            const pan = !in_view and f.regions.terminal.contains(x, y);
+            f.press = .{ .active = true, .x0 = x, .y0 = y, .in_view = in_view, .pan = pan, .last_y = y };
+            if (hit) |h| f.press.setAction(h.action);
+            if (in_view) sink.drag(.{ .phase = .down, .x = x, .y = y, .scale = f.scale });
+            return;
+        }
         if (hit) |h| if (!h.tap) {
             switch (h.action) {
                 .answer => |a| sink.answer(a),
@@ -481,13 +512,7 @@ pub const Frame = struct {
         if (button == .left and f.view_shown and f.regions.terminal.contains(x, y)) {
             f.press = .{ .active = true, .x0 = x, .y0 = y };
             sink.drag(.{ .phase = .down, .x = x, .y = y, .scale = f.scale });
-            if (hit) |h| switch (h.action) {
-                .answer => |a| if (a.len <= 16) {
-                    f.press.action = .{ .answer = .{ .len = @intCast(a.len) } };
-                    @memcpy(f.press.action.answer.buf[0..a.len], a);
-                },
-                .button => |id| f.press.action = .{ .button = id },
-            };
+            if (hit) |h| f.press.setAction(h.action);
             return;
         }
         sink.mouse(f.mouseAt(.down, button, x, y, mods));
@@ -496,7 +521,18 @@ pub const Frame = struct {
     pub fn pointerMove(f: *Frame, x: f32, y: f32, sink: input.InputSink) void {
         if (f.press.active) {
             if (!f.press.moved and @max(@abs(x - f.press.x0), @abs(y - f.press.y0)) > drag_slop * f.scale) f.press.moved = true;
-            sink.drag(.{ .phase = .move, .x = x, .y = y, .scale = f.scale });
+            if (f.press.in_view) {
+                sink.drag(.{ .phase = .move, .x = x, .y = y, .scale = f.scale });
+            } else if (f.press.moved and f.press.pan) {
+                // Touch, over the grid: finger down = earlier rows.
+                f.press.pan_acc += (y - f.press.last_y) / @max(f.cells.ch, 1);
+                f.press.last_y = y;
+                const rows = @trunc(f.press.pan_acc);
+                if (rows != 0) {
+                    f.press.pan_acc -= rows;
+                    f.scrollRows(@intFromFloat(rows));
+                }
+            }
             return;
         }
         sink.mouse(f.mouseAt(.move, .left, x, y, .{}));
@@ -506,11 +542,11 @@ pub const Frame = struct {
         if (f.press.active) {
             const pr = f.press;
             f.press = .{};
-            sink.drag(.{ .phase = .up, .x = x, .y = y, .scale = f.scale });
+            if (pr.in_view) sink.drag(.{ .phase = .up, .x = x, .y = y, .scale = f.scale });
             if (pr.moved) return;
             // A tap: what it began on, if the release is still on it.
             const h = f.hitFull(x, y) orelse return;
-            if (!h.tap) return;
+            if (!h.tap and !f.touch) return;
             switch (pr.action) {
                 .none => {},
                 .answer => |a| if (h.action == .answer and std.mem.eql(u8, h.action.answer, a.buf[0..a.len])) sink.answer(a.buf[0..a.len]),
@@ -519,6 +555,15 @@ pub const Frame = struct {
             return;
         }
         sink.mouse(f.mouseAt(.up, button, x, y, .{}));
+    }
+
+    /// The OS took the press away (iOS touchesCancelled): it ends without
+    /// acting on it. A content view's drag is released where it began (a
+    /// swipe springs back), and no button fires.
+    pub fn pointerCancel(f: *Frame, sink: input.InputSink) void {
+        const pr = f.press;
+        f.press = .{};
+        if (pr.active and pr.in_view) sink.drag(.{ .phase = .up, .x = pr.x0, .y = pr.y0, .scale = f.scale });
     }
 
     /// A wheel turn of `notches` (> 0: away from the user) at (x, y): scrolls
@@ -1838,6 +1883,57 @@ test "content view: a tap on its button answers on release, a drag goes to the v
     f.pointerDown(300, 200, .left, .{}, sink);
     try std.testing.expectEqual(@as(usize, 1), r.mice);
 }
+
+test "touch: nothing acts on a press; buttons are taps; a cancel never taps; drags over the grid scroll its rows" {
+    var f = Frame.init(std.testing.allocator, .fit_grid);
+    defer f.deinit();
+    var r: TapRec = .{};
+    const sink: input.InputSink = .{ .ctx = &r, .vtable = &TapRec.vt };
+    f.touch = true;
+    f.regions.terminal = .{ .x = 0, .y = 0, .w = 400, .h = 300 };
+    f.cells = .{ .ch = 20 };
+    // An answer-bar button (fires on press with a mouse): on touch only on
+    // release, and only without moving off it.
+    f.addHit(.{ .x = 10, .y = 320, .w = 100, .h = 40, .action = .{ .answer = "1" } });
+    f.pointerDown(20, 330, .left, .{}, sink);
+    try std.testing.expectEqual(@as(usize, 0), r.n_answers);
+    f.pointerUp(22, 332, .left, sink);
+    try std.testing.expectEqual(@as(usize, 1), r.n_answers);
+    try std.testing.expectEqualStrings("1", r.answers[0][0..r.answer_lens[0]]);
+    // A drag that starts on it (scrolling) answers nothing.
+    f.pointerDown(20, 330, .left, .{}, sink);
+    f.pointerMove(20, 290, sink);
+    f.pointerMove(20, 330, sink);
+    f.pointerUp(20, 330, .left, sink);
+    // Cancelled by the system: nothing, even without moving.
+    f.pointerDown(20, 330, .left, .{}, sink);
+    f.pointerCancel(sink);
+    try std.testing.expectEqual(@as(usize, 1), r.n_answers);
+    // A drag over the grid scrolls its rows (finger down: earlier rows).
+    f.pointerDown(200, 100, .left, .{}, sink);
+    f.pointerMove(200, 105, sink);
+    try std.testing.expectEqual(@as(u16, 0), f.scroll_back);
+    f.pointerMove(200, 150, sink);
+    try std.testing.expectEqual(@as(u16, 2), f.scroll_back);
+    f.pointerMove(200, 100, sink);
+    try std.testing.expectEqual(@as(u16, 0), f.scroll_back);
+    f.pointerUp(200, 100, .left, sink);
+    try std.testing.expectEqual(@as(usize, 0), r.mice);
+    try std.testing.expectEqual([3]usize{ 0, 0, 0 }, r.drags);
+    // Over a content view: its drags; a cancel releases where it began.
+    f.view_shown = true;
+    f.pointerDown(200, 100, .left, .{}, sink);
+    f.pointerMove(300, 100, sink);
+    try std.testing.expectEqual(@as(f32, 300), r.last_drag.x);
+    f.pointerCancel(sink);
+    try std.testing.expect(r.last_drag.phase == .up);
+    try std.testing.expectEqual(@as(f32, 200), r.last_drag.x);
+    try std.testing.expectEqual([3]usize{ 1, 1, 1 }, r.drags);
+    f.pointerUp(300, 100, .left, sink); // the window's own up after a cancel: nothing more
+    try std.testing.expectEqual([3]usize{ 1, 1, 1 }, r.drags);
+    try std.testing.expectEqual(@as(usize, 1), r.n_answers);
+}
+
 
 test "hit-testing maps clicks to what the last frame drew" {
     var f = Frame.init(std.testing.allocator, .fit_grid);

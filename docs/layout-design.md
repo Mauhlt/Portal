@@ -159,14 +159,21 @@ keeps the terminal. In the Conversation view the window is minimal:
   types a space); a headset's play / pause button (`media_play_pause`)
   toggles it only when `Shell.headsetMicPresent()` says a headset with a
   microphone is attached: a predicate hook for the audio work (../Audio,
-  IMMDevice form factor), false until then. (The Renderer's Win32 window
-  does not deliver WM_APPCOMMAND yet: the glue has nothing to map.)
+  IMMDevice form factor), false until then. The Renderer's Win32 window
+  delivers WM_APPCOMMAND's play / pause as `Event.media`; the Presenter
+  maps it to `media_play_pause` (only while Portal's window has the
+  keyboard focus; macOS / iOS remote commands are a later step).
 * While the Conversation view is shown the keyboard does not reach the
   terminal (no stray answers): PageUp / PageDown / Home / End scroll, the
   arrows answer the swipe card.
 * The **Terminal view** keeps the full interaction slice (answer bar, and
   the instruction line in `instruct` mode).
-* Scrolling: wheel, vertical drag, PageUp / PageDown / Home / End. At the
+* Scrolling: wheel, vertical drag, PageUp / PageDown / Home / End. On the
+  iPhone one finger is the pointer (the window reports touches as
+  down / move / up, `Frame.touch`): a sideways drag swipes the card, a
+  vertical one scrolls, a drag over the terminal scrolls its rows, and
+  every button acts on release only (a drag or a cancelled touch never
+  presses one). At the
   bottom the list follows new items; scrolled up it stays anchored on the
   item at the top and a pill offers the newest. A tab without a transcript
   shows "No conversation log for this tab — use Terminal".

@@ -40,6 +40,88 @@ pub fn wide(gpa: Allocator, s: []const u8) error{ OutOfMemory, InvalidWtf8 }![:0
     return std.unicode.wtf8ToWtf16LeAllocZ(gpa, s);
 }
 
+/// `s` as a NUL-terminated UTF-16 path that Win32 file APIs (CreateFileW,
+/// FindFirstFileW, GetFileAttributesW, ...) accept beyond MAX_PATH (260):
+/// an absolute path gets the `\\?\` prefix (`\\?\UNC\` for `\\server\share`),
+/// with `/` made `\`, repeated separators collapsed and `.` / `..`
+/// resolved first, since the prefix turns that normalisation off. Paths
+/// that already carry a `\\?\` or `\\.\` prefix, and relative ones, are
+/// converted as they are (`wide`).
+pub fn longWide(gpa: Allocator, s: []const u8) error{ OutOfMemory, InvalidWtf8 }![:0]u16 {
+    const sep = '\\';
+    const verbatim = s.len >= 4 and isSep(s[0]) and isSep(s[1]) and (s[2] == '?' or s[2] == '.') and isSep(s[3]);
+    const drive = s.len >= 3 and std.ascii.isAlphabetic(s[0]) and s[1] == ':' and isSep(s[2]);
+    const unc = !verbatim and s.len >= 3 and isSep(s[0]) and isSep(s[1]) and !isSep(s[2]);
+    if (verbatim or !(drive or unc)) return wide(gpa, s);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try out.appendSlice(gpa, if (drive) "\\\\?\\" else "\\\\?\\UNC\\");
+    // The root that `..` never climbs above: `X:\` or `server\share\`.
+    var rest = s;
+    if (drive) {
+        try out.appendSlice(gpa, s[0..2]);
+        try out.append(gpa, sep);
+        rest = s[3..];
+    } else rest = s[2..];
+    var root_len = out.items.len;
+    var unc_parts: usize = if (unc) 2 else 0;
+    var it = std.mem.tokenizeAny(u8, rest, "\\/");
+    while (it.next()) |part| {
+        if (unc_parts > 0) {
+            try out.appendSlice(gpa, part);
+            try out.append(gpa, sep);
+            unc_parts -= 1;
+            root_len = out.items.len;
+            continue;
+        }
+        if (std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) {
+            // Drop the last component (never the root).
+            var end = out.items.len;
+            if (end > root_len) {
+                end -= 1; // its trailing separator
+                while (end > root_len and out.items[end - 1] != sep) end -= 1;
+                out.shrinkRetainingCapacity(end);
+            }
+            continue;
+        }
+        try out.appendSlice(gpa, part);
+        try out.append(gpa, sep);
+    }
+    // No trailing separator unless the path had one (or is a bare root).
+    if (out.items.len > root_len and !isSep(rest[rest.len - 1]))
+        out.shrinkRetainingCapacity(out.items.len - 1);
+    return wide(gpa, out.items);
+}
+
+fn isSep(c: u8) bool {
+    return c == '\\' or c == '/';
+}
+
+test "longWide: absolute paths get the long-path prefix, normalised; others as they are" {
+    const gpa = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "C:\\a\\b.jsonl", "\\\\?\\C:\\a\\b.jsonl" },
+        .{ "C:/a//b/./c/../d", "\\\\?\\C:\\a\\b\\d" },
+        .{ "C:\\..\\x", "\\\\?\\C:\\x" },
+        .{ "C:\\a\\*.jsonl", "\\\\?\\C:\\a\\*.jsonl" },
+        .{ "C:\\", "\\\\?\\C:\\" },
+        .{ "C:\\dir\\", "\\\\?\\C:\\dir\\" },
+        .{ "\\\\srv\\share\\p\\..\\..\\q", "\\\\?\\UNC\\srv\\share\\q" },
+        .{ "\\\\?\\C:\\already", "\\\\?\\C:\\already" },
+        .{ "\\\\.\\pipe\\x", "\\\\.\\pipe\\x" },
+        .{ "rel\\x", "rel\\x" },
+    };
+    for (cases) |c| {
+        const got = try longWide(gpa, c[0]);
+        defer gpa.free(got);
+        const want = try wide(gpa, c[1]);
+        defer gpa.free(want);
+        try std.testing.expectEqualSlices(u16, want, got);
+    }
+}
+
+
 /// Replaces `final` with `data` atomically: written to a fresh temporary
 /// file next to it, flushed to disk, then renamed over it
 /// (MoveFileEx REPLACE_EXISTING | WRITE_THROUGH), so a reader or a crash
