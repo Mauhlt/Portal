@@ -84,7 +84,11 @@ toggle away), read from the agent's transcript on the desktop and
 scrubbed of paths and your user name before it is sent. Portal starts
 the agent with its own `--session-id` per tab (unless your configured
 arguments already use `--session-id`, `--resume` or `--continue`), so each
-tab follows exactly its own transcript. Details: docs/protocol.md
+tab follows exactly its own transcript. After `/clear` or `/resume` in a
+tab, the tab moves to the new transcript only if that tab's terminal
+printed within 2 seconds of it appearing or growing, and no other tab in
+the same folder did; a transcript no tab printed near (an agent
+session outside Portal) is never shown. Details: docs/protocol.md
 section 3b.
 
 ## Security layers

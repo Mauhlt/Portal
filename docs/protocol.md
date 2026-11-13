@@ -197,11 +197,31 @@ session (`--session-id`, `--resume`/`-r`, `--continue`/`-c`), Portal starts
 each tab's program with its own `--session-id <random v4 UUID>` and follows
 exactly `<projects>\<encoded folder>\<uuid>.jsonl` (waiting for it to
 appear); another session's transcript in the same folder is not the tab's.
-After it, a new or growing transcript in that folder whose `cwd` is the
-tab's folder and that no other tab follows takes over (`/clear`,
-`/resume` inside the session). Without an id (the arguments chose a
-session) only that rule applies. The UUID never leaves the desktop: it is
-not logged with paths and not sent; viewers only see Portal's own tab ids.
+After it, another transcript in that folder takes over (`/clear`,
+`/resume` inside the session) only when all of these hold:
+
+* it is new, or grows, after the tab started (a transcript once passed
+  over must grow again to be looked at again);
+* the tab's own program printed within 2 seconds (before or after) of
+  the moment Portal first saw it new or growing. The agent redraws at
+  once on `/clear` and `/resume` and prints on every turn; a session
+  outside Portal writes while the tab is quiet. Two seconds covers late
+  directory notifications, batched output checks and a slow `/resume`,
+  and is far shorter than a human's turn;
+* its records' `cwd` is the tab's folder (or inside it);
+* no other tab follows it, and it is not another tab's own
+  `--session-id` transcript;
+* no other tab whose transcripts share the folder printed from the start
+  of that window until the decision. Then whose it is is unclear: neither
+  tab takes it, both keep their transcripts, and the desktop log notes it
+  (at most once a minute per tab, without paths).
+
+No timer is involved: a candidate is decided by comparing timestamps at
+the next event Portal gets anyway (the tab's output, a change in the
+folder); at most 8 wait at once. A transcript no tab takes is never
+shown. Without an id (the arguments chose a session) only these rules
+apply. The UUID never leaves the desktop: it is not logged with paths and
+not sent; viewers only see Portal's own tab ids.
 
 ```
 {"t":"convo","id":"<32 hex>","on":true,"items":[ITEM,...]}

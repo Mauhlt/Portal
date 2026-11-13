@@ -10,7 +10,10 @@
 //!   2. an AskUserQuestion with two options; waits for 1 or 2;
 //!   3. a command that needs permission (OSC 7501 kind=permission); waits
 //!      for 1 (allow) or Esc (deny);
-//!   4. a closing reply; then idles until its console closes.
+//!   4. a closing reply; then waits for 1;
+//!   5. `/clear`: prints, then starts a second transcript (a new session
+//!      id of its own, as the agent does); then idles until its console
+//!      closes.
 //!
 //! A tab whose folder's name contains "quiet" writes no transcript at all.
 //!
@@ -207,6 +210,17 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m5\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"All done.\"}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"system\",\"subtype\":\"turn_duration\",\"durationMs\":5,\"cwd\":\"{c}\"}");
     say("\x1b]7501;state=idle\x07FAKE-DONE\r\n");
+
+    // 5. On 1: `/clear` as the agent does it: the screen first, then a
+    // new session file (not the --session-id one) with the next prompt.
+    while (key()) |k| if (k == '1') break;
+    say("\x1b[2J\x1b[HFAKE-CLEARING\r\n");
+    io.random(&rnd);
+    var t2 = t;
+    t2.path = std.fmt.allocPrint(gpa, "{s}\\e2e00000-0000-4000-8000-{x}.jsonl", .{ dir, &rnd }) catch return 2;
+    t2.rec("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"AFTER-CLEAR prompt\"},\"cwd\":\"{c}\",\"sessionId\":\"y\"}");
+    t2.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m6\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Fresh start.\"}]},\"cwd\":\"{c}\"}");
+    say("FAKE-CLEARED\r\n");
     while (key()) |_| {}
     return 0;
 }

@@ -21,13 +21,28 @@
 //!
 //! The tab's working directory names the folder (`<projects>\<encoded
 //! cwd>`). When the tab starts, the sizes of
-//! the transcripts already there are noted. A transcript then belongs to
-//! the tab when it is new or has grown since (its program started or
-//! resumed it after the tab did), its records' `cwd` is the tab's folder
-//! (or inside it; folder names can collide, e.g. `a-b` and `a\b`), and no
-//! other tab claimed it. When another one starts growing later (`/clear`
-//! starts a new session file, `/resume` continues an old one), the view
-//! moves to it and starts over.
+//! the transcripts already there are noted. Another transcript then
+//! becomes the tab's (`/clear` starts a new session file, `/resume`
+//! continues an old one; the view moves to it and starts over) only when
+//! all of these hold:
+//!   * it is new or has grown since it was last noted;
+//!   * the tab's own program printed within `adopt_window_ms` of the
+//!     moment the follower first saw it new or growing (the agent prints
+//!     at once on `/clear`, `/resume` and every prompt; a session outside
+//!     Portal writes while the tab is quiet);
+//!   * its records' `cwd` is the tab's folder (or inside it; folder names
+//!     can collide, e.g. `a-b` and `a\b`);
+//!   * no other tab follows it or was started with it as its session id
+//!     (the hub's claim table);
+//!   * no other tab whose transcripts share the folder printed from the
+//!     start of that window until the decision: then whose it is is
+//!     unclear, so neither takes it and the view keeps its transcript.
+//! Nothing here waits on a timer: a transcript seen new or growing stays
+//! a candidate (at most `max_pending`), decided at the next event that
+//! arrives anyway (the tab's output or a change in the folder) by
+//! comparing timestamps. One whose window passed without the tab's output
+//! is dropped and its size noted again, so only further growth makes it a
+//! candidate again. Transcripts no tab takes are never shown.
 //!
 //! Without a transcript (none yet, the projects folder missing, or the
 //! program not keeping one) the view says so; the terminal is unaffected.
@@ -55,6 +70,27 @@ const confirm_bytes = 256 * 1024;
 /// Pokes closer together than this share one size check (web.zig's
 /// frame interval: output is shown at most this often anyway).
 pub const poke_batch_ms = 33;
+/// A transcript seen new or growing is the tab's only if the tab printed
+/// this close to that moment (before or after). The agent prints
+/// within milliseconds of starting or extending a transcript (the screen
+/// redrawn on `/clear` and `/resume`, the echoed prompt and spinner of a
+/// turn), but the moment the follower sees the file lags: directory
+/// notifications can be late (some only once the writer flushes), pokes
+/// are batched (`poke_batch_ms`), the tick clock moves in ~16 ms steps,
+/// and a loaded machine may take a second to load a long session for
+/// `/resume`. Two seconds covers that and is still far shorter than a
+/// human's turn, so a quiet tab is not credited with another session's
+/// writes.
+pub const adopt_window_ms = 2000;
+/// At most this many transcripts wait for a decision; the oldest goes.
+pub const max_pending = 8;
+/// "Unclear whose transcript" is noted at most this often per tab.
+const note_interval_ms = 60_000;
+
+/// The monotonic clock of pokes and decisions (milliseconds).
+pub fn nowMs() i64 {
+    return @intCast(w.GetTickCount64());
+}
 
 /// "The tab's program printed something": wakes the follower to look at
 /// its transcript's size. `poke` is cheap and never blocks (an atomic
@@ -62,6 +98,11 @@ pub const poke_batch_ms = 33;
 pub const Poke = struct {
     ev: w.HANDLE,
     pending: std.atomic.Value(bool) = .init(false),
+    /// When the program last printed (nowMs), or `never`. Read by the
+    /// tab's follower and, through the claim table, by other tabs'.
+    last_ms: std.atomic.Value(i64) = .init(never),
+
+    pub const never = std.math.minInt(i64);
 
     /// An auto-reset event; null if it cannot be made (no pokes then).
     pub fn init() ?Poke {
@@ -74,6 +115,7 @@ pub const Poke = struct {
     }
 
     pub fn poke(p: *Poke) void {
+        p.last_ms.store(nowMs(), .release);
         if (p.pending.swap(true, .acq_rel)) return;
         _ = w.SetEvent(p.ev);
     }
@@ -87,9 +129,18 @@ pub const Sink = struct {
     apply: *const fn (ctx: *anyopaque, rec: *const transcript.Record) void,
     /// The view starts over: a transcript is followed now (`on`), or none.
     reset: *const fn (ctx: *anyopaque, on: bool) void,
-    /// Claims transcript `stem` for this tab; false if another tab has it.
-    claim: *const fn (ctx: *anyopaque, stem: []const u8) bool,
+    /// Claims transcript `stem` for this tab: `taken` if another tab
+    /// follows it or was started with it as its session id. With
+    /// `rival_since`, `contested` (and nothing claimed) if another tab
+    /// whose transcripts share this tab's folder printed at or after that
+    /// time (nowMs).
+    claim: *const fn (ctx: *anyopaque, stem: []const u8, rival_since: ?i64) Claim,
+    /// A new transcript was left alone because another tab in the folder
+    /// printed too (rate-limited: `note_interval_ms`). Optional.
+    contested: ?*const fn (ctx: *anyopaque) void = null,
 };
+
+pub const Claim = enum { ok, taken, contested };
 
 /// ReadDirectoryChangesW on one directory, overlapped, so the waiting
 /// thread can also wait for its stop event. Heap-allocated: the buffer
@@ -180,6 +231,16 @@ const Current = struct {
     offset: u64,
 };
 
+/// A transcript seen new or growing, not the tab's yet.
+const Pending = struct {
+    stem: [36]u8,
+    /// When the follower first saw it so (nowMs).
+    seen: i64,
+    /// The tab printed within `adopt_window_ms` of `seen`; what may be
+    /// missing is its `cwd` (not written yet).
+    mine: bool = false,
+};
+
 pub const Follower = struct {
     gpa: Allocator,
     sink: Sink,
@@ -194,11 +255,18 @@ pub const Follower = struct {
     noted: bool = false,
     /// Transcripts whose `cwd` is not the tab's (owned keys).
     rejected: std.StringHashMapUnmanaged(void) = .empty,
-    /// New transcripts not yet known to be the tab's (no `cwd` written
-    /// yet): looked at again on every poke, since appends through a handle
-    /// the program keeps open may never be reported.
-    unsure: [8][36]u8 = undefined,
-    n_unsure: usize = 0,
+    /// Transcripts seen new or growing, not decided yet (the tab's output
+    /// not seen near them yet, or no `cwd` written yet): looked at again
+    /// on every poke, since appends through a handle the program keeps
+    /// open may never be reported.
+    pending: [max_pending]Pending = undefined,
+    n_pending: usize = 0,
+    /// When the tab's program last printed (nowMs), if it has.
+    last_out: ?i64 = null,
+    /// When "unclear whose" was last noted.
+    last_note: ?i64 = null,
+    /// Tests set the clock.
+    test_now: ?i64 = null,
     cur: ?Current = null,
     /// The session id Portal gave the program (`--session-id`): its
     /// transcript is the tab's, and nothing else is until it appeared.
@@ -264,12 +332,14 @@ pub const Follower = struct {
                 const hs = [_]w.HANDLE{ stop, dc.ev, if (poke) |p| p.ev else stop };
                 const r = w.WaitForMultipleObjects(if (poke != null) 3 else 2, &hs, 0, w.INFINITE);
                 f.wakes +|= 1;
+                // Whatever woke it, decisions use the latest output time.
+                if (poke) |p| f.noteOutput(p.last_ms.load(.acquire));
                 if (r == w.WAIT_OBJECT_0 + 2) {
                     // The program printed: coalesce a burst of output into
                     // one look at the transcript's size.
                     if (w.WaitForSingleObject(stop, poke_batch_ms) == w.WAIT_OBJECT_0) return;
                     poke.?.pending.store(false, .release);
-                    f.recheck();
+                    f.printed(poke.?.last_ms.load(.acquire));
                     continue;
                 }
                 if (r != w.WAIT_OBJECT_0 + 1) return; // stop, or the wait failed
@@ -398,39 +468,101 @@ pub const Follower = struct {
         return size > before;
     }
 
-    /// The program printed: read what the followed transcript gained (its
-    /// size on a fresh handle is current even when the directory entry is
-    /// not), and look again at new transcripts not yet confirmed.
-    fn recheck(f: *Follower) void {
+    fn now(f: *const Follower) i64 {
+        return f.test_now orelse nowMs();
+    }
+
+    fn noteOutput(f: *Follower, at: i64) void {
+        if (at == Poke.never) return;
+        if (f.last_out == null or at > f.last_out.?) f.last_out = at;
+    }
+
+    /// The tab's program printed (at `at`, nowMs): read what the followed
+    /// transcript gained (its size on a fresh handle is current even when
+    /// the directory entry is not), and decide the candidates.
+    pub fn printed(f: *Follower, at: i64) void {
+        f.noteOutput(at);
         f.readMore();
         if (f.waitingExpected()) {
             const e = f.expected.?;
             f.changedStem(&e);
         }
-        var list: [8][36]u8 = undefined;
-        const n = f.n_unsure;
-        @memcpy(list[0..n], f.unsure[0..n]);
-        for (list[0..n]) |*stem| f.changedStem(stem);
-    }
-
-    fn addUnsure(f: *Follower, stem: []const u8) void {
-        for (f.unsure[0..f.n_unsure]) |*u| if (std.mem.eql(u8, u, stem)) return;
-        if (f.n_unsure == f.unsure.len) {
-            std.mem.copyForwards([36]u8, f.unsure[0 .. f.unsure.len - 1], f.unsure[1..]);
-            f.n_unsure -= 1;
+        var list: [max_pending][36]u8 = undefined;
+        const n = f.n_pending;
+        for (f.pending[0..n], list[0..n]) |p, *l| l.* = p.stem;
+        for (list[0..n]) |*stem| {
+            if (f.findPending(stem) == null) continue; // decided meanwhile
+            // Gone (deleted): nothing to decide, it just leaves the list.
+            if (f.fileSize(stem) == null) {
+                f.dropPending(stem);
+                continue;
+            }
+            f.changedStem(stem);
         }
-        f.unsure[f.n_unsure] = stem[0..36].*;
-        f.n_unsure += 1;
     }
 
-    fn dropUnsure(f: *Follower, stem: []const u8) void {
+    fn findPending(f: *Follower, stem: []const u8) ?*Pending {
+        for (f.pending[0..f.n_pending]) |*p| if (std.mem.eql(u8, &p.stem, stem)) return p;
+        return null;
+    }
+
+    /// The candidate for `stem`, added (seen now) if it is not one yet.
+    fn pendingFor(f: *Follower, stem: []const u8, now_ms: i64) *Pending {
+        if (f.findPending(stem)) |p| return p;
+        // Make room: first the ones whose window has passed, then the oldest.
         var i: usize = 0;
-        while (i < f.n_unsure) {
-            if (std.mem.eql(u8, &f.unsure[i], stem)) {
-                std.mem.copyForwards([36]u8, f.unsure[i .. f.n_unsure - 1], f.unsure[i + 1 .. f.n_unsure]);
-                f.n_unsure -= 1;
+        while (i < f.n_pending) {
+            if (f.judge(&f.pending[i], now_ms) == .expired) {
+                const gone = f.pending[i].stem;
+                f.giveUp(&gone);
             } else i += 1;
         }
+        if (f.n_pending == f.pending.len) {
+            std.mem.copyForwards(Pending, f.pending[0 .. f.pending.len - 1], f.pending[1..]);
+            f.n_pending -= 1;
+        }
+        f.pending[f.n_pending] = .{ .stem = stem[0..36].*, .seen = now_ms };
+        f.n_pending += 1;
+        return &f.pending[f.n_pending - 1];
+    }
+
+    fn dropPending(f: *Follower, stem: []const u8) void {
+        var i: usize = 0;
+        while (i < f.n_pending) {
+            if (std.mem.eql(u8, &f.pending[i].stem, stem)) {
+                std.mem.copyForwards(Pending, f.pending[i .. f.n_pending - 1], f.pending[i + 1 .. f.n_pending]);
+                f.n_pending -= 1;
+            } else i += 1;
+        }
+    }
+
+    const Judged = enum { mine, wait, expired };
+
+    /// Did the tab print within the window around when `p` was seen?
+    /// Every output after `seen` reaches a decision here (each poke looks
+    /// at every candidate), so the latest output time is enough.
+    fn judge(f: *Follower, p: *Pending, now_ms: i64) Judged {
+        if (p.mine) return .mine;
+        if (f.last_out) |o| if (o >= p.seen - adopt_window_ms and o <= p.seen + adopt_window_ms) {
+            p.mine = true;
+            return .mine;
+        };
+        return if (now_ms > p.seen + adopt_window_ms) .expired else .wait;
+    }
+
+    /// Not the tab's: leaves the candidates, and its size now is noted,
+    /// so only further growth brings it back.
+    fn giveUp(f: *Follower, stem: []const u8) void {
+        f.dropPending(stem);
+        const size = f.fileSize(stem) orelse return;
+        const gop = f.start_sizes.getOrPut(f.gpa, stem) catch return;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = f.gpa.dupe(u8, stem) catch {
+                f.start_sizes.removeByPtr(gop.key_ptr);
+                return;
+            };
+        }
+        gop.value_ptr.* = size;
     }
 
     /// An entry of the folder changed.
@@ -447,25 +579,51 @@ pub const Follower = struct {
         if (f.cur) |c| if (std.mem.eql(u8, &c.stem, stem)) f.readMore();
     }
 
-    /// Switches to transcript `stem` if it is the tab's.
+    /// Switches to transcript `stem` (seen new or growing) if it is the
+    /// tab's.
     fn consider(f: *Follower, stem: []const u8) void {
         const expected = f.isExpected(stem);
         // Until the session Portal started has its transcript, nothing
         // else in the folder is the tab's (another session there, e.g. one
         // outside Portal, is not).
         if (f.waitingExpected() and !expected) return;
-        if (!expected) switch (f.confirm(stem)) {
-            .unknown => return f.addUnsure(stem), // no `cwd` yet: looked at again when it grows
-            .no => {
-                f.dropUnsure(stem);
-                const k = f.gpa.dupe(u8, stem) catch return;
-                f.rejected.put(f.gpa, k, {}) catch f.gpa.free(k);
+        var rival_since: ?i64 = null;
+        if (!expected) {
+            const now_ms = f.now();
+            const p = f.pendingFor(stem, now_ms);
+            switch (f.judge(p, now_ms)) {
+                .wait => return, // the tab's output may still come
+                .expired => return f.giveUp(stem),
+                .mine => {},
+            }
+            rival_since = p.seen - adopt_window_ms;
+            switch (f.confirm(stem)) {
+                .unknown => return, // no `cwd` yet: looked at again when it grows
+                .no => {
+                    f.dropPending(stem);
+                    const k = f.gpa.dupe(u8, stem) catch return;
+                    f.rejected.put(f.gpa, k, {}) catch f.gpa.free(k);
+                    return;
+                },
+                .yes => {},
+            }
+        }
+        f.dropPending(stem);
+        switch (f.sink.claim(f.sink.ctx, stem, rival_since)) {
+            .ok => {},
+            .taken => return,
+            .contested => {
+                // Two tabs printed: whose it is is unclear, so neither
+                // takes it and the view keeps what it follows.
+                f.giveUp(stem);
+                const now_ms = f.now();
+                if (f.last_note == null or now_ms - f.last_note.? >= note_interval_ms) {
+                    f.last_note = now_ms;
+                    if (f.sink.contested) |c| c(f.sink.ctx);
+                }
                 return;
             },
-            .yes => {},
-        };
-        f.dropUnsure(stem);
-        if (!f.sink.claim(f.sink.ctx, stem)) return;
+        }
         if (expected) f.expected_seen = true;
         const size = f.fileSize(stem) orelse 0;
         f.cur = .{ .stem = stem[0..36].*, .offset = if (size > max_initial) size - tail_read else 0 };
@@ -645,16 +803,26 @@ const Find = struct {
 const testing = std.testing;
 const Convo = @import("model.zig").Convo;
 
-/// A sink straight into a conversation, with claims shared by "tabs".
+/// A sink straight into a conversation, with claims shared by "tabs":
+/// `others` are transcripts other tabs have; `peer` is another tab in the
+/// same folder (its claim and when it last printed).
 const TestSink = struct {
     convo: Convo,
     claimed: ?[36]u8 = null,
     others: []const [36]u8 = &.{},
+    peer: ?*TestSink = null,
+    /// When this tab's program last printed (as the hub knows it).
+    out: ?i64 = null,
     resets: u32 = 0,
+    contested_notes: u32 = 0,
     applied: std.atomic.Value(u32) = .init(0),
 
     fn sink(s: *TestSink) Sink {
-        return .{ .ctx = s, .apply = apply, .reset = reset, .claim = claim };
+        return .{ .ctx = s, .apply = apply, .reset = reset, .claim = claim, .contested = contested };
+    }
+    fn contested(ctx: *anyopaque) void {
+        const s: *TestSink = @ptrCast(@alignCast(ctx));
+        s.contested_notes += 1;
     }
     fn apply(ctx: *anyopaque, rec: *const transcript.Record) void {
         const s: *TestSink = @ptrCast(@alignCast(ctx));
@@ -666,11 +834,15 @@ const TestSink = struct {
         s.convo.reset(on);
         s.resets += 1;
     }
-    fn claim(ctx: *anyopaque, stem: []const u8) bool {
+    fn claim(ctx: *anyopaque, stem: []const u8, rival_since: ?i64) Claim {
         const s: *TestSink = @ptrCast(@alignCast(ctx));
-        for (s.others) |o| if (std.mem.eql(u8, &o, stem)) return false;
+        for (s.others) |o| if (std.mem.eql(u8, &o, stem)) return .taken;
+        if (s.peer) |p| {
+            if (p.claimed) |c| if (std.mem.eql(u8, &c, stem)) return .taken;
+            if (rival_since) |since| if (p.out) |o| if (o >= since) return .contested;
+        }
         s.claimed = stem[0..36].*;
-        return true;
+        return .ok;
     }
 
     fn texts(s: *TestSink, buf: []u8) []const u8 {
@@ -720,6 +892,13 @@ const stem_a = "11111111-2222-3333-4444-555555555555";
 const stem_b = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 const stem_old = "00000000-0000-0000-0000-000000000000";
 
+/// The tab's program printed at `at` (the test's clock is then `at`).
+fn printedAt(f: *Follower, ts: *TestSink, at: i64) void {
+    f.test_now = at;
+    ts.out = at;
+    f.printed(at);
+}
+
 fn recLine(comptime kind: []const u8, comptime cwd: []const u8, comptime text: []const u8) []const u8 {
     if (comptime std.mem.eql(u8, kind, "user"))
         return "{\"type\":\"user\",\"cwd\":\"" ++ cwd ++ "\",\"sessionId\":\"s\",\"message\":{\"role\":\"user\",\"content\":\"" ++ text ++ "\"}}\n";
@@ -744,6 +923,8 @@ test "follower: notes old transcripts, picks the new one, reads appends and part
     try f.resolveFolder();
     try testing.expect(f.folder != null);
     f.rescan(); // notes sizes; follows nothing yet
+    // The tab's program is printing throughout (same moment).
+    printedAt(&f, &ts, 1000);
     try testing.expect(f.cur == null);
     try testing.expect(!ts.convo.on);
 
@@ -797,6 +978,7 @@ test "follower: with a session id, only that transcript until it appears; then /
     f.expected = stem_b.*;
     try f.resolveFolder();
     f.rescan();
+    printedAt(&f, &ts, 1000);
     // Another session in the same folder (outside Portal), same cwd: ignored.
     try t.append("projects\\C--p\\" ++ stem_a ++ ".jsonl", recLine("user", "C:\\\\p", "outside"));
     f.changed(stem_a ++ ".jsonl");
@@ -809,8 +991,10 @@ test "follower: with a session id, only that transcript until it appears; then /
     f.changed(stem_b ++ ".jsonl");
     var buf: [256]u8 = undefined;
     try testing.expectEqualStrings("mine|", ts.texts(&buf));
-    // /clear: a new session file with the tab's cwd takes over.
+    // /clear: a new session file with the tab's cwd takes over (the tab
+    // printed as it appeared).
     const stem_c = "cccccccc-0000-0000-0000-000000000000";
+    printedAt(&f, &ts, 9000);
     try t.append("projects\\C--p\\" ++ stem_c ++ ".jsonl", recLine("user", "C:\\\\p", "cleared"));
     f.changed(stem_c ++ ".jsonl");
     try testing.expectEqualStrings(stem_c, &f.cur.?.stem);
@@ -831,12 +1015,172 @@ test "follower: a transcript claimed by another tab is left alone" {
     defer f.deinit();
     try f.resolveFolder();
     f.rescan();
+    printedAt(&f, &ts, 1000);
     try t.append("projects\\C--p\\" ++ stem_a ++ ".jsonl", recLine("user", "C:\\\\p", "theirs"));
     f.changed(stem_a ++ ".jsonl");
     try testing.expect(f.cur == null);
     try t.append("projects\\C--p\\" ++ stem_b ++ ".jsonl", recLine("user", "C:\\\\p", "mine"));
     f.changed(stem_b ++ ".jsonl");
     try testing.expectEqualStrings(stem_b, &f.cur.?.stem);
+}
+
+/// Two tabs in one folder (`C:\p`), each following its own session id,
+/// as Portal runs them; the test drives their clocks and output.
+const TwoTabs = struct {
+    t: Tmp,
+    pb: [1024]u8 = undefined,
+    a: TestSink,
+    b: TestSink,
+    fa: Follower,
+    fb: Follower,
+
+    const sid_a = "a0000000-0000-4000-8000-00000000000a";
+    const sid_b = "b0000000-0000-4000-8000-00000000000b";
+    const new = "c0000000-0000-4000-8000-00000000000c";
+
+    fn init(tt: *TwoTabs) !void {
+        const gpa = testing.allocator;
+        tt.t = try Tmp.init();
+        try tt.t.tmp.dir.createDirPath(testing.io, "projects\\C--p");
+        const projects = tt.t.path(&tt.pb, "projects");
+        tt.a = .{ .convo = Convo.init(gpa, .{ .root = "C:\\p", .name = "p" }) };
+        tt.b = .{ .convo = Convo.init(gpa, .{ .root = "C:\\p", .name = "p" }) };
+        tt.a.peer = &tt.b;
+        tt.b.peer = &tt.a;
+        tt.fa = try Follower.init(gpa, tt.a.sink(), projects, "C:\\p");
+        tt.fb = try Follower.init(gpa, tt.b.sink(), projects, "C:\\p");
+        tt.fa.expected = sid_a.*;
+        tt.fb.expected = sid_b.*;
+        for ([_]*Follower{ &tt.fa, &tt.fb }) |f| {
+            try f.resolveFolder();
+            f.test_now = 0;
+            f.rescan();
+        }
+        // Both sessions start and write their own transcripts.
+        try tt.write(sid_a, "a's");
+        try tt.write(sid_b, "b's");
+        try testing.expectEqualStrings(sid_a, &tt.fa.cur.?.stem);
+        try testing.expectEqualStrings(sid_b, &tt.fb.cur.?.stem);
+    }
+
+    fn deinit(tt: *TwoTabs) void {
+        tt.fa.deinit();
+        tt.fb.deinit();
+        tt.a.convo.deinit();
+        tt.b.convo.deinit();
+        tt.t.deinit();
+    }
+
+    /// A record appended to `stem`; both followers are told, as the
+    /// directory notification tells both.
+    fn write(tt: *TwoTabs, comptime stem: []const u8, comptime text: []const u8) !void {
+        try tt.t.append("projects\\C--p\\" ++ stem ++ ".jsonl", recLine("user", "C:\\\\p", text));
+        tt.fa.changed(stem ++ ".jsonl");
+        tt.fb.changed(stem ++ ".jsonl");
+    }
+
+    fn clock(tt: *TwoTabs, at: i64) void {
+        tt.fa.test_now = at;
+        tt.fb.test_now = at;
+    }
+
+    fn stemA(tt: *TwoTabs) []const u8 {
+        return &tt.fa.cur.?.stem;
+    }
+    fn stemB(tt: *TwoTabs) []const u8 {
+        return &tt.fb.cur.?.stem;
+    }
+};
+
+test "follower: /clear in tab A (A printed) moves A only, in either order" {
+    var tt: TwoTabs = undefined;
+    try tt.init();
+    defer tt.deinit();
+    // A prints, then its new transcript appears.
+    printedAt(&tt.fa, &tt.a, 10_000);
+    tt.clock(10_300);
+    try tt.write(TwoTabs.new, "cleared in A");
+    try testing.expectEqualStrings(TwoTabs.new, tt.stemA());
+    try testing.expectEqualStrings(TwoTabs.sid_b, tt.stemB());
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("cleared in A|", tt.a.texts(&buf));
+    try testing.expectEqualStrings("b's|", tt.b.texts(&buf));
+    // Again (/clear once more), the file first: decided at A's output.
+    const newer = "d0000000-0000-4000-8000-00000000000d";
+    tt.clock(20_000);
+    try tt.write(newer, "again");
+    try testing.expectEqualStrings(TwoTabs.new, tt.stemA());
+    printedAt(&tt.fa, &tt.a, 21_500);
+    try testing.expectEqualStrings(newer, tt.stemA());
+    try testing.expectEqualStrings(TwoTabs.sid_b, tt.stemB());
+    // B prints later: B's window for it has passed, and A has it anyway.
+    printedAt(&tt.fb, &tt.b, 23_000);
+    try testing.expectEqualStrings(TwoTabs.sid_b, tt.stemB());
+    try testing.expectEqual(@as(u32, 0), tt.a.contested_notes + tt.b.contested_notes);
+}
+
+test "follower: a session outside Portal (no tab printed) is nobody's" {
+    var tt: TwoTabs = undefined;
+    try tt.init();
+    defer tt.deinit();
+    printedAt(&tt.fa, &tt.a, 1000);
+    printedAt(&tt.fb, &tt.b, 1000);
+    tt.clock(30_000);
+    try tt.write(TwoTabs.new, "outside");
+    try tt.write(TwoTabs.new, "outside more");
+    try testing.expectEqualStrings(TwoTabs.sid_a, tt.stemA());
+    try testing.expectEqualStrings(TwoTabs.sid_b, tt.stemB());
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("a's|", tt.a.texts(&buf));
+    try testing.expectEqualStrings("b's|", tt.b.texts(&buf));
+}
+
+test "follower: both tabs in the folder printed: neither takes the new transcript" {
+    var tt: TwoTabs = undefined;
+    try tt.init();
+    defer tt.deinit();
+    printedAt(&tt.fa, &tt.a, 40_000);
+    printedAt(&tt.fb, &tt.b, 40_100);
+    tt.clock(40_500);
+    try tt.write(TwoTabs.new, "whose");
+    try testing.expectEqualStrings(TwoTabs.sid_a, tt.stemA());
+    try testing.expectEqualStrings(TwoTabs.sid_b, tt.stemB());
+    // Noted (each tab once), not per decision.
+    try testing.expectEqual(@as(u32, 1), tt.a.contested_notes);
+    try testing.expectEqual(@as(u32, 1), tt.b.contested_notes);
+    // More output in the window changes nothing; nor does the next record.
+    printedAt(&tt.fa, &tt.a, 41_000);
+    printedAt(&tt.fb, &tt.b, 41_000);
+    tt.clock(41_200);
+    try tt.write(TwoTabs.new, "whose 2");
+    try testing.expectEqualStrings(TwoTabs.sid_a, tt.stemA());
+    try testing.expectEqualStrings(TwoTabs.sid_b, tt.stemB());
+    try testing.expectEqual(@as(u32, 1), tt.a.contested_notes);
+    try testing.expectEqual(@as(u32, 1), tt.b.contested_notes);
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("a's|", tt.a.texts(&buf));
+    try testing.expectEqualStrings("b's|", tt.b.texts(&buf));
+}
+
+test "follower: a candidate older than the window when the output comes is not taken" {
+    var tt: TwoTabs = undefined;
+    try tt.init();
+    defer tt.deinit();
+    tt.clock(50_000);
+    try tt.write(TwoTabs.new, "stale");
+    // A prints 2.5 s later: too late for that write.
+    printedAt(&tt.fa, &tt.a, 50_000 + adopt_window_ms + 500);
+    try testing.expectEqualStrings(TwoTabs.sid_a, tt.stemA());
+    try testing.expectEqual(@as(usize, 0), tt.fa.n_pending);
+    // Its next output alone changes nothing (no growth)...
+    printedAt(&tt.fa, &tt.a, 53_000);
+    try testing.expectEqualStrings(TwoTabs.sid_a, tt.stemA());
+    // ... but a later write next to A's output (/resume of that session
+    // in A) is A's.
+    tt.clock(53_200);
+    try tt.write(TwoTabs.new, "resumed");
+    try testing.expectEqualStrings(TwoTabs.new, tt.stemA());
+    try testing.expectEqualStrings(TwoTabs.sid_b, tt.stemB());
 }
 
 test "follower: overlong lines are cut, not kept whole" {
@@ -936,6 +1280,8 @@ test "follower thread: stops on its event; waits for the folder to appear" {
     defer ts.convo.deinit();
     var f = try Follower.init(gpa, ts.sink(), projects, "C:\\late");
     defer f.deinit();
+    // Portal's own session id: followed without the program's output.
+    f.expected = stem_a.*;
     const stop = w.validHandle(w.CreateEventW(null, 1, 0, null)).?;
     defer _ = w.CloseHandle(stop);
     const th = try std.Thread.spawn(.{}, Follower.run, .{ &f, stop, null });
