@@ -1,10 +1,9 @@
-//! Unit test root for the client-specific code (the reusable view module
-//! has its own test root, src/view/root.zig).
+//! Unit test root for the client-specific code (the view module and the
+//! shared UI, ../ui, have their own test roots).
 test {
     _ = @import("gframe.zig");
     _ = @import("keys.zig");
-    _ = @import("inputline.zig");
-    _ = @import("dataview.zig");
+    _ = @import("touchkbd.zig");
     _ = @import("credstore.zig");
     _ = @import("net/http.zig");
     _ = @import("net/x509check.zig");
@@ -12,7 +11,5 @@ test {
     _ = @import("net/watchdog.zig");
     _ = @import("net/pin.zig");
     _ = @import("net/client.zig");
-    _ = @import("remote.zig");
-    _ = @import("setup.zig");
     _ = @import("sync/root.zig");
 }

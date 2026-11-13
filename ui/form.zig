@@ -1,6 +1,6 @@
-//! Editing state for TermView panels: bounded one-line text fields and a
-//! focus ring. Pure data, no drawing (TermView.Panel draws what the host
-//! builds from these), so the panels' state machines are unit-tested.
+//! Editing state for the UI's panels: bounded one-line text fields and a
+//! focus ring. Pure data, no drawing (frame.Panel draws what the panels
+//! build from these), so the panels' state machines are unit-tested.
 
 const std = @import("std");
 

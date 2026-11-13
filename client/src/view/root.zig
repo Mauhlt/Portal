@@ -1,32 +1,25 @@
-//! Module "view": everything needed to show a terminal grid in a native
-//! window with the owner's Vulkan Renderer, and nothing about networking.
-//! Self-contained (imports only std, the Renderer's "Renderer", "Window" and
-//! "Font" modules and "imgdec"), so Portal's
-//! root build can add it as a module for `portal run`'s local GUI terminal
-//! as well as for the remote client (`portal connect`).
+//! Module "view": the shared UI (module "portal_ui") on screen in a native
+//! window with the owner's Vulkan Renderer, and nothing about networking or
+//! what the UI shows. Imports only std, the Renderer's "Renderer", "Window"
+//! and "Font" modules, "imgdec" and "portal_ui", so Portal's root build adds
+//! it for the desk's window (`portal run`) as well as for the remote viewer
+//! (`portal connect`).
 //!
-//!   TermView   window + renderer + fonts + atlas + theme + fit/zoom + chrome
-//!   grid       Grid/Cell snapshot model (mirrors src/vt.zig) and Theme
-//!   input      Key/Mods/Event, InputSink interface, answer buttons
+//!   Presenter  window + renderer + fonts + atlas + inline images; builds
+//!              the UI's frame and draws its draw list; window input
+//!              through the frame's hit-testing to an InputSink
+//!   images     PNG decode / scale / pack into the texture's image region
 //!   Window     the Renderer's Window module (re-exported): one window API
 //!              for Win32, Wayland and macOS
-//!   font       the Renderer's Font module: TrueType parser, rasteriser,
-//!              system font set, glyph atlas (re-exported)
-//!   wcwidth    cell widths: the Font module's table, the same one the
-//!              server's src/vt.zig and the browser client use
+//!   font       the Renderer's Font module (re-exported)
 
-pub const TermView = @import("TermView.zig");
-pub const grid = @import("grid.zig");
-pub const form = @import("form.zig");
+pub const Presenter = @import("Presenter.zig");
 pub const images = @import("images.zig");
-pub const input = @import("input.zig");
 pub const Window = @import("Window");
 pub const font = @import("Font");
 pub const wcwidth = font.wcwidth;
 
 test {
-    _ = TermView;
-    _ = grid;
-    _ = form;
+    _ = Presenter;
     _ = images;
 }

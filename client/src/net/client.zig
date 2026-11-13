@@ -46,10 +46,12 @@ const net = Io.net;
 const http = @import("http.zig");
 const ws = @import("shared").ws;
 const tabs_wire = @import("shared").tabs;
+const convo_wire = @import("shared").convo;
 const tlsconn = @import("tlsconn.zig");
 const x509check = @import("x509check.zig");
 const watchdog = @import("watchdog.zig");
-const Grid = @import("view").grid.Grid;
+const ui = @import("portal_ui");
+const Grid = ui.grid.Grid;
 const gframe = @import("../gframe.zig");
 const keys = @import("../keys.zig");
 const credstore = @import("../credstore.zig");
@@ -109,15 +111,36 @@ pub fn classify(err: anyerror) Reach {
     };
 }
 
-/// The user-facing sentences for the session-ended and offline states.
-pub fn endedText(code: i64, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Session ended on the desktop (exit code {d})", .{code}) catch "Session ended on the desktop";
+/// The user-facing sentences for the session-ended and offline states
+/// (the shared UI's, which shows them too).
+pub const endedText = ui.shell.endedText;
+pub const offline_text = ui.shell.offline_text;
+
+/// Errors that mean "this is not the Portal we trust" (or not Portal's
+/// TLS at all), as opposed to the network being down.
+pub fn isTrustError(err: anyerror) bool {
+    const list = [_]anyerror{
+        error.NotIssuedByPinnedCa,    error.HostMismatch,          error.CertificateExpired,
+        error.CertificateNotYetValid, error.CaExpired,             error.BadCertificate,
+        error.UnsupportedCertificate, error.NotTls13,              error.UnsupportedCipherSuite,
+        error.HelloRetryRequest,      error.TlsHandshakeMalformed, error.TlsUnexpectedMessage,
+        error.TlsDecodeError,         error.TlsAlert,              error.TlsConnectionTruncated,
+        error.NoServerCertificate,
+    };
+    for (list) |e| if (e == err) return true;
+    return false;
 }
-pub const offline_text = "Desktop offline \u{2014} reconnects automatically";
+
+test "trust errors" {
+    try std.testing.expect(isTrustError(error.HostMismatch));
+    try std.testing.expect(!isTrustError(error.TimedOut));
+}
 
 pub const Shared = struct {
     mutex: Io.Mutex = .init,
     grid: Grid = .{},
+    /// The conversation of the tab shown (convo / convo+ messages).
+    convo: ui.convo.Conversation = .{},
     /// hello's `input` (null before hello and while disconnected).
     mode: ?keys.Policy = null,
     /// The desktop's open project tabs (hello, then `tabs`), the one shown
@@ -307,6 +330,21 @@ pub const Client = struct {
         if (status == .connected) s.last_error = null;
         if (status != .connected) s.mode = if (status == .session_ended) s.mode else null;
         s.mutex.unlock(c.io);
+        c.notify();
+    }
+
+    /// A `convo` / `convo+` message: parsed strictly (malformed: ignored)
+    /// and kept in Shared.convo for the Conversation view.
+    fn applyConvo(c: *Client, payload: []const u8) void {
+        if (payload.len > convo_wire.max_message) return;
+        const scratch = c.gpa.create(convo_wire.Scratch) catch return;
+        defer c.gpa.destroy(scratch);
+        scratch.text = c.gpa.alloc(u8, payload.len) catch return;
+        defer c.gpa.free(scratch.text);
+        const m = convo_wire.parse(payload, scratch) orelse return;
+        c.shared.mutex.lockUncancelable(c.io);
+        c.shared.convo.apply(c.gpa, m) catch {};
+        c.shared.mutex.unlock(c.io);
         c.notify();
     }
 
@@ -949,6 +987,12 @@ pub const Client = struct {
                 c.notify();
             },
             .text => {
+                // The conversation of the tab shown (larger than the
+                // other messages; its own strict parser).
+                if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"convo")) {
+                    c.applyConvo(frame.payload);
+                    return null;
+                }
                 if (frame.payload.len > 8192) return null;
                 const parsed = std.json.parseFromSlice(Msg, c.gpa, frame.payload, .{ .ignore_unknown_fields = true }) catch return null;
                 defer parsed.deinit();

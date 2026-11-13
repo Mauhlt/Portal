@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const vt = @import("vt.zig");
-const grid = @import("view").grid;
+const grid = @import("portal_ui").grid;
 
 pub const Sync = struct {
     /// rowGen of each row when it was last copied.
@@ -173,7 +173,7 @@ test "sync copies dirty rows, cursor, title and follows resizes" {
     try testing.expectEqual(@as(u21, 'h'), g.cell(0, 0).cp);
     try testing.expectEqual(@as(u21, 'X'), g.cell(2, 0).cp);
     try testing.expect(g.cell(2, 0).attrs.bold);
-    try testing.expectEqual(@as(u32, 0xCD0000), g.cell(2, 0).fg);
+    try testing.expectEqual(@import("shared").theme.ansi16[1], g.cell(2, 0).fg);
     try testing.expectEqual(@as(u16, 3), g.cursor_x);
     try testing.expectEqualStrings("my title", s.title());
 

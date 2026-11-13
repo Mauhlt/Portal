@@ -1,4 +1,4 @@
-//! The native client's instruction line (`instruct` mode, the server's
+//! The instruction line (`instruct` mode, the server's
 //! default): a one-line field under the answer bar, the counterpart of the
 //! browser's input box. What Enter does with the text, the answer words and
 //! the refusal texts are the shared logic (module "inputrules",
@@ -13,17 +13,17 @@
 //!   * A line the server refuses ({"t":"rejected"}) comes back into the
 //!     field if nothing new was typed meanwhile.
 //!
-//! The desk's input box (src/gui.zig) is the same line with `policy` set to
+//! The desk's input box is the same line with `policy` set to
 //! `text` (the person at the desk has full control): there Enter types the
 //! text and presses Enter (`t:` then `k:enter`), with no line checks.
 //!
-//! Pure state, no drawing: remote.zig and gui.zig build the bottom pane
-//! from `snapshot()`.
+//! Pure state, no drawing: the shell (shell.zig) builds the bottom pane
+//! from `snapshot()` on every device.
 
 const std = @import("std");
 const rules = @import("inputrules");
-const view_mod = @import("view");
-const input = view_mod.input;
+const form = @import("form.zig");
+const input = @import("input.zig");
 
 /// A little above the line limit, so an over-long line gets the "too long"
 /// note instead of silently refusing more characters.
@@ -33,7 +33,7 @@ pub const Line = struct {
     /// What Enter does with the text (rules.decide): `instruct` for remote
     /// viewers, `text` on the desk.
     policy: rules.Policy = .instruct,
-    field: view_mod.form.TextField(cap) = .{},
+    field: form.TextField(cap) = .{},
     /// The last line sent, for a server refusal.
     last_buf: [rules.max_line_bytes]u8 = undefined,
     last_len: usize = 0,

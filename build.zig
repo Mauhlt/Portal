@@ -161,7 +161,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(client_tests).step);
     test_step.dependOn(&wasm.step);
     const gui_mods = gui_root.gui;
-    // The shared GUI modules' own unit tests (client/src/view, client/src).
+    // The shared UI (ui/: layout, draw list, shell, panels, theme use) and
+    // the GUI modules' own unit tests (client/src/view, client/src).
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.ui })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.view })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gui_mods.client })).step);
     // The protocol code every program shares (shared/root.zig), including
@@ -207,9 +209,9 @@ fn laptopClientCheck(b: *std.Build, t: std.Build.ResolvedTarget) *std.Build.Step
         .link_libc = true, // libsecret / Security.framework via dlopen
         .imports = &.{
             .{ .name = "view", .module = gui.view },
+            .{ .name = "portal_ui", .module = gui.ui },
             .{ .name = "shared", .module = sharedModule(b, t, .Debug) },
             .{ .name = "inputrules", .module = inputrules },
-            .{ .name = "datafeed", .module = datafeedModule(b, t, .Debug) },
         },
     }) });
 }
@@ -224,7 +226,7 @@ fn inputrulesModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
 
 /// "datafeed" (src/datafeed): the Data slice's model (bounded history of
 /// what the session pushed, the "new" badge), shared by the browser client
-/// (src/wasm/data.zig) and the native one (client/src/dataview.zig).
+/// (src/wasm/data.zig) and the shared UI (ui/dataview.zig).
 fn datafeedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     return b.createModule(.{ .root_source_file = b.path("src/datafeed/root.zig"), .target = target, .optimize = optimize });
 }
@@ -288,6 +290,8 @@ fn clientModule(b: *std.Build, root_src: []const u8, target: std.Build.ResolvedT
     const vt_mod = b.createModule(.{ .root_source_file = b.path("src/vt.zig"), .target = target, .optimize = optimize });
     vt_mod.addImport("imgcheck", img.imgcheck);
     vt_mod.addImport("Font", font);
+    // The theme's ANSI colours (shared/theme.zig).
+    vt_mod.addImport("shared", sharedModule(b, target, optimize));
     m.addImport("vt", vt_mod);
     m.addImport("Font", font);
     // Keys and the input box follow the server's own rules.
@@ -375,16 +379,38 @@ fn imageModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
 
 // ---- GUI modules (shared with client/, which still builds on its own) ----
 
-const GuiModules = struct { view: *std.Build.Module, client: *std.Build.Module, imgdec: *std.Build.Module, imgcheck: *std.Build.Module, inputrules: *std.Build.Module };
+const GuiModules = struct { ui: *std.Build.Module, view: *std.Build.Module, client: *std.Build.Module, imgdec: *std.Build.Module, imgcheck: *std.Build.Module, inputrules: *std.Build.Module };
 
-/// Adds "view" (client/src/view: window, Vulkan drawing via the owner's
-/// Renderer, fonts via its Font module; used by `portal run`'s window) and "client"
-/// (client/src: the remote viewer behind `portal connect`) to `mod`.
+/// "portal_ui" (ui/root.zig): the one Portal UI every native device runs
+/// (layout, draw list, shell, panels; colours from shared/theme.zig). A
+/// plain module of this build rather than a package, like inputrules,
+/// because it shares this compilation's "Font", "shared", "inputrules" and
+/// "datafeed" instances (a file may belong to one module per compilation);
+/// client/build.zig creates it the same way from ../ui/root.zig.
+fn uiModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inputrules: *std.Build.Module) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("ui/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "Font", .module = fontModule(b, target, optimize) },
+            .{ .name = "shared", .module = sharedModule(b, target, optimize) },
+            .{ .name = "inputrules", .module = inputrules },
+            .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
+        },
+    });
+}
+
+/// Adds "portal_ui" (ui/), "view" (client/src/view: window, Vulkan drawing
+/// of the UI's draw list via the owner's Renderer, fonts via its Font
+/// module; used by `portal run`'s window) and "client" (client/src: the
+/// remote viewer behind `portal connect`) to `mod`.
 fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inputrules: *std.Build.Module) GuiModules {
     const renderer = rendererDep(b, target, optimize);
     const link_libc = target.result.os.tag != .windows; // dlopen off Windows
     const img = imageModules(b, target, optimize);
     const shared = sharedModule(b, target, optimize);
+    const ui = uiModule(b, target, optimize, inputrules);
     const view = b.createModule(.{
         .root_source_file = b.path("client/src/view/root.zig"),
         .target = target,
@@ -396,7 +422,7 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
             .{ .name = "Window", .module = renderer.module("Window") },
             .{ .name = "Font", .module = renderer.module("Font") },
             .{ .name = "imgdec", .module = img.imgdec },
-            .{ .name = "shared", .module = shared },
+            .{ .name = "portal_ui", .module = ui },
         },
     });
     const client = b.createModule(.{
@@ -406,14 +432,15 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
         .link_libc = link_libc,
         .imports = &.{
             .{ .name = "view", .module = view },
+            .{ .name = "portal_ui", .module = ui },
             .{ .name = "shared", .module = shared },
             .{ .name = "inputrules", .module = inputrules },
-            .{ .name = "datafeed", .module = datafeedModule(b, target, optimize) },
         },
     });
     mod.addImport("view", view);
+    mod.addImport("portal_ui", ui);
     mod.addImport("client", client);
     // src/vt.zig (a file of the root module) validates transmitted images.
     mod.addImport("imgcheck", img.imgcheck);
-    return .{ .view = view, .client = client, .imgdec = img.imgdec, .imgcheck = img.imgcheck, .inputrules = inputrules };
+    return .{ .ui = ui, .view = view, .client = client, .imgdec = img.imgdec, .imgcheck = img.imgcheck, .inputrules = inputrules };
 }

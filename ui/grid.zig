@@ -1,4 +1,5 @@
-//! Grid snapshot: the plain cell model TermView draws. Filled either from
+//! Grid snapshot: the plain cell model the shared UI draws in its
+//! terminal view. Filled either from
 //! remote 'G' frames (../gframe.zig) or from Portal's local src/vt.zig
 //! Terminal (src/localgrid.zig). The model mirrors vt.zig: `Kind` = vt `Wide`
 //! (narrow/lead/cont), `Attrs` = vt's wire attrs (bold 1, dim 2, italic 4,
@@ -8,15 +9,16 @@
 const std = @import("std");
 /// The wire format's limits (shared/screen.zig), which every client uses.
 const screen = @import("shared").screen;
+const theme = @import("shared").theme;
 
 pub const max_cols = screen.max_dim;
 pub const max_rows = screen.max_dim;
 
-pub const color_default: u32 = 0xFF000000;
+pub const color_default = theme.color_default;
 /// Default background used as a foreground (inverse video).
-pub const color_default_bg_as_fg: u32 = 0xFF000002;
+pub const color_default_bg_as_fg = theme.color_default_bg_as_fg;
 /// Default foreground used as a background (inverse video).
-pub const color_default_fg_as_bg: u32 = 0xFF000003;
+pub const color_default_fg_as_bg = theme.color_default_fg_as_bg;
 
 pub const Attrs = packed struct(u8) {
     bold: bool = false,
@@ -47,7 +49,7 @@ pub const max_blob_total_bytes = screen.max_blob_total_bytes;
 pub const max_placements = screen.max_placements;
 
 /// The images of the visible screen: PNG bytes by id (untrusted; decoded
-/// by TermView through imgdec) and their placements. Bounded: at most
+/// by the view module through imgdec) and their placements. Bounded: at most
 /// `max_blobs` blobs of `max_blob_bytes`, `max_blob_total_bytes` in all,
 /// `max_placements` placements.
 pub const Images = struct {
@@ -168,34 +170,8 @@ pub const Grid = struct {
     }
 };
 
-// ------------------------------------------------------------------ theme
-
-pub const Rgb = [3]u8;
-
-pub const Theme = struct {
-    fg: Rgb = .{ 0xD8, 0xDC, 0xE2 },
-    bg: Rgb = .{ 0x16, 0x18, 0x1D },
-    cursor: Rgb = .{ 0xE8, 0xB0, 0x4C },
-    /// Background of selected cells.
-    selection: Rgb = .{ 0x2F, 0x4B, 0x78 },
-
-    fn rgb(v: u32) Rgb {
-        return .{ @truncate(v >> 16), @truncate(v >> 8), @truncate(v) };
-    }
-
-    pub fn resolveFg(t: Theme, v: u32) Rgb {
-        if (v == color_default_bg_as_fg) return t.bg;
-        if (v >> 24 != 0) return t.fg; // default, or an unknown sentinel
-        return rgb(v);
-    }
-
-    pub fn resolveBg(t: Theme, v: u32) Rgb {
-        if (v == color_default_fg_as_bg) return t.fg;
-        if (v >> 24 != 0) return t.bg;
-        return rgb(v);
-    }
-};
-
+/// Colours are resolved with the theme (shared/theme.zig).
+pub const Rgb = theme.Rgb;
 
 const testing = std.testing;
 
@@ -227,14 +203,4 @@ test "images: blobs bounded, dropped when no placement references them" {
     try testing.expect(im.total_bytes <= max_blob_total_bytes);
     try testing.expectEqual(@as(usize, 10), im.blobs.items.len);
     try testing.expect(im.blob(1000) == null and im.blob(1010) != null);
-}
-
-test "theme resolves sentinels" {
-    const t: Theme = .{};
-    try testing.expectEqual(t.fg, t.resolveFg(color_default));
-    try testing.expectEqual(t.bg, t.resolveBg(color_default));
-    try testing.expectEqual(t.bg, t.resolveFg(color_default_bg_as_fg));
-    try testing.expectEqual(t.fg, t.resolveBg(color_default_fg_as_bg));
-    try testing.expectEqual(Rgb{ 0x12, 0x34, 0x56 }, t.resolveFg(0x00123456));
-    try testing.expectEqual(t.fg, t.resolveFg(0xFF000005));
 }
