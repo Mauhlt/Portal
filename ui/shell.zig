@@ -47,6 +47,7 @@
 const std = @import("std");
 const rules = @import("inputrules");
 const tabs_wire = @import("shared").tabs;
+const subtabs_wire = @import("shared").subtabs;
 const theme = @import("shared").theme;
 const frame = @import("frame.zig");
 const input = @import("input.zig");
@@ -91,6 +92,8 @@ pub const ids = struct {
     /// tab0 + position: show that tab; close0 + position: close it.
     pub const tab0: u32 = 1000;
     pub const close0: u32 = 1100;
+    /// sub0 + position: show that sub-tab of the tab shown (read-only).
+    pub const sub0: u32 = 1600;
 };
 
 /// What the main slice shows (the top bar's view toggle on devices).
@@ -228,6 +231,11 @@ pub const State = struct {
     /// The open project tabs and the one shown (protocol v2 / the hub).
     tabs: []const tabs_wire.Entry = &.{},
     current: ?tabs_wire.Id = null,
+    /// The shown tab's subagent sub-tabs (section 3e), drawn after it in
+    /// the top bar, and the one shown instead of the tab (null: none). A
+    /// sub-tab is read-only: its conversation, no Instruct, no keys.
+    subs: []const subtabs_wire.Entry = &.{},
+    sub_shown: ?subtabs_wire.Id = null,
     /// The device's modal panel to draw now, if any.
     panel: ?frame.Panel = null,
     desk: Desk = .{},
@@ -266,6 +274,9 @@ pub const HeadsetMic = struct {
 pub const Command = union(enum) {
     /// Show / close the tab at top-bar position i; open a new one (desk).
     select_tab: usize,
+    /// Show sub-tab i of the tab shown (State.subs), or (null) the tab's
+    /// own view again.
+    select_sub: ?usize,
     close_tab: usize,
     open_tab,
     /// Copy the selected cells (desk), paste the clipboard into the terminal.
@@ -387,6 +398,11 @@ pub const Shell = struct {
     question_digits: u8 = 0,
     n_tabs: usize = 0,
     shown: ?usize = null,
+    /// As of the last overlay: the shown tab's sub-tab count, and the one
+    /// shown (its position), which makes the main slice its read-only
+    /// conversation.
+    n_subs: usize = 0,
+    sub_at: ?usize = null,
     /// The status panel open (panels/status.zig), and the tab whose badge
     /// opened it.
     info: status_panels.Screen = .none,
@@ -404,7 +420,9 @@ pub const Shell = struct {
         panes: [frame.max_panes]frame.Pane = undefined,
         row: [2]frame.PanelButton = undefined,
         keys: [16]input.Answer = undefined,
-        top_tabs: [tabs_wire.max_tabs]frame.TopTab = undefined,
+        top_tabs: [tabs_wire.max_tabs + subtabs_wire.max_subs]frame.TopTab = undefined,
+        sub_labels: [subtabs_wire.max_subs][subtabs_wire.max_name + 16]u8 = undefined,
+        sub_status: [subtabs_wire.max_name + 48]u8 = undefined,
         buttons: [8]frame.TopButton = undefined,
         badges: [tabs_wire.max_tabs][8]u8 = undefined,
         tasks: [64]u8 = undefined,
@@ -432,6 +450,9 @@ pub const Shell = struct {
 
     pub fn focus(sh: *const Shell) Focus {
         if (sh.modalActive() != null or sh.info != .none) return .panel;
+        // A sub-tab: its conversation (scrolling), nothing reaches a
+        // terminal or a line.
+        if (sh.sub_at != null and sh.conversation != null) return .view;
         switch (sh.device) {
             .desk => return if (sh.line_focus) .line else .terminal,
             .viewer => {
@@ -484,6 +505,7 @@ pub const Shell = struct {
     /// panel's line doesn't, so there only the panel's mic button and the
     /// headset's media key toggle dictation.
     pub fn toggleDictation(sh: *Shell) void {
+        if (sh.sub_at != null) return; // a sub-tab takes no input
         if (sh.dictating) sh.stopDictation() else sh.startDictation();
     }
 
@@ -537,7 +559,14 @@ pub const Shell = struct {
         sh.question_digits = if (card) 0 else @min(st.viewer.question_digits, 9);
         sh.n_tabs = 0;
         sh.shown = null;
+        sh.n_subs = @min(st.subs.len, subtabs_wire.max_subs);
+        sh.sub_at = null;
+        if (st.sub_shown) |id| for (st.subs[0..sh.n_subs], 0..) |*e, i| {
+            if (std.mem.eql(u8, &e.id, &id)) sh.sub_at = i;
+        };
         if (sh.instructing and !(if (sh.policy()) |m| m.acceptsAnswers() else false)) sh.closeInstruct();
+        // A sub-tab takes no input: no instruct panel over it.
+        if (sh.instructing and sh.sub_at != null) sh.closeInstruct();
         // A status panel needs what it shows: System the desk's setting,
         // any of them a connection (devices).
         const sysmon = if (st.activity) |a| a.sysmon else false;
@@ -547,6 +576,7 @@ pub const Shell = struct {
             .desk => sh.deskOverlay(st),
             .viewer => sh.viewerOverlay(st),
         };
+        if (sh.sub_at) |i| sh.subOverlay(st, st.subs[i], &o);
         sh.view_shown = o.screen == .view;
         o.panel = st.panel;
         if (o.panel == null) o.panel = status_panels.panel(sh.info, .{
@@ -577,32 +607,63 @@ pub const Shell = struct {
     /// lock while building the overlay).
     fn focusFor(sh: *const Shell, st: State) Focus {
         if (st.panel != null or sh.info != .none) return .panel;
+        if (sh.sub_at != null and sh.conversation != null) return .view;
         return switch (sh.device) {
             .desk => if (sh.line_focus) .line else .terminal,
             .viewer => viewerFocus(sh.main == .conversation and sh.conversation != null, st.viewer.status, st.viewer.mode, sh.instructing),
         };
     }
 
+    /// A sub-tab is shown (`sub`): the main slice is its conversation,
+    /// read-only (no Instruct, no view toggle), and the status line says
+    /// whose it is.
+    fn subOverlay(sh: *Shell, st: State, sub: subtabs_wire.Entry, o: *frame.Overlay) void {
+        if (o.top_bar == null) return; // not connected: the message stays
+        if (sh.conversation) |c| o.screen = .{ .view = c };
+        o.bottom = &.{};
+        o.selection = null;
+        if (o.top_bar) |*tb| if (sh.device == .viewer) {
+            tb.buttons = sh.statusButtons(st, &.{});
+        };
+        o.status.extra = std.fmt.bufPrint(&sh.bufs.sub_status, "subagent{s}: {s} \u{00B7} read-only", .{ if (sub.done) " (finished)" else "", sub.name() }) catch "subagent \u{00B7} read-only";
+        o.status.extra_tone = .muted;
+    }
+
     fn tabBar(sh: *Shell, st: State, closable: bool) []const frame.TopTab {
-        const n = @min(st.tabs.len, sh.bufs.top_tabs.len);
+        const n = @min(st.tabs.len, tabs_wire.max_tabs);
+        var k: usize = 0;
         for (st.tabs[0..n], 0..) |*e, i| {
             const active = if (st.current) |id| std.mem.eql(u8, &id, &e.id) else false;
             if (active) sh.shown = i;
             sh.tab_ids[i] = e.id;
             const act: ?*const activity_wire.Tab = if (st.activity) |a| a.find(e.id) else null;
-            sh.bufs.top_tabs[i] = .{
+            sh.bufs.top_tabs[k] = .{
                 .label = e.name(),
                 .color = theme.fromU32(e.color),
-                .active = active,
+                // A sub-tab shown: the tab is its parent, not shown itself.
+                .active = active and sh.sub_at == null,
                 .attention = e.state.attention(),
                 .id = ids.tab0 + @as(u32, @intCast(i)),
                 .close_id = if (closable) ids.close0 + @as(u32, @intCast(i)) else null,
                 .badge = if (act) |t| status_panels.badgeText(t, &sh.bufs.badges[i]) else "",
                 .badge_id = ids.badge0 + @as(u32, @intCast(i)),
             };
+            k += 1;
+            // The shown tab's sub-tabs right after it: "▸ <description>",
+            // in its colour, without a close box (they end with their
+            // subagent, never from here).
+            if (active) for (st.subs[0..sh.n_subs], 0..) |*s, j| {
+                sh.bufs.top_tabs[k] = .{
+                    .label = std.fmt.bufPrint(&sh.bufs.sub_labels[j], "\u{25B8} {s}{s}", .{ s.name(), if (s.done) " \u{00B7} done" else "" }) catch s.name(),
+                    .color = theme.fromU32(e.color),
+                    .active = sh.sub_at == j,
+                    .id = ids.sub0 + @as(u32, @intCast(j)),
+                };
+                k += 1;
+            };
         }
         sh.n_tabs = n;
-        return sh.bufs.top_tabs[0..n];
+        return sh.bufs.top_tabs[0..k];
     }
 
     /// "2 shells · 1 monitor" for the tab shown ("" if nothing runs).
@@ -1073,7 +1134,12 @@ pub const Shell = struct {
         const sh = self(ctx);
         if (sh.modalActive()) |m| return m.button(m.ctx, id);
         switch (id) {
-            ids.tab0...ids.tab0 + tabs_wire.max_tabs - 1 => if (id - ids.tab0 < sh.n_tabs) sh.command(.{ .select_tab = id - ids.tab0 }),
+            // The parent of the sub-tab shown: back to its own view.
+            ids.tab0...ids.tab0 + tabs_wire.max_tabs - 1 => if (id - ids.tab0 < sh.n_tabs) {
+                if (sh.sub_at != null and sh.shown == id - ids.tab0) return sh.command(.{ .select_sub = null });
+                sh.command(.{ .select_tab = id - ids.tab0 });
+            },
+            ids.sub0...ids.sub0 + subtabs_wire.max_subs - 1 => if (id - ids.sub0 < sh.n_subs) sh.command(.{ .select_sub = id - ids.sub0 }),
             ids.close0...ids.close0 + tabs_wire.max_tabs - 1 => if (id - ids.close0 < sh.n_tabs) sh.command(.{ .close_tab = id - ids.close0 }),
             ids.tab_add => sh.command(.open_tab),
             // A tap on the line: it takes the keyboard (desk), and on a
@@ -2001,4 +2067,60 @@ test "dictation toggles: Space only without a focused field, the media key only 
     Shell.onChar(&sh, ' ', .{});
     try testing.expect(!sh.dictating);
     try testing.expectEqual(@as(usize, 1), r.chars);
+}
+
+test "sub-tabs: after the shown tab, read-only (no Instruct, no keys), labelled; the parent goes back" {
+    for ([_]Device{ .viewer, .desk }) |dev| {
+        var r: Rec = .{};
+        var sh = Shell.init(testing.allocator, dev, r.host());
+        defer sh.deinit();
+        var sv: StubView = .{};
+        sh.conversation = sv.view();
+        var list: [2]tabs_wire.Entry = .{ .{ .id = @splat(1), .color = 0x3366CC }, .{ .id = @splat(2), .color = 0x10B981 } };
+        list[0].setName("Alpha");
+        list[1].setName("Beta");
+        var subs: [2]subtabs_wire.Entry = .{ .{ .id = @splat(7) }, .{ .id = @splat(8), .done = true } };
+        subs[0].setName("Find the tests");
+        subs[1].setName("Review");
+        const v: Viewer = .{ .status = .connected, .mode = .instruct, .host = "h", .has_grid = true };
+        // Beta shown, its sub-tabs right after it, none shown.
+        var o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2), .subs = &subs });
+        var tb = o.top_bar.?;
+        try testing.expectEqual(@as(usize, 4), tb.tabs.len);
+        try testing.expectEqualStrings("Beta", tb.tabs[1].label);
+        try testing.expect(tb.tabs[1].active);
+        try testing.expectEqualStrings("\u{25B8} Find the tests", tb.tabs[2].label);
+        try testing.expectEqualStrings("\u{25B8} Review \u{00B7} done", tb.tabs[3].label);
+        try testing.expect(tb.tabs[2].close_id == null and !tb.tabs[2].active);
+        try testing.expectEqual(theme.fromU32(0x10B981), tb.tabs[2].color);
+        try testing.expectEqual(ids.sub0 + 1, tb.tabs[3].id);
+        // A click on a sub-tab asks for it.
+        Shell.onButton(&sh, ids.sub0 + 1);
+        try testing.expectEqual(@as(?usize, 1), r.cmds[r.n_cmds - 1].select_sub);
+        // Shown: its conversation, nothing at the bottom, the status says
+        // whose it is, the keyboard reaches nothing.
+        o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2), .subs = &subs, .sub_shown = @splat(8) });
+        tb = o.top_bar.?;
+        try testing.expect(o.screen == .view);
+        try testing.expectEqual(@as(usize, 0), o.bottom.len);
+        try testing.expect(tb.tabs[3].active and !tb.tabs[1].active);
+        try testing.expectEqualStrings("subagent (finished): Review \u{00B7} read-only", o.status.extra);
+        try testing.expectEqual(Focus.view, sh.focus());
+        const before = r.chars + r.keys + r.answers + r.n_frames;
+        Shell.onChar(&sh, 'y', .{});
+        Shell.onKey(&sh, .enter, .{});
+        Shell.onChar(&sh, ' ', .{}); // no dictation either
+        sh.toggleDictation();
+        try testing.expectEqual(before, r.chars + r.keys + r.answers + r.n_frames);
+        try testing.expect(!sh.instructing);
+        // Its parent: back to the tab's own view (not a tab switch).
+        Shell.onButton(&sh, ids.tab0 + 1);
+        try testing.expectEqual(@as(?usize, null), r.cmds[r.n_cmds - 1].select_sub);
+        // Another tab: a plain switch.
+        Shell.onButton(&sh, ids.tab0);
+        try testing.expectEqual(@as(usize, 0), r.cmds[r.n_cmds - 1].select_tab);
+        // A sub-tab id that is not in the list shows nothing special.
+        o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2), .subs = &subs, .sub_shown = @splat(9) });
+        try testing.expect(o.bottom.len > 0);
+    }
 }

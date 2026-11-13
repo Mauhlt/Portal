@@ -57,6 +57,7 @@ const Allocator = std.mem.Allocator;
 const w = @import("../win32.zig");
 const fsutil = @import("../fsutil.zig");
 const transcript = @import("transcript.zig");
+const subagents = @import("subagents.zig");
 
 /// Longest transcript line kept whole.
 pub const max_line = 512 * 1024;
@@ -284,6 +285,9 @@ pub const Follower = struct {
     rec: *transcript.Record,
     /// Wakes of the wait loop (tests and the log measure idle cost).
     wakes: u32 = 0,
+    /// The subagents of the transcript followed (sub-tabs), if the tab
+    /// shows them: driven from this loop (subagents.zig).
+    subs: ?*subagents.Watcher = null,
 
     pub fn init(gpa: Allocator, sink: Sink, projects: []const u8, cwd: []const u8) !Follower {
         return .{
@@ -333,18 +337,43 @@ pub const Follower = struct {
                 continue;
             };
             f.rescan();
+            // The folder came back with the transcript still followed:
+            // its subagents again (rescan only finds other transcripts).
+            if (f.subs) |s| if (f.cur) |*c| if (s.session_dir == null) s.follow_(f.folder.?, &c.stem, false);
             while (true) {
-                const hs = [_]w.HANDLE{ stop, dc.ev, if (poke) |p| p.ev else stop };
-                const r = w.WaitForMultipleObjects(if (poke != null) 3 else 2, &hs, 0, w.INFINITE);
+                // stop, the folder, the program's output, then the
+                // subagents' own (subagents.Watcher.handles).
+                var hs: [5]w.HANDLE = undefined;
+                hs[0] = stop;
+                hs[1] = dc.ev;
+                var n: usize = 2;
+                if (poke) |p| {
+                    hs[n] = p.ev;
+                    n += 1;
+                }
+                const sub_base = n;
+                if (f.subs) |s| {
+                    var sb: [2]w.HANDLE = undefined;
+                    for (s.handles(&sb)) |h| {
+                        hs[n] = h;
+                        n += 1;
+                    }
+                }
+                const r = w.WaitForMultipleObjects(@intCast(n), &hs, 0, w.INFINITE);
                 f.wakes +|= 1;
                 // Whatever woke it, decisions use the latest output time.
                 if (poke) |p| f.noteOutput(p.last_ms.load(.acquire));
-                if (r == w.WAIT_OBJECT_0 + 2) {
+                if (poke != null and r == w.WAIT_OBJECT_0 + 2) {
                     // The program printed: coalesce a burst of output into
                     // one look at the transcript's size.
                     if (w.WaitForSingleObject(stop, poke_batch_ms) == w.WAIT_OBJECT_0) return;
                     poke.?.pending.store(false, .release);
                     f.printed(poke.?.last_ms.load(.acquire));
+                    if (f.subs) |s| s.printed();
+                    continue;
+                }
+                if (r >= w.WAIT_OBJECT_0 + sub_base and r < w.WAIT_OBJECT_0 + n) {
+                    f.subs.?.signaled(hs[r - w.WAIT_OBJECT_0]);
                     continue;
                 }
                 if (r != w.WAIT_OBJECT_0 + 1) return; // stop, or the wait failed
@@ -362,6 +391,7 @@ pub const Follower = struct {
     }
 
     fn lostFolder(f: *Follower) void {
+        if (f.subs) |s| s.stop();
         if (f.folder) |p| f.gpa.free(p);
         f.folder = null;
     }
@@ -639,6 +669,9 @@ pub const Follower = struct {
         f.line_cut = size > max_initial;
         f.skip_partial = size > max_initial;
         f.sink.reset(f.sink.ctx, true);
+        // Its subagents: all new if the tab started this transcript (or
+        // it was new when taken), else those already finished are history.
+        if (f.subs) |s| if (f.folder) |folder| s.follow_(folder, stem, expected or f.history_until == 0);
     }
 
     const Confirm = enum { yes, no, unknown };
@@ -747,7 +780,7 @@ fn openRead(gpa: Allocator, path: []const u8) ?w.HANDLE {
     return w.validHandle(w.CreateFileW(pw.ptr, w.GENERIC_READ, w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE, null, w.OPEN_EXISTING, w.FILE_ATTRIBUTE_NORMAL, null));
 }
 
-fn sizeOf(gpa: Allocator, path: []const u8) ?u64 {
+pub fn sizeOf(gpa: Allocator, path: []const u8) ?u64 {
     const h = openRead(gpa, path) orelse return null;
     defer _ = w.CloseHandle(h);
     var size: i64 = 0;
@@ -756,7 +789,7 @@ fn sizeOf(gpa: Allocator, path: []const u8) ?u64 {
 }
 
 /// Reads up to `buf.len` bytes at `offset`; the count read.
-fn readAt(gpa: Allocator, path: []const u8, offset: u64, buf: []u8) !usize {
+pub fn readAt(gpa: Allocator, path: []const u8, offset: u64, buf: []u8) !usize {
     const h = openRead(gpa, path) orelse return error.OpenFailed;
     defer _ = w.CloseHandle(h);
     if (w.SetFilePointerEx(h, @intCast(offset), null, w.FILE_BEGIN) == 0) return error.SeekFailed;
@@ -773,14 +806,14 @@ fn readAt(gpa: Allocator, path: []const u8, offset: u64, buf: []u8) !usize {
 
 /// Directory listing (FindFirstFileW): names (UTF-8), sizes, last write
 /// times.
-const Find = struct {
+pub const Find = struct {
     h: ?w.HANDLE,
     data: w.WIN32_FIND_DATAW = undefined,
     first: bool = true,
 
     const Entry = struct { name: []const u8, dir: bool, size: u64, time: u64 };
 
-    fn open(gpa: Allocator, pattern: []const u8) !Find {
+    pub fn open(gpa: Allocator, pattern: []const u8) !Find {
         const pw = try fsutil.longWide(gpa, pattern);
         defer gpa.free(pw);
         var f: Find = .{ .h = null };
@@ -788,7 +821,7 @@ const Find = struct {
         return f;
     }
 
-    fn next(f: *Find, out: []u8) ?Entry {
+    pub fn next(f: *Find, out: []u8) ?Entry {
         const h = f.h orelse return null;
         while (true) {
             if (!f.first) {
@@ -807,7 +840,7 @@ const Find = struct {
         }
     }
 
-    fn close(f: *Find) void {
+    pub fn close(f: *Find) void {
         if (f.h) |h| _ = w.FindClose(h);
     }
 };

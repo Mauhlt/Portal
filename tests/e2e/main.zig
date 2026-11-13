@@ -35,6 +35,7 @@ const convo_tests = @import("convo_tests.zig");
 const status_tests = @import("status_tests.zig");
 const probe_tests = @import("probe_tests.zig");
 const hooks_tests = @import("hooks_tests.zig");
+const subtabs_tests = @import("subtabs_tests.zig");
 
 /// Each run picks its own base port (a multiple of 200 in 20000..59800),
 /// so concurrent runs don't collide; `--base-port N` fixes it. Portal binds
@@ -75,6 +76,7 @@ const groups = [_]Group{
     .{ .name = "status", .run = status_tests.run, .port_offset = 160 },
     .{ .name = "probe", .run = probe_tests.run, .port_offset = 170 },
     .{ .name = "hooks", .run = hooks_tests.run, .port_offset = 180 },
+    .{ .name = "subtabs", .run = subtabs_tests.run, .port_offset = 190 },
 };
 
 pub fn main(init: std.process.Init) !void {

@@ -295,6 +295,10 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     };
     var ts_buf: [32]u8 = undefined;
     t.ts = isoTime(std.Io.Timestamp.now(io, .real).toSeconds(), &ts_buf);
+    if (std.mem.indexOf(u8, std.fs.path.basename(cwd), "subagent") != null) {
+        subagentRun(gpa, io, &t, dir, stem, env.get("PORTAL_TAB") orelse "");
+        return 0;
+    }
 
     // 1. A turn.
     t.rec("{\"type\":\"mode\",\"mode\":\"normal\",\"sessionId\":\"x\"}");
@@ -370,4 +374,48 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     say("FAKE-CLEARED\r\n");
     drain("END");
     return 0;
+}
+
+/// A folder whose name contains "subagent" (the subtabs group,
+/// tests/e2e/subtabs_tests.zig): one turn that starts a subagent, laid
+/// out as the real program does (keys and types only; docs/tabs-design.md,
+/// "Subagent sub-tabs"): `<session>\subagents\agent-<id>.jsonl` with
+/// sidechain records and `agent-<id>.meta.json` with its description,
+/// `finished: true` added when it ends.
+///   1. the main turn (a prompt, an Agent tool call), then the subagent's
+///      meta and first records; prints FAKE-SUB-STARTED;
+///   2. waits for 1; the subagent's last record, its meta rewritten as
+///      finished, the main reply; prints FAKE-SUB-DONE; then idles.
+fn subagentRun(gpa: std.mem.Allocator, io: std.Io, t: *Transcript, dir: []const u8, stem: []const u8, tab_key: []const u8) void {
+    // The tab's hook key, for the test's synthetic hooks (test only).
+    if (std.fs.path.join(gpa, &.{ t.cwd, "e2e-tabkey" })) |kp| {
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = kp, .data = tab_key }) catch {};
+    } else |_| {}
+    t.rec("{\"parentUuid\":null,\"isSidechain\":false,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"MAIN-PROMPT find the tests\"},\"cwd\":\"{c}\",\"sessionId\":\"x\",\"origin\":{\"kind\":\"human\"}}");
+    t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_sub1\",\"name\":\"Agent\",\"input\":{\"description\":\"Look in {c}\\\\src for {u}\",\"prompt\":\"ARG-SECRET\",\"subagent_type\":\"general-purpose\"}}]},\"cwd\":\"{c}\"}");
+    const subs = std.fmt.allocPrint(gpa, "{s}\\{s}\\subagents", .{ dir, stem }) catch return;
+    std.Io.Dir.cwd().createDirPath(io, subs) catch return;
+    var meta: Transcript = t.*;
+    meta.path = std.fmt.allocPrint(gpa, "{s}\\agent-e2esub1.meta.json", .{subs}) catch return;
+    writeWhole(&meta, "{\"agentType\":\"general-purpose\",\"isBuiltIn\":true,\"description\":\"Look in {c}\\\\src for {u}\",\"toolUseId\":\"toolu_sub1\",\"spawnDepth\":1}");
+    var sub: Transcript = t.*;
+    sub.path = std.fmt.allocPrint(gpa, "{s}\\agent-e2esub1.jsonl", .{subs}) catch return;
+    sub.rec("{\"parentUuid\":null,\"isSidechain\":true,\"agentId\":\"e2esub1\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"SUB-PROMPT search {c}\\\\src\"},\"cwd\":\"{c}\",\"sessionId\":\"x\"}");
+    sub.rec("{\"isSidechain\":true,\"agentId\":\"e2esub1\",\"type\":\"assistant\",\"message\":{\"id\":\"s1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"SUB-WORKING in {c}\\\\lib for {u}\"}]},\"cwd\":\"{c}\"}");
+    sub.rec("{\"isSidechain\":true,\"agentId\":\"e2esub1\",\"type\":\"assistant\",\"message\":{\"id\":\"s1\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"r1\",\"name\":\"Read\",\"input\":{\"file_path\":\"{c}\\\\ARG-SECRET.zig\"}}]},\"cwd\":\"{c}\"}");
+    say("FAKE-SUB-STARTED\r\n");
+    _ = answer(&.{"1"}, "SUB") orelse return;
+    sub.rec("{\"isSidechain\":true,\"agentId\":\"e2esub1\",\"type\":\"assistant\",\"message\":{\"id\":\"s2\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"SUB-RESULT found 3 tests\"}]},\"cwd\":\"{c}\"}");
+    writeWhole(&meta, "{\"agentType\":\"general-purpose\",\"isBuiltIn\":true,\"description\":\"Look in {c}\\\\src for {u}\",\"toolUseId\":\"toolu_sub1\",\"spawnDepth\":1,\"finished\":true}");
+    t.rec("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"toolu_sub1\",\"type\":\"tool_result\",\"content\":\"RESULT-SECRET\"}]},\"toolUseResult\":{\"status\":\"completed\",\"agentId\":\"e2esub1\"},\"cwd\":\"{c}\"}");
+    t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"MAIN-REPLY the subagent finished.\"}]},\"cwd\":\"{c}\"}");
+    say("FAKE-SUB-DONE\r\n");
+    drain("END");
+}
+
+/// Replaces `t.path` with one record (`fmt` as in Transcript.rec), the way
+/// the program rewrites a meta file.
+fn writeWhole(t: *Transcript, comptime fmt: []const u8) void {
+    std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = t.path, .data = "" }) catch return;
+    t.rec(fmt);
 }

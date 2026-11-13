@@ -86,6 +86,7 @@ never open or close projects. That stays desk-only: Ctrl+T folder picker, or
      | `Stop` | the turn finished (not after a user interrupt) | `done` (then `idle` from idle_prompt) |
      | `StopFailure` | the turn ended with an API error (`error`: rate_limit, ...) | `error` |
      | `SessionEnd` | the session ended (`reason`: clear, logout, prompt_input_exit, ...) | `idle` |
+     | `SubagentStart`, `SubagentStop` | a subagent started / ended (`agent_id`) | no state: the tab's sub-tabs ("Subagent sub-tabs" below) |
      Other notification types and every other event change nothing;
      settings.json's Notification entry has the matcher
      `permission_prompt|idle_prompt`, so the others don't even start it.
@@ -131,6 +132,89 @@ never open or close projects. That stays desk-only: Ctrl+T folder picker, or
 3. **Last resort:** `preferredNotifChannel: "terminal_bell"`, which makes
    the agent ring BEL, and vt.zig counts BEL per session. Also a settings
    change, so it too needs the owner's approval.
+
+## Subagent sub-tabs (implemented 2026-11-13)
+
+When the program in a tab starts subagents, each becomes a read-only
+sub-tab under that tab, on the desk and on devices: its own
+Conversation view, labelled with the subagent's description, marked
+done when it ends. Protocol: docs/protocol.md section 3e.
+
+### Where the data is (checked 2026-11-13, structure only)
+
+Inspected read-only on real sessions of this machine with a small
+throw-away Zig tool that printed key paths, value types and whether a
+value equals a known id; no message text was printed, copied or kept.
+
+* Layout: next to `<projects>\<folder>\<session>.jsonl` the program
+  creates a folder `<session>\` holding `subagents\` (and `tool-results\`,
+  not read). `subagents\` has two files per subagent:
+  `agent-<agentId>.jsonl` and `agent-<agentId>.meta.json` (`agentId`: 17
+  characters, `a` and hex digits; nothing else was found there).
+* `agent-<id>.jsonl`: the same record format as the session's transcript
+  (`user`, `assistant`, `attachment`, `api-request*` records ...). Every
+  record has `isSidechain: true`, `agentId` (string, equals the file's
+  id), `sessionId` (string, equals the parent session's id), `cwd`,
+  `uuid`, `parentUuid` (null on the first record), `timestamp`. The
+  first `user` record is the task the session gave the subagent.
+* `agent-<id>.meta.json`: one object. `agentType` (string, e.g.
+  `general-purpose`, `fork`), `isBuiltIn` (bool), `description`
+  (string: the description given to the Agent tool call),
+  `toolUseId` (string: equals the parent's `tool_use` block `id` of the
+  Agent call), `spawnDepth` (integer), `requestShape`, `pickedEffortModel`
+  (strings), `requestNonInteractive`, `launchedWithDefaults` (bools);
+  forks add `isFork`, `parentAgentId`, `model`. `finished: true` is
+  added when the subagent ends; while it runs the key is absent (5 of
+  43 meta files of a running session had none).
+* The parent's transcript links the other way: the Agent `tool_use`
+  block (`name` `Agent`, `input.description`, `input.subagent_type`),
+  and its `tool_result` record's `toolUseResult.agentId` (string;
+  `toolUseResult.status` `async_launched` for background ones,
+  `canContinueAgent`, `resumedAgentId`, `revivedAgentId`).
+* Only `description` and `finished` of the meta file and the sidechain
+  records of the subagent's transcript are read; the description is
+  scrubbed before it becomes the sub-tab's name.
+
+### How
+
+* Reading (`src/convo/subagents.zig`, a `Watcher` driven by the tab's
+  transcript follower, follow.zig, on the same thread and wait): when the
+  follower takes a transcript it points the watcher at
+  `<folder>\<session>\subagents\`. If that folder does not exist yet, a
+  change notification on its nearest existing ancestor waits for it;
+  then ReadDirectoryChangesW on it reports new subagents, meta rewrites
+  and appends, and the tab's output (the follower's poke) checks the
+  sizes of running subagents' transcripts, as for the main one. No
+  polling, no timer. The records go through the same parser
+  (transcript.parseLine) and model (model.Convo, with `sidechain` set so
+  only sidechain records count) as the tab's conversation.
+* Model (`src/convo/subtabs.zig`, `Tab.subs`, under the hub's lock):
+  at most 16 per tab; random 128-bit ids of Portal's own; the
+  subagent's id stays on the desktop; a new transcript in the tab
+  (`/clear`, `/resume`) empties the list; when the tab took over an
+  earlier session, subagents already finished then are history and get
+  no sub-tab.
+* Hooks: `SubagentStart` / `SubagentStop` (`agent_id`) travel as
+  `agent=<id>` in the hook message (hookmsg.zig) and reach
+  `Tab.subagentEvent` (tabs.zig), the one seam: start gives the sub-tab
+  at once, stop marks it done; both kick the watcher to look again. The
+  files stay the source of the conversation. `portalctl hooks install`
+  adds both events (they come from hookmsg.Event).
+* Viewers: `subtabs` lists them for the tab watched; `a:<id>` shows one
+  (web.zig sends its conversation instead of the tab's; the viewer's
+  `k:`/`t:`/`l:` are dropped meanwhile), `a:` goes back. The desk copies
+  the shown sub-tab's conversation through the same writer and parser
+  into its own Conversation view (gui.zig).
+* UI (ui/shell.zig): the shown tab's sub-tabs follow it in the top bar
+  ("▸ <description>", "· done" when finished, the tab's
+  colour, no close box). Shown, the main slice is its conversation, the
+  bottom is empty (no Instruct), the status line says "subagent: <name>
+  · read-only", and keys reach nothing; a click on the parent tab
+  goes back. The browser page has no Conversation view yet, so no
+  sub-tabs either.
+* Privacy: names and texts are scrubbed on the desktop; no path, user
+  name, subagent id, session id, tool argument or result leaves it
+  (tests/e2e/subtabs_tests.zig checks every message).
 
 ## Recent projects per device (owner's decision, 2026-11-11)
 
