@@ -6,7 +6,7 @@
     .dependencies = .{
         // The owner's Renderer (Font, Window, Instanced2D): the de-facto
         // checkout, no worktree, no pin.
-        .Renderer = .{ .path = "../../Renderer-wt-ios" }, // TEMPORARY (feat/ios-native): back to ../../Renderer once ios-window is merged
+        .Renderer = .{ .path = "../../Renderer" },
         // The owner's Image package (Image.check + PNG decoder): the de-facto
         // checkout, no pin.
         .Image = .{ .path = "../../Image" },
