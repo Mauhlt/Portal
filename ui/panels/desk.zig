@@ -112,6 +112,9 @@ pub fn Panels(comptime devices: type) type {
             program: form.TextField(1024) = .{},
             project: form.TextField(64) = .{},
             input: rules.Policy = .keys,
+            /// "Show system monitor" (Settings only, not the first run):
+            /// the System button and its sampling (src/sysmon.zig).
+            sysmon: bool = false,
         };
 
         pub const Ui = struct {
@@ -370,7 +373,7 @@ pub fn Panels(comptime devices: type) type {
             /// Fields of the current screen, in focus order (fields come first).
             fn fieldCount(ui: *const Ui) u8 {
                 return switch (ui.screen) {
-                    .setup => 4,
+                    .setup => if (ui.setup.first_run) 4 else 5,
                     .pair_name, .export_form => 1,
                     else => 0,
                 };
@@ -500,6 +503,8 @@ pub fn Panels(comptime devices: type) type {
                     .left, .right => {
                         if (ui.screen == .setup and ui.focus.index == 3) {
                             ui.setup.input = cyclePolicy(ui.setup.input, k == .right);
+                        } else if (ui.screen == .setup and ui.focus.index == 4) {
+                            ui.setup.sysmon = !ui.setup.sysmon;
                         } else if (ui.focusedField() == null) {
                             if (k == .left) ui.focus.prev() else ui.focus.next();
                         }
@@ -528,7 +533,7 @@ pub fn Panels(comptime devices: type) type {
                     switch (f) {
                         .text => |t| _ = t.insert_cp(t.ctx, cp),
                         .choice => if (cp == ' ') {
-                            ui.setup.input = cyclePolicy(ui.setup.input, true);
+                            if (ui.focus.index == 4) ui.setup.sysmon = !ui.setup.sysmon else ui.setup.input = cyclePolicy(ui.setup.input, true);
                         },
                     }
                     return .none;
@@ -548,6 +553,7 @@ pub fn Panels(comptime devices: type) type {
                 if (b >= id.field0 and b < id.field0 + ui.fieldCount()) {
                     const i: u8 = @intCast(b - id.field0);
                     if (ui.screen == .setup and i == 3 and ui.focus.index == 3) ui.setup.input = cyclePolicy(ui.setup.input, true);
+                    if (ui.screen == .setup and i == 4 and ui.focus.index == 4) ui.setup.sysmon = !ui.setup.sysmon;
                     ui.focus.index = i;
                     return .none;
                 }
@@ -674,7 +680,7 @@ pub fn Panels(comptime devices: type) type {
                 lines: [14]frame.PanelText = undefined,
                 after: [6]frame.PanelText = undefined,
                 rows: [@max(devices.max_devices, max_pkgs)]frame.PanelRow = undefined,
-                fields: [4]frame.PanelField = undefined,
+                fields: [5]frame.PanelField = undefined,
                 buttons: [4]frame.PanelButton = undefined,
                 txt: [14][200]u8 = undefined,
                 row_txt: [@max(devices.max_devices, max_pkgs)][120]u8 = undefined,
@@ -760,7 +766,12 @@ pub fn Panels(comptime devices: type) type {
                         bufs.fields[2] = .{ .label = "Project name (optional, shown in the title)", .value = ui.setup.project.text(), .hint = "e.g. acme-api", .id = id.field0 + 2, .focused = f == 2 };
                         bufs.fields[3] = .{ .label = "Remote input (Left/Right to change)", .value = policyLabel(ui.setup.input), .id = id.field0 + 3, .focused = f == 3, .choice = true };
                         p.fields = bufs.fields[0..4];
+                        if (!ui.setup.first_run) {
+                            bufs.fields[4] = .{ .label = "Show system monitor (Left/Right to change; applies now)", .value = if (ui.setup.sysmon) "On: a System button shows CPU, memory, GPU and each tab's load" else "Off", .id = id.field0 + 4, .focused = f == 4, .choice = true };
+                            p.fields = bufs.fields[0..5];
+                        }
                         L.add(&bufs.after, &na, .{ .text = policyHelp(ui.setup.input), .tone = if (ui.setup.input == .text) .bad else .muted });
+                        if (ui.setup.sysmon and !ui.setup.first_run) L.add(&bufs.after, &na, .{ .text = "The monitor measures only while a System panel is open (once a second); off, it never measures." });
                     },
                     .pair_name => {
                         p.title = "Pair a device";

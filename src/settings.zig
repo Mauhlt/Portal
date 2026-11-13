@@ -9,12 +9,15 @@
 //!   program = agent --some-flag
 //!   cwd = C:\code\acme-api
 //!   color = acme-api #3366cc
+//!   system_monitor = on
 //!
 //! One `key = value` per line; blank lines and lines starting with '#' are
 //! ignored, so are unknown keys and values that are too long. `program` is
 //! a command line (split by splitCommand). Command-line options always win
 //! over the file. There is deliberately no default program: if none is
-//! configured, the window asks for one.
+//! configured, the window asks for one. `system_monitor` (`on` / `off`,
+//! default off) shows the System button and lets the system monitor
+//! sample while a System panel is open (sysmon.zig).
 
 const std = @import("std");
 const Io = std.Io;
@@ -62,6 +65,8 @@ pub const Settings = struct {
     project: Str(max_project) = .{},
     program: Str(max_program) = .{},
     cwd: Str(max_cwd) = .{},
+    /// "Show system monitor" (null: not set, i.e. off).
+    system_monitor: ?bool = null,
     /// Tab colours overriding the one derived from the name.
     colors: [max_colors]ColorEntry = undefined,
     n_colors: usize = 0,
@@ -92,6 +97,8 @@ pub const Settings = struct {
                 _ = s.program.set(val);
             } else if (std.mem.eql(u8, key, "cwd")) {
                 _ = s.cwd.set(val);
+            } else if (std.mem.eql(u8, key, "system_monitor")) {
+                if (std.ascii.eqlIgnoreCase(val, "on")) s.system_monitor = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.system_monitor = false;
             } else if (std.mem.eql(u8, key, "color")) {
                 // NAME #rrggbb: the name may contain spaces.
                 const sp = std.mem.lastIndexOfScalar(u8, val, ' ') orelse continue;
@@ -114,6 +121,7 @@ pub const Settings = struct {
         if (s.project.get()) |v| try out.print("project = {s}\r\n", .{v});
         if (s.program.get()) |v| try out.print("program = {s}\r\n", .{v});
         if (s.cwd.get()) |v| try out.print("cwd = {s}\r\n", .{v});
+        if (s.system_monitor) |v| try out.print("system_monitor = {s}\r\n", .{if (v) "on" else "off"});
         for (s.colors[0..s.n_colors]) |*c| {
             const name = c.name.get() orelse continue;
             try out.print("color = {s} {s}\r\n", .{ name, &tabs_wire.colorHex(c.color) });
@@ -199,6 +207,10 @@ test "settings parse and format round trip" {
     const s = Settings.parse(text);
     try testing.expectEqualStrings("10.8.0.1:8420", s.listen.get().?);
     try testing.expectEqual(keymap.Policy.instruct, s.input.?);
+    try testing.expect(Settings.parse("system_monitor = ON\r\n").system_monitor.?);
+    try testing.expect(!Settings.parse("system_monitor=off").system_monitor.?);
+    try testing.expect(Settings.parse("system_monitor = maybe").system_monitor == null);
+    try testing.expect(Settings.parse("").system_monitor == null);
     try testing.expectEqualStrings("acme api", s.project.get().?);
     try testing.expectEqualStrings("\"C:\\Program Files\\tool\\tool.exe\" --flag", s.program.get().?);
     try testing.expectEqualStrings("C:\\code\\acme", s.cwd.get().?);

@@ -11,6 +11,7 @@
 //!   * without a session, nothing about the session is visible at all.
 
 const std = @import("std");
+const shared = @import("shared");
 const proc = @import("proc.zig");
 const client = @import("client.zig");
 const pairing = @import("pairing.zig");
@@ -206,6 +207,17 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         const got = v.waitText("\"t\":\"convo\"", 1, 8000);
         const snap = v.lastText("\"t\":\"convo\"") orelse "";
         _ = r.check("convo snapshot: no transcript (on=false), no paths or names", got and std.mem.indexOf(u8, snap, "\"on\":false") != null and leaks.find(snap) == null, "{s}", .{snap});
+        // Background tasks and usage: every tab, numbers and ids only.
+        const got_act = v.waitText("\"t\":\"activity\"", 1, 8000);
+        const act_text = v.lastText("\"t\":\"activity\"") orelse "";
+        var act: shared.activity.Activity = undefined;
+        const parsed = shared.activity.parse(act_text, &act);
+        _ = r.check("activity: parses, one tab (the one shown), nothing running, monitor off, no paths or names", got_act and parsed and act.len == 1 and
+            std.mem.eql(u8, &act.tabs[0].id, &id.?) and act.tabs[0].n_tasks == 0 and act.tabs[0].usage.isZero() and !act.sysmon and leaks.find(act_text) == null, "{s}", .{act_text});
+        // The system monitor is off (the default): `y:on` gets nothing.
+        v.send("y:on");
+        v.pump(2500);
+        _ = r.check("system monitor off: y:on is ignored, no sys message", v.countText("\"t\":\"sys\"") == 0, "{d}", .{v.countText("\"t\":\"sys\"")});
     }
 
     // Without a session, the stream is refused before any data.

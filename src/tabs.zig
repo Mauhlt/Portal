@@ -37,6 +37,8 @@ const Log = @import("log.zig").Log;
 const title = @import("title.zig");
 const w32 = @import("win32.zig");
 const Convo = @import("convo/model.zig").Convo;
+const Activity = @import("convo/activity.zig").Activity;
+const activity_wire = @import("shared").activity;
 const follow = @import("convo/follow.zig");
 const transcript = @import("convo/transcript.zig");
 const cmdline = @import("cmdline.zig");
@@ -86,6 +88,9 @@ pub const Tab = struct {
     /// The Conversation view (docs/protocol.md section 3b). Guarded by
     /// hub.mutex, like the screen.
     convo: Convo = undefined,
+    /// Background tasks and token use (docs/protocol.md section 3c), from
+    /// the same transcript. Guarded by hub.mutex.
+    activity: Activity = undefined,
     /// The transcript the tab follows (its session id), so two tabs in
     /// one folder never show the same one. Guarded by hub.mutex.
     convo_claim: [36]u8 = undefined,
@@ -234,8 +239,13 @@ pub const Tab = struct {
         const h = t.hub;
         h.mutex.lockUncancelable(h.io);
         t.convo.applyRecord(rec) catch {};
+        const rev = t.activity.rev;
+        t.activity.applyRecord(rec);
+        const act = t.activity.rev != rev;
+        if (act) h.activity_gen +%= 1;
         h.mutex.unlock(h.io);
         h.cond.broadcast(h.io);
+        if (act) h.notify();
     }
 
     fn convoReset(ctx: *anyopaque, on: bool) void {
@@ -243,8 +253,11 @@ pub const Tab = struct {
         const h = t.hub;
         h.mutex.lockUncancelable(h.io);
         t.convo.reset(on);
+        t.activity.reset();
+        h.activity_gen +%= 1;
         h.mutex.unlock(h.io);
         h.cond.broadcast(h.io);
+        h.notify();
     }
 
     /// The claim table: a transcript is one tab's at most, and a tab's own
@@ -341,6 +354,9 @@ pub const Hub = struct {
     convo_projects: ?[]const u8 = null,
     /// The user's name, scrubbed from conversation texts.
     user_name: ?[]const u8 = null,
+    /// The desk's "Show system monitor" setting, as viewers are told
+    /// (`activity.sysmon`). Guarded by `mutex`; set with setSysmon.
+    sysmon_on: bool = false,
 
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
@@ -350,6 +366,9 @@ pub const Hub = struct {
     /// Bumped on any change viewers announce (`tabs`): a tab opened or
     /// closed, renamed, or its program's state changed. Guarded by `mutex`.
     gen: u64 = 1,
+    /// Bumped when any tab's activity (tasks, usage) or the sysmon setting
+    /// changes: viewers send `activity` again. Guarded by `mutex`.
+    activity_gen: u64 = 1,
     /// The tab the desk shows (new viewers start there). Guarded by `mutex`.
     desk_active: ?*Tab = null,
     /// The size the desk gives every tab (the window or console).
@@ -477,6 +496,8 @@ pub const Hub = struct {
         t.local = .{ .gpa = h.gpa, .io = h.io, .session = &t.session };
         t.session.local = &t.local;
         t.convo = Convo.init(h.gpa, .{ .root = t.cwd, .name = t.name(), .user = h.user_name });
+        t.activity = Activity.init(h.gpa, .{ .root = t.cwd, .name = t.name(), .user = h.user_name });
+        t.activity.dayOf = localDay;
         t.session.convo = &t.convo;
         if (h.convo_projects != null) {
             t.convo_stop = w32.validHandle(w32.CreateEventW(null, 1, 0, null));
@@ -629,6 +650,26 @@ pub const Hub = struct {
         }
     }
 
+    /// Caller holds `mutex`. Every open tab's activity, in bar order, as
+    /// of the real-time clock's day.
+    pub fn activityLocked(h: *Hub, out: *activity_wire.Activity) void {
+        const now_day = localDay(std.Io.Timestamp.now(h.io, .real).toSeconds());
+        out.len = h.n;
+        out.sysmon = h.sysmon_on;
+        for (h.tabs[0..h.n], 0..) |t, i| t.activity.toWire(t.id, now_day, &out.tabs[i]);
+    }
+
+    /// The desk changed "Show system monitor": viewers learn it from the
+    /// next `activity`.
+    pub fn setSysmon(h: *Hub, on: bool) void {
+        h.mutex.lockUncancelable(h.io);
+        h.sysmon_on = on;
+        h.activity_gen +%= 1;
+        h.mutex.unlock(h.io);
+        h.cond.broadcast(h.io);
+        h.notify();
+    }
+
     pub fn setDeskActive(h: *Hub, t: *Tab) void {
         h.mutex.lockUncancelable(h.io);
         if (!t.removed) h.desk_active = t;
@@ -692,6 +733,17 @@ pub const Hub = struct {
         return buf[0..n];
     }
 };
+
+/// The desktop's local day number of Unix time `t` (days since
+/// 1970-01-01 in the local time zone): what "today" means for usage.
+pub fn localDay(t: i64) i64 {
+    if (t <= 0) return @divFloor(t, 86400);
+    const ft: w32.FILETIME = .fromU64((@as(u64, @intCast(t)) + 11644473600) * 10_000_000);
+    var local: w32.FILETIME = undefined;
+    if (w32.FileTimeToLocalFileTime(&ft, &local) == 0) return @divFloor(t, 86400);
+    const lt: i64 = @as(i64, @intCast(local.toU64() / 10_000_000)) - 11644473600;
+    return @divFloor(lt, 86400);
+}
 
 /// The tab name for a folder: its basename, made printable and cut to 64
 /// bytes. Never the path, and never the user's name: the home folder

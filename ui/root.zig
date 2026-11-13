@@ -13,7 +13,8 @@
 //!              description of one frame), hit-testing, cell mapping
 //!   draw       the draw list: rects, glyphs, text runs, images
 //!   panels     desk (setup, pairing, devices, export), setup (a device's
-//!              first run), sync (approvals, packages): state machines that
+//!              first run), sync (approvals, packages), status (background
+//!              tasks, usage, system): state machines / builders that
 //!              describe frame.Panels
 //!   inputline  the interaction slice's input line (rules: "inputrules")
 //!   dataview   the Data slice's state (model: "datafeed")
@@ -48,6 +49,7 @@ pub const panels = struct {
     pub const desk = @import("panels/desk.zig");
     pub const setup = @import("panels/setup.zig");
     pub const sync = @import("panels/sync.zig");
+    pub const status = @import("panels/status.zig");
 };
 
 pub const Shell = shell.Shell;
@@ -68,4 +70,5 @@ test {
     _ = convoview;
     _ = panels.setup;
     _ = panels.desk;
+    _ = panels.status;
 }

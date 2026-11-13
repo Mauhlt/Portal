@@ -158,6 +158,9 @@ const Host = struct {
     sync_bufs: sync.ui.Ui.Bufs = .{},
     /// Whether the OS touch keyboard was last asked to show.
     keyboard_shown: bool = false,
+    /// This frame's copies of the status panels' data.
+    activity: client_mod.Activity = .{},
+    sys: client_mod.SysSnapshot = .{},
     /// The Conversation view (the devices' default main view): its own
     /// copy of Shared.convo, synced under the lock each frame.
     convo_view: ui.convoview.View = undefined,
@@ -204,10 +207,17 @@ const Host = struct {
         h.sync.mutex.lockUncancelable(h.client.io);
         defer h.sync.mutex.unlock(h.client.io);
         const panel = h.sync.ui.panel(&h.sync_bufs);
+        // Status panels: copies, so the shell's panel text stays valid while
+        // the network thread replaces Shared's.
+        h.activity = s.activity;
+        if (s.has_sys) h.sys = s.sys;
         const o = h.shell.overlay(.{
             .tabs = if (st == .connected) h.tabs.slice() else &.{},
             .current = s.current,
             .panel = panel,
+            .activity = if (s.has_activity) &h.activity else null,
+            .sys = if (s.has_sys) &h.sys else null,
+            .now = std.Io.Timestamp.now(h.client.io, .real).toSeconds(),
             .viewer = .{
                 .status = uiStatus(st),
                 .mode = s.mode,
@@ -302,6 +312,11 @@ const Host = struct {
             // A device opens and closes no tabs, has no selection yet, and
             // the remote grid size is the server's (the view scales to fit).
             .close_tab, .open_tab, .copy, .paste, .button, .resized => {},
+            // Slash commands are never sent from a device (the panel offers
+            // no such button; this is the second fence).
+            .usage_slash => {},
+            // The System panel: the desktop samples only while one is open.
+            .system_panel => |on| h.client.setSysPanel(on),
         }
     }
 

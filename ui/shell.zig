@@ -26,6 +26,14 @@
 //! with the device's panels (desk panels, sync panels, ...) as a modal
 //! layer.
 //!
+//! On both: each tab's badge counts its running background tasks, the
+//! status line says what runs in the tab shown, and the top bar's Usage
+//! (and, while the desk's "Show system monitor" is on, System) open the
+//! status panels (panels/status.zig), which the shell owns: they stay
+//! open until closed and take the keyboard like any panel. The desk's
+//! Usage panel offers "Open /usage" per tab (Command.usage_slash); a
+//! device's never does.
+//!
 //! The device's glue feeds a `State` each frame (`overlay`) and receives
 //! what input means through `Host`: terminal keys and characters, answer
 //! keys, input-line frames and `Command`s (switch / close / open a tab,
@@ -41,11 +49,15 @@ const frame = @import("frame.zig");
 const input = @import("input.zig");
 const inputline = @import("inputline.zig");
 const dataview = @import("dataview.zig");
+const activity_wire = @import("shared").activity;
+const sysinfo = @import("shared").sysinfo;
+const status_panels = @import("panels/status.zig");
 
 pub const Device = enum { desk, viewer };
 
 /// Ids of the shell's own controls, clear of the panels' ranges (desk
-/// panels 1-13, 100-279; setup 1-101; sync 301-699). Ids it doesn't know
+/// panels 1-13, 100-279; setup 1-101; sync 301-699; status panels
+/// 1500-1521; content view 1300-1399). Ids it doesn't know
 /// go to the host (Command.button), e.g. the desk tools.
 pub const ids = struct {
     pub const line: u32 = 900;
@@ -65,6 +77,12 @@ pub const ids = struct {
     /// The content view's own buttons (ui/convoview.zig ids).
     pub const view0: u32 = 1300;
     pub const view_last: u32 = 1399;
+    /// The top bar's Usage and System, the status line's task summary.
+    pub const usage: u32 = 913;
+    pub const system: u32 = 914;
+    pub const tasks: u32 = 915;
+    /// badge0 + position: that tab's background-task badge.
+    pub const badge0: u32 = 1200;
     /// tab0 + position: show that tab; close0 + position: close it.
     pub const tab0: u32 = 1000;
     pub const close0: u32 = 1100;
@@ -200,6 +218,13 @@ pub const State = struct {
     panel: ?frame.Panel = null,
     desk: Desk = .{},
     viewer: Viewer = .{},
+    /// Every tab's background tasks and usage (`activity`); null: not
+    /// known (no Usage button, no badges).
+    activity: ?*const activity_wire.Activity = null,
+    /// The latest system monitor sample, if any.
+    sys: ?*const sysinfo.Snapshot = null,
+    /// Unix seconds now (task ages in the panel).
+    now: i64 = 0,
 };
 
 /// Who gets the keyboard, decided here only. `view`: the Conversation view
@@ -239,6 +264,12 @@ pub const Command = union(enum) {
     button: u32,
     /// The cells that fit the main slice changed (desk: the PTY's size).
     resized: [2]u16,
+    /// Desk only: type `/usage` + Enter into the tab at bar position i
+    /// (the Usage panel's "Open /usage"; plan limits are only there).
+    usage_slash: usize,
+    /// The System panel opened (true) or closed: the glue subscribes to
+    /// the system monitor (desk) or sends `y:on` / `y:off` (devices).
+    system_panel: bool,
 };
 
 /// The device's side: what the shell's input turns into.
@@ -333,6 +364,12 @@ pub const Shell = struct {
     mode: ?rules.Policy = null,
     n_tabs: usize = 0,
     shown: ?usize = null,
+    /// The status panel open (panels/status.zig), and the tab whose badge
+    /// opened it.
+    info: status_panels.Screen = .none,
+    info_first: ?tabs_wire.Id = null,
+    /// The tabs' ids as of the last overlay (badge clicks name a position).
+    tab_ids: [tabs_wire.max_tabs]tabs_wire.Id = undefined,
     bufs: Bufs = .{},
 
     const Bufs = struct {
@@ -345,6 +382,9 @@ pub const Shell = struct {
         row: [2]frame.PanelButton = undefined,
         top_tabs: [tabs_wire.max_tabs]frame.TopTab = undefined,
         buttons: [8]frame.TopButton = undefined,
+        badges: [tabs_wire.max_tabs][8]u8 = undefined,
+        tasks: [64]u8 = undefined,
+        info: status_panels.Bufs = .{},
     };
 
     pub fn init(gpa: std.mem.Allocator, device: Device, host: Host) Shell {
@@ -367,7 +407,7 @@ pub const Shell = struct {
     }
 
     pub fn focus(sh: *const Shell) Focus {
-        if (sh.modalActive() != null) return .panel;
+        if (sh.modalActive() != null or sh.info != .none) return .panel;
         switch (sh.device) {
             .desk => return if (sh.line_focus) .line else .terminal,
             .viewer => {
@@ -451,12 +491,25 @@ pub const Shell = struct {
         sh.n_tabs = 0;
         sh.shown = null;
         if (sh.mode != .instruct and sh.instructing) sh.closeInstruct();
+        // A status panel needs what it shows: System the desk's setting,
+        // any of them a connection (devices).
+        const sysmon = if (st.activity) |a| a.sysmon else false;
+        const live = sh.device == .desk or st.viewer.status == .connected;
+        if (!live or st.activity == null) sh.setInfo(.none) else if (sh.info == .system and !sysmon) sh.setInfo(.none);
         var o = switch (sh.device) {
             .desk => sh.deskOverlay(st),
             .viewer => sh.viewerOverlay(st),
         };
         sh.view_shown = o.screen == .view;
         o.panel = st.panel;
+        if (o.panel == null) o.panel = status_panels.panel(sh.info, .{
+            .desk = sh.device == .desk,
+            .tabs = st.tabs,
+            .first = sh.info_first,
+            .activity = st.activity,
+            .sys = st.sys,
+            .now = st.now,
+        }, &sh.bufs.info);
         if (o.panel != null) o.selection = null;
         o.touch = sh.touch.enabled;
         // The keyboard goes when the line loses the keyboard (or a hardware
@@ -468,7 +521,7 @@ pub const Shell = struct {
     /// `focus` as of `st` (without asking the modal: the glue may hold its
     /// lock while building the overlay).
     fn focusFor(sh: *const Shell, st: State) Focus {
-        if (st.panel != null) return .panel;
+        if (st.panel != null or sh.info != .none) return .panel;
         return switch (sh.device) {
             .desk => if (sh.line_focus) .line else .terminal,
             .viewer => viewerFocus(sh.main == .conversation and sh.conversation != null, st.viewer.status, st.viewer.mode, sh.instructing),
@@ -480,6 +533,8 @@ pub const Shell = struct {
         for (st.tabs[0..n], 0..) |*e, i| {
             const active = if (st.current) |id| std.mem.eql(u8, &id, &e.id) else false;
             if (active) sh.shown = i;
+            sh.tab_ids[i] = e.id;
+            const act: ?*const activity_wire.Tab = if (st.activity) |a| a.find(e.id) else null;
             sh.bufs.top_tabs[i] = .{
                 .label = e.name(),
                 .color = theme.fromU32(e.color),
@@ -487,10 +542,58 @@ pub const Shell = struct {
                 .attention = e.state.attention(),
                 .id = ids.tab0 + @as(u32, @intCast(i)),
                 .close_id = if (closable) ids.close0 + @as(u32, @intCast(i)) else null,
+                .badge = if (act) |t| status_panels.badgeText(t, &sh.bufs.badges[i]) else "",
+                .badge_id = ids.badge0 + @as(u32, @intCast(i)),
             };
         }
         sh.n_tabs = n;
         return sh.bufs.top_tabs[0..n];
+    }
+
+    /// "2 shells · 1 monitor" for the tab shown ("" if nothing runs).
+    fn shownTasks(sh: *Shell, st: State) []const u8 {
+        const a = st.activity orelse return "";
+        const id = st.current orelse return "";
+        const t = a.find(id) orelse return "";
+        return status_panels.tasksText(t, &sh.bufs.tasks);
+    }
+
+    /// The top bar's status buttons after `before` (Usage; System while
+    /// the desk's setting is on), in `bufs.buttons`.
+    fn statusButtons(sh: *Shell, st: State, before: []const frame.TopButton) []const frame.TopButton {
+        var n: usize = 0;
+        for (before) |b| if (n < sh.bufs.buttons.len) {
+            sh.bufs.buttons[n] = b;
+            n += 1;
+        };
+        if (st.activity) |a| {
+            if (n < sh.bufs.buttons.len) {
+                sh.bufs.buttons[n] = .{ .label = "Usage", .id = ids.usage, .active = sh.info == .usage };
+                n += 1;
+            }
+            if (a.sysmon and n < sh.bufs.buttons.len) {
+                sh.bufs.buttons[n] = .{ .label = "System", .id = ids.system, .active = sh.info == .system };
+                n += 1;
+            }
+        }
+        return sh.bufs.buttons[0..n];
+    }
+
+    /// Opens (or closes) a status panel; the System panel's opening and
+    /// closing go to the host (the monitor samples only while one is open).
+    fn setInfo(sh: *Shell, to: status_panels.Screen) void {
+        if (sh.info == to) return;
+        const was_sys = sh.info == .system;
+        sh.info = to;
+        if (to == .none) sh.info_first = null;
+        if (was_sys) sh.command(.{ .system_panel = false });
+        if (to == .system) sh.command(.{ .system_panel = true });
+    }
+
+    fn toggleInfo(sh: *Shell, to: status_panels.Screen, first: ?tabs_wire.Id) void {
+        if (sh.info == to and (first == null or sh.info_first == null or std.mem.eql(u8, &first.?, &sh.info_first.?))) return sh.setInfo(.none);
+        sh.info_first = first;
+        sh.setInfo(to);
     }
 
     fn linePane(sh: *Shell, hint: []const u8, focused: bool) []const frame.Pane {
@@ -567,7 +670,7 @@ pub const Shell = struct {
                 .right = viewerText(d.viewers, &sh.bufs.right),
                 .right_tone = if (watching) .warn else .muted,
                 .right_badge = watching,
-                .buttons = d.tools,
+                .buttons = sh.statusButtons(st, d.tools),
             },
             .selection = sh.select.range(),
             .status = .{
@@ -576,6 +679,8 @@ pub const Shell = struct {
                 .extra = if (line_note) lv.note else remote_input,
                 .extra_tone = if (line_note) noteTone(lv.note_tone) else if (d.policy == .text) .bad else .muted,
                 .right = std.fmt.bufPrint(&sh.bufs.extra, "sharing on {s}", .{d.url}) catch d.url,
+                .tasks = sh.shownTasks(st),
+                .tasks_id = ids.tasks,
             },
         };
     }
@@ -694,9 +799,13 @@ pub const Shell = struct {
         };
         // The tabs (connected only): a device switches, never opens or closes.
         if (s == .connected and st.tabs.len > 0) {
-            b.buttons[0] = .{ .label = "Terminal", .id = ids.view_terminal, .active = sh.main == .terminal };
-            b.buttons[1] = .{ .label = "Conversation", .id = ids.view_conversation, .active = sh.main == .conversation };
-            o.top_bar = .{ .tabs = sh.tabBar(st, false), .buttons = b.buttons[0..2] };
+            const toggle = [_]frame.TopButton{
+                .{ .label = "Terminal", .id = ids.view_terminal, .active = sh.main == .terminal },
+                .{ .label = "Conversation", .id = ids.view_conversation, .active = sh.main == .conversation },
+            };
+            o.top_bar = .{ .tabs = sh.tabBar(st, false), .buttons = sh.statusButtons(st, &toggle) };
+            o.status.tasks = sh.shownTasks(st);
+            o.status.tasks_id = ids.tasks;
         }
         if (!v.has_grid) {
             o.screen = .{ .message = .{ .title = statusWord(s), .title_tone = .muted, .detail = v.detail } };
@@ -767,6 +876,11 @@ pub const Shell = struct {
     fn onKey(ctx: *anyopaque, key: input.Key, mods: input.Mods) void {
         const sh = self(ctx);
         if (sh.modalActive()) |m| return m.key(m.ctx, key, mods);
+        // A status panel: Esc or Enter closes it; nothing else is typed.
+        if (sh.info != .none) {
+            if (key == .escape or key == .enter) sh.setInfo(.none);
+            return;
+        }
         // F2 (never sent anywhere): collapse / open the Data slice.
         if (key == .f2 and !mods.ctrl and !mods.alt and !mods.super) return sh.data.toggle();
         // Ctrl+Tab / Ctrl+Shift+Tab: the next / previous tab, wherever the
@@ -846,10 +960,7 @@ pub const Shell = struct {
             };
         }
         switch (f) {
-            .panel => {
-                const m = sh.modalActive().?;
-                m.char(m.ctx, cp, mods);
-            },
+            .panel => if (sh.modalActive()) |m| m.char(m.ctx, cp, mods),
             .pair_screen => if (!mods.ctrl and (cp == 'p' or cp == 'P')) sh.command(.pair),
             .wait_screen => {},
             // Space with no text field focused: dictation on / off.
@@ -864,7 +975,7 @@ pub const Shell = struct {
 
     fn onAnswer(ctx: *anyopaque, key: []const u8) void {
         const sh = self(ctx);
-        if (sh.modalActive() != null) return;
+        if (sh.modalActive() != null or sh.info != .none) return;
         sh.select.active = false;
         sh.host.vtable.answer(sh.host.ctx, key);
     }
@@ -904,6 +1015,18 @@ pub const Shell = struct {
             },
             ids.pair => sh.command(.pair),
             ids.cancel_pair => sh.command(.cancel_pair),
+            ids.usage => sh.toggleInfo(.usage, null),
+            ids.system => sh.toggleInfo(.system, null),
+            ids.tasks => sh.toggleInfo(.tasks, if (sh.shown) |i| sh.tab_ids[i] else null),
+            ids.badge0...ids.badge0 + tabs_wire.max_tabs - 1 => if (id - ids.badge0 < sh.n_tabs) sh.toggleInfo(.tasks, sh.tab_ids[id - ids.badge0]),
+            status_panels.ids.close => sh.setInfo(.none),
+            // Desk only, from its Usage panel: the panel closes and the
+            // tab gets `/usage` (a device's panel has no such button, and
+            // a stray id from one does nothing).
+            status_panels.ids.slash0...status_panels.ids.slash0 + tabs_wire.max_tabs - 1 => if (sh.device == .desk and sh.info == .usage and id - status_panels.ids.slash0 < sh.n_tabs) {
+                sh.setInfo(.none);
+                sh.command(.{ .usage_slash = id - status_panels.ids.slash0 });
+            },
             else => sh.command(.{ .button = id }),
         }
     }
@@ -915,7 +1038,7 @@ pub const Shell = struct {
     fn onMouse(ctx: *anyopaque, m: input.Mouse) void {
         const sh = self(ctx);
         if (sh.device != .desk) return; // no selection on devices yet
-        if (sh.modalActive() != null) return; // modal: only its buttons react
+        if (sh.modalActive() != null or sh.info != .none) return; // modal: only its buttons react
         // A click outside the controls gives the keyboard back to the terminal.
         if (m.action == .down) sh.line_focus = false;
         switch (m.button) {
@@ -1216,6 +1339,133 @@ test "desk: drag selects, right-click copies, Ctrl+Shift+V pastes" {
     try testing.expect(sh.select.range() == null);
     Shell.onChar(&sh, 'v', .{ .ctrl = true, .shift = true });
     try testing.expect(r.cmds[r.n_cmds - 1] == .paste);
+}
+
+fn activityFixture(list: *[2]tabs_wire.Entry, a: *activity_wire.Activity) void {
+    list[0] = .{ .id = @splat(1), .color = 0x3366CC };
+    list[0].setName("Alpha");
+    list[1] = .{ .id = @splat(2), .color = 0x10B981 };
+    list[1].setName("Beta");
+    a.* = .{ .len = 2 };
+    a.tabs[0] = .{ .id = @splat(1) };
+    a.tabs[0].tasks[0] = .{ .kind = .shell, .state = .running };
+    a.tabs[0].tasks[1] = .{ .kind = .shell, .state = .running };
+    a.tabs[0].tasks[2] = .{ .kind = .monitor, .state = .running };
+    a.tabs[0].tasks[3] = .{ .kind = .shell, .state = .done };
+    a.tabs[0].n_tasks = 4;
+    a.tabs[1] = .{ .id = @splat(2) };
+}
+
+test "badges and the status line: running tasks only, hidden when none" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .viewer, r.host());
+    defer sh.deinit();
+    var list: [2]tabs_wire.Entry = undefined;
+    var a: activity_wire.Activity = undefined;
+    activityFixture(&list, &a);
+    const v: Viewer = .{ .status = .connected, .mode = .keys, .host = "h", .has_grid = true };
+    var o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(1), .activity = &a });
+    const tb = o.top_bar.?;
+    try testing.expectEqualStrings("3", tb.tabs[0].badge);
+    try testing.expectEqualStrings("", tb.tabs[1].badge);
+    try testing.expectEqual(ids.badge0 + 1, tb.tabs[1].badge_id.?);
+    try testing.expectEqualStrings("2 shells \u{00B7} 1 monitor", o.status.tasks);
+    try testing.expectEqual(ids.tasks, o.status.tasks_id.?);
+    // Usage always; System only while the desk's setting is on.
+    try testing.expectEqual(@as(usize, 3), tb.buttons.len);
+    try testing.expectEqual(ids.usage, tb.buttons[2].id);
+    a.sysmon = true;
+    o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(1), .activity = &a });
+    try testing.expectEqual(ids.system, o.top_bar.?.buttons[3].id);
+    // The other tab, with nothing running: no summary.
+    o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2), .activity = &a });
+    try testing.expectEqualStrings("", o.status.tasks);
+    // No activity known (an older desktop): no Usage, no badges.
+    o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(1) });
+    try testing.expectEqual(@as(usize, 2), o.top_bar.?.buttons.len);
+    try testing.expectEqualStrings("", o.top_bar.?.tabs[0].badge);
+}
+
+test "status panels: open from a badge, the status line or the top bar; Esc closes; System tells the host" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .viewer, r.host());
+    defer sh.deinit();
+    var list: [2]tabs_wire.Entry = undefined;
+    var a: activity_wire.Activity = undefined;
+    activityFixture(&list, &a);
+    a.sysmon = true;
+    const v: Viewer = .{ .status = .connected, .mode = .instruct, .host = "h", .has_grid = true };
+    const st: State = .{ .viewer = v, .tabs = &list, .current = @splat(2), .activity = &a };
+    _ = sh.overlay(st);
+    Shell.onButton(&sh, ids.badge0); // Alpha's badge
+    var o = sh.overlay(st);
+    try testing.expectEqualStrings("Background tasks", o.panel.?.title);
+    try testing.expect(std.mem.startsWith(u8, o.panel.?.rows[0].text, "Alpha"));
+    try testing.expectEqual(Focus.panel, sh.focus());
+    // Keys and answers go nowhere while it is open.
+    Shell.onChar(&sh, 'x', .{});
+    Shell.onAnswer(&sh, "y");
+    try testing.expectEqual(@as(usize, 0), r.answers);
+    try testing.expectEqualStrings("", sh.line.text());
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expect(sh.overlay(st).panel == null);
+    try testing.expectEqual(Focus.line, sh.focus());
+    // The status line's summary opens it too; its Close button closes.
+    Shell.onButton(&sh, ids.tasks);
+    try testing.expect(sh.overlay(st).panel != null);
+    Shell.onButton(&sh, status_panels.ids.close);
+    try testing.expect(sh.overlay(st).panel == null);
+    // Usage: a device's panel has no Open /usage, and its id does nothing.
+    Shell.onButton(&sh, ids.usage);
+    o = sh.overlay(st);
+    try testing.expectEqualStrings("Usage", o.panel.?.title);
+    for (o.panel.?.rows) |row| try testing.expect(row.button == null);
+    const before = r.n_cmds;
+    Shell.onButton(&sh, status_panels.ids.slash0);
+    try testing.expectEqual(before, r.n_cmds);
+    // System: the host hears it open and close (subscribe / unsubscribe).
+    Shell.onButton(&sh, ids.system);
+    try testing.expect(r.cmds[r.n_cmds - 1].system_panel);
+    _ = sh.overlay(st);
+    Shell.onButton(&sh, ids.usage); // another panel instead: System closes
+    try testing.expect(!r.cmds[r.n_cmds - 1].system_panel);
+    Shell.onButton(&sh, ids.system);
+    try testing.expect(r.cmds[r.n_cmds - 1].system_panel);
+    // The desk turns the setting off: the panel closes and the host hears it.
+    a.sysmon = false;
+    o = sh.overlay(st);
+    try testing.expect(o.panel == null);
+    try testing.expect(!r.cmds[r.n_cmds - 1].system_panel);
+    // Disconnected: panels close.
+    Shell.onButton(&sh, ids.usage);
+    _ = sh.overlay(.{ .viewer = .{ .status = .retrying, .host = "h", .has_grid = true }, .activity = &a });
+    try testing.expectEqual(status_panels.Screen.none, sh.info);
+}
+
+test "desk: Open /usage types into that tab (desk only), from the Usage panel" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    var list: [2]tabs_wire.Entry = undefined;
+    var a: activity_wire.Activity = undefined;
+    activityFixture(&list, &a);
+    const tools = [_]frame.TopButton{.{ .label = "Devices", .id = 11 }};
+    const st: State = .{ .tabs = &list, .current = @splat(1), .activity = &a, .desk = .{ .tools = &tools } };
+    var o = sh.overlay(st);
+    try testing.expectEqual(@as(usize, 2), o.top_bar.?.buttons.len); // Devices, Usage
+    // Not open: its ids do nothing.
+    Shell.onButton(&sh, status_panels.ids.slash0 + 1);
+    try testing.expectEqual(@as(usize, 0), r.n_cmds);
+    Shell.onButton(&sh, ids.usage);
+    o = sh.overlay(st);
+    try testing.expectEqual(status_panels.ids.slash0 + 1, o.panel.?.rows[2].button.?.id);
+    Shell.onButton(&sh, status_panels.ids.slash0 + 1);
+    try testing.expectEqual(@as(usize, 1), r.cmds[r.n_cmds - 1].usage_slash);
+    try testing.expect(sh.overlay(st).panel == null);
+    // The usage button toggles.
+    Shell.onButton(&sh, ids.usage);
+    Shell.onButton(&sh, ids.usage);
+    try testing.expect(sh.overlay(st).panel == null);
 }
 
 const StubView = struct {

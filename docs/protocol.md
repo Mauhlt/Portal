@@ -154,6 +154,8 @@ frames must be masked; no fragmentation; no extensions.
 | `rejected` | `reason` | an `l:` instruction line was refused (e.g. `ShellEscape`, `SlashCommand`, `MemoryShortcut`, `ControlCharacter`, `TooLong`, `Empty`); nothing was typed |
 | `convo` | `id`, `on`, `items` | the whole Conversation view of the tab watched (section 3b): after `hello` and every `session`, and whenever the server starts the conversation over. Replaces what the client had |
 | `convo+` | `id`, `items` | new or changed items of that conversation (section 3b) |
+| `activity` | `sysmon`, `tabs` | every open tab's background tasks and token usage (section 3c): after `hello`, then whenever any of it, the tab list or the desk's system-monitor setting changes |
+| `sys` | `cpu`, `mem`, `gpus`, `tabs` | a system monitor sample (section 3d): only to a viewer whose System panel is open (`y:on`), only while the desk's setting is on, about once a second |
 
 ### 3a. Project tabs (sessions)
 
@@ -276,6 +278,84 @@ ITEM = {"n":<u32>,"k":"<kind>","text":"<text>"
   invalid UTF-8, controls) is rejected whole. Unknown scalar fields are
   ignored.
 
+### 3c. Background tasks and usage (`activity`)
+
+What each tab's session program runs in the background and what it has
+used, for the tab badges, the status line and the Tasks / Usage panels.
+Built on the desktop from the same transcript as the conversation
+(`src/convo/activity.zig`); numbers and short descriptions only.
+
+```
+{"t":"activity","sysmon":<bool>,"tabs":[TAB,...]}
+TAB   = {"id":"<32 hex>"[,"model":"<model id>"],"usage":USAGE,"today":USAGE,
+         "tasks":[TASK,...]}
+USAGE = {"in":<n>,"out":<n>,"cr":<n>,"cw":<n>}
+TASK  = {"k":"shell"|"monitor","state":"<state>","since":<unix s>,"text":"<description>"}
+```
+
+* Not scoped to the tab watched: one message for every open tab, in bar
+  order, so each tab's badge can show its count. Sent after `hello` and
+  again whenever any tab's tasks or usage change, a tab opens or closes,
+  or the desk changes "Show system monitor" (`sysmon`). Event-driven: it
+  rides on the transcript follower's own wake-ups.
+* Tasks: a `Bash` / `PowerShell` call with `run_in_background` is a
+  `shell`, a `Monitor` call a `monitor`. `text` is the description the
+  program gave (scrubbed like conversation texts: paths become the tab's
+  name or `[path]`, the user's name `[user]`; one line, at most 120
+  bytes); never the command, its output or its output file. `state`:
+  `running`; `done` (the program's notification said `completed`, or a
+  monitor's timeout passed); `failed`; `killed` (its notification, or
+  `TaskStop`); `stale` (started in the transcript before the tab started,
+  i.e. by an earlier run of the program: not known to run). A new
+  transcript in the tab (`/clear`, `/resume`) keeps running tasks and
+  drops finished ones; a tab that ends takes its tasks with it. At most
+  16 per tab (finished ones go first), newest last; `since` is when it
+  started (0: unknown).
+* Usage: `usage` sums the replies of the transcript the tab follows now
+  (input, output, cache read and cache write tokens, from
+  `message.usage`; each reply counted once); `today` counts only replies
+  dated today in the desktop's time zone. `model` is the latest reply's
+  model id (`[A-Za-z0-9._:@[]-]`, at most 64 bytes), absent if unknown.
+  Plan-limit percentages are not in transcripts: the desk's Usage panel
+  offers "Open /usage", which types `/usage` + Enter into that tab at the
+  desk; devices never get that button, and `l:/usage` stays rejected
+  (`SlashCommand`, section 4).
+* `sysmon`: the desk's "Show system monitor" setting; clients show the
+  System button only while it is `true`.
+* Strict parser and writer: `shared/activity.zig` (malformed, too many
+  tabs or tasks, an unknown kind or state, a model id or text out of
+  bounds: rejected whole; unknown scalar fields ignored).
+
+### 3d. The system monitor (`sys`)
+
+Optional, off by default: the desk's Settings panel "Show system monitor"
+(`settings.txt`: `system_monitor = on`). While it is off nothing is
+measured at all (no sampler thread, no performance counters, no timer)
+and `y:on` is ignored (and logged at the desk, rate limited). While it is
+on, the desktop samples once a second, on deadlines aligned to the
+second, **only while at least one System panel is open** (the desk's, or
+a viewer that sent `y:on`), and stops as soon as the last one closes or
+the setting is turned off. This is Portal's one deliberate exception to
+being event-driven, scoped to "a System panel is visible".
+
+```
+{"t":"sys","cpu":<tenths of %>,"mem":{"used":<bytes>,"total":<bytes>},
+ "gpus":[{"util":<tenths of %>,"used":<bytes>,"total":<bytes>},...],
+ "tabs":[{"id":"<32 hex>","cpu":<tenths of %>,"mem":<bytes>,"procs":<n>},...]}
+```
+
+* `cpu`: the whole machine, 0..1000. `mem`: physical memory in use.
+* `gpus`: per hardware adapter, unnamed: the busiest engine type's
+  utilisation (as Task Manager shows it) and dedicated video memory in
+  use / its size (`total` 0 if unknown). From Windows performance
+  counters (`GPU Engine`, `GPU Adapter Memory`) and DXGI; vendor-neutral.
+* `tabs`: each open tab's process tree (its job object: the program and
+  everything it started, e.g. background shells): CPU as a share of the
+  whole machine, working-set memory, process count.
+* Numbers and tab ids only: never process names, command lines, paths or
+  user names. Sent only to viewers that asked (`y:on`) and only after a
+  new sample. Strict parser and writer: `shared/sysinfo.zig`.
+
 **Binary frames**: grid updates, always starting with `'G'`, little-endian:
 
 ```
@@ -389,6 +469,7 @@ passed, so the program can't read the pair as Alt+key.
 | `t:<utf8>` | type text (only when `input` is `"text"`; a `!` typed at the start of a line is dropped, where "start of a line" means after any key other than the character keys `0`…`9`, `y`, `n`: Enter, Esc, Ctrl+C, Backspace, the arrows, Home, End…) |
 | `l:<line>` | an instruction line (`"instruct"` and `"text"`): Portal rejects a leading `!` (shell), `/` (slash command) or `#` (memory), control characters, line breaks and bidi controls, max 2000 bytes; otherwise it types the line (as a bracketed paste when the program enabled it) and presses Enter |
 | `s:<id>` | watch the open tab `id` (32 hex digits; in every input mode, `none` included). Input sent after it goes to that tab. Answered by `session` (and a snapshot) or, for anything that is not an open tab, `nosession`; rejected ids are logged at the desk, rate limited, never echoed |
+| `y:on`, `y:off` | this viewer's System panel opened / closed (section 3d; every input mode: it is read-only). While the desk's "Show system monitor" is off, `y:on` is ignored and logged at the desk. Closing the connection counts as `y:off` |
 
 `k:`, `t:` and `l:` go to the tab the viewer last chose with `s:` (at
 first, the tab in `hello.session`); while that tab has ended or the last

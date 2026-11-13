@@ -29,6 +29,24 @@
 //!   `level`, `content`.
 //! * `AskUserQuestion` tool input: `questions[]` of `question`, `header`,
 //!   `multiSelect`, `options[]` of `label`, `description`.
+//! * `timestamp`: ISO 8601 UTC (`2026-11-12T10:00:00.000Z`).
+//! * Token use (assistant records): `message.model` (a model id, or
+//!   `<synthetic>` for the agent's own notes) and `message.usage` with
+//!   `input_tokens`, `output_tokens`, `cache_read_input_tokens`,
+//!   `cache_creation_input_tokens` (integers; further fields ignored). Every
+//!   record of one reply repeats its usage: count each `message.id` once.
+//! * Background work (activity.zig): a `Bash` / `PowerShell` tool_use with
+//!   `input.run_in_background` true starts a shell; a `Monitor` tool_use
+//!   starts a monitor (`input.timeout_ms`). Both have `input.description`.
+//!   The tool_result's record has `toolUseResult.backgroundTaskId` (shell)
+//!   or `toolUseResult.taskId` and `.persistent` (monitor): the task id.
+//!   `TaskStop` (`input.task_id`) stops one. When a task ends (or a
+//!   monitor reports an event) the agent queues a notification: a
+//!   `queue-operation` record (`operation` `enqueue`, `content`) and, once
+//!   delivered, a `user` record (`origin.kind` `task-notification`) whose
+//!   content starts `<task-notification>` and holds `<task-id>` and, when
+//!   the task ended, `<status>` (`completed`, `failed`, `killed`). Only the
+//!   id and the status are read from it.
 //!
 //! Tool arguments are never kept: a tool's file argument (`file_path`,
 //! `notebook_path`) is only hashed, to count distinct files.
@@ -181,7 +199,7 @@ pub fn permissionPhrase(buf: []u8, cat: Category, tool: []const u8) []const u8 {
 
 // ------------------------------------------------------------ records
 
-pub const RecordType = enum { other, user, assistant, system };
+pub const RecordType = enum { other, user, assistant, system, queue };
 
 pub const BlockKind = enum { other, text, image, thinking, tool_use, tool_result };
 
@@ -190,6 +208,16 @@ pub const max_questions = 4;
 pub const max_question_options = 9;
 pub const max_cwd = 1024;
 pub const max_tool_name = 64;
+/// Longest tool description kept (before scrubbing and cutting).
+pub const max_desc = 512;
+pub const max_model = 64;
+
+pub const Usage = struct {
+    input: u64 = 0,
+    output: u64 = 0,
+    cache_read: u64 = 0,
+    cache_write: u64 = 0,
+};
 /// Text kept per record (all strings of it together).
 pub const arena_size = 64 * 1024;
 
@@ -213,6 +241,15 @@ pub const Block = struct {
     is_error: bool = false,
     /// Hash of the tool's file argument, 0 if none.
     file_hash: u64 = 0,
+    /// tool_use input: `run_in_background` true.
+    background: bool = false,
+    /// tool_use input: `description` (cut to `max_desc`); scrubbed before
+    /// it is shown anywhere.
+    desc: []const u8 = "",
+    /// tool_use input: `timeout_ms` (Monitor), 0 if none.
+    timeout_ms: u64 = 0,
+    /// tool_use input: hash of `task_id` (TaskStop), 0 if none.
+    task_ref: u64 = 0,
     questions: [max_questions]Question = undefined,
     n_questions: usize = 0,
 
@@ -239,6 +276,22 @@ pub const Record = struct {
     cwd_len: u16 = 0,
     cwd_cut: bool = false,
     msg_hash: u64 = 0,
+    /// `timestamp` as Unix seconds, 0 if absent or malformed.
+    timestamp: i64 = 0,
+    /// `queue-operation` records: `operation` is `enqueue`.
+    enqueue: bool = false,
+    /// `message.model`.
+    model_buf: [max_model]u8 = undefined,
+    model_len: u8 = 0,
+    /// `message.usage`, if present.
+    usage: ?Usage = null,
+    /// `toolUseResult.backgroundTaskId` or `.taskId`, hashed (0: none).
+    result_task: u64 = 0,
+    /// `toolUseResult.persistent` (a monitor without a timeout).
+    result_persistent: bool = false,
+    /// Set by the follower: the record was in the transcript before the
+    /// tab started (an earlier run of the program).
+    history: bool = false,
     blocks: [max_blocks]Block = undefined,
     n_blocks: usize = 0,
     arena: [arena_size]u8 = undefined,
@@ -249,6 +302,10 @@ pub const Record = struct {
     }
 
     /// The record's `cwd`, or null if absent (or too long to keep).
+    pub fn model(r: *const Record) []const u8 {
+        return r.model_buf[0..r.model_len];
+    }
+
     pub fn cwd(r: *const Record) ?[]const u8 {
         if (r.cwd_len == 0 or r.cwd_cut) return null;
         return r.cwd_buf[0..r.cwd_len];
@@ -268,6 +325,13 @@ pub const Record = struct {
         r.cwd_len = 0;
         r.cwd_cut = false;
         r.msg_hash = 0;
+        r.timestamp = 0;
+        r.enqueue = false;
+        r.model_len = 0;
+        r.usage = null;
+        r.result_task = 0;
+        r.result_persistent = false;
+        r.history = false;
         r.n_blocks = 0;
         r.arena_len = 0;
     }
@@ -416,8 +480,7 @@ const P = struct {
             if (eq(k, "type")) {
                 if (try p.isString()) {
                     const v = try p.small(&vb);
-                    r.rtype = std.meta.stringToEnum(RecordType, v) orelse .other;
-                    if (r.rtype == .other and !eq(v, "other")) r.rtype = .other;
+                    r.rtype = if (eq(v, "queue-operation")) .queue else if (eq(v, "queue")) .other else std.meta.stringToEnum(RecordType, v) orelse .other;
                 }
             } else if (eq(k, "isSidechain")) {
                 r.sidechain = try p.boolean();
@@ -443,6 +506,12 @@ const P = struct {
                         r.cwd_len = @intCast(v.len);
                     }
                 }
+            } else if (eq(k, "timestamp")) {
+                if (try p.isString()) r.timestamp = parseTimestamp(try p.small(&vb)) orelse 0;
+            } else if (eq(k, "operation")) {
+                if (try p.isString()) r.enqueue = eq(try p.small(&vb), "enqueue");
+            } else if (eq(k, "toolUseResult")) {
+                try p.toolUseResult();
             } else if (eq(k, "subtype")) {
                 if (try p.isString()) r.compact_boundary = eq(try p.small(&vb), "compact_boundary");
             } else if (eq(k, "level")) {
@@ -471,6 +540,13 @@ const P = struct {
         while (try p.key(&kb)) |k| {
             if (eq(k, "id")) {
                 if (try p.isString()) r.msg_hash = hash(try p.small(&ib));
+            } else if (eq(k, "model")) {
+                if (try p.isString()) {
+                    const v = try p.small(&r.model_buf);
+                    r.model_len = @intCast(v.len);
+                }
+            } else if (eq(k, "usage")) {
+                try p.usage();
             } else if (eq(k, "content")) {
                 const tt = try p.sc.peekNextTokenType();
                 if (tt == .string) {
@@ -533,6 +609,14 @@ const P = struct {
         while (try p.key(&kb)) |k| {
             if (eq(k, "file_path") or eq(k, "notebook_path")) {
                 if (try p.isString()) b.file_hash = hash(try p.small(&fb));
+            } else if (eq(k, "run_in_background")) {
+                b.background = try p.boolean();
+            } else if (eq(k, "description")) {
+                if (try p.isString()) b.desc = try p.str(max_desc);
+            } else if (eq(k, "timeout_ms")) {
+                b.timeout_ms = (try p.int()) orelse 0;
+            } else if (eq(k, "task_id")) {
+                if (try p.isString()) b.task_ref = hash(try p.small(&fb));
             } else if (eq(k, "questions")) {
                 if (!try p.expect(.array_begin)) continue;
                 while (true) {
@@ -546,6 +630,70 @@ const P = struct {
                     }
                     if (try p.question(&b.questions[b.n_questions])) b.n_questions += 1;
                 }
+            } else try p.skip();
+        }
+    }
+
+    /// A non-negative integer value (anything else is skipped: null).
+    fn int(p: *P) Error!?u64 {
+        const tt = try p.sc.peekNextTokenType();
+        if (tt != .number) {
+            try p.skip();
+            return null;
+        }
+        var buf: [24]u8 = undefined;
+        var n: usize = 0;
+        var too_long = false;
+        while (true) {
+            const t = try p.sc.next();
+            const piece: []const u8 = switch (t) {
+                .number => |s| s,
+                .partial_number => |s| s,
+                else => return error.UnexpectedToken,
+            };
+            if (n + piece.len > buf.len) {
+                too_long = true;
+            } else {
+                @memcpy(buf[n..][0..piece.len], piece);
+                n += piece.len;
+            }
+            if (t == .number) break;
+        }
+        if (too_long) return null;
+        return std.fmt.parseInt(u64, buf[0..n], 10) catch null;
+    }
+
+    /// `message.usage`: the four token counts.
+    fn usage(p: *P) Error!void {
+        if (!try p.expect(.object_begin)) return;
+        var u: Usage = .{};
+        var kb: [40]u8 = undefined;
+        while (try p.key(&kb)) |k| {
+            if (eq(k, "input_tokens")) {
+                u.input = (try p.int()) orelse 0;
+            } else if (eq(k, "output_tokens")) {
+                u.output = (try p.int()) orelse 0;
+            } else if (eq(k, "cache_read_input_tokens")) {
+                u.cache_read = (try p.int()) orelse 0;
+            } else if (eq(k, "cache_creation_input_tokens")) {
+                u.cache_write = (try p.int()) orelse 0;
+            } else try p.skip();
+        }
+        p.rec.usage = u;
+    }
+
+    /// The top-level `toolUseResult` (an object for most tools): only the
+    /// background task's id.
+    fn toolUseResult(p: *P) Error!void {
+        if (!try p.expect(.object_begin)) return;
+        const r = p.rec;
+        var kb: [32]u8 = undefined;
+        var ib: [128]u8 = undefined;
+        while (try p.key(&kb)) |k| {
+            if (eq(k, "backgroundTaskId") or eq(k, "taskId")) {
+                if (try p.isString()) r.result_task = hash(try p.small(&ib));
+            } else if (eq(k, "persistent")) {
+                r.result_persistent = try p.boolean();
             } else try p.skip();
         }
     }
@@ -601,6 +749,78 @@ pub fn taggedPrompt(text: []const u8) bool {
         if (c == '-') dash = true else if (!(c >= 'a' and c <= 'z') and !(c >= '0' and c <= '9')) return false;
     }
     return false;
+}
+
+/// `2026-11-12T10:00:00.000Z` (fraction and offset optional; `Z` or
+/// `+hh:mm`) as Unix seconds, or null.
+pub fn parseTimestamp(s: []const u8) ?i64 {
+    if (s.len < 19 or s[4] != '-' or s[7] != '-' or (s[10] != 'T' and s[10] != ' ') or s[13] != ':' or s[16] != ':') return null;
+    const y = std.fmt.parseInt(i64, s[0..4], 10) catch return null;
+    const mo = std.fmt.parseInt(u8, s[5..7], 10) catch return null;
+    const d = std.fmt.parseInt(u8, s[8..10], 10) catch return null;
+    const hh = std.fmt.parseInt(i64, s[11..13], 10) catch return null;
+    const mi = std.fmt.parseInt(i64, s[14..16], 10) catch return null;
+    const ss = std.fmt.parseInt(i64, s[17..19], 10) catch return null;
+    if (mo < 1 or mo > 12 or d < 1 or d > 31 or hh > 23 or mi > 59 or ss > 60) return null;
+    var i: usize = 19;
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    }
+    var off: i64 = 0;
+    if (i < s.len) switch (s[i]) {
+        'Z' => i += 1,
+        '+', '-' => {
+            if (i + 6 > s.len or s[i + 3] != ':') return null;
+            const oh = std.fmt.parseInt(i64, s[i + 1 .. i + 3], 10) catch return null;
+            const om = std.fmt.parseInt(i64, s[i + 4 .. i + 6], 10) catch return null;
+            off = (oh * 60 + om) * 60;
+            if (s[i] == '-') off = -off;
+            i += 6;
+        },
+        else => return null,
+    };
+    if (i != s.len) return null;
+    return daysFromCivil(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss - off;
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's
+/// algorithm).
+pub fn daysFromCivil(y0: i64, m: u8, d: u8) i64 {
+    const y = if (m <= 2) y0 - 1 else y0;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const mp: i64 = if (m > 2) m - 3 else m + 9;
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+pub const NoticeStatus = enum { completed, failed, killed };
+
+/// What a task notification says: the task (hashed id) and, if it ended,
+/// how. Nothing else of it is read.
+pub const Notice = struct { task: u64, status: ?NoticeStatus };
+
+/// A `<task-notification>` text (a queued or delivered notification), or
+/// null for anything else.
+pub fn taskNotice(text: []const u8) ?Notice {
+    const t = std.mem.trimStart(u8, text, " \t\r\n");
+    if (!std.mem.startsWith(u8, t, "<task-notification>")) return null;
+    const id = tagValue(t, "task-id") orelse return null;
+    if (id.len == 0 or id.len > 64) return null;
+    var st: ?NoticeStatus = null;
+    if (tagValue(t, "status")) |v| st = std.meta.stringToEnum(NoticeStatus, v);
+    return .{ .task = hash(id), .status = st };
+}
+
+/// The text between `<name>` and `</name>` (the first pair), or null.
+fn tagValue(t: []const u8, comptime name: []const u8) ?[]const u8 {
+    const open = "<" ++ name ++ ">";
+    const a = std.mem.indexOf(u8, t, open) orelse return null;
+    const start = a + open.len;
+    const b = std.mem.indexOfPos(u8, t, start, "</" ++ name ++ ">") orelse return null;
+    return std.mem.trim(u8, t[start..b], " \t\r\n");
 }
 
 /// The owner interrupted the program (Esc): the agent records this as a
@@ -749,6 +969,66 @@ test "schema drift and damage: unknown types, wrong value types, cut lines" {
     try testing.expectEqual(hash("a.txt"), r.blocks[0].file_hash);
     // A truncated line marked complete is malformed: rejected.
     try testing.expect(!parseLine(gpa, full, true, r));
+}
+
+test "timestamps" {
+    try testing.expectEqual(@as(?i64, 1_762_941_600), parseTimestamp("2025-11-12T10:00:00.000Z"));
+    try testing.expectEqual(@as(?i64, 0), parseTimestamp("1970-01-01T00:00:00Z"));
+    try testing.expectEqual(@as(?i64, 1_762_941_600 - 3600), parseTimestamp("2025-11-12T10:00:00+01:00"));
+    try testing.expectEqual(@as(?i64, 951_782_400), parseTimestamp("2000-02-29T00:00:00"));
+    try testing.expect(parseTimestamp("2025-13-12T10:00:00Z") == null);
+    try testing.expect(parseTimestamp("yesterday") == null);
+    try testing.expect(parseTimestamp("2025-11-12T10:00:00Zjunk") == null);
+}
+
+test "usage, model, background tasks, notifications" {
+    const a = try parsed(
+        \\{"type":"assistant","timestamp":"2025-11-12T10:00:00.000Z","message":{"model":"model-large-4-1","id":"msg_9","usage":{"input_tokens":3,"cache_creation_input_tokens":120,"cache_read_input_tokens":4500,"cache_creation":{"ephemeral_5m_input_tokens":0},"output_tokens":17,"service_tier":"standard","server_tool_use":{"web_search_requests":0}},"content":[{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"zig build test C:\\Users\\bob","description":"Run the tests","run_in_background":true,"timeout":600000}}]}}
+    );
+    defer testing.allocator.destroy(a);
+    try testing.expectEqual(@as(i64, 1_762_941_600), a.timestamp);
+    try testing.expectEqualStrings("model-large-4-1", a.model());
+    try testing.expectEqual(@as(u64, 3), a.usage.?.input);
+    try testing.expectEqual(@as(u64, 17), a.usage.?.output);
+    try testing.expectEqual(@as(u64, 4500), a.usage.?.cache_read);
+    try testing.expectEqual(@as(u64, 120), a.usage.?.cache_write);
+    try testing.expect(a.blocks[0].background);
+    try testing.expectEqualStrings("Run the tests", a.blocks[0].desc);
+    const m = try parsed(
+        \\{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"toolu_m","name":"Monitor","input":{"command":"tail -f x","description":"Watch the log","timeout_ms":300000}}]}}
+    );
+    defer testing.allocator.destroy(m);
+    try testing.expectEqual(@as(u64, 300000), m.blocks[0].timeout_ms);
+    try testing.expect(m.usage == null);
+    const r = try parsed(
+        \\{"type":"user","message":{"content":[{"tool_use_id":"toolu_m","type":"tool_result","content":"Monitor started"}]},"toolUseResult":{"taskId":"b12345678","timeoutMs":300000,"persistent":false}}
+    );
+    defer testing.allocator.destroy(r);
+    try testing.expectEqual(hash("b12345678"), r.result_task);
+    try testing.expect(!r.result_persistent);
+    const s = try parsed(
+        \\{"type":"user","message":{"content":[{"tool_use_id":"toolu_b","type":"tool_result","content":"Command running in background"}]},"toolUseResult":{"stdout":"","stderr":"","interrupted":false,"backgroundTaskId":"bzzzz1234"}}
+    );
+    defer testing.allocator.destroy(s);
+    try testing.expectEqual(hash("bzzzz1234"), s.result_task);
+    const stop = try parsed(
+        \\{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"toolu_s","name":"TaskStop","input":{"task_id":"bzzzz1234"}}]}}
+    );
+    defer testing.allocator.destroy(stop);
+    try testing.expectEqual(hash("bzzzz1234"), stop.blocks[0].task_ref);
+    const q = try parsed(
+        \\{"type":"queue-operation","operation":"enqueue","timestamp":"2025-11-12T10:05:00.000Z","sessionId":"s","content":"<task-notification>\n<task-id>bzzzz1234</task-id>\n<tool-use-id>toolu_b</tool-use-id>\n<output-file>C:\\x</output-file>\n<status>failed</status>\n<summary>secret</summary>\n</task-notification>"}
+    );
+    defer testing.allocator.destroy(q);
+    try testing.expectEqual(RecordType.queue, q.rtype);
+    try testing.expect(q.enqueue);
+    const n = taskNotice(q.content).?;
+    try testing.expectEqual(hash("bzzzz1234"), n.task);
+    try testing.expectEqual(NoticeStatus.failed, n.status.?);
+    // A monitor's event: no status (still running).
+    try testing.expect(taskNotice("<task-notification><task-id>b1</task-id><event>line</event></task-notification>").?.status == null);
+    try testing.expect(taskNotice("no <task-notification>") == null);
+    try testing.expect(taskNotice("<task-notification><status>completed</status></task-notification>") == null);
 }
 
 test "long strings are cut, not refused" {

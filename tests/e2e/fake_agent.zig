@@ -6,14 +6,18 @@
 //! console input, the way the real program would:
 //!
 //!   1. a prompt, a reply, two edits and a command (every text full of
-//!      paths and the user's name, which Portal must scrub);
+//!      paths and the user's name, which Portal must scrub); token usage
+//!      on the replies (repeated on every record of one reply, as the agent
+//!      does), and background work: two shells (one finishes at once
+//!      through a queued task notification) and a monitor;
 //!   2. an AskUserQuestion with two options; waits for 1 or 2;
 //!   3. a command that needs permission (OSC 7501 kind=permission); waits
 //!      for 1 (allow) or Esc (deny);
-//!   4. a closing reply; then waits for 1;
+//!   4. the other shell's notification and a TaskStop for the monitor
+//!      (nothing runs any more), a closing reply; then waits for 1;
 //!   5. `/clear`: prints, then starts a second transcript (a new session
-//!      id of its own, as the agent does); then idles until its console
-//!      closes.
+//!      id of its own, as the agent does); then idles until its
+//!      console closes.
 //!
 //! A tab whose folder's name contains "quiet" writes no transcript at all.
 //! With PORTAL_E2E_SHOWCASE set (manual visual checks only, never the e2e
@@ -67,6 +71,8 @@ const Transcript = struct {
     path: []const u8,
     cwd: []const u8,
     user: []const u8,
+    /// Now, as a transcript timestamp ({t}).
+    ts: []const u8 = "2026-11-12T10:00:00.000Z",
 
     fn append(t: *Transcript, line: []const u8) void {
         var f = std.Io.Dir.cwd().createFile(t.io, t.path, .{ .truncate = false }) catch return;
@@ -77,14 +83,18 @@ const Transcript = struct {
     }
 
     /// `fmt` with {c} = the working folder, {u} = the user's name, both
-    /// JSON-escaped.
+    /// JSON-escaped, {t} = now as a timestamp.
     fn rec(t: *Transcript, comptime fmt: []const u8) void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(t.gpa);
         var i: usize = 0;
         while (i < fmt.len) : (i += 1) {
-            if (fmt[i] == '{' and i + 2 < fmt.len and fmt[i + 2] == '}' and (fmt[i + 1] == 'c' or fmt[i + 1] == 'u')) {
-                const v = if (fmt[i + 1] == 'c') t.cwd else t.user;
+            if (fmt[i] == '{' and i + 2 < fmt.len and fmt[i + 2] == '}' and (fmt[i + 1] == 'c' or fmt[i + 1] == 'u' or fmt[i + 1] == 't')) {
+                const v = switch (fmt[i + 1]) {
+                    'c' => t.cwd,
+                    'u' => t.user,
+                    else => t.ts,
+                };
                 for (v) |ch| {
                     if (ch == '\\' or ch == '"') out.append(t.gpa, '\\') catch return;
                     out.append(t.gpa, ch) catch return;
@@ -97,6 +107,23 @@ const Transcript = struct {
         t.append(out.items);
     }
 };
+
+/// Unix seconds as `YYYY-MM-DDTHH:MM:SS.000Z` (civil-from-days, written
+/// here independently of Portal's parser).
+fn isoTime(t: i64, buf: []u8) []const u8 {
+    const days = @divFloor(t, 86400);
+    const secs = @mod(t, 86400);
+    const z = days + 719468;
+    const era = @divFloor(z, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    const y = yoe + era * 400 + @as(i64, if (m <= 2) 1 else 0);
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z", .{ @as(u64, @intCast(y)), @as(u64, @intCast(m)), @as(u64, @intCast(d)), @as(u64, @intCast(@divFloor(secs, 3600))), @as(u64, @intCast(@divFloor(@mod(secs, 3600), 60))), @as(u64, @intCast(@mod(secs, 60))) }) catch "2026-11-12T10:00:00.000Z";
+}
 
 fn validUuid(s: []const u8) bool {
     if (s.len != 36) return false;
@@ -159,13 +186,15 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
         .cwd = cwd,
         .user = env.get("USERNAME") orelse "nobody",
     };
+    var ts_buf: [32]u8 = undefined;
+    t.ts = isoTime(std.Io.Timestamp.now(io, .real).toSeconds(), &ts_buf);
 
     // 1. A turn.
     t.rec("{\"type\":\"mode\",\"mode\":\"normal\",\"sessionId\":\"x\"}");
     t.rec("{\"parentUuid\":null,\"isSidechain\":false,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Please fix the build in {c}\\\\src and tell {u}\"},\"uuid\":\"u1\",\"timestamp\":\"2026-11-12T10:00:00.000Z\",\"cwd\":\"{c}\",\"sessionId\":\"x\",\"origin\":{\"kind\":\"human\"},\"promptSource\":\"typed\"}");
     t.rec("{\"type\":\"user\",\"isMeta\":true,\"message\":{\"role\":\"user\",\"content\":\"<system-reminder>injected {c}</system-reminder>\"},\"cwd\":\"{c}\"}");
-    t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"THINKING-SECRET {c}\"}]},\"cwd\":\"{c}\"}");
-    t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"I will look at {c}\\\\build.zig and C:\\\\Users\\\\{u}\\\\notes.txt\"}]},\"cwd\":\"{c}\"}");
+    t.rec("{\"type\":\"assistant\",\"timestamp\":\"{t}\",\"message\":{\"model\":\"model-e2e-1\",\"id\":\"m1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":40,\"cache_read_input_tokens\":300,\"output_tokens\":20,\"service_tier\":\"standard\"},\"content\":[{\"type\":\"thinking\",\"thinking\":\"THINKING-SECRET {c}\"}]},\"cwd\":\"{c}\"}");
+    t.rec("{\"type\":\"assistant\",\"timestamp\":\"{t}\",\"message\":{\"model\":\"model-e2e-1\",\"id\":\"m1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":40,\"cache_read_input_tokens\":300,\"output_tokens\":20,\"service_tier\":\"standard\"},\"content\":[{\"type\":\"text\",\"text\":\"I will look at {c}\\\\build.zig and C:\\\\Users\\\\{u}\\\\notes.txt\"}]},\"cwd\":\"{c}\"}");
     const showcase = env.get("PORTAL_E2E_SHOWCASE") != null;
     if (showcase) t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"The build fails because two steps install the same artifact. The fix is small; this is the step that runs the tests afterwards:\\n\\n```zig\\nconst run = b.addRunArtifact(tests);\\ntest_step.dependOn(&run.step); // one step per artifact, never two installs of the same file\\n```\\n\\nI can apply it in one of three ways.\"}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Edit\",\"input\":{\"file_path\":\"{c}\\\\a.zig\",\"old_string\":\"ARG-SECRET\",\"new_string\":\"y\"}}]},\"cwd\":\"{c}\"}");
@@ -173,6 +202,15 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"Write\",\"input\":{\"file_path\":\"{c}\\\\b.zig\",\"content\":\"ARG-SECRET\"}}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t3\",\"name\":\"Bash\",\"input\":{\"command\":\"dir {c} ARG-SECRET\"}}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"t3\",\"type\":\"tool_result\",\"content\":\"RESULT-SECRET\",\"is_error\":true}]},\"cwd\":\"{c}\"}");
+    // Background work: a shell that keeps running, a monitor, and a shell
+    // that finishes at once (its notification queued while busy).
+    t.rec("{\"type\":\"assistant\",\"timestamp\":\"{t}\",\"message\":{\"model\":\"model-e2e-1\",\"id\":\"m6\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":1,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":2},\"content\":[{\"type\":\"tool_use\",\"id\":\"bg1\",\"name\":\"Bash\",\"input\":{\"command\":\"SECRET-CMD {c}\",\"description\":\"Run the tests in {c}\\\\src for {u}\",\"run_in_background\":true}}]},\"cwd\":\"{c}\"}");
+    t.rec("{\"type\":\"user\",\"timestamp\":\"{t}\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"bg1\",\"type\":\"tool_result\",\"content\":\"Command running in background with ID: bshell001. Output is being written to: {c}\\\\RESULT-SECRET.txt\"}]},\"toolUseResult\":{\"stdout\":\"\",\"stderr\":\"\",\"interrupted\":false,\"backgroundTaskId\":\"bshell001\",\"backgroundCwdHint\":\"{c}\"},\"cwd\":\"{c}\"}");
+    t.rec("{\"type\":\"assistant\",\"timestamp\":\"{t}\",\"message\":{\"model\":\"model-e2e-1\",\"id\":\"m6\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":1,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":2},\"content\":[{\"type\":\"tool_use\",\"id\":\"mon1\",\"name\":\"Monitor\",\"input\":{\"command\":\"SECRET-CMD tail\",\"description\":\"Watch the build log\",\"timeout_ms\":3600000}}]},\"cwd\":\"{c}\"}");
+    t.rec("{\"type\":\"user\",\"timestamp\":\"{t}\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"mon1\",\"type\":\"tool_result\",\"content\":\"Monitor started\"}]},\"toolUseResult\":{\"taskId\":\"bmon00001\",\"timeoutMs\":3600000,\"persistent\":false},\"cwd\":\"{c}\"}");
+    t.rec("{\"type\":\"assistant\",\"timestamp\":\"{t}\",\"message\":{\"model\":\"model-e2e-1\",\"id\":\"m6\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":1,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":2},\"content\":[{\"type\":\"tool_use\",\"id\":\"bg2\",\"name\":\"PowerShell\",\"input\":{\"command\":\"SECRET-CMD lint\",\"description\":\"Lint the docs\",\"run_in_background\":true}}]},\"cwd\":\"{c}\"}");
+    t.rec("{\"type\":\"user\",\"timestamp\":\"{t}\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"bg2\",\"type\":\"tool_result\",\"content\":\"Command running in background with ID: bshell002\"}]},\"toolUseResult\":{\"stdout\":\"\",\"backgroundTaskId\":\"bshell002\"},\"cwd\":\"{c}\"}");
+    t.rec("{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"{t}\",\"sessionId\":\"x\",\"content\":\"<task-notification>\\n<task-id>bshell002</task-id>\\n<tool-use-id>bg2</tool-use-id>\\n<output-file>{c}\\\\RESULT-SECRET.out</output-file>\\n<status>completed</status>\\n<summary>SUMMARY-SECRET {c}</summary>\\n</task-notification>\"}");
     t.rec("{\"type\":\"frame-link\",\"whatever\":{\"future\":[1,2,3]}}");
     t.rec("this line is not JSON {c}");
 
@@ -213,6 +251,11 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     say("\x1b]7501;state=working\x07");
     say(if (allowed) "FAKE-ALLOWED\r\n" else "FAKE-DENIED\r\n");
 
+    // 4. Done: the first shell's notification (delivered as a prompt), and
+    // the monitor stopped.
+    t.rec("{\"type\":\"user\",\"timestamp\":\"{t}\",\"origin\":{\"kind\":\"task-notification\",\"producer\":\"session-task\"},\"message\":{\"role\":\"user\",\"content\":\"<task-notification>\\n<task-id>bshell001</task-id>\\n<status>completed</status>\\n<summary>SUMMARY-SECRET</summary>\\n</task-notification>\"},\"cwd\":\"{c}\"}");
+    t.rec("{\"type\":\"assistant\",\"timestamp\":\"{t}\",\"message\":{\"model\":\"model-e2e-1\",\"id\":\"m7\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"stop1\",\"name\":\"TaskStop\",\"input\":{\"task_id\":\"bmon00001\"}}]},\"cwd\":\"{c}\"}");
+    t.rec("{\"type\":\"user\",\"timestamp\":\"{t}\",\"message\":{\"role\":\"user\",\"content\":[{\"tool_use_id\":\"stop1\",\"type\":\"tool_result\",\"content\":\"stopped\"}]},\"toolUseResult\":{\"message\":\"stopped\",\"task_id\":\"bmon00001\",\"task_type\":\"local_bash\",\"command\":\"SECRET-CMD tail\"},\"cwd\":\"{c}\"}");
     // 4. Done.
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m5\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"All done.\"}]},\"cwd\":\"{c}\"}");
     t.rec("{\"type\":\"system\",\"subtype\":\"turn_duration\",\"durationMs\":5,\"cwd\":\"{c}\"}");

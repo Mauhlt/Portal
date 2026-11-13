@@ -302,7 +302,7 @@ pub const Convo = struct {
                     try c.errorLine(rec.content);
                 }
             },
-            .other => return,
+            .other, .queue => return,
         }
         c.refreshWait();
     }
