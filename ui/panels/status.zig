@@ -93,6 +93,15 @@ fn usageLine(u: activity.Usage, buf: []u8) []const u8 {
     }) catch "";
 }
 
+/// "in 1.2k · out 34.5k · cache read 2.1M · cache write 9.0k".
+fn breakdown(u: activity.Usage, buf: []u8) []const u8 {
+    var b: [16]u8 = undefined;
+    var c: [16]u8 = undefined;
+    var d: [16]u8 = undefined;
+    var e: [16]u8 = undefined;
+    return std.fmt.bufPrint(buf, "in {s} \u{00B7} out {s} \u{00B7} cache read {s} \u{00B7} cache write {s}", .{ tokens(u.input, &b), tokens(u.output, &c), tokens(u.cache_read, &d), tokens(u.cache_write, &e) }) catch "";
+}
+
 /// "just started", "5 min", "2 h 10 min", "3 days".
 pub fn age(since: i64, now: i64, buf: []u8) []const u8 {
     if (since <= 0 or now <= 0) return "";
@@ -214,9 +223,11 @@ pub fn panel(screen: Screen, in: Input, b: *Bufs) ?frame.Panel {
                 x.line(.normal, true, "Today, all tabs: {s}", .{usageLine(a.today(), &lb)});
                 for (in.tabs, 0..) |e, i| {
                     const t = a.find(e.id) orelse continue;
+                    var tb: [16]u8 = undefined;
                     var ub: [160]u8 = undefined;
                     const btn: ?frame.PanelButton = if (in.desk) .{ .label = "Open /usage", .id = ids.slash0 + @as(u32, @intCast(i)) } else null;
-                    if (!x.row(.normal, false, btn, "{s} \u{00B7} {s} \u{00B7} this session {s}", .{ e.name(), if (t.model().len > 0) t.model() else "model not known yet", usageLine(t.usage, &ub) })) break;
+                    if (!x.row(.normal, true, btn, "{s} \u{00B7} {s} \u{00B7} {s} tokens this session", .{ e.name(), if (t.model().len > 0) t.model() else "model not known yet", tokens(t.usage.total(), &tb) })) break;
+                    if (!x.row(.muted, false, null, "   {s}", .{breakdown(t.usage, &ub)})) break;
                 }
             } else x.line(.muted, false, "No usage known yet.", .{});
             b.after[0] = .{ .text = if (in.desk)
@@ -320,9 +331,11 @@ test "usage panel: per tab and today; Open /usage on the desk only" {
     var b: Bufs = .{};
     const d = panel(.usage, .{ .desk = true, .tabs = &list, .activity = &a }, &b).?;
     try testing.expectEqualStrings("Today, all tabs: 305 tokens (in 105 \u{00B7} out 200 \u{00B7} cache read 0 \u{00B7} cache write 0)", d.lines[0].text);
-    try testing.expect(std.mem.startsWith(u8, d.rows[0].text, "Alpha \u{00B7} model-large-4-1 \u{00B7} this session 2.1M tokens (in 1.2k"));
-    try testing.expectEqualStrings("Beta \u{00B7} model not known yet \u{00B7} this session 0 tokens (in 0 \u{00B7} out 0 \u{00B7} cache read 0 \u{00B7} cache write 0)", d.rows[1].text);
-    try testing.expectEqual(ids.slash0 + 1, d.rows[1].button.?.id);
+    try testing.expectEqualStrings("Alpha \u{00B7} model-large-4-1 \u{00B7} 2.1M tokens this session", d.rows[0].text);
+    try testing.expectEqualStrings("   in 1.2k \u{00B7} out 34.5k \u{00B7} cache read 2.1M \u{00B7} cache write 9.0k", d.rows[1].text);
+    try testing.expectEqualStrings("Beta \u{00B7} model not known yet \u{00B7} 0 tokens this session", d.rows[2].text);
+    try testing.expectEqual(ids.slash0 + 1, d.rows[2].button.?.id);
+    try testing.expect(d.rows[3].button == null);
     var b2: Bufs = .{};
     const v = panel(.usage, .{ .desk = false, .tabs = &list, .activity = &a }, &b2).?;
     for (v.rows) |r| try testing.expect(r.button == null);

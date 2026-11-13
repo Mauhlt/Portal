@@ -1249,7 +1249,7 @@ test "desk: Open /usage types into that tab (desk only), from the Usage panel" {
     try testing.expectEqual(@as(usize, 0), r.n_cmds);
     Shell.onButton(&sh, ids.usage);
     o = sh.overlay(st);
-    try testing.expectEqual(status_panels.ids.slash0 + 1, o.panel.?.rows[1].button.?.id);
+    try testing.expectEqual(status_panels.ids.slash0 + 1, o.panel.?.rows[2].button.?.id);
     Shell.onButton(&sh, status_panels.ids.slash0 + 1);
     try testing.expectEqual(@as(usize, 1), r.cmds[r.n_cmds - 1].usage_slash);
     try testing.expect(sh.overlay(st).panel == null);
