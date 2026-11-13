@@ -108,6 +108,12 @@ These are hard requirements for the tabs and recent-projects work, enforced by
 4. **Per-device history.** A device sees only its own recent list. Closed
    entries carry name + colour + last-used time only (no id, no path), and
    can't be subscribed to. Closed sessions keep no screen buffer to replay.
+   The Conversation view (protocol section 3b) is the one place program
+   text leaves the grid as text, by the owner's decision (2026-11-12): it
+   is scrubbed on the desktop first (src/convo/scrub.zig: the tab's
+   folder becomes its name, other absolute paths `[path]`, the user's
+   name `[user]`), and tool arguments, results and thinking are never
+   sent. Covered by tests/e2e/convo_tests.zig and privacy.zig.
 5. **Program-controlled strings stay in the grid.** Window titles set by
    programs (OSC 0/2, which the agent uses and which can contain paths) are
    not sent as metadata. Tab names are desk-assigned. Inline images are

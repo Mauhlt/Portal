@@ -46,6 +46,7 @@ const net = Io.net;
 const http = @import("http.zig");
 const ws = @import("shared").ws;
 const tabs_wire = @import("shared").tabs;
+const convo_wire = @import("shared").convo;
 const tlsconn = @import("tlsconn.zig");
 const x509check = @import("x509check.zig");
 const watchdog = @import("watchdog.zig");
@@ -138,6 +139,8 @@ test "trust errors" {
 pub const Shared = struct {
     mutex: Io.Mutex = .init,
     grid: Grid = .{},
+    /// The conversation of the tab shown (convo / convo+ messages).
+    convo: ui.convo.Conversation = .{},
     /// hello's `input` (null before hello and while disconnected).
     mode: ?keys.Policy = null,
     /// The desktop's open project tabs (hello, then `tabs`), the one shown
@@ -327,6 +330,21 @@ pub const Client = struct {
         if (status == .connected) s.last_error = null;
         if (status != .connected) s.mode = if (status == .session_ended) s.mode else null;
         s.mutex.unlock(c.io);
+        c.notify();
+    }
+
+    /// A `convo` / `convo+` message: parsed strictly (malformed: ignored)
+    /// and kept in Shared.convo for the Conversation view.
+    fn applyConvo(c: *Client, payload: []const u8) void {
+        if (payload.len > convo_wire.max_message) return;
+        const scratch = c.gpa.create(convo_wire.Scratch) catch return;
+        defer c.gpa.destroy(scratch);
+        scratch.text = c.gpa.alloc(u8, payload.len) catch return;
+        defer c.gpa.free(scratch.text);
+        const m = convo_wire.parse(payload, scratch) orelse return;
+        c.shared.mutex.lockUncancelable(c.io);
+        c.shared.convo.apply(c.gpa, m) catch {};
+        c.shared.mutex.unlock(c.io);
         c.notify();
     }
 
@@ -969,6 +987,12 @@ pub const Client = struct {
                 c.notify();
             },
             .text => {
+                // The conversation of the tab shown (larger than the
+                // other messages; its own strict parser).
+                if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"convo")) {
+                    c.applyConvo(frame.payload);
+                    return null;
+                }
                 if (frame.payload.len > 8192) return null;
                 const parsed = std.json.parseFromSlice(Msg, c.gpa, frame.payload, .{ .ignore_unknown_fields = true }) catch return null;
                 defer parsed.deinit();

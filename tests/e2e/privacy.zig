@@ -200,6 +200,12 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
             list != null and list.?.len == 1 and id != null and list.?.find(id.?) != null and
             std.mem.indexOfScalar(u8, list.?.items[0].name(), '\\') == null and std.mem.indexOfScalar(u8, list.?.items[0].name(), '/') == null and
             std.mem.indexOfScalar(u8, list.?.items[0].name(), ':') == null, "{s}", .{hello});
+        // The Conversation view's snapshot follows for the tab shown. This
+        // program keeps no transcript: it says so, and carries nothing
+        // from the desktop (tests/e2e/convo_tests.zig covers one that does).
+        const got = v.waitText("\"t\":\"convo\"", 1, 8000);
+        const snap = v.lastText("\"t\":\"convo\"") orelse "";
+        _ = r.check("convo snapshot: no transcript (on=false), no paths or names", got and std.mem.indexOf(u8, snap, "\"on\":false") != null and leaks.find(snap) == null, "{s}", .{snap});
     }
 
     // Without a session, the stream is refused before any data.

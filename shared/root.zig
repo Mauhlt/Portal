@@ -13,6 +13,8 @@
 //!            hello/tabs, tab colours, program state
 //!   theme    Portal's colour scheme (the one place colours are defined):
 //!            palette, ANSI colours, terminal defaults, tab accents, UI roles
+//!   convo    the Conversation view (convo / convo+ messages): items,
+//!            writer and strict parser
 //!   tls13    TLS 1.3 suites, record protection, HKDF-Expand-Label and a
 //!            bounds-checked byte cursor
 //!
@@ -26,6 +28,7 @@ pub const pki = @import("pki/root.zig");
 pub const tls13 = @import("tls13.zig");
 pub const tabs = @import("tabs.zig");
 pub const theme = @import("theme.zig");
+pub const convo = @import("convo.zig");
 
 test {
     _ = screen;
@@ -35,4 +38,5 @@ test {
     _ = tls13;
     _ = tabs;
     _ = theme;
+    _ = convo;
 }

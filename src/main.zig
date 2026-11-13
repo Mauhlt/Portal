@@ -1543,6 +1543,17 @@ const OpenWatch = struct {
     }
 };
 
+/// The agent's transcript folder, read (never written) for each tab's
+/// Conversation view (src/convo/follow.zig): %PORTAL_AGENT_PROJECTS%
+/// (tests point it at a scratch folder), else %CLAUDE_CONFIG_DIR%\projects,
+/// else %USERPROFILE%\.claude\projects. Lives as long as the process.
+fn convoProjects(gpa: Allocator, env: *const std.process.Environ.Map) ?[]const u8 {
+    if (env.get("PORTAL_AGENT_PROJECTS")) |p| if (p.len > 0) return p;
+    if (env.get("CLAUDE_CONFIG_DIR")) |d| if (d.len > 0) return std.fs.path.join(gpa, &.{ d, "projects" }) catch null;
+    const home = env.get("USERPROFILE") orelse return null;
+    return std.fs.path.join(gpa, &.{ home, ".claude", "projects" }) catch null;
+}
+
 /// Opens `dir` (absolute) as a new tab named `name` (or its display
 /// name). Returns null, or why it was not opened (no path in it).
 pub fn openFolder(gpa: Allocator, hub: *tabs.Hub, env: *const std.process.Environ.Map, dir: []const u8, name: ?[]const u8) ?[]const u8 {
@@ -1795,6 +1806,8 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .policy = cfg.policy,
         .program = .{ .app = resolved.app, .cmdline = resolved.cmdline, .command_name = std.fs.path.basename(command[0]) },
         .colors = saved.colorChoices(&colors_buf),
+        .convo_projects = convoProjects(gpa, env),
+        .user_name = env.get("USERNAME"),
         .size = initial,
     };
     if (host) |h| h.attach(hub);
@@ -2040,6 +2053,10 @@ test {
     _ = @import("fsutil.zig");
     _ = @import("bucket.zig");
     _ = @import("title.zig");
+    _ = @import("convo/scrub.zig");
+    _ = @import("convo/transcript.zig");
+    _ = @import("convo/model.zig");
+    _ = @import("convo/follow.zig");
 }
 
 test "isYes" {

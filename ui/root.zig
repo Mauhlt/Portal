@@ -17,6 +17,7 @@
 //!              describe frame.Panels
 //!   inputline  the interaction slice's input line (rules: "inputrules")
 //!   dataview   the Data slice's state (model: "datafeed")
+//!   convo      the conversation items a device keeps (shared/convo.zig)
 //!   grid       the terminal snapshot model the frame draws
 //!   form       text fields and focus rings for panels
 //!   input      keys, mods, pointer, InputSink, the answer buttons
@@ -36,6 +37,7 @@ pub const form = @import("form.zig");
 pub const input = @import("input.zig");
 pub const inputline = @import("inputline.zig");
 pub const dataview = @import("dataview.zig");
+pub const convo = @import("convo.zig");
 pub const theme = @import("shared").theme;
 pub const panels = struct {
     pub const desk = @import("panels/desk.zig");
@@ -56,5 +58,6 @@ test {
     _ = form;
     _ = inputline;
     _ = dataview;
+    _ = convo;
     _ = panels.setup;
 }
