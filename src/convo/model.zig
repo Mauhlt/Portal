@@ -104,6 +104,9 @@ pub const Convo = struct {
     /// Set while Portal adds its own question (askFromState).
     asking: bool = false,
     wait: Wait = .none,
+    /// A subagent's conversation (a sub-tab, subagents.zig): its
+    /// transcript's records are all `isSidechain`, and only those count.
+    sidechain: bool = false,
     /// The tool category an agent hook named for the permission
     /// prompt (session.setHookState), used when the transcript has not
     /// shown the tool yet. Cleared when the wait ends.
@@ -295,7 +298,7 @@ pub const Convo = struct {
 
     /// Adds what one transcript record says.
     pub fn applyRecord(c: *Convo, rec: *const transcript.Record) Allocator.Error!void {
-        if (rec.sidechain) return;
+        if (rec.sidechain != c.sidechain) return;
         switch (rec.rtype) {
             .user => try c.userRecord(rec),
             .assistant => try c.assistantRecord(rec),

@@ -299,8 +299,8 @@ portalctl hooks uninstall    # removes exactly Portal's entries again
 This edits `%USERPROFILE%\.claude\settings.json` (or
 `%CLAUDE_CONFIG_DIR%\settings.json`): one entry each for
 `UserPromptSubmit`, `PermissionRequest`, `Notification`
-(`permission_prompt` and `idle_prompt` only), `Stop`, `StopFailure` and
-`SessionEnd`, each running the installed
+(`permission_prompt` and `idle_prompt` only), `Stop`, `StopFailure`,
+`SessionEnd`, `SubagentStart` and `SubagentStop`, each running the installed
 `%LOCALAPPDATA%\Portal\bin\portalctl.exe hook` (exec form, no shell).
 Everything else in the file stays byte for byte; a file that isn't valid
 JSON is refused with the reason; the previous file is kept next to it as

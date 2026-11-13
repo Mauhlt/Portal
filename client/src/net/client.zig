@@ -47,6 +47,7 @@ const http = @import("http.zig");
 const ws = @import("shared").ws;
 const tabs_wire = @import("shared").tabs;
 const convo_wire = @import("shared").convo;
+const subtabs_wire = @import("shared").subtabs;
 const activity_wire = @import("shared").activity;
 const sysinfo = @import("shared").sysinfo;
 const tlsconn = @import("tlsconn.zig");
@@ -64,6 +65,7 @@ const sync_manifest = @import("../sync/manifest.zig");
 pub const max_frame_payload = 8 << 20;
 pub const http_Cookie = http.Cookie;
 pub const TabList = tabs_wire.List;
+pub const SubList = subtabs_wire.List;
 
 pub const connect_timeout_ms = 15_000;
 pub const request_timeout_ms = 15_000;
@@ -147,8 +149,13 @@ pub const SysSnapshot = sysinfo.Snapshot;
 pub const Shared = struct {
     mutex: Io.Mutex = .init,
     grid: Grid = .{},
-    /// The conversation of the tab shown (convo / convo+ messages).
+    /// The conversation of the tab shown (convo / convo+ messages), or of
+    /// its sub-tab `sub_shown`.
     convo: ui.convo.Conversation = .{},
+    /// The shown tab's subagent sub-tabs (`subtabs`, section 3e) and the
+    /// one whose conversation is shown (null: the tab's own). Read-only.
+    subs: subtabs_wire.List = .{},
+    sub_shown: ?subtabs_wire.Id = null,
     /// Every tab's background tasks and usage (`activity`), once known.
     activity: activity_wire.Activity = .{},
     has_activity: bool = false,
@@ -367,8 +374,41 @@ pub const Client = struct {
         defer c.gpa.free(scratch.text);
         const m = convo_wire.parse(payload, scratch) orelse return;
         c.shared.mutex.lockUncancelable(c.io);
+        // The tab's own conversation again: the sub-tab shown went.
+        if (m.snapshot and sameId(c.shared.current, m.id)) c.shared.sub_shown = null;
         c.shared.convo.apply(c.gpa, m) catch {};
         c.shared.mutex.unlock(c.io);
+        c.notify();
+    }
+
+    /// A `subtabs` message (section 3e): the shown tab's sub-tabs. If the
+    /// one shown went, back to the tab's own conversation.
+    fn applySubtabs(c: *Client, payload: []const u8) void {
+        const l = subtabs_wire.parse(payload) orelse return;
+        c.shared.mutex.lockUncancelable(c.io);
+        if (!sameId(c.shared.current, l.tab)) {
+            c.shared.mutex.unlock(c.io);
+            return;
+        }
+        c.shared.subs = l;
+        var back = false;
+        if (c.shared.sub_shown) |s| if (l.find(s) == null) {
+            c.shared.sub_shown = null;
+            back = true;
+        };
+        c.shared.mutex.unlock(c.io);
+        if (back) _ = c.sendInput("a:");
+        c.notify();
+    }
+
+    /// Shows sub-tab `id` of the tab shown (read-only), or (null) the
+    /// tab's own conversation: "a:<id>" / "a:". Callable from any thread.
+    pub fn showSub(c: *Client, id: ?subtabs_wire.Id) void {
+        c.shared.mutex.lockUncancelable(c.io);
+        c.shared.sub_shown = id;
+        c.shared.mutex.unlock(c.io);
+        var b: [34]u8 = undefined;
+        _ = c.sendInput(subtabs_wire.viewFrame(id, &b));
         c.notify();
     }
 
@@ -1083,6 +1123,10 @@ pub const Client = struct {
                     c.applyConvo(frame.payload);
                     return null;
                 }
+                if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"subtabs\"")) {
+                    c.applySubtabs(frame.payload);
+                    return null;
+                }
                 if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"activity\"")) {
                     c.applyActivity(frame.payload);
                     return null;
@@ -1100,6 +1144,8 @@ pub const Client = struct {
                     c.shared.mode = keys.parsePolicy(m.input orelse "none");
                     c.shared.tabs = tabs_wire.parseList(frame.payload) orelse .{};
                     c.shared.current = tabs_wire.idField(frame.payload, "session");
+                    c.shared.subs = .{};
+                    c.shared.sub_shown = null;
                     // Reconnected: back to the tab this device was on, if
                     // it is still open.
                     const back = c.shared.chosen;
@@ -1120,6 +1166,8 @@ pub const Client = struct {
                     // follows. Images belong to the old tab: drop them.
                     c.shared.mutex.lockUncancelable(c.io);
                     c.shared.current = tabs_wire.idField(frame.payload, "id");
+                    c.shared.subs = .{};
+                    c.shared.sub_shown = null;
                     c.shared.grid.images.deinit(c.gpa);
                     c.shared.grid.images = .{};
                     c.shared.mutex.unlock(c.io);
@@ -1778,4 +1826,35 @@ test "convo: the client keeps the shown tab's items from convo / convo+ (malform
     // A key outside the answer keys: the whole message is refused.
     c.applyConvo("{\"t\":\"convo+\",\"id\":\"" ++ id ++ "\",\"items\":[{\"n\":3,\"k\":\"question\",\"text\":\"x\",\"open\":true,\"options\":[{\"label\":\"rm\",\"key\":\"t:rm -rf\"}]}]}");
     try std.testing.expectEqual(@as(usize, 2), shared.convo.items.items.len);
+}
+
+test "subtabs: kept for the tab shown only; the sub-tab shown going (or the tab's own snapshot) ends showing it" {
+    const io = std.testing.io;
+    var shared: Shared = .{};
+    defer shared.convo.deinit(std.testing.allocator);
+    const c = try std.testing.allocator.create(Client);
+    defer std.testing.allocator.destroy(c);
+    c.* = try Client.init(std.testing.allocator, io, &shared, "127.0.0.1:1", .insecure_plain_http);
+    c.quiet = true;
+    const tab = "0102030405060708090a0b0c0d0e0f10";
+    const sub = "abababababababababababababababab";
+    shared.current = tabs_wire.parseId(tab);
+    c.applySubtabs("{\"t\":\"subtabs\",\"id\":\"" ++ tab ++ "\",\"subs\":[{\"id\":\"" ++ sub ++ "\",\"name\":\"Find tests\",\"done\":false}]}");
+    try std.testing.expectEqual(@as(usize, 1), shared.subs.len);
+    try std.testing.expectEqualStrings("Find tests", shared.subs.items[0].name());
+    // Another tab's list is ignored; a malformed one too.
+    c.applySubtabs("{\"t\":\"subtabs\",\"id\":\"ffffffffffffffffffffffffffffffff\",\"subs\":[]}");
+    c.applySubtabs("{\"t\":\"subtabs\",\"id\":\"" ++ tab ++ "\",\"subs\":[{\"id\":\"x\"}]}");
+    try std.testing.expectEqual(@as(usize, 1), shared.subs.len);
+    // Shown, then the tab's own snapshot arrives: back to the tab.
+    shared.sub_shown = subtabs_wire.parse("{\"t\":\"subtabs\",\"id\":\"" ++ tab ++ "\",\"subs\":[{\"id\":\"" ++ sub ++ "\",\"name\":\"x\"}]}").?.items[0].id;
+    c.applyConvo("{\"t\":\"convo\",\"id\":\"" ++ sub ++ "\",\"on\":true,\"items\":[]}");
+    try std.testing.expect(shared.sub_shown != null);
+    c.applyConvo("{\"t\":\"convo\",\"id\":\"" ++ tab ++ "\",\"on\":true,\"items\":[]}");
+    try std.testing.expect(shared.sub_shown == null);
+    // Shown, then it leaves the list.
+    shared.sub_shown = shared.subs.items[0].id;
+    c.applySubtabs("{\"t\":\"subtabs\",\"id\":\"" ++ tab ++ "\",\"subs\":[]}");
+    try std.testing.expect(shared.sub_shown == null);
+    try std.testing.expectEqual(@as(usize, 0), shared.subs.len);
 }

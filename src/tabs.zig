@@ -40,6 +40,8 @@ const Convo = @import("convo/model.zig").Convo;
 const Activity = @import("convo/activity.zig").Activity;
 const activity_wire = @import("shared").activity;
 const follow = @import("convo/follow.zig");
+const subagents = @import("convo/subagents.zig");
+const SubTabs = @import("convo/subtabs.zig").SubTabs;
 const transcript = @import("convo/transcript.zig");
 const cmdline = @import("cmdline.zig");
 const childenv = @import("childenv.zig");
@@ -103,6 +105,12 @@ pub const Tab = struct {
     /// checks the transcript's size (appends through a handle kept open
     /// are not always reported by the directory).
     convo_poke: ?follow.Poke = null,
+    /// The subagents of the session the tab follows, each a read-only
+    /// sub-tab (docs/protocol.md section 3e). Guarded by hub.mutex.
+    subs: SubTabs = undefined,
+    /// Set by the agent's SubagentStart / SubagentStop hooks
+    /// (subagentEvent): the follower's subagent watcher looks again.
+    subs_kick: ?w32.HANDLE = null,
     /// The `--session-id` Portal gave the agent for this launch (its
     /// transcript's name), if it gave one. Desktop-only.
     session_uuid: ?[36]u8 = null,
@@ -144,8 +152,10 @@ pub const Tab = struct {
         if (t.refs.fetchSub(1, .acq_rel) != 1) return;
         const gpa = t.hub.gpa;
         t.convo.deinit();
+        t.subs.deinit();
         gpa.free(t.cwd);
         if (t.convo_stop) |e| _ = w32.CloseHandle(e);
+        if (t.subs_kick) |e| _ = w32.CloseHandle(e);
         if (t.convo_poke) |*p| p.deinit();
         t.session.term.deinit();
         t.local.deinit();
@@ -237,7 +247,71 @@ pub const Tab = struct {
         var f = follow.Follower.init(h.gpa, .{ .ctx = t, .apply = convoApply, .reset = convoReset, .claim = convoClaim, .contested = convoContested }, projects, t.cwd) catch return;
         defer f.deinit();
         f.expected = t.session_uuid;
+        // The session's subagents, as sub-tabs (subagents.zig).
+        var sw = subagents.Watcher.init(h.gpa, .{ .ctx = t, .clear = subsClear, .upsert = subsUpsert, .apply = subsApply, .restart = subsRestart }) catch null;
+        defer if (sw) |*s| s.deinit();
+        if (sw) |*s| {
+            s.kick = t.subs_kick;
+            f.subs = s;
+        }
         f.run(stop, if (t.convo_poke) |*p| p else null);
+    }
+
+    /// The sub-tabs changed: viewers and the desk look again.
+    fn subsChanged(h: *Hub) void {
+        h.mutex.unlock(h.io);
+        h.cond.broadcast(h.io);
+        h.notify();
+    }
+
+    fn subsClear(ctx: *anyopaque) void {
+        const t: *Tab = @ptrCast(@alignCast(ctx));
+        const h = t.hub;
+        h.mutex.lockUncancelable(h.io);
+        t.subs.clear();
+        subsChanged(h);
+    }
+
+    fn subsUpsert(ctx: *anyopaque, agent: []const u8, description: ?[]const u8, done: bool) bool {
+        const t: *Tab = @ptrCast(@alignCast(ctx));
+        const h = t.hub;
+        h.mutex.lockUncancelable(h.io);
+        const ok = t.subs.upsert(agent, description, done) != null;
+        subsChanged(h);
+        return ok;
+    }
+
+    fn subsApply(ctx: *anyopaque, agent: []const u8, rec: *const transcript.Record) void {
+        const t: *Tab = @ptrCast(@alignCast(ctx));
+        const h = t.hub;
+        h.mutex.lockUncancelable(h.io);
+        t.subs.apply(agent, rec);
+        subsChanged(h);
+    }
+
+    fn subsRestart(ctx: *anyopaque, agent: []const u8) void {
+        const t: *Tab = @ptrCast(@alignCast(ctx));
+        const h = t.hub;
+        h.mutex.lockUncancelable(h.io);
+        t.subs.restart(agent);
+        subsChanged(h);
+    }
+
+    /// What an agent hook says about one of the tab's subagents.
+    pub const SubagentEvent = enum { start, stop };
+
+    /// The seam for the agent's SubagentStart / SubagentStop hooks
+    /// (Hub.applyHook): `start` gives subagent `agent` its sub-tab at once
+    /// (named once its meta file is read), `stop` marks it finished. Either
+    /// way the follower's watcher looks at the subagents folder again
+    /// (`subs_kick`), so what the subagent wrote last is read. The files
+    /// stay the source of the conversation; hooks only make it timely.
+    pub fn subagentEvent(t: *Tab, ev: SubagentEvent, agent: []const u8) void {
+        const h = t.hub;
+        h.mutex.lockUncancelable(h.io);
+        _ = t.subs.upsert(agent, null, ev == .stop);
+        subsChanged(h);
+        if (t.subs_kick) |k| _ = w32.SetEvent(k);
     }
 
     fn convoApply(ctx: *anyopaque, rec: *const transcript.Record) void {
@@ -545,7 +619,9 @@ pub const Hub = struct {
         t.activity = Activity.init(h.gpa, .{ .root = t.cwd, .name = t.name(), .user = h.user_name });
         t.activity.dayOf = localDay;
         t.session.convo = &t.convo;
+        t.subs = SubTabs.init(h.gpa, h.io, .{ .root = t.cwd, .name = t.name(), .user = h.user_name });
         if (h.convo_projects != null) {
+            t.subs_kick = w32.validHandle(w32.CreateEventW(null, 0, 0, null));
             t.convo_stop = w32.validHandle(w32.CreateEventW(null, 1, 0, null));
             t.convo_poke = follow.Poke.init();
             if (t.convo_poke) |*p| t.session.convo_poke = p;
@@ -720,6 +796,10 @@ pub const Hub = struct {
     /// Only an open tab's own key counts; anything else changes nothing
     /// and is logged at most once a minute, without its contents.
     pub fn applyHook(h: *Hub, m: *const hookmsg.Message) void {
+        switch (m.event) {
+            .SubagentStart, .SubagentStop => return h.applySubagentHook(m),
+            else => {},
+        }
         const e = hookmsg.effect(m) orelse return;
         h.mutex.lockUncancelable(h.io);
         var found: ?*Tab = null;
@@ -744,6 +824,22 @@ pub const Hub = struct {
         // Desktop log only: the tab's name (shown on the desk anyway),
         // the event and the new state; never the key or anything else.
         if (t.session.setHookState(e)) h.log.print("hooks: tab '{s}': {t} -> {t}", .{ t.name(), m.event, stateOf(e.state) });
+    }
+
+    /// SubagentStart / SubagentStop from `portalctl hook`: only an open
+    /// tab's own key counts (like applyHook); its sub-tabs learn it.
+    fn applySubagentHook(h: *Hub, m: *const hookmsg.Message) void {
+        if (m.agent_len == 0) return;
+        h.mutex.lockUncancelable(h.io);
+        var found: ?*Tab = null;
+        for (h.tabs[0..h.n]) |t| if (std.crypto.timing_safe.eql(hookmsg.Key, t.hook_key, m.key)) {
+            t.acquire();
+            found = t;
+        };
+        h.mutex.unlock(h.io);
+        const t = found orelse return;
+        defer t.release();
+        t.subagentEvent(if (m.event == .SubagentStart) .start else .stop, m.agent());
     }
 
     pub fn setDeskActive(h: *Hub, t: *Tab) void {

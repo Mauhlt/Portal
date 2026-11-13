@@ -252,7 +252,7 @@ fn parseEntry(text: []const u8, start: usize, e: *Entry) ?usize {
 
 /// Reads a JSON string at `p.*` (escapes `\"` and `\\` only) into `out`
 /// and moves `p` past it. Null if malformed or longer than `out`.
-fn readString(text: []const u8, p: *usize, out: []u8) ?[]const u8 {
+pub fn readString(text: []const u8, p: *usize, out: []u8) ?[]const u8 {
     var i = p.*;
     if (i >= text.len or text[i] != '"') return null;
     i += 1;
@@ -278,7 +278,7 @@ fn readString(text: []const u8, p: *usize, out: []u8) ?[]const u8 {
     return null;
 }
 
-fn skipSpace(text: []const u8, start: usize) usize {
+pub fn skipSpace(text: []const u8, start: usize) usize {
     var p = start;
     while (p < text.len and (text[p] == ' ' or text[p] == '\t' or text[p] == '\n' or text[p] == '\r')) p += 1;
     return p;

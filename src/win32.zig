@@ -189,6 +189,7 @@ pub const FILE_SHARE_READ: DWORD = 0x0001;
 pub const FILE_SHARE_WRITE: DWORD = 0x0002;
 pub const MOVEFILE_REPLACE_EXISTING: DWORD = 0x1;
 pub const OPEN_ALWAYS: DWORD = 4;
+pub const CREATE_ALWAYS: DWORD = 2;
 pub const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
 
 pub extern "kernel32" fn CreateFileW(

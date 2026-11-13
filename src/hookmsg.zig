@@ -5,7 +5,8 @@
 //!
 //! Agent hook input: JSON on stdin with
 //! `hook_event_name`, and per event `tool_name` (PermissionRequest),
-//! `notification_type` (Notification). Everything else (the prompt, tool
+//! `notification_type` (Notification), `agent_id` (SubagentStart,
+//! SubagentStop). Everything else (the prompt, tool
 //! input, messages, paths) is never read past the parser and never sent.
 //!
 //! The message (at most `max_message` bytes, ASCII lines):
@@ -15,6 +16,7 @@
 //!   event=<one of `Event`>
 //!   tool=<tool name>              (PermissionRequest only, optional)
 //!   ntype=<notification type>     (Notification only)
+//!   agent=<subagent id>           (SubagentStart / SubagentStop only)
 //!
 //! Untrusted on both ends: the sender only sends enumerated event names
 //! and `[A-Za-z0-9_-]{1,64}` names; the receiver accepts only those, maps
@@ -46,6 +48,10 @@ pub const Event = enum {
     Stop,
     StopFailure,
     SessionEnd,
+    /// A subagent started / finished (`agent_id`): the tab's sub-tabs
+    /// (tabs.Tab.subagentEvent); no state change.
+    SubagentStart,
+    SubagentStop,
 
     pub fn fromName(s: []const u8) ?Event {
         return std.meta.stringToEnum(Event, s);
@@ -82,12 +88,22 @@ pub const Message = struct {
     tool_len: u8 = 0,
     ntype_buf: [max_name]u8 = undefined,
     ntype_len: u8 = 0,
+    agent_buf: [max_name]u8 = undefined,
+    agent_len: u8 = 0,
 
     pub fn tool(m: *const Message) []const u8 {
         return m.tool_buf[0..m.tool_len];
     }
     pub fn ntype(m: *const Message) []const u8 {
         return m.ntype_buf[0..m.ntype_len];
+    }
+    pub fn agent(m: *const Message) []const u8 {
+        return m.agent_buf[0..m.agent_len];
+    }
+    fn setAgent(m: *Message, s: []const u8) void {
+        if (!validName(s)) return;
+        @memcpy(m.agent_buf[0..s.len], s);
+        m.agent_len = @intCast(s.len);
     }
     fn setTool(m: *Message, s: []const u8) void {
         if (!validName(s)) return;
@@ -106,6 +122,7 @@ pub const Message = struct {
         wr.print("{s}\ntab={s}\nevent={t}\n", .{ header, &hex, m.event }) catch unreachable;
         if (m.tool_len > 0) wr.print("tool={s}\n", .{m.tool()}) catch unreachable;
         if (m.ntype_len > 0) wr.print("ntype={s}\n", .{m.ntype()}) catch unreachable;
+        if (m.agent_len > 0) wr.print("agent={s}\n", .{m.agent()}) catch unreachable;
         return wr.buffered();
     }
 };
@@ -119,6 +136,7 @@ pub fn parse(text: []const u8) ?Message {
     var event: ?Event = null;
     var tool: []const u8 = "";
     var ntype: []const u8 = "";
+    var agent: []const u8 = "";
     while (it.next()) |line| {
         if (line.len == 0) continue;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse return null;
@@ -134,11 +152,15 @@ pub fn parse(text: []const u8) ?Message {
         } else if (std.mem.eql(u8, k, "ntype")) {
             if (!validName(v)) return null;
             ntype = v;
+        } else if (std.mem.eql(u8, k, "agent")) {
+            if (!validName(v)) return null;
+            agent = v;
         } // unknown keys: ignored (a newer sender)
     }
     var m: Message = .{ .key = key orelse return null, .event = event orelse return null };
     m.setTool(tool);
     m.setNtype(ntype);
+    m.setAgent(agent);
     return m;
 }
 
@@ -150,6 +172,7 @@ pub fn fromHookJson(scratch: std.mem.Allocator, key: Key, json: []const u8) ?Mes
         hook_event_name: ?[]const u8 = null,
         tool_name: ?[]const u8 = null,
         notification_type: ?[]const u8 = null,
+        agent_id: ?[]const u8 = null,
     };
     const in = std.json.parseFromSliceLeaky(In, scratch, json, .{ .ignore_unknown_fields = true, .duplicate_field_behavior = .use_last }) catch return null;
     const event = Event.fromName(in.hook_event_name orelse return null) orelse return null;
@@ -160,6 +183,11 @@ pub fn fromHookJson(scratch: std.mem.Allocator, key: Key, json: []const u8) ?Mes
             const nt = in.notification_type orelse return null;
             if (!std.mem.eql(u8, nt, "permission_prompt") and !std.mem.eql(u8, nt, "idle_prompt")) return null;
             m.setNtype(nt);
+        },
+        // Without a usable id there is nothing to tell.
+        .SubagentStart, .SubagentStop => {
+            m.setAgent(in.agent_id orelse return null);
+            if (m.agent_len == 0) return null;
         },
         else => {},
     }
@@ -195,6 +223,7 @@ pub fn effect(m: *const Message) ?Effect {
         .Stop => .{ .state = .done, .wait = .none },
         .StopFailure => .{ .state = .failed, .wait = .none },
         .SessionEnd => .{ .state = .idle, .wait = .none },
+        .SubagentStart, .SubagentStop => null,
     };
 }
 
@@ -314,4 +343,29 @@ test "pipeName: per user and data directory, case-insensitive directory" {
     try testing.expectEqualStrings(x, pipeName(&b, "S-1-5-21-1-2-3-1001", "c:\\users\\X\\appdata\\local\\portal"));
     try testing.expect(!std.mem.eql(u8, x, pipeName(&b, "S-1-5-21-1-2-3-1002", "C:\\Users\\x\\AppData\\Local\\Portal")));
     try testing.expect(!std.mem.eql(u8, x, pipeName(&b, "S-1-5-21-1-2-3-1001", "C:\\t\\Portal")));
+}
+
+test "SubagentStart / SubagentStop: the agent id travels, nothing else; no state change" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key: Key = @splat(0x02);
+    const start = fromHookJson(a, key,
+        \\{"session_id":"s","transcript_path":"C:\\x\\t.jsonl","cwd":"C:\\p","hook_event_name":"SubagentStart","agent_id":"a01496045a85e979c","agent_type":"Explore"}
+    ).?;
+    try testing.expectEqual(Event.SubagentStart, start.event);
+    try testing.expectEqualStrings("a01496045a85e979c", start.agent());
+    try testing.expect(effect(&start) == null);
+    const stop = fromHookJson(a, key,
+        \\{"hook_event_name":"SubagentStop","agent_id":"a1","agent_type":"x","agent_transcript_path":"C:\\x\\agent-a1.jsonl","last_assistant_message":"secret","stop_hook_active":false}
+    ).?;
+    var buf: [max_message]u8 = undefined;
+    const text = stop.format(&buf);
+    try testing.expectEqualStrings("portal-hook-v1\ntab=02020202020202020202020202020202\nevent=SubagentStop\nagent=a1\n", text);
+    const back = parse(text).?;
+    try testing.expectEqualStrings("a1", back.agent());
+    // No id, or one that is not a plain name: nothing to tell.
+    try testing.expect(fromHookJson(a, key, "{\"hook_event_name\":\"SubagentStop\"}") == null);
+    try testing.expect(fromHookJson(a, key, "{\"hook_event_name\":\"SubagentStart\",\"agent_id\":\"../x\"}") == null);
+    try testing.expect(parse("portal-hook-v1\ntab=02020202020202020202020202020202\nevent=SubagentStop\nagent=a/b\n") == null);
 }

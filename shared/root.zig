@@ -20,6 +20,7 @@
 //!   pairqr   the pairing QR code's text (desk shows it, iPhone scans it)
 //!   activity background tasks and token usage per tab (activity message)
 //!   sysinfo  the optional system monitor's numbers (sys message)
+//!   subtabs  subagent sub-tabs of the tab watched (subtabs message, a: frame)
 //!
 //! Zig analyses only what a build references, so the browser build only
 //! compiles what it uses (it must stay wasm32-freestanding clean).
@@ -35,6 +36,7 @@ pub const convo = @import("convo.zig");
 pub const pairqr = @import("pairqr.zig");
 pub const activity = @import("activity.zig");
 pub const sysinfo = @import("sysinfo.zig");
+pub const subtabs = @import("subtabs.zig");
 
 test {
     _ = screen;
@@ -48,4 +50,5 @@ test {
     _ = pairqr;
     _ = activity;
     _ = sysinfo;
+    _ = subtabs;
 }

@@ -2145,6 +2145,8 @@ test {
     _ = @import("convo/model.zig");
     _ = @import("convo/follow.zig");
     _ = @import("convo/activity.zig");
+    _ = @import("convo/subtabs.zig");
+    _ = @import("convo/subagents.zig");
     _ = @import("sysmon.zig");
 }
 
