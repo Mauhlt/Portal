@@ -189,6 +189,12 @@ promotes the result. It also installs launchers into
 `%LOCALAPPDATA%\Portal\bin` on your PATH once, then type `portal`, or pin
 `portal.exe` to Start.
 
+For the other Windows devices, `zig build package` writes ready-to-copy
+ReleaseSafe folders: `zig-out/portal-x86_64-windows` (the desktop) and
+`zig-out/portal-aarch64-windows` (Snapdragon X laptops, the Surface).
+Installing and pairing each device, in order:
+[docs/pairing.md](docs/pairing.md).
+
 ### 2. WireGuard (free, open source)
 
 See [docs/wireguard.md](docs/wireguard.md) for the full walk-through. In short:

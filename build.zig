@@ -201,6 +201,7 @@ pub fn build(b: *std.Build) void {
     addE2e(b, target, optimize, gui_mods, ctl_exe, show_exe);
     addIos(b, optimize, test_step);
     addBrand(b, test_step);
+    addPackage(b, wasm.getEmittedBin(), test_step);
 }
 
 /// Windows: links docs/brand/portal.ico as icon resource 1 (Explorer,
@@ -213,6 +214,71 @@ fn addAppIcon(b: *std.Build, exe: *std.Build.Step.Compile) void {
     const rc = wf.add("portal.rc", "1 ICON \"portal.ico\"\n");
     exe.root_module.addWin32ResourceFile(.{ .file = rc });
 }
+
+/// `zig build package`: ready-to-copy ReleaseSafe folders, one per Windows
+/// machine type the owner's devices use, built whatever -Dtarget says:
+///   zig-out/portal-x86_64-windows/   the desktop
+///   zig-out/portal-aarch64-windows/  the Snapdragon X laptop and the Surface
+/// Each holds portal.exe, portalctl.exe, portal-show.exe, README.txt
+/// (docs/package-readme.txt) and the bundled font's licence. No DLLs: the
+/// tunnel is the WireGuard app's own, Vulkan comes with the GPU driver.
+/// src/tools/pecheck.zig checks every exe's PE machine and subsystem and
+/// writes zig-out/portal-<arch>-windows-check.txt.
+fn addPackage(b: *std.Build, wasm_bin: std.Build.LazyPath, test_step: *std.Build.Step) void {
+    const step = b.step("package", "Build ReleaseSafe folders for x86_64 and aarch64 Windows (zig-out/portal-<arch>-windows)");
+    const pecheck_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/pecheck.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const pecheck = b.addExecutable(.{ .name = "portal-pecheck", .root_module = pecheck_mod });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = pecheck_mod })).step);
+    for ([_]std.Target.Cpu.Arch{ .x86_64, .aarch64 }) |arch| {
+        // Baseline CPU (no -mcpu=native): the folder runs on any machine of
+        // that architecture, not only the one that built it.
+        const t = b.resolveTargetQuery(.{ .cpu_arch = arch, .os_tag = .windows });
+        const gui_root = rootModule(b, t, .ReleaseSafe, .gui, wasm_bin);
+        const ctl_root = rootModule(b, t, .ReleaseSafe, .ctl, wasm_bin);
+        const exe = b.addExecutable(.{ .name = "portal", .root_module = gui_root.root });
+        exe.subsystem = .windows;
+        addAppIcon(b, exe);
+        const ctl = b.addExecutable(.{ .name = "portalctl", .root_module = ctl_root.root });
+        addAppIcon(b, ctl);
+        const show = b.addExecutable(.{ .name = "portal-show", .root_module = showModule(b, t, .ReleaseSafe, gui_root.gui.imgcheck) });
+
+        const name = b.fmt("portal-{t}-windows", .{arch});
+        const wf = b.addWriteFiles();
+        _ = wf.addCopyFile(exe.getEmittedBin(), "portal.exe");
+        _ = wf.addCopyFile(ctl.getEmittedBin(), "portalctl.exe");
+        _ = wf.addCopyFile(show.getEmittedBin(), "portal-show.exe");
+        _ = wf.add("README.txt", b.fmt("Portal for {t} Windows (ReleaseSafe)\r\n\r\n{s}", .{ arch, crlf(b, @embedFile("docs/package-readme.txt")) }));
+        _ = wf.addCopyFile(b.path("src/web/fonts/LICENSE.txt"), "licenses/DejaVu-fonts-LICENSE.txt");
+
+        const check = b.addRunArtifact(pecheck);
+        check.addArg(@tagName(arch));
+        const report = check.addOutputFileArg("check.txt");
+        for ([_]struct { kind: []const u8, c: *std.Build.Step.Compile }{
+            .{ .kind = "gui", .c = exe },
+            .{ .kind = "console", .c = ctl },
+            .{ .kind = "console", .c = show },
+        }) |e| {
+            check.addArg(e.kind);
+            check.addFileArg(e.c.getEmittedBin());
+        }
+
+        const install = b.addInstallDirectory(.{ .source_dir = wf.getDirectory(), .install_dir = .prefix, .install_subdir = name });
+        install.step.dependOn(&check.step);
+        step.dependOn(&install.step);
+        step.dependOn(&b.addInstallFile(report, b.fmt("{s}-check.txt", .{name})).step);
+    }
+}
+
+/// `text` with CRLF line ends, for Notepad on any Windows.
+fn crlf(b: *std.Build, text: []const u8) []const u8 {
+    const lf = std.mem.replaceOwned(u8, b.allocator, text, "\r\n", "\n") catch @panic("OOM");
+    return std.mem.replaceOwned(u8, b.allocator, lf, "\n", "\r\n") catch @panic("OOM");
+}
+
 
 /// `zig build brand`: regenerates docs/brand's raster assets (the icon
 /// PNGs, portal.ico, the embedded hero PNG) with src/tools/brand.zig. Its
