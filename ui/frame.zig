@@ -778,6 +778,22 @@ pub const Frame = struct {
         return x;
     }
 
+    /// A bar in the brand's accent gradient (the hero's neon ring: blue,
+    /// cyan, green from left to right), drawn as narrow slices.
+    fn accentBar(f: *Frame, x: f32, y: f32, w: f32, h: f32) void {
+        const stops = theme.ui.accent;
+        const n: usize = std.math.clamp(@as(usize, @intFromFloat(@max(w, 0) / 6)), 1, 32);
+        const nf: f32 = @floatFromInt(n);
+        var x0 = x;
+        for (0..n) |i| {
+            const x1 = if (i + 1 == n) x + w else @round(x + w * @as(f32, @floatFromInt(i + 1)) / nf);
+            const t = (@as(f32, @floatFromInt(i)) + 0.5) / nf * @as(f32, @floatFromInt(stops.len - 1));
+            const k: usize = @min(@as(usize, @intFromFloat(t)), stops.len - 2);
+            f.rect(x0, y, x1 - x0, h, mixBy(stops[k], stops[k + 1], t - @as(f32, @floatFromInt(k))));
+            x0 = x1;
+        }
+    }
+
     fn outline(f: *Frame, x: f32, y: f32, w: f32, h: f32, t: f32, c: Rgb) void {
         f.rect(x, y, w, t, c);
         f.rect(x, y + h - t, w, t, c);
@@ -898,7 +914,7 @@ pub const Frame = struct {
                 const bw = textWidth(ui, b.label) + 2 * @as(f32, @floatFromInt(ui.cell_w));
                 bx -= bw;
                 _ = f.addButton(ui, bx, by, bh, b.label, b.id, if (b.active) theme.ui.button_active else theme.ui.button);
-                if (b.active) f.rect(bx, by + bh - @max(2, @round(2 * s)), bw, @max(2, @round(2 * s)), theme.ui.focus);
+                if (b.active) f.accentBar(bx, by + bh - @max(2, @round(2 * s)), bw, @max(2, @round(2 * s)));
                 bx -= @round(6 * s);
             }
             right_w = W - bx;
@@ -949,6 +965,8 @@ pub const Frame = struct {
             f.rect(x, ty, w, th, bg);
             // The colour stripe on top (all tabs), thicker on the active one.
             f.rect(x, ty, w, if (t.active) @round(3 * s) else @round(2 * s), t.color);
+            // The active tab: an accent underline.
+            if (t.active) f.accentBar(x, ty + th - @max(2, @round(2 * s)), w, @max(2, @round(2 * s)));
             if (t.attention) f.outline(x, ty, w, th, @max(2, @round(2 * s)), theme.ui.attention);
             var tx = x + cw;
             const text_y = ty + @round((th - @as(f32, @floatFromInt(ui.cell_h))) / 2);
@@ -1203,6 +1221,7 @@ pub const Frame = struct {
     /// The input box's Send: a `w` wide button, label centred.
     fn sendButton(f: *Frame, m: Metrics, x: f32, y: f32, w: f32, h: f32, b: PanelButton, s: f32) void {
         f.rect(x, y, w, h, theme.ui.button_active);
+        f.accentBar(x, y + h - @max(2, @round(2 * s)), w, @max(2, @round(2 * s)));
         if (b.focused) f.outline(x, y, w, h, @max(2, @round(2 * s)), theme.ui.focus);
         const lw = textWidth(m, b.label);
         _ = f.text(m, x + @round(@max(0, (w - lw) / 2)), y + @round((h - @as(f32, @floatFromInt(m.cell_h))) / 2), clipText(m, b.label, w, false), theme.ui.button_text, true);
