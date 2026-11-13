@@ -1,7 +1,7 @@
 //! The desktop's own Portal window (portal.exe): device glue that binds
 //! the shared UI (module "portal_ui": its shell with device `.desk`, the
 //! desk panels) to the local sessions and the server. The UI itself (layout,
-//! tabs with + and ×, the desk tools, the input box, the Data slice,
+//! tabs with + and ×, the desk tools, the Instruct panel, the Data slice,
 //! selection, the panels' screens) lives in ui/; this file feeds it the hub's
 //! state each frame and performs what it asks: VT bytes to the shown tab's
 //! PTY, tab switches, the folder picker, the clipboard, and the desk
