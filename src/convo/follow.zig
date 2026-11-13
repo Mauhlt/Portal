@@ -155,7 +155,7 @@ pub const DirChanges = struct {
     buf: [32 * 1024]u8 align(8) = undefined,
 
     pub fn open(gpa: Allocator, path: []const u8, filter: w.DWORD) !*DirChanges {
-        const pw = try fsutil.wide(gpa, path);
+        const pw = try fsutil.longWide(gpa, path);
         defer gpa.free(pw);
         const dir = w.validHandle(w.CreateFileW(pw.ptr, w.FILE_LIST_DIRECTORY, w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE, null, w.OPEN_EXISTING, w.FILE_FLAG_BACKUP_SEMANTICS | w.FILE_FLAG_OVERLAPPED, null)) orelse return error.OpenFailed;
         errdefer _ = w.CloseHandle(dir);
@@ -393,7 +393,7 @@ pub const Follower = struct {
     }
 
     fn exists(f: *Follower, path: []const u8) bool {
-        const pw = fsutil.wide(f.gpa, path) catch return false;
+        const pw = fsutil.longWide(f.gpa, path) catch return false;
         defer f.gpa.free(pw);
         const a = w.GetFileAttributesW(pw.ptr);
         return a != w.INVALID_FILE_ATTRIBUTES and a & w.FILE_ATTRIBUTE_DIRECTORY != 0;
@@ -742,7 +742,7 @@ fn stemOf(name: []const u8) ?[]const u8 {
 }
 
 fn openRead(gpa: Allocator, path: []const u8) ?w.HANDLE {
-    const pw = fsutil.wide(gpa, path) catch return null;
+    const pw = fsutil.longWide(gpa, path) catch return null;
     defer gpa.free(pw);
     return w.validHandle(w.CreateFileW(pw.ptr, w.GENERIC_READ, w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE, null, w.OPEN_EXISTING, w.FILE_ATTRIBUTE_NORMAL, null));
 }
@@ -781,7 +781,7 @@ const Find = struct {
     const Entry = struct { name: []const u8, dir: bool, size: u64, time: u64 };
 
     fn open(gpa: Allocator, pattern: []const u8) !Find {
-        const pw = try fsutil.wide(gpa, pattern);
+        const pw = try fsutil.longWide(gpa, pattern);
         defer gpa.free(pw);
         var f: Find = .{ .h = null };
         f.h = w.validHandle(w.FindFirstFileW(pw.ptr, &f.data));
@@ -893,7 +893,7 @@ const Tmp = struct {
     fn append(t: *Tmp, rel: []const u8, data: []const u8) !void {
         var pb: [1024]u8 = undefined;
         const p = t.path(&pb, rel);
-        const pw = try fsutil.wide(testing.allocator, p);
+        const pw = try fsutil.longWide(testing.allocator, p);
         defer testing.allocator.free(pw);
         const h = w.validHandle(w.CreateFileW(pw.ptr, w.FILE_APPEND_DATA, w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null)) orelse return error.OpenFailed;
         defer _ = w.CloseHandle(h);
@@ -1251,6 +1251,51 @@ test "follower: overlong lines are cut, not kept whole" {
     try testing.expectEqualStrings("Edited 1 file|", ts.texts(&buf));
 }
 
+test "follower: a transcript path longer than MAX_PATH is found, watched and read" {
+    var t = try Tmp.init();
+    defer t.deinit();
+    const gpa = testing.allocator;
+    const cwd = "C:\\proj\\acme";
+    // projects\ddd...\ddd...\...\C--proj-acme: well over 300 characters.
+    const seg = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const deep = "projects\\" ++ seg ++ "\\" ++ seg ++ "\\" ++ seg ++ "\\" ++ seg ++ "\\" ++ seg;
+    const folder_rel = deep ++ "\\C--proj-acme";
+    try t.tmp.dir.createDirPath(testing.io, folder_rel);
+    var pb: [1024]u8 = undefined;
+    const projects = t.path(&pb, deep);
+    var fb: [1024]u8 = undefined;
+    const transcript_path = std.fmt.bufPrint(&fb, "{s}\\C--proj-acme\\{s}.jsonl", .{ projects, stem_a }) catch unreachable;
+    try testing.expect(transcript_path.len > 300);
+
+    var ts: TestSink = .{ .convo = Convo.init(gpa, .{ .root = cwd, .name = "acme" }) };
+    defer ts.convo.deinit();
+    var f = try Follower.init(gpa, ts.sink(), projects, cwd);
+    defer f.deinit();
+    try f.resolveFolder();
+    try testing.expect(f.folder != null);
+    f.rescan();
+    printedAt(&f, &ts, 1000);
+
+    const dc = try DirChanges.open(gpa, f.folder.?, w.FILE_NOTIFY_CHANGE_FILE_NAME | w.FILE_NOTIFY_CHANGE_SIZE | w.FILE_NOTIFY_CHANGE_LAST_WRITE);
+    defer dc.close();
+    try dc.arm();
+    try t.append(folder_rel ++ "\\" ++ stem_a ++ ".jsonl", recLine("user", "C:\\\\proj\\\\acme", "hello"));
+    try testing.expectEqual(w.WAIT_OBJECT_0, w.WaitForSingleObject(dc.ev, 5000));
+    var b = try dc.collect();
+    var nb: [256]u8 = undefined;
+    try testing.expectEqualStrings(stem_a ++ ".jsonl", b.next(&nb).?);
+
+    f.changed(stem_a ++ ".jsonl");
+    try testing.expectEqualStrings(stem_a, &f.cur.?.stem);
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("hello|", ts.texts(&buf));
+    // A rescan (Find over the long folder) still sees it.
+    try t.append(folder_rel ++ "\\" ++ stem_a ++ ".jsonl", recLine("assistant", "C:\\\\proj\\\\acme", "long way"));
+    f.rescan();
+    try testing.expectEqualStrings("hello|long way|", ts.texts(&buf));
+}
+
+
 test "DirChanges: a new transcript in the folder is reported by name" {
     var t = try Tmp.init();
     defer t.deinit();
@@ -1296,7 +1341,7 @@ test "follower: a poke (the program printed) picks up appends through a kept-ope
     // what it appends later may never be reported.
     var fb: [1024]u8 = undefined;
     const fpath = t.path(&fb, "projects\\C--kept\\" ++ stem_a ++ ".jsonl");
-    const pw = try fsutil.wide(gpa, fpath);
+    const pw = try fsutil.longWide(gpa, fpath);
     defer gpa.free(pw);
     const h = w.validHandle(w.CreateFileW(pw.ptr, w.FILE_APPEND_DATA, w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null)).?;
     defer _ = w.CloseHandle(h);
