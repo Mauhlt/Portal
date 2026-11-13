@@ -34,7 +34,7 @@
 //! Swiping (the owner's "Tinder for agent questions"): a press on the card
 //! grabs it (it grows to `grab_scale` and gives a short shake, plus a light
 //! haptic through `haptic` on the iPhone); dragged sideways it follows the
-//! pointer with a slight tilt, its colour moving from the held yellow
+//! pointer with a slight tilt, its colour moving from the held neutral light
 //! towards green (the Yes side) or red (the No side), full at the threshold
 //! (`swipeTint`; colour only, no text, no transparency). Guarded against
 //! accidental approvals: only the newest open question, only two-option
@@ -236,6 +236,28 @@ pub fn parseSwipeSetting(text: []const u8) ?YesSide {
     return out;
 }
 
+/// `key = on | off` from a settings file's text (null: not set or not
+/// understood).
+pub fn parseOnOffSetting(text: []const u8, key: []const u8) ?bool {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var out: ?bool = null;
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, line[0..eq], " \t"), key)) continue;
+        const val = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(val, "on")) out = true else if (std.ascii.eqlIgnoreCase(val, "off")) out = false;
+    }
+    return out;
+}
+
+test "on/off settings" {
+    try testing.expectEqual(@as(?bool, false), parseOnOffSetting("swipe = left-yes\r\nbackground_art = off\r\n", "background_art"));
+    try testing.expectEqual(@as(?bool, true), parseOnOffSetting("background_art=ON", "background_art"));
+    try testing.expectEqual(@as(?bool, null), parseOnOffSetting("# background_art = off\nbackground_art = maybe", "background_art"));
+}
+
 /// Whether a released swipe of `offset` px on a `card_w` wide card answers,
 /// and which way it went: past `swipe_share` of the width and
 /// `swipe_min_px` logical px.
@@ -261,15 +283,16 @@ pub fn grabShake(since: i64) f32 {
 }
 
 /// A held swipe card's colours at `offset` px (threshold `need` px):
-/// yellow at rest, towards green on the Yes side and red on the No side,
-/// fully there at the threshold. Opaque: colour only.
+/// a neutral light border at rest, towards meadow green on the Yes side and
+/// sunset red on the No side, fully there at the threshold; the fill is the
+/// border tinting the card. Opaque: colour only.
 pub const Tint = struct { border: Rgb, fill: Rgb };
 pub fn swipeTint(offset: f32, need: f32, ys: YesSide, yes_no: bool) Tint {
     const hold = theme.ui.swipe_hold;
     const k = if (offset == 0 or !(need > 0)) 0 else std.math.clamp(@abs(offset) / need, 0, 1);
     const target: Rgb = if (!yes_no) theme.ui.swipe_choice else if (ys.answer(if (offset > 0) .right else .left) == .yes) theme.ui.swipe_yes else theme.ui.swipe_no;
     const border = mix(hold, target, k);
-    return .{ .border = border, .fill = mix(border, theme.palette.bg, 0.8) };
+    return .{ .border = border, .fill = mix(border, theme.ui.card, 0.82) };
 }
 
 /// Swipes are allowed `swipe_guard_ms` after the card appeared.
@@ -292,7 +315,7 @@ const colors = struct {
     const bubble = mix(theme.palette.blue, theme.palette.bg, 0.78);
     const code_bg = theme.ui.panel;
     const code_fg = theme.palette.cyan_cooler;
-    const card = mix(theme.palette.yellow_warmer, theme.palette.bg, 0.9);
+    const card = theme.ui.card;
     const card_closed = theme.ui.panel;
     const yes = theme.palette.green;
     const no = theme.palette.red;
@@ -744,7 +767,7 @@ pub const View = struct {
         const inner = @max(1, W - 2 * g.qpad);
         const map = swipeMap(e.*);
         e.boxes.append(v.gpa, .{ .x = 0, .y = 0, .w = W, .h = 0, .color = if (e.open) colors.card else colors.card_closed, .kind = .card }) catch {};
-        e.boxes.append(v.gpa, .{ .x = 0, .y = 0, .w = W, .h = 0, .color = if (e.open) theme.ui.attention else theme.ui.border, .kind = .outline }) catch {};
+        e.boxes.append(v.gpa, .{ .x = 0, .y = 0, .w = W, .h = 0, .color = if (e.open) theme.ui.question else theme.ui.border, .kind = .outline }) catch {};
         var y = g.qpad;
         // The header: what the card is waiting for (a swipe card says which
         // way gives which answer).
@@ -760,7 +783,7 @@ pub const View = struct {
             std.fmt.allocPrint(v.gpa, "Question \u{00B7} swipe {s}: {s} \u{00B7} {s}: {s}", .{ yes_dir, sm.yes_label, no_dir, sm.no_label }) catch &.{})
         else
             v.gpa.dupe(u8, "Question \u{00B7} waiting for your answer") catch &.{};
-        e.lines.append(v.gpa, .{ .str = frame.clipText(f.small, e.head, inner, false), .x = g.qpad, .y = y, .font = .small, .color = if (e.open) theme.ui.attention else theme.ui.dim, .bold = true }) catch {};
+        e.lines.append(v.gpa, .{ .str = frame.clipText(f.small, e.head, inner, false), .x = g.qpad, .y = y, .font = .small, .color = if (e.open) theme.ui.question_head else theme.ui.dim, .bold = true }) catch {};
         y += g.slh + @round(4 * g.s);
         y += v.layoutText(e, f, g, e.text, g.qpad, y, inner, theme.ui.text, .body, false).h;
         if (e.open and e.multi) {
@@ -1741,7 +1764,7 @@ test "two options never get buttons (Yes/No or a choice); more than two do; mult
     try testing.expectEqualStrings("enter", v.hitAt(v.col_x + done.x + 2, r.y + e5.y - v.top + done.y + 2).?.answer);
 }
 
-test "swipe tint: yellow held, towards green on the Yes side, red on the No side, full at the threshold" {
+test "swipe tint: neutral held, towards green on the Yes side, red on the No side, full at the threshold" {
     const need: f32 = 200;
     const hold = theme.ui.swipe_hold;
     try testing.expectEqual(hold, swipeTint(0, need, .left, true).border);
@@ -1754,8 +1777,8 @@ test "swipe tint: yellow held, towards green on the Yes side, red on the No side
     // right-yes: the other way round.
     try testing.expectEqual(theme.ui.swipe_yes, swipeTint(200, need, .right, true).border);
     try testing.expectEqual(theme.ui.swipe_no, swipeTint(-200, need, .right, true).border);
-    // The fill is the border mixed into the background (opaque).
-    try testing.expectEqual(mix(theme.ui.swipe_no, theme.palette.bg, 0.8), swipeTint(200, need, .left, true).fill);
+    // The fill is the border tinting the card (opaque).
+    try testing.expectEqual(mix(theme.ui.swipe_no, theme.ui.card, 0.82), swipeTint(200, need, .left, true).fill);
 }
 
 test "grab: scaled and shaking at once, enlarged while held, springs back to 1, flies off from the enlarged size" {

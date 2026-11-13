@@ -193,6 +193,7 @@ pub const LocalHost = struct {
     /// The desk panels' context. Call before any thread starts.
     pub fn attachDesk(h: *LocalHost, d: Desk) void {
         h.desk = d;
+        h.p.setBackgroundArt(d.saved.background_art orelse true);
     }
 
     /// Cells that fit the window now: the PTY's initial size.
@@ -641,6 +642,7 @@ pub const LocalHost = struct {
         const s = &d.saved;
         h.ui.openSetup(false, s.listen.get() orelse h.opts.listen_host, s.program.get() orelse "", s.project.get() orelse "", s.input orelse h.opts.policy);
         h.ui.setup.sysmon = s.system_monitor orelse false;
+        h.ui.setup.bg_art = s.background_art orelse true;
     }
 
     /// The Settings panel (during a session): checked, then saved for the
@@ -664,6 +666,7 @@ pub const LocalHost = struct {
         _ = s.project.set(project);
         s.input = st.input;
         s.system_monitor = st.sysmon;
+        s.background_art = st.bg_art;
         settings.save(h.gpa, h.io, d.paths.dir, &s) catch |err|
             return h.ui.setNote(.bad, "Could not save the settings: {t}.", .{err});
         h.desk.?.saved = s;
@@ -671,6 +674,7 @@ pub const LocalHost = struct {
         // once; viewers learn it from the next `activity`.
         if (d.srv.sysmon) |m| m.setEnabled(st.sysmon);
         if (h.hub) |hub| hub.setSysmon(st.sysmon);
+        h.p.setBackgroundArt(st.bg_art);
         d.srv.log.print("settings: system monitor {s}", .{if (st.sysmon) "on" else "off"});
         h.ui.close();
     }

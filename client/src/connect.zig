@@ -475,7 +475,10 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     host_ui.convo_view.clock = .{ .ctx = host_ui, .now = Host.clockNow };
     {
         var sbuf: [4096]u8 = undefined;
-        if (ui.convoview.parseSwipeSetting(pin_mod.loadDeviceSettings(io, &sbuf))) |side| host_ui.convo_view.yes_side = side;
+        const text = pin_mod.loadDeviceSettings(io, &sbuf);
+        if (ui.convoview.parseSwipeSetting(text)) |side| host_ui.convo_view.yes_side = side;
+        // `background_art = off` hides the faint hero art (on by default).
+        if (ui.convoview.parseOnOffSetting(text, "background_art")) |on| tv.setBackgroundArt(on);
     }
     host_ui.shell.conversation = host_ui.convo_view.contentView();
     // Portal sync (docs/sync-design.md): a worker that runs a pass on

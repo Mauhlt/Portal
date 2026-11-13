@@ -64,12 +64,12 @@ colours are derived from it). Contrast ratios are WCAG 2.x, against `bg`
 | `inactive` (buttons) | `#1F2B5C` | night, two steps lighter | 1.45; `fg` on it 11.6 |
 | `fg` (text, ANSI 15) | `#E8EEFF` | moonlight | 16.9 (15.3) |
 | `dim` (secondary text, ANSI 7) | `#94A3CC` | moon haze | 7.8 (7.1) |
-| `border` (lines, ANSI 8) | `#5B6AA3` | night horizon | 3.8 (3.4): UI ≥ 3 |
+| `border` (lines, ANSI 8) | `#6A7AB3` | night horizon | 4.7 (4.3); 3.7 over the art's brightest |
 | `selection` | `#27407F` | night sky | `fg` on it 8.5 |
 | `active` (Send, chosen button) | `#0B4FCC` | ring blue | `fg` on it 6.0 |
 | `red` (ANSI 1; swipe No) | `#FF6B6B` | sunset red | 7.0 (6.4), L 0.33 |
 | `green` (ANSI 2; good, swipe Yes) | `#4FD67A` | meadow | 10.5 (9.5), L 0.51 |
-| `yellow` (ANSI 3; warn, swipe hold) | `#FFC940` | sun gold | 12.7 (11.6) |
+| `yellow` (ANSI 3; warn text) | `#FFC940` | sun gold | 12.7 (11.6) |
 | `blue` (ANSI 4; two-option swipe) | `#4DA3FF` | ring blue, lifted to read | 7.4 (6.8) |
 | `magenta` (ANSI 5) | `#D29BFF` | halo violet | 9.2 (8.4) |
 | `cyan` (ANSI 6) | `#22D3EE` | ring cyan | 10.8 (9.8) |
@@ -79,7 +79,12 @@ colours are derived from it). Contrast ratios are WCAG 2.x, against `bg`
 | `blue_warmer` (ANSI 12) | `#93B8FF` | moon cool blue | 9.8 (8.9) |
 | `magenta_cooler` (ANSI 13) | `#A5B4FC` | cool halo band | 9.8 (8.9) |
 | `cyan_cooler` (ANSI 14) | `#8AE8FF` | moon glow | 14.0 (12.8) |
-| `warn_fg` / `warn_bg` (badges) | `#FFC940` / `#5C4200` | sun gold on dark gold | 6.1 |
+| `warn_fg` / `warn_bg` (badges: "1 REMOTE VIEWER WATCHING") | `#060B1E` / `#FFC940` | dark text on light sun gold | 12.7 |
+| `caution` (warning-tone button) | `#B4410E` | sunset orange | `fg` on it 4.9 |
+| `card` (question cards) | `#121C40` | night, a step lighter | `fg` 14.3, header `cyan_cooler` 11.9, border `cyan` 9.2 |
+| `tab_active` (active tab pill) | `#1A2550` | night | `fg` on it 12.7 |
+| `pill` (a tab's task count) | `#33407A` | night haze | `fg` on it 8.4 |
+| `hold` (held swipe card border) | `#C8D4F0` | moonlight | 11.2 on `card`; held fill `#333D60`: `fg` 9+ |
 | `approve` (button) | `#17733A` | meadow, dark | `fg` on it 5.1 |
 | `deny` (button) | `#A8262B` | sunset, dark | `fg` on it 6.1 |
 | `ring_blue` → `ring_cyan` → `ring_green` (accent) | `#1F6BFF` → `#00C8FF` → `#7DFF5C` | the neon ring | focus (`ring_cyan`) 10.0 |
@@ -93,8 +98,18 @@ colours are derived from it). Contrast ratios are WCAG 2.x, against `bg`
   bottom) underlines the active tab and the active top-bar button and
   edges Send / Instruct (`Frame.accentBar`); keyboard focus outlines are
   `ring_cyan`.
-- Swipe cards: held = sun gold (`yellow`), towards Yes = meadow green,
-  towards No = sunset red; a two-option (not Yes/No) card = `blue`.
+- Never yellow on brown / olive. Question cards are `card` navy with a
+  crisp `cyan` border, a `cyan_cooler` header and white body text. A held
+  swipe card gets the neutral light `hold` border, then leans towards
+  meadow green (Yes) or sunset red (No); its fill is that colour mixed 18%
+  into `card` (white text stays ≥ 9:1); a two-option (not Yes/No) card
+  leans `blue`.
+- Tabs have no outlines: the active one is a `tab_active` pill with the
+  accent underline, the others are text only in `dim`; each shows its
+  project-colour dot, which turns the warm sun accent (`yellow_warmer`,
+  `#FFAA33`, 7.8 on `tab_active`, 9.4 on the bar) while its program waits
+  for an answer (static, no animation); background tasks are a neutral
+  `pill` count.
 - The project tab colours cycle through the twelve hues above.
 
 ## Splash
@@ -107,7 +122,8 @@ The hero art shows centred, scaled to fit (92% of the shorter side), on
   (pairing, a trust problem, an error); the first-run screen ends it at
   once.
 
-It is shown for at least 0.9 s once drawn (no flicker) and at most 4 s
+It is shown for at least 0.9 s once drawn (no flicker; also when the app
+was ready before the art was decoded) and at most 4 s
 after start, and any key, click or touch ends it. It never delays
 start-up: the PNG is decoded on its own thread (the window is woken when
 it is done) and an undecodable PNG is skipped. Event-driven: one frame,
@@ -115,3 +131,35 @@ no animation; the only timeouts are those two real deadlines.
 
 There is no About panel yet; when one is added, `view.hero_png` is the
 art to use.
+
+## Background art
+
+The same picture stays behind the app, faint, after the splash (desk,
+laptop, iPhone): one opaque textured quad, drawn first, covering the
+window. Its texture (1024 × 1024, in a region of the Presenter's texture
+of its own) is the hero mixed into `bg` at 10% (`Presenter.art_alpha`),
+made and uploaded once when the splash ends; after that it costs one quad
+per frame and is only redrawn with frames that happen anyway. Bars,
+panels, modals, cards, fields and coloured terminal cells paint their own
+solid fills over it, so it shows only where the terminal and the
+conversation have the plain background.
+
+Contrast is checked against the art's brightest possible pixel (white,
+the sun's core) at 10%, i.e. a background of `#1F2334`:
+
+| Text | Plain `bg` | Over the brightest art |
+|---|---|---|
+| `fg` (terminal, conversation) | 16.9 | 13.4 |
+| `dim` (secondary, tool lines) | 7.8 | 6.2 |
+| ANSI red / green / yellow / blue | 7.0 / 10.5 / 12.7 / 7.4 | 5.6 / 8.3 / 10.2 / 5.9 |
+| ANSI magenta / cyan | 9.2 / 10.8 | 7.3 / 8.6 |
+| ANSI bright red / blue / cyan | 8.9 / 9.8 / 14.0 | 7.1 / 7.8 / 11.2 |
+| ANSI 8 (bright black, `border`) | 4.7 | 3.7 |
+| attention dot `#FFAA33` | 10.3 | 8.2 |
+
+The status line, bars and panels have solid fills (no art behind them).
+
+Turning it off: desk Settings "Background art" (`background_art = off`
+in `%LOCALAPPDATA%\Portal\settings.txt`, applies at once); laptop and
+iPhone `background_art = off` in the device's settings file (next to
+`swipe = ...`; read at start).

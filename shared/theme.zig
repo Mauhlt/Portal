@@ -53,6 +53,16 @@ pub const Palette = struct {
     ring_blue: Rgb,
     ring_cyan: Rgb,
     ring_green: Rgb,
+    /// Cards (questions): navy one step lighter than `bg`.
+    card: Rgb,
+    /// The active tab's pill: one step lighter than the bar.
+    tab_active: Rgb,
+    /// Small neutral count pills (a tab's background tasks).
+    pill: Rgb,
+    /// A held swipe card's neutral border, before it leans Yes / No.
+    hold: Rgb,
+    /// A warning-tone button's fill (white text on it).
+    caution: Rgb,
 };
 
 /// "Portal night": the colours of the hero art (docs/brand/portal-hero.jpg;
@@ -68,7 +78,7 @@ pub const portal_night: Palette = .{
     .inactive = hex(0x1F2B5C),
     .fg = hex(0xE8EEFF),
     .dim = hex(0x94A3CC),
-    .border = hex(0x5B6AA3),
+    .border = hex(0x6A7AB3),
     .selection = hex(0x27407F),
     .active = hex(0x0B4FCC),
     .red = hex(0xFF6B6B),
@@ -83,13 +93,19 @@ pub const portal_night: Palette = .{
     .blue_warmer = hex(0x93B8FF),
     .magenta_cooler = hex(0xA5B4FC),
     .cyan_cooler = hex(0x8AE8FF),
-    .warn_fg = hex(0xFFC940),
-    .warn_bg = hex(0x5C4200),
+    // Warning badges: dark text on light sun gold (never gold on brown).
+    .warn_fg = hex(0x060B1E),
+    .warn_bg = hex(0xFFC940),
     .approve = hex(0x17733A),
     .deny = hex(0xA8262B),
     .ring_blue = hex(0x1F6BFF),
     .ring_cyan = hex(0x00C8FF),
     .ring_green = hex(0x7DFF5C),
+    .card = hex(0x121C40),
+    .tab_active = hex(0x1A2550),
+    .pill = hex(0x33407A),
+    .hold = hex(0xC8D4F0),
+    .caution = hex(0xB4410E),
 };
 
 /// The scheme in use.
@@ -197,14 +213,22 @@ pub const ui = struct {
     pub const badge_bg = palette.warn_bg;
     pub const approve = palette.approve;
     pub const deny = palette.deny;
-    pub const caution = palette.warn_bg;
+    pub const caution = palette.caution;
     pub const selected_row = palette.inactive;
     /// A tab whose program waits for an answer.
-    pub const attention = palette.warn_fg;
+    pub const attention = palette.yellow_warmer;
+    /// Tabs: the active one's pill, a background-task count pill.
+    pub const tab_active = palette.tab_active;
+    pub const pill_bg = palette.pill;
+    pub const pill_fg = palette.fg;
+    /// Question cards: fill, border while open, header label.
+    pub const card = palette.card;
+    pub const question = palette.cyan;
+    pub const question_head = palette.cyan_cooler;
     /// A swipe card (Yes/No question) while held: its neutral colour, and
     /// the colours it moves towards on the Yes and the No side (full at the
-    /// answer threshold). Its fill is the colour mixed into the background.
-    pub const swipe_hold = palette.yellow; // sun gold
+    /// answer threshold). Its fill is the colour mixed into the card's.
+    pub const swipe_hold = palette.hold;
     pub const swipe_yes = palette.green; // meadow
     pub const swipe_no = palette.red; // sunset
     /// A swipe card choosing between two options that are not Yes / No:

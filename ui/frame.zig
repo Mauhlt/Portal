@@ -939,11 +939,13 @@ pub const Frame = struct {
         _ = f.text(ui, x, ty, clipText(ui, tb.title, avail, false), theme.ui.text, true);
     }
 
-    /// The project tabs from `x0` to `x1`: each a box in its project colour
-    /// (the active one bright, the others dimmed), a dot and an outline in
-    /// the attention colour while its program waits for an answer, an
-    /// optional close box, then the optional "+". Tabs share the room when
-    /// it is short.
+    /// The project tabs from `x0` to `x1`: each a dot in its project colour
+    /// (in the warm attention colour while its program waits for an
+    /// answer) and its name; the active one on a pill a step lighter than
+    /// the bar with the neon accent underline, the others text only and
+    /// dimmer; a neutral count pill for background tasks, an optional
+    /// close box, then the optional "+". No outlines. Tabs share the room
+    /// when it is short.
     fn drawTabs(f: *Frame, ui: Metrics, tb: TopBar, x0: f32, x1: f32, h: f32, s: f32) void {
         const cw: f32 = @floatFromInt(ui.cell_w);
         const gap = @round(4 * s);
@@ -956,24 +958,24 @@ pub const Frame = struct {
         var x = x0;
         for (tb.tabs) |t| {
             const close_w: f32 = if (t.close_id != null) 2 * cw else 0;
-            const dot_w: f32 = if (t.attention) 2 * cw else 0;
+            const dot_w: f32 = 2 * cw;
             const badge_w: f32 = if (t.badge.len > 0) textWidth(ui, t.badge) + 2 * cw else 0;
             const natural = textWidth(ui, t.label) + 2 * cw + close_w + dot_w + badge_w;
             const w = @min(natural, @max(max_each, 3 * cw));
             if (x + w > x1) break;
-            const bg = if (t.active) mixBy(t.color, theme.palette.bg, 0.25) else mixBy(t.color, theme.ui.bar, 0.72);
-            f.rect(x, ty, w, th, bg);
-            // The colour stripe on top (all tabs), thicker on the active one.
-            f.rect(x, ty, w, if (t.active) @round(3 * s) else @round(2 * s), t.color);
-            // The active tab: an accent underline.
-            if (t.active) f.accentBar(x, ty + th - @max(2, @round(2 * s)), w, @max(2, @round(2 * s)));
-            if (t.attention) f.outline(x, ty, w, th, @max(2, @round(2 * s)), theme.ui.attention);
+            // The active tab: a pill a step lighter than the bar with a
+            // neon underline; the others are text only. No outlines.
+            if (t.active) {
+                f.rect(x, ty, w, th, theme.ui.tab_active);
+                f.accentBar(x, ty + th - @max(2, @round(2 * s)), w, @max(2, @round(2 * s)));
+            }
             var tx = x + cw;
             const text_y = ty + @round((th - @as(f32, @floatFromInt(ui.cell_h))) / 2);
-            if (t.attention) {
-                _ = f.text(ui, tx, text_y, "\u{25CF}", theme.ui.attention, true);
-                tx += 2 * cw;
-            }
+            // The project's dot; in the warm sun colour while its program
+            // waits for an answer.
+            const dot: Rgb = if (t.attention) theme.ui.attention else if (t.active) t.color else mixBy(t.color, theme.ui.bar, 0.35);
+            _ = f.text(ui, tx, text_y, "\u{25CF}", dot, true);
+            tx += 2 * cw;
             const label_room = @max(0, x + w - cw - close_w - badge_w - tx);
             const fg: Rgb = if (t.active) theme.ui.tab_text else theme.ui.tab_text_inactive;
             _ = f.text(ui, tx, text_y, clipText(ui, t.label, label_room, false), fg, t.active);
@@ -985,8 +987,8 @@ pub const Frame = struct {
                 const bw = badge_w - @round(cw / 2);
                 const bh = @round(@as(f32, @floatFromInt(ui.cell_h)) * 1.1);
                 const by = ty + @round((th - bh) / 2);
-                f.rect(bx, by, bw, bh, theme.ui.badge_bg);
-                _ = f.text(ui, bx + @round((bw - textWidth(ui, t.badge)) / 2), text_y, t.badge, theme.ui.badge_fg, true);
+                f.rect(bx, by, bw, bh, theme.ui.pill_bg);
+                _ = f.text(ui, bx + @round((bw - textWidth(ui, t.badge)) / 2), text_y, t.badge, theme.ui.pill_fg, true);
                 f.registerButton(x + w - close_w - badge_w, ty, badge_w, th, t.badge_id orelse t.id);
             }
             if (t.close_id) |cid| {

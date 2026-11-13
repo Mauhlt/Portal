@@ -31,9 +31,17 @@ const input = ui.input;
 const theme = ui.theme;
 const draw = ui.draw;
 
-/// The texture: glyph atlas in rows 0..2047, inline images below it.
+/// The texture: glyph atlas in rows 0..2047, inline images below it, the
+/// background art below them.
 const tex_w: u32 = 2048;
-const tex_h: u32 = images.region_y + images.region_h;
+const art_y: u32 = images.region_y + images.region_h;
+pub const art_side: u32 = 1024;
+const tex_h: u32 = art_y + art_side;
+
+/// The background art's strength: the hero mixed into the theme's
+/// background at this share (a watermark; docs/brand/README.md has the
+/// contrast numbers against its brightest pixels).
+pub const art_alpha: f32 = 0.10;
 
 const Presenter = @This();
 
@@ -80,6 +88,12 @@ native_supported: bool = true,
 scroll_acc: f32 = 0,
 /// The start-up splash (beginSplash) while it shows.
 splash: ?*Splash = null,
+/// The background art (the hero, faint, behind the main content): shown
+/// when on; its pixels (premixed into the background) wait in `art_px`
+/// until present() uploads them once into the texture's art region.
+art_on: bool = true,
+art_px: ?[]u8 = null,
+art_uploaded: bool = false,
 
 /// Grid rows per scroll notch: a notch is 16 pt of finger travel on a
 /// touch screen, a wheel detent elsewhere.
@@ -143,6 +157,7 @@ fn setAppIcon(p: *Presenter) void {
 
 pub fn deinit(p: *Presenter) void {
     p.endSplash();
+    if (p.art_px) |px| p.gpa.free(px);
     p.releaseGpu();
     p.window.deinit();
     p.atlas.deinit();
@@ -364,6 +379,13 @@ pub fn present(p: *Presenter) void {
     for (p.img.uploads.items) |u| {
         renderer.updateTexture(u.x, images.region_y + u.y, u.w, u.h, u.px) catch |err| std.log.warn("image upload failed: {t}", .{err});
     }
+    if (p.art_px) |px| {
+        // Once: the region is the art's alone.
+        renderer.updateTexture(0, art_y, art_side, art_side, px) catch |err| std.log.warn("art upload failed: {t}", .{err});
+        p.gpa.free(px);
+        p.art_px = null;
+        p.art_uploaded = true;
+    }
     p.img.clearUploads();
     const bg = p.frame.list.clear;
     renderer.drawFrame(.{
@@ -455,7 +477,11 @@ pub fn splashDone(p: *Presenter) void {
 pub fn endSplash(p: *Presenter) void {
     const sp = p.splash orelse return;
     if (sp.thread) |t| t.join(); // a bounded decode
-    if (sp.decoded) |*d| d.deinit(p.gpa);
+    if (sp.decoded) |*d| {
+        // The same picture, faint, becomes the background art.
+        if (!p.art_uploaded and p.art_px == null) p.art_px = premixArt(p.gpa, d.*);
+        d.deinit(p.gpa);
+    }
     p.gpa.destroy(sp);
     p.splash = null;
     // The image region's pixels at (0, 0) were the splash's.
@@ -475,8 +501,9 @@ fn splashTick(p: *Presenter) void {
     if (done and sp.decoded == null) return p.endSplash(); // undecodable: skip it
     if (now - sp.begun_ms >= splash_max_ms) return p.endSplash();
     if (sp.ready) {
-        // Ready before the art ever showed: no reason to wait for it.
-        const t = sp.shown_ms orelse return p.endSplash();
+        // Ready before the art showed: it still shows once decoded (the
+        // decode thread wakes the window), bounded by splash_max_ms.
+        const t = sp.shown_ms orelse return;
         if (now - t >= splash_min_ms) return p.endSplash();
     }
     if (done and sp.shown_ms == null) p.dirty = true;
@@ -560,6 +587,60 @@ test "splash art scaling: down box, up bilinear" {
     const down = scaleArt(gpa, src, 1).?;
     defer gpa.free(down);
     try std.testing.expect(down[0] > 100 and down[0] < 155);
+}
+
+// ------------------------------------------------------ background art
+
+/// Shows or hides the background art (Settings "Background art").
+pub fn setBackgroundArt(p: *Presenter, on: bool) void {
+    if (p.art_on == on) return;
+    p.art_on = on;
+    p.dirty = true;
+}
+
+/// One opaque quad under everything, covering the window (the art is
+/// premixed into the background colour, so what the frame leaves
+/// unpainted shows it faintly; bars, panels, cards and fields paint over
+/// it with their own fills).
+fn pushArt(p: *Presenter) void {
+    if (!p.art_on or !(p.art_uploaded or p.art_px != null)) return;
+    const fb = p.window.framebufferSize();
+    const w: f32 = @floatFromInt(fb[0]);
+    const h: f32 = @floatFromInt(fb[1]);
+    const side = @max(w, h); // cover
+    const fw: f32 = @floatFromInt(tex_w);
+    const fh: f32 = @floatFromInt(tex_h);
+    const y0: f32 = @floatFromInt(art_y);
+    const sd: f32 = @floatFromInt(art_side);
+    p.push(@round((w - side) / 2), @round((h - side) / 2), side, side, .{ 0, y0 / fh, sd / fw, (y0 + sd) / fh }, .{ 255, 255, 255, 255 });
+}
+
+/// The art at `art_side` square, mixed into the theme background at
+/// `art_alpha` (opaque). Null without memory.
+fn premixArt(gpa: std.mem.Allocator, src: imgdec.Rgba) ?[]u8 {
+    const px = scaleArt(gpa, src, art_side) orelse return null;
+    const bg = theme.palette.bg;
+    var i: usize = 0;
+    while (i < px.len) : (i += 4) {
+        for (0..3) |k| {
+            const a: f32 = @floatFromInt(px[i + k]);
+            const b: f32 = @floatFromInt(bg[k]);
+            px[i + k] = @intFromFloat(@round(b + (a - b) * art_alpha));
+        }
+        px[i + 3] = 255;
+    }
+    return px;
+}
+
+test "background art is premixed: never brighter than bg + alpha * (white - bg)" {
+    const gpa = std.testing.allocator;
+    var white: [2 * 2 * 4]u8 = @splat(255);
+    const px = premixArt(gpa, .{ .w = 2, .h = 2, .px = &white }).?;
+    defer gpa.free(px);
+    const bg = theme.palette.bg;
+    const want: u8 = @intFromFloat(@round(@as(f32, @floatFromInt(bg[0])) + (255 - @as(f32, @floatFromInt(bg[0]))) * art_alpha));
+    try std.testing.expectEqual(want, px[0]);
+    try std.testing.expectEqual(@as(u8, 255), px[3]);
 }
 
 // ------------------------------------------------------ native text field
@@ -657,6 +738,7 @@ fn resolve(p: *Presenter) void {
     defer p.img.end();
     const dl = &p.frame.list;
     const white = p.atlas.whiteUv();
+    p.pushArt();
     for (dl.cmds.items) |c| switch (c) {
         .rect => |r| p.push(r.x, r.y, r.w, r.h, white, r.color),
         .glyph => |g| p.glyph(g.cp, g.style, dl.fonts[g.font], g.cells, g.x, g.y, g.color),
