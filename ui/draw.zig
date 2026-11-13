@@ -4,7 +4,8 @@
 //!   rect    a filled rectangle (colour with alpha)
 //!   glyph   one character cell's glyph (terminal cells: style, cell span)
 //!   text    a run of UTF-8 text in one font and colour, laid out on the
-//!           cell grid of its font (wcwidth), spaces and controls skipped
+//!           cell grid of its font (wcwidth), spaces and controls skipped;
+//!           optionally italic and clipped to a rectangle
 //!   image   an inline image from an image store, scaled to `disp_w x
 //!           disp_h` pixels and clipped to `clip`; when it can't be decoded
 //!           the renderer draws a box with its size instead
@@ -48,7 +49,10 @@ pub const Text = struct {
     len: u32,
     font: u8,
     bold: bool = false,
+    italic: bool = false,
     color: Rgba,
+    /// Only the part inside x0, y0, x1, y1 is drawn (null: all of it).
+    clip: ?[4]f32 = null,
 };
 
 pub const Image = struct {
@@ -118,10 +122,15 @@ pub const DrawList = struct {
     }
 
     pub fn pushText(dl: *DrawList, gpa: std.mem.Allocator, x: f32, y: f32, s: []const u8, font_i: u8, bold: bool, color: Rgba) void {
+        dl.pushTextStyled(gpa, x, y, s, font_i, .{ .bold = bold }, color, null);
+    }
+
+    /// `pushText` with italics and a clip rectangle (x0, y0, x1, y1).
+    pub fn pushTextStyled(dl: *DrawList, gpa: std.mem.Allocator, x: f32, y: f32, s: []const u8, font_i: u8, style: Style, color: Rgba, clip: ?[4]f32) void {
         if (s.len == 0) return;
         const start = dl.bytes.items.len;
         dl.bytes.appendSlice(gpa, s) catch return;
-        dl.push(gpa, .{ .text = .{ .x = x, .y = y, .start = @intCast(start), .len = @intCast(s.len), .font = font_i, .bold = bold, .color = color } });
+        dl.push(gpa, .{ .text = .{ .x = x, .y = y, .start = @intCast(start), .len = @intCast(s.len), .font = font_i, .bold = style.bold, .italic = style.italic, .color = color, .clip = clip } });
     }
 };
 

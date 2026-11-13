@@ -1696,3 +1696,25 @@ test "classify: desktop offline vs network error vs anything else" {
     var b: [64]u8 = undefined;
     try std.testing.expectEqualStrings("Session ended on the desktop (exit code -1)", endedText(-1, &b));
 }
+
+test "convo: the client keeps the shown tab's items from convo / convo+ (malformed ignored)" {
+    const io = std.testing.io;
+    var shared: Shared = .{};
+    defer shared.convo.deinit(std.testing.allocator);
+    const c = try std.testing.allocator.create(Client);
+    defer std.testing.allocator.destroy(c);
+    c.* = try Client.init(std.testing.allocator, io, &shared, "127.0.0.1:1", .insecure_plain_http);
+    c.quiet = true;
+    const id = "0102030405060708090a0b0c0d0e0f10";
+    c.applyConvo("{\"t\":\"convo\",\"id\":\"" ++ id ++ "\",\"on\":true,\"items\":[{\"n\":1,\"k\":\"user\",\"text\":\"fix it\"},{\"n\":2,\"k\":\"question\",\"text\":\"Run tests?\",\"open\":true,\"options\":[{\"label\":\"Yes\",\"key\":\"1\"},{\"label\":\"No\",\"key\":\"esc\"}]}]}");
+    try std.testing.expect(shared.convo.on);
+    try std.testing.expectEqual(@as(usize, 2), shared.convo.items.items.len);
+    try std.testing.expectEqualStrings("esc", shared.convo.items.items[1].options[1].key);
+    const gen = shared.convo.generation;
+    c.applyConvo("{\"t\":\"convo+\",\"id\":\"" ++ id ++ "\",\"items\":[{\"n\":2,\"k\":\"question\",\"text\":\"Run tests?\",\"open\":false}]}");
+    try std.testing.expect(!shared.convo.items.items[1].open);
+    try std.testing.expect(shared.convo.generation != gen);
+    // A key outside the answer keys: the whole message is refused.
+    c.applyConvo("{\"t\":\"convo+\",\"id\":\"" ++ id ++ "\",\"items\":[{\"n\":3,\"k\":\"question\",\"text\":\"x\",\"open\":true,\"options\":[{\"label\":\"rm\",\"key\":\"t:rm -rf\"}]}]}");
+    try std.testing.expectEqual(@as(usize, 2), shared.convo.items.items.len);
+}

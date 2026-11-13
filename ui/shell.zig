@@ -11,6 +11,15 @@
 //!             the pairing / trust / ended screens, the instruction line
 //!             per the desktop's input mode (module "inputrules").
 //!
+//! Devices open on the Conversation view (ui/convoview.zig) in its minimal
+//! form: top bar, the conversation (questions carry their own controls:
+//! swipe cards for two options, numbered buttons for more), the Data
+//! strip, and at the bottom only Instruct (the instruction line + Send, and
+//! dictation once a device has it: `toggleDictation`). No answer keys at
+//! all there: Esc and Enter live in the Terminal view (the power mode),
+//! which keeps the full answer bar and, in `instruct` mode, the line. The
+//! desk keeps the terminal.
+//!
 //! Layout (frame.zig): top bar (+ tabs), main slice (a pluggable content
 //! view: the terminal, or the conversation once a device provides one),
 //! Data slice, interaction slice (answers, input box + Send), status line,
@@ -50,6 +59,12 @@ pub const ids = struct {
     pub const cancel_pair: u32 = 908;
     /// The interaction bar's on-screen keyboard button (touch).
     pub const keyboard: u32 = 909;
+    /// The Conversation view's bottom row: open the instruction line (and
+    /// dictation), show the full answer bar.
+    pub const instruct: u32 = 910;
+    /// The content view's own buttons (ui/convoview.zig ids).
+    pub const view0: u32 = 1300;
+    pub const view_last: u32 = 1399;
     /// tab0 + position: show that tab; close0 + position: close it.
     pub const tab0: u32 = 1000;
     pub const close0: u32 = 1100;
@@ -187,8 +202,27 @@ pub const State = struct {
     viewer: Viewer = .{},
 };
 
-/// Who gets the keyboard, decided here only.
-pub const Focus = enum { panel, pair_screen, wait_screen, line, terminal };
+/// Who gets the keyboard, decided here only. `view`: the Conversation view
+/// on a device (scrolling and its cards' keys; nothing reaches the
+/// terminal from there).
+pub const Focus = enum { panel, pair_screen, wait_screen, line, terminal, view };
+
+/// Where a device's speech-to-text plugs in (future: Portal's mic capture
+/// from ../Audio, then stt, typing into the instruction line for review;
+/// the user sends). Dictation toggles: `start`, then `stop`.
+pub const Dictation = struct {
+    ctx: *anyopaque,
+    start: *const fn (ctx: *anyopaque) void,
+    stop: *const fn (ctx: *anyopaque) void,
+};
+
+/// Whether a headset with a microphone is attached (the audio work
+/// implements it: ../Audio, IMMDevice form factor). Its media button
+/// toggles dictation only then.
+pub const HeadsetMic = struct {
+    ctx: ?*anyopaque = null,
+    present: *const fn (ctx: ?*anyopaque) bool,
+};
 
 pub const Command = union(enum) {
     /// Show / close the tab at top-bar position i; open a new one (desk).
@@ -272,9 +306,22 @@ pub const Shell = struct {
     line_focus: bool = false,
     data: dataview.DataView = .{},
     select: Select = .{},
+    /// What the main slice shows: the terminal on the desk, the
+    /// conversation on devices (the owner's default; the top bar toggles).
     main: MainView = .terminal,
-    /// The conversation view, once the device has one (ui/convo).
+    /// The conversation view, once the device has one (ui/convoview).
     conversation: ?frame.ContentView = null,
+    /// The last overlay showed the conversation view (its input routing).
+    view_shown: bool = false,
+    /// Conversation view on a device: the instruction line is open
+    /// (Instruct).
+    instructing: bool = false,
+    /// Speech-to-text, when the device has it (toggleDictation).
+    dictation: ?Dictation = null,
+    /// Dictation is running (the bottom row shows "Listening…").
+    dictating: bool = false,
+    /// The headset predicate (headsetMicPresent); none yet: false.
+    headset_mic: ?HeadsetMic = null,
     /// Set by the glue from the OS (Touch).
     touch: Touch = .{},
     /// The on-screen keyboard should be up: the glue shows or hides the
@@ -294,7 +341,8 @@ pub const Shell = struct {
         title: [48]u8 = undefined,
         extra: [256]u8 = undefined,
         right: [128]u8 = undefined,
-        panes: [1]frame.Pane = undefined,
+        panes: [2]frame.Pane = undefined,
+        row: [2]frame.PanelButton = undefined,
         top_tabs: [tabs_wire.max_tabs]frame.TopTab = undefined,
         buttons: [8]frame.TopButton = undefined,
     };
@@ -305,6 +353,7 @@ pub const Shell = struct {
             .device = device,
             .host = host,
             .line = .{ .policy = if (device == .desk) .text else .instruct },
+            .main = if (device == .viewer) .conversation else .terminal,
         };
     }
 
@@ -324,10 +373,55 @@ pub const Shell = struct {
             .viewer => {
                 if (sh.status == .need_pairing or sh.status == .pair_closed) return .pair_screen;
                 if (sh.status == .pairing or sh.status == .pair_waiting) return .wait_screen;
-                if (sh.status == .connected and sh.mode == .instruct) return .line;
-                return .terminal;
+                return viewerFocus(sh.main == .conversation and sh.conversation != null, sh.status, sh.mode, sh.instructing);
             },
         }
+    }
+
+    fn viewerFocus(conversation: bool, st: Status, mode: ?rules.Policy, instructing: bool) Focus {
+        if (conversation) return if (st == .connected and mode == .instruct and instructing) .line else .view;
+        if (st == .connected and mode == .instruct) return .line;
+        return .terminal;
+    }
+
+    /// Instruct: opens the instruction line with the keyboard (the touch
+    /// keyboard on a tablet without one) and starts dictation when the
+    /// device has it. Esc, or a sent line, closes it again.
+    pub fn startDictation(sh: *Shell) void {
+        if (sh.device != .viewer or sh.mode != .instruct) return;
+        sh.instructing = true;
+        if (sh.touch.on_screen_keyboard) sh.keyboard = true;
+        if (sh.dictating) return;
+        if (sh.dictation) |d| {
+            d.start(d.ctx);
+            sh.dictating = true;
+        }
+    }
+
+    /// Stops dictation; its text stays in the line for review.
+    pub fn stopDictation(sh: *Shell) void {
+        if (!sh.dictating) return;
+        sh.dictating = false;
+        if (sh.dictation) |d| d.stop(d.ctx);
+    }
+
+    /// The `toggle_dictation` action (Space with no text field focused,
+    /// the Instruct / Listening button, a headset's media button).
+    pub fn toggleDictation(sh: *Shell) void {
+        if (sh.dictating) sh.stopDictation() else sh.startDictation();
+    }
+
+    /// A headset with a microphone is attached (false until the audio
+    /// work provides the predicate).
+    pub fn headsetMicPresent(sh: *const Shell) bool {
+        const h = sh.headset_mic orelse return false;
+        return h.present(h.ctx);
+    }
+
+    fn closeInstruct(sh: *Shell) void {
+        sh.stopDictation();
+        sh.instructing = false;
+        sh.keyboard = false;
     }
 
     /// The server refused an instruction line ({"t":"rejected"}).
@@ -356,10 +450,12 @@ pub const Shell = struct {
         sh.mode = st.viewer.mode;
         sh.n_tabs = 0;
         sh.shown = null;
+        if (sh.mode != .instruct and sh.instructing) sh.closeInstruct();
         var o = switch (sh.device) {
             .desk => sh.deskOverlay(st),
             .viewer => sh.viewerOverlay(st),
         };
+        sh.view_shown = o.screen == .view;
         o.panel = st.panel;
         if (o.panel != null) o.selection = null;
         o.touch = sh.touch.enabled;
@@ -375,7 +471,7 @@ pub const Shell = struct {
         if (st.panel != null) return .panel;
         return switch (sh.device) {
             .desk => if (sh.line_focus) .line else .terminal,
-            .viewer => if (st.viewer.status == .connected and st.viewer.mode == .instruct) .line else .terminal,
+            .viewer => viewerFocus(sh.main == .conversation and sh.conversation != null, st.viewer.status, st.viewer.mode, sh.instructing),
         };
     }
 
@@ -398,14 +494,47 @@ pub const Shell = struct {
     }
 
     fn linePane(sh: *Shell, hint: []const u8, focused: bool) []const frame.Pane {
-        sh.bufs.panes[0] = .{ .content = .{ .field = .{
+        sh.bufs.panes[0] = sh.lineField(hint, focused);
+        return sh.bufs.panes[0..1];
+    }
+
+    fn lineField(sh: *Shell, hint: []const u8, focused: bool) frame.Pane {
+        return .{ .content = .{ .field = .{
             .label = "",
             .value = sh.line.text(),
             .hint = hint,
             .id = ids.line,
             .focused = focused,
         } }, .send = .{ .label = "Send", .id = ids.send }, .keyboard = if (sh.touch.on_screen_keyboard) .{ .label = "Keyboard", .id = ids.keyboard, .focused = sh.keyboard } else null };
-        return sh.bufs.panes[0..1];
+    }
+
+    /// The Conversation view's bottom (devices): the Instruct button, or
+    /// the open instruction line (with its dictation toggle).
+    fn conversationBottom(sh: *Shell, mode: rules.Policy) []const frame.Pane {
+        const b = &sh.bufs;
+        if (sh.instructing and mode == .instruct) {
+            var n: usize = 0;
+            // With speech-to-text: its toggle, and the recording indicator.
+            if (sh.dictation != null) {
+                b.row[0] = if (sh.dictating)
+                    .{ .label = "\u{25CF} Listening\u{2026}  (stop)", .id = ids.instruct, .tone = .bad }
+                else
+                    .{ .label = "\u{1F3A4} Dictate", .id = ids.instruct, .tone = .good };
+                b.panes[n] = .{ .content = .{ .buttons = b.row[0..1] } };
+                n += 1;
+            }
+            b.panes[n] = sh.lineField(if (sh.dictating) "Listening \u{2014} the text lands here; Send when ready (Esc closes)" else if (sh.dictation != null) "Type, or Dictate (Esc closes)" else "Type an instruction, then Enter or Send (Esc closes) \u{00B7} speech coming soon", true);
+            n += 1;
+            return b.panes[0..n];
+        }
+        var n: usize = 0;
+        if (mode == .instruct) {
+            b.row[n] = .{ .label = "\u{1F3A4} Instruct", .id = ids.instruct, .tone = .good };
+            n += 1;
+        }
+        if (n == 0) return &.{};
+        b.panes[0] = .{ .content = .{ .buttons = b.row[0..n] } };
+        return b.panes[0..1];
     }
 
     fn noteTone(t: rules.Tone) frame.Tone {
@@ -523,8 +652,15 @@ pub const Shell = struct {
                 o.show_answers = mode.acceptsAnswers();
                 o.status.extra = mode.label();
                 o.status.extra_tone = if (mode == .text) .warn else .normal;
+                // The Conversation view: questions carry their own controls;
+                // the answer bar and the line come on request.
+                const minimal = sh.main == .conversation and sh.conversation != null and v.has_grid;
+                if (minimal) {
+                    o.show_answers = false;
+                    o.bottom = sh.conversationBottom(mode);
+                }
                 if (mode == .instruct) {
-                    o.bottom = sh.linePane(rules.placeholder(.instruct), true);
+                    if (!minimal) o.bottom = sh.linePane(rules.placeholder(.instruct), true);
                     const lv = sh.line.snapshot();
                     if (lv.note.len > 0) {
                         o.status.extra = std.fmt.bufPrint(&b.extra, "{s}: {s}", .{ mode.label(), lv.note }) catch mode.label();
@@ -589,7 +725,20 @@ pub const Shell = struct {
         .button = onButton,
         .resized = onResized,
         .mouse = onMouse,
+        .scroll = onScroll,
+        .drag = onDrag,
+        .action = onAction,
     };
+
+    fn onAction(ctx: *anyopaque, a: input.Action) void {
+        const sh = self(ctx);
+        if (sh.device != .viewer or sh.modalActive() != null) return;
+        switch (a) {
+            .toggle_dictation => sh.toggleDictation(),
+            // A headset's play / pause button: only with its microphone.
+            .media_play_pause => if (sh.headsetMicPresent()) sh.toggleDictation(),
+        }
+    }
 
     fn self(ctx: *anyopaque) *Shell {
         return @ptrCast(@alignCast(ctx));
@@ -623,23 +772,65 @@ pub const Shell = struct {
         // Ctrl+Tab / Ctrl+Shift+Tab: the next / previous tab, wherever the
         // keyboard is (a terminal program gets nothing for Ctrl+Tab anyway).
         if (key == .tab and mods.ctrl and !mods.alt) return sh.cycleTab(if (mods.shift) -1 else 1);
-        switch (sh.focus()) {
+        const f = sh.focus();
+        // The conversation's navigation: PageUp / PageDown also while the
+        // line is open (Home / End then edit the line).
+        if (sh.view_shown and (f == .view or (f == .line and (key == .page_up or key == .page_down)))) {
+            if (sh.viewKey(key, mods)) return;
+        }
+        switch (f) {
             .panel => {},
             .pair_screen => if (key == .enter) sh.command(.pair),
             .wait_screen => if (key == .escape) sh.command(.cancel_pair),
+            .view => {},
             .line => {
                 // Desk: Esc on an empty box gives the keyboard back.
                 if (sh.device == .desk and key == .escape and sh.line.text().len == 0) {
                     sh.line_focus = false;
                     return;
                 }
+                // The Conversation view's line: Esc closes it.
+                if (sh.device == .viewer and sh.instructing and key == .escape) return sh.closeInstruct();
                 _ = sh.line.onKey(key, mods, LineSender{ .sh = sh });
+                // Sent: back to the minimal view.
+                if (sh.instructing and key == .enter and sh.line.text().len == 0) sh.closeInstruct();
             },
             .terminal => {
                 sh.select.active = false;
                 sh.host.vtable.key(sh.host.ctx, key, mods);
             },
         }
+    }
+
+    /// A key for the conversation view; true if it took it (an answer from
+    /// a Yes/No card goes out like an answer button).
+    fn viewKey(sh: *Shell, key: input.Key, mods: input.Mods) bool {
+        const c = sh.conversation orelse return false;
+        const f = c.key orelse return false;
+        switch (f(c.ctx, key, mods)) {
+            .ignored => return false,
+            .consumed => return true,
+            .answer => |a| {
+                sh.host.vtable.answer(sh.host.ctx, a);
+                return true;
+            },
+        }
+    }
+
+    fn onScroll(ctx: *anyopaque, dy: f32) void {
+        const sh = self(ctx);
+        if (!sh.view_shown or sh.modalActive() != null) return;
+        const c = sh.conversation orelse return;
+        if (c.scroll) |f| f(c.ctx, dy);
+    }
+
+    fn onDrag(ctx: *anyopaque, d: input.Drag) void {
+        const sh = self(ctx);
+        if (!sh.view_shown or sh.modalActive() != null) return;
+        const c = sh.conversation orelse return;
+        const f = c.drag orelse return;
+        // A committed swipe: its answer key, through the answer path.
+        if (f(c.ctx, d)) |key| sh.host.vtable.answer(sh.host.ctx, key);
     }
 
     fn onChar(ctx: *anyopaque, cp: u21, mods: input.Mods) void {
@@ -661,6 +852,8 @@ pub const Shell = struct {
             },
             .pair_screen => if (!mods.ctrl and (cp == 'p' or cp == 'P')) sh.command(.pair),
             .wait_screen => {},
+            // Space with no text field focused: dictation on / off.
+            .view => if (cp == ' ' and !mods.ctrl and !mods.alt and !mods.super) sh.toggleDictation(),
             .line => _ = sh.line.onChar(cp, mods),
             .terminal => {
                 sh.select.active = false;
@@ -696,11 +889,19 @@ pub const Shell = struct {
             // Send: what Enter in the line does.
             ids.send => if (sh.focus() == .line or sh.device == .desk) {
                 _ = sh.line.onKey(.enter, .{}, LineSender{ .sh = sh });
+                if (sh.instructing and sh.line.text().len == 0) sh.closeInstruct();
             },
             ids.data_toggle => sh.data.toggle(),
             ids.data_clear => sh.data.clear(sh.gpa),
-            ids.view_terminal => sh.main = .terminal,
+            ids.view_terminal => {
+                sh.main = .terminal;
+                sh.instructing = false;
+            },
             ids.view_conversation => sh.main = .conversation,
+            ids.instruct => if (sh.instructing) sh.toggleDictation() else sh.startDictation(),
+            ids.view0...ids.view_last => if (sh.conversation) |c| if (c.button) |f| {
+                _ = f(c.ctx, id);
+            },
             ids.pair => sh.command(.pair),
             ids.cancel_pair => sh.command(.cancel_pair),
             else => sh.command(.{ .button = id }),
@@ -799,6 +1000,7 @@ test "viewer: waiting shows the request code; trust errors are explained" {
     var r: Rec = .{};
     var sh = Shell.init(testing.allocator, .viewer, r.host());
     defer sh.deinit();
+    sh.main = .terminal;
     const w = sh.overlay(.{ .viewer = .{ .status = .pair_waiting, .host = "10.8.0.1:8420", .code = "7f3a".* } });
     try testing.expectEqualStrings("Request code 7f3a", w.screen.message.title);
     try testing.expectEqual(ids.cancel_pair, w.screen.message.button.?.id);
@@ -815,6 +1017,8 @@ test "viewer per input mode: the same features as the browser" {
     var r: Rec = .{};
     var sh = Shell.init(testing.allocator, .viewer, r.host());
     defer sh.deinit();
+    // The Terminal view (the Conversation view's rules: further down).
+    sh.main = .terminal;
     var v: Viewer = .{ .status = .connected, .host = "h", .has_grid = true, .mode = .none };
     // view only: no answer bar, no line.
     var o = sh.overlay(.{ .viewer = v });
@@ -886,12 +1090,15 @@ test "viewer top bar: the desktop's tabs, the one shown active, no open or close
     try testing.expect(tb.tabs[0].close_id == null and tb.add_id == null);
     try testing.expectEqual(ids.tab0 + 1, tb.tabs[1].id);
     try testing.expectEqual(theme.fromU32(0x3366CC), tb.tabs[0].color);
-    // The view toggle: Terminal chosen; Conversation shows its placeholder.
+    // The view toggle: Conversation chosen (the devices' default; without
+    // a view, its placeholder), Terminal one click away.
     try testing.expectEqual(@as(usize, 2), tb.buttons.len);
-    try testing.expect(tb.buttons[0].active and !tb.buttons[1].active);
-    Shell.onButton(&sh, ids.view_conversation);
+    try testing.expect(!tb.buttons[0].active and tb.buttons[1].active);
     const conv = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
-    try testing.expect(conv.screen == .message and conv.top_bar.?.buttons[1].active);
+    try testing.expect(conv.screen == .message);
+    Shell.onButton(&sh, ids.view_terminal);
+    const term = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2) });
+    try testing.expect(term.screen == .grid and term.top_bar.?.buttons[0].active);
     // Ctrl+Tab cycles, a click switches.
     Shell.onKey(&sh, .tab, .{ .ctrl = true });
     try testing.expectEqual(@as(usize, 0), r.cmds[r.n_cmds - 1].select_tab);
@@ -909,6 +1116,7 @@ test "viewer: session ended, then desktop offline, are explicit screens" {
     var r: Rec = .{};
     var sh = Shell.init(testing.allocator, .viewer, r.host());
     defer sh.deinit();
+    sh.main = .terminal;
     const ended = sh.overlay(.{ .viewer = .{ .status = .session_ended, .mode = .keys, .host = "h", .has_grid = true, .exit_code = 1 } });
     try testing.expectEqualStrings("session ended", ended.status.label);
     try testing.expectEqualStrings("Session ended on the desktop (exit code 1)", ended.screen.message.title);
@@ -1008,4 +1216,227 @@ test "desk: drag selects, right-click copies, Ctrl+Shift+V pastes" {
     try testing.expect(sh.select.range() == null);
     Shell.onChar(&sh, 'v', .{ .ctrl = true, .shift = true });
     try testing.expect(r.cmds[r.n_cmds - 1] == .paste);
+}
+
+const StubView = struct {
+    scrolled: f32 = 0,
+    keys: usize = 0,
+    buttons: usize = 0,
+    fn of(p: *anyopaque) *StubView {
+        return @ptrCast(@alignCast(p));
+    }
+    fn draw(_: *anyopaque, _: *frame.Painter, _: frame.Rect) void {}
+    fn scroll(p: *anyopaque, dy: f32) void {
+        of(p).scrolled += dy;
+    }
+    fn key(p: *anyopaque, k: input.Key, _: input.Mods) frame.ViewInput {
+        of(p).keys += 1;
+        return switch (k) {
+            .right => .{ .answer = "1" },
+            .page_up, .page_down, .home, .end => .consumed,
+            else => .ignored,
+        };
+    }
+    fn button(p: *anyopaque, _: u32) bool {
+        of(p).buttons += 1;
+        return true;
+    }
+    fn drag(_: *anyopaque, d: input.Drag) ?[]const u8 {
+        return if (d.phase == .up and d.x > 100) "esc" else null;
+    }
+    fn view(sv: *StubView) frame.ContentView {
+        return .{ .ctx = sv, .draw = draw, .scroll = scroll, .key = key, .button = button, .drag = drag };
+    }
+};
+
+const DictRec = struct {
+    started: usize = 0,
+    fn start(p: *anyopaque) void {
+        const d: *DictRec = @ptrCast(@alignCast(p));
+        d.started += 1;
+    }
+    fn stop(_: *anyopaque) void {}
+};
+
+test "conversation view (devices): the default, no answer keys, only Instruct at the bottom" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .viewer, r.host());
+    defer sh.deinit();
+    var sv: StubView = .{};
+    sh.conversation = sv.view();
+    var dict: DictRec = .{};
+    sh.dictation = .{ .ctx = &dict, .start = DictRec.start, .stop = DictRec.stop };
+    var v: Viewer = .{ .status = .connected, .mode = .instruct, .host = "h", .has_grid = true };
+    var o = sh.overlay(.{ .viewer = v });
+    try testing.expectEqual(MainView.conversation, sh.main);
+    try testing.expect(o.screen == .view);
+    // Minimal: no answer bar, no line; only Instruct, at the bottom.
+    try testing.expect(!o.show_answers);
+    try testing.expectEqual(@as(usize, 1), o.bottom.len);
+    const row = o.bottom[0].content.buttons;
+    try testing.expectEqual(@as(usize, 1), row.len);
+    try testing.expectEqual(ids.instruct, row[0].id);
+    try testing.expectEqual(Focus.view, sh.focus());
+    // Typing reaches nothing from the view (no stray answers).
+    Shell.onChar(&sh, 'y', .{});
+    Shell.onKey(&sh, .enter, .{});
+    try testing.expectEqual(@as(usize, 0), r.chars + r.keys + r.answers + r.n_frames);
+    // Instruct: the line with the keyboard, dictation started.
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expectEqual(@as(usize, 1), dict.started);
+    o = sh.overlay(.{ .viewer = v });
+    try testing.expectEqual(Focus.line, sh.focus());
+    const line = o.bottom[o.bottom.len - 1];
+    try testing.expect(line.content == .field and line.content.field.focused);
+    // Esc closes it; Send closes it after sending.
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expect(!sh.instructing);
+    try testing.expectEqual(Focus.view, sh.focus());
+    sh.startDictation();
+    for ("run the tests") |c| Shell.onChar(&sh, c, .{});
+    Shell.onButton(&sh, ids.send);
+    try testing.expectEqualStrings("l:run the tests", r.lastFrame());
+    try testing.expect(!sh.instructing);
+    o = sh.overlay(.{ .viewer = v });
+    try testing.expectEqual(ids.instruct, o.bottom[0].content.buttons[0].id);
+    try testing.expectEqualStrings("instructions: Sent.", o.status.extra);
+    // keys / text / view-only modes: no Instruct, nothing at the bottom,
+    // never the answer bar.
+    for ([_]rules.Policy{ .keys, .text, .none }) |m| {
+        v.mode = m;
+        o = sh.overlay(.{ .viewer = v });
+        try testing.expectEqual(@as(usize, 0), o.bottom.len);
+        try testing.expect(!o.show_answers);
+    }
+    v.mode = .keys;
+    _ = sh.overlay(.{ .viewer = v });
+    sh.startDictation();
+    try testing.expect(!sh.instructing);
+    // The Terminal view keeps the full bar and the line.
+    v.mode = .instruct;
+    Shell.onButton(&sh, ids.view_terminal);
+    o = sh.overlay(.{ .viewer = v });
+    try testing.expect(o.screen == .grid and o.show_answers);
+    try testing.expect(o.bottom[0].content == .field);
+    try testing.expectEqual(Focus.line, sh.focus());
+}
+
+test "conversation view input: navigation keys, scroll, a swipe's and a card key's answer through the answer path" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .viewer, r.host());
+    defer sh.deinit();
+    var sv: StubView = .{};
+    sh.conversation = sv.view();
+    const v: Viewer = .{ .status = .connected, .mode = .instruct, .host = "h", .has_grid = true };
+    _ = sh.overlay(.{ .viewer = v });
+    Shell.onKey(&sh, .page_up, .{});
+    Shell.onKey(&sh, .right, .{});
+    try testing.expectEqual(@as(usize, 2), sv.keys);
+    try testing.expectEqual(@as(usize, 1), r.answers);
+    Shell.onScroll(&sh, 30);
+    try testing.expectEqual(@as(f32, 30), sv.scrolled);
+    Shell.onDrag(&sh, .{ .phase = .down, .x = 10, .y = 10 });
+    Shell.onDrag(&sh, .{ .phase = .up, .x = 200, .y = 10 });
+    try testing.expectEqual(@as(usize, 2), r.answers);
+    Shell.onButton(&sh, ids.view0);
+    try testing.expectEqual(@as(usize, 1), sv.buttons);
+    // While the line is open, PageUp still scrolls; Home edits the line.
+    sh.startDictation();
+    Shell.onKey(&sh, .page_down, .{});
+    Shell.onKey(&sh, .home, .{});
+    try testing.expectEqual(@as(usize, 3), sv.keys);
+    // The terminal shown: nothing reaches the view.
+    Shell.onButton(&sh, ids.view_terminal);
+    _ = sh.overlay(.{ .viewer = v });
+    Shell.onScroll(&sh, 30);
+    try testing.expectEqual(@as(f32, 30), sv.scrolled);
+}
+
+test "desk: the terminal stays the default" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    try testing.expectEqual(MainView.terminal, sh.main);
+    try testing.expect(sh.overlay(.{}).screen == .grid);
+}
+
+const DictToggle = struct {
+    starts: usize = 0,
+    stops: usize = 0,
+    fn of(p: *anyopaque) *DictToggle {
+        return @ptrCast(@alignCast(p));
+    }
+    fn start(p: *anyopaque) void {
+        of(p).starts += 1;
+    }
+    fn stop(p: *anyopaque) void {
+        of(p).stops += 1;
+    }
+    fn yes(_: ?*anyopaque) bool {
+        return true;
+    }
+};
+
+fn hasLabel(o: frame.Overlay, needle: []const u8) bool {
+    for (o.bottom) |p| if (p.content == .buttons) for (p.content.buttons) |b| {
+        if (std.mem.indexOf(u8, b.label, needle) != null) return true;
+    };
+    return false;
+}
+
+test "dictation toggles: Space only without a focused field, the media key only with a headset mic, the indicator" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .viewer, r.host());
+    defer sh.deinit();
+    var sv: StubView = .{};
+    sh.conversation = sv.view();
+    var d: DictToggle = .{};
+    sh.dictation = .{ .ctx = &d, .start = DictToggle.start, .stop = DictToggle.stop };
+    const v: Viewer = .{ .status = .connected, .mode = .instruct, .host = "h", .has_grid = true };
+    var o = sh.overlay(.{ .viewer = v });
+    try testing.expect(!hasLabel(o, "Listening"));
+    // Space in the conversation (no field focused): starts; the line opens
+    // with the indicator above it.
+    Shell.onChar(&sh, ' ', .{});
+    try testing.expect(sh.dictating and sh.instructing);
+    try testing.expectEqual(@as(usize, 1), d.starts);
+    o = sh.overlay(.{ .viewer = v });
+    try testing.expect(hasLabel(o, "Listening"));
+    try testing.expectEqual(@as(usize, 2), o.bottom.len);
+    try testing.expect(o.bottom[1].content == .field);
+    // The line has the keyboard now: Space types a space.
+    Shell.onChar(&sh, 'a', .{});
+    Shell.onChar(&sh, ' ', .{});
+    try testing.expectEqualStrings("a ", sh.line.text());
+    try testing.expect(sh.dictating);
+    // The indicator's button stops it; the text stays for review.
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(!sh.dictating and sh.instructing);
+    try testing.expectEqual(@as(usize, 1), d.stops);
+    o = sh.overlay(.{ .viewer = v });
+    try testing.expect(!hasLabel(o, "Listening") and hasLabel(o, "Dictate"));
+    try testing.expectEqualStrings("a ", sh.line.text());
+    // Esc closes the line (stopping dictation if it ran).
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.dictating);
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expect(!sh.dictating and !sh.instructing);
+    try testing.expectEqual(@as(usize, 2), d.stops);
+    // The headset's media button: ignored without a headset mic ...
+    try testing.expect(!sh.headsetMicPresent());
+    Shell.onAction(&sh, .media_play_pause);
+    try testing.expect(!sh.dictating);
+    // ... toggles with one; the toggle action always does.
+    sh.headset_mic = .{ .present = DictToggle.yes };
+    Shell.onAction(&sh, .media_play_pause);
+    try testing.expect(sh.dictating);
+    Shell.onAction(&sh, .toggle_dictation);
+    try testing.expect(!sh.dictating);
+    // Not in the Terminal view: Space goes to the terminal there.
+    Shell.onKey(&sh, .escape, .{});
+    Shell.onButton(&sh, ids.view_terminal);
+    _ = sh.overlay(.{ .viewer = .{ .status = .connected, .mode = .text, .host = "h", .has_grid = true } });
+    Shell.onChar(&sh, ' ', .{});
+    try testing.expect(!sh.dictating);
+    try testing.expectEqual(@as(usize, 1), r.chars);
 }
