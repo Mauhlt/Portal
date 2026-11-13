@@ -182,7 +182,7 @@ pub fn oneLiner(buf: []u8, cat: Category, tool: []const u8, calls: u32, files: u
 }
 
 /// What the owner is asked to allow, for a permission prompt about a tool
-/// of this category ("The agent wants to <phrase>.").
+/// of this category ("Claude wants to <phrase>.").
 pub fn permissionPhrase(buf: []u8, cat: Category, tool: []const u8) []const u8 {
     return switch (cat) {
         .edit => "edit a file",

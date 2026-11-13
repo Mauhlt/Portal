@@ -300,7 +300,7 @@ pub fn refusalText(r: Refusal) []const u8 {
         .shell_escape => "Lines can't start with ! (shell commands are blocked).",
         .slash_command => "Lines can't start with / (slash commands are blocked).",
         .memory_shortcut => "Lines can't start with # (the memory shortcut is blocked).",
-        .not_waiting => "Up/Down only work while the agent is waiting for an answer.",
+        .not_waiting => "Up/Down only work while Claude is waiting for an answer.",
     };
 }
 

@@ -1,5 +1,5 @@
 //! `portalctl hooks install | uninstall | status` and the desk's Settings
-//! item "Agent integration": Portal's entries in the agent's user
+//! item "Claude Code integration": Portal's entries in the agent's user
 //! settings (`%CLAUDE_CONFIG_DIR%\settings.json`, else
 //! `%USERPROFILE%\.claude\settings.json`).
 //!
@@ -584,7 +584,7 @@ pub fn command(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args
         }
     }
     const path = settingsPath(gpa, env) catch {
-        std.debug.print("portalctl: cannot find the agent's settings (no USERPROFILE)\n", .{});
+        std.debug.print("portalctl: cannot find Claude Code's settings (no USERPROFILE)\n", .{});
         return 1;
     };
     defer gpa.free(path);
@@ -608,8 +608,8 @@ pub fn command(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args
             .partly => "partly installed (run `portalctl hooks install` to complete it)",
             .other_exe => "installed for another portalctl.exe (run `portalctl hooks install` to point it here)",
         };
-        std.debug.print("Agent integration: {s}\n  settings: {s}\n  hook:     {s} hook\n", .{ text, path, exe });
-        if (r.all_disabled) std.debug.print("  note: disableAllHooks is true in that file, so the agent runs no hooks\n", .{});
+        std.debug.print("Claude Code integration: {s}\n  settings: {s}\n  hook:     {s} hook\n", .{ text, path, exe });
+        if (r.all_disabled) std.debug.print("  note: disableAllHooks is true in that file, so Claude Code runs no hooks\n", .{});
         return 0;
     }
     const op: Op = if (std.mem.eql(u8, sub, "install")) .install else if (std.mem.eql(u8, sub, "uninstall")) .uninstall else {
@@ -630,7 +630,7 @@ pub fn command(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args
         return 0;
     }
     if (ch.backup) |b| std.debug.print("backup of the previous file: {s}\n", .{b});
-    std.debug.print("{s} {s}: {s}\n", .{ if (op == .install) "installed in" else "removed from", path, if (op == .install) "Agent sessions started in Portal tabs now report their state (new and running sessions pick it up)" else "Portal's hooks are gone; everything else is unchanged" });
+    std.debug.print("{s} {s}: {s}\n", .{ if (op == .install) "installed in" else "removed from", path, if (op == .install) "Claude Code sessions started in Portal tabs now report their state (new and running sessions pick it up)" else "Portal's hooks are gone; everything else is unchanged" });
     return 0;
 }
 

@@ -83,7 +83,7 @@ pub fn Panels(comptime devices: type) type {
             setup_cancel,
             /// Read the clipboard and call `paste`.
             paste,
-            /// "Agent integration": install Portal's hooks in the agent's
+            /// "Claude Code integration": install Portal's hooks in the agent's
             /// settings.json, or remove them when installed
             /// (src/agenthooks.zig); the glue sets `ui.setup.agent`.
             agent_hooks,
@@ -126,7 +126,7 @@ pub fn Panels(comptime devices: type) type {
             /// "Background art" (Settings only): the hero art, faint,
             /// behind the window's content.
             bg_art: bool = true,
-            /// "Agent integration" (Settings only): applies at once
+            /// "Claude Code integration" (Settings only): applies at once
             /// (Action.agent_hooks), not with the other settings.
             agent: AgentHooks = .unknown,
         };
@@ -763,10 +763,10 @@ pub fn Panels(comptime devices: type) type {
                 return switch (c) {
                     .unknown => "Unknown",
                     .not_installed => "Not installed: [Install]",
-                    .installed => "Installed: tabs show when the agent works, waits or is done [Remove]",
+                    .installed => "Installed: tabs show when Claude works, waits or is done [Remove]",
                     .partly => "Partly installed: [Install] completes it",
                     .other_exe => "Installed for another Portal: [Install] points it here",
-                    .unreadable => "The agent's settings.json could not be read (see the note)",
+                    .unreadable => "Claude Code's settings.json could not be read (see the note)",
                 };
             }
 
@@ -802,11 +802,11 @@ pub fn Panels(comptime devices: type) type {
                         if (!ui.setup.first_run) {
                             bufs.fields[4] = .{ .label = "Show system monitor (Left/Right to change; applies now)", .value = if (ui.setup.sysmon) "On: a System button shows CPU, memory, GPU and each tab's load" else "Off", .id = id.field0 + 4, .focused = f == 4, .choice = true };
                             bufs.fields[5] = .{ .label = "Background art (Left/Right to change; applies now)", .value = if (ui.setup.bg_art) "On: the Portal art, faint, behind the terminal" else "Off", .id = id.field0 + 5, .focused = f == 5, .choice = true };
-                            bufs.fields[6] = .{ .label = "Agent integration (Left/Right or click to install or remove; applies now)", .value = agentLabel(ui.setup.agent), .id = id.field0 + 6, .focused = f == 6, .choice = true };
+                            bufs.fields[6] = .{ .label = "Claude Code integration (Left/Right or click to install or remove; applies now)", .value = agentLabel(ui.setup.agent), .id = id.field0 + 6, .focused = f == 6, .choice = true };
                             p.fields = bufs.fields[0..7];
                         }
                         L.add(&bufs.after, &na, .{ .text = policyHelp(ui.setup.input), .tone = if (ui.setup.input == .text) .bad else .muted });
-                        if (!ui.setup.first_run and f == 6) L.add(&bufs.after, &na, .{ .text = "Adds Portal's hooks to the agent's settings.json (a backup is kept next to it): each runs `portalctl hook`, which tells this Portal, over a pipe only you can open, when the agent in a tab works, waits for an answer or is done. Nothing is sent outside this computer." });
+                        if (!ui.setup.first_run and f == 6) L.add(&bufs.after, &na, .{ .text = "Adds Portal's hooks to Claude Code's settings.json (a backup is kept next to it): each runs `portalctl hook`, which tells this Portal, over a pipe only you can open, when Claude in a tab works, waits for an answer or is done. Nothing is sent outside this computer." });
                         if (ui.setup.sysmon and !ui.setup.first_run) L.add(&bufs.after, &na, .{ .text = "The monitor measures only while a System panel is open (once a second); off, it never measures." });
                     },
                     .pair_name => {

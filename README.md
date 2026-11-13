@@ -47,7 +47,7 @@ Input modes (`--input`, or Remote input in the window's Settings):
   **Up/Down** (for arrow-select menus without numbers, such as the agent's
   folder-trust prompt) are accepted only while the shown tab's
   program waits for an answer: it reports OSC 7501 `state=blocked`, an
-  agent hook reported a permission prompt (see "Agent
+  agent hook reported a permission prompt (see "Claude Code
   integration" below), or its Conversation view has an open question. Otherwise Portal refuses them
   (`rejected` `NotWaiting`), because at an idle prompt Up recalls an older
   prompt from history (possibly a `!` shell command or a slash command
@@ -284,10 +284,10 @@ reach the session):
 
 Panels are keyboard driven: Tab / arrows move, Enter activates, Esc closes.
 
-**Agent integration (hooks).** The agent can't tell Portal its
+**Claude Code integration (hooks).** The agent can't tell Portal its
 state in-band under Windows' pseudo console (docs/protocol.md, "Program
 status (OSC 7501)"), so Portal offers agent hooks instead. They are
-off until you install them, once, either in Settings ("Agent
+off until you install them, once, either in Settings ("Claude Code
 integration", Left/Right or a click: Install / Remove) or from a terminal:
 
 ```
@@ -311,7 +311,7 @@ environment: it exits at once, prints nothing). In a Portal tab it tells
 the running Portal, over a local pipe only your Windows account can open
 (never the network, never a device), that the agent works (a prompt was
 sent), waits for a permission answer (the tab is highlighted, devices get
-"The agent wants to run a command. Allow it?" with Yes / No, and Up/Down
+"Claude wants to run a command. Allow it?" with Yes / No, and Up/Down
 work), is done, failed (an API error) or idle. Only the event name, the
 tool's name (to pick a fixed phrase; it is never shown) and the
 notification type travel; prompts, tool input and paths don't. One hook
@@ -555,6 +555,9 @@ zig build release-status   # current, known-good, history, and their zig version
   releases folder for both the tools and the launchers; the launchers are
   then installed into the `bin` folder next to it. Both print a note when
   it is set.
+* For testing only, `PORTAL_AGENT_PROJECTS` points the Conversation view at
+  a scratch transcript folder instead of the agent's own (the e2e harness
+  sets it). Like every `PORTAL_*` name, it never reaches a tab's program.
 * `src\win32.zig` declares its own Win32 bindings, and `build.zig` tolerates the
   0.17 to 0.18 build API change, to reduce breakage from std churn.
 * ZVC can vet new compilers against Portal before promoting them: add this

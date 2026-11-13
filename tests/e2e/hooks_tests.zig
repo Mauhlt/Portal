@@ -6,7 +6,7 @@
 //!   * the tab got its own PORTAL_TAB, not the inherited one;
 //!   * every hook exits 0 and prints nothing;
 //!   * UserPromptSubmit -> working; PermissionRequest (Bash) -> waiting,
-//!     the "The agent wants to run a command. Allow it?" card (Yes = 1,
+//!     the "Claude wants to run a command. Allow it?" card (Yes = 1,
 //!     No = esc), instruct's Up/Down gate open; Notification idle_prompt
 //!     -> idle; Stop -> done; StopFailure -> error; SessionEnd -> idle;
 //!   * a hook without PORTAL_TAB, with a malformed one or with an unknown
@@ -103,7 +103,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
 
     _ = hook(h, dir, key, "{\"session_id\":\"abc\",\"hook_event_name\":\"PermissionRequest\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"rm -rf node_modules\"},\"permission_suggestions\":[]}");
     _ = r.check("PermissionRequest: the tab is waiting", tabsWith(v, "waiting", 1, 5000), "{s}", .{lastTabs(v)});
-    const card = "The agent wants to run a command. Allow it?";
+    const card = "Claude wants to run a command. Allow it?";
     _ = r.check("the permission card, Yes = 1 and No = esc", v.waitText(card, 1, 5000) and
         std.mem.indexOf(u8, v.lastText(card) orelse "", "{\"label\":\"Yes\",\"key\":\"1\"},{\"label\":\"No\",\"key\":\"esc\"}") != null, "{?s}", .{v.lastText(card)});
     const rej1 = v.countText("NotWaiting");
@@ -125,7 +125,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
 
     // An unknown tool: a fixed phrase, never its name.
     _ = hook(h, dir, key, "{\"hook_event_name\":\"PermissionRequest\",\"tool_name\":\"mcp__secretsrv__exfil_tool\"}");
-    _ = r.check("an unknown tool's card says \"use a tool\", never the name", v.waitText("The agent wants to use a tool. Allow it?", 1, 5000) and v.countText("exfil") == 0 and v.countText("secretsrv") == 0, "", .{});
+    _ = r.check("an unknown tool's card says \"use a tool\", never the name", v.waitText("Claude wants to use a tool. Allow it?", 1, 5000) and v.countText("exfil") == 0 and v.countText("secretsrv") == 0, "", .{});
     _ = hook(h, dir, key, "{\"hook_event_name\":\"Stop\"}");
     _ = r.check("Stop again: done", tabsWith(v, "done", 2, 5000), "{s}", .{lastTabs(v)});
 

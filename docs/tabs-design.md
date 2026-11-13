@@ -25,7 +25,7 @@ and the terminal-bell fallback for "waiting". What exists:
   `state=` report followed.
 * Agent hooks (fallback 2 below) are implemented, approved by the
   owner 2026-11-12, and installed only on request (`portalctl hooks
-  install`, or the desk's Settings, "Agent integration"):
+  install`, or the desk's Settings, "Claude Code integration"):
   `src/hookmsg.zig` (the message and the mapping), `src/hookpipe.zig`
   (the pipe and `portalctl hook`), `src/agenthooks.zig` (settings.json),
   `Session.setHookState` (the same Hub.gen / convo / notify paths as
@@ -80,7 +80,7 @@ never open or close projects. That stays desk-only: Ctrl+T folder picker, or
      | Event | Meaning | Tab |
      |---|---|---|
      | `UserPromptSubmit` | the user submitted a prompt | `working` |
-     | `PermissionRequest` | a permission prompt is about to show (`tool_name`, `tool_input`) | `waiting`, the permission card "The agent wants to <phrase>. Allow it?" (Yes = `1`, No = `esc`); the phrase from `tool_name`'s category (transcript.category: Bash runs a command, Edit edits a file, ...), any other tool "use a tool": the name itself is never shown |
+     | `PermissionRequest` | a permission prompt is about to show (`tool_name`, `tool_input`) | `waiting`, the permission card "Claude wants to <phrase>. Allow it?" (Yes = `1`, No = `esc`); the phrase from `tool_name`'s category (transcript.category: Bash runs a command, Edit edits a file, ...), any other tool "use a tool": the name itself is never shown |
      | `Notification`, `notification_type` `permission_prompt` | the prompt has waited a few seconds | `waiting` (a backstop) |
      | `Notification`, `idle_prompt` | the session has been idle for about a minute | `idle` (not `waiting`: an idle prompt is not an answer menu, so Up/Down stay refused) |
      | `Stop` | the turn finished (not after a user interrupt) | `done` (then `idle` from idle_prompt) |

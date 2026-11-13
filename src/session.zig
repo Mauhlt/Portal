@@ -677,7 +677,7 @@ test "hook states: same generation and convo paths as OSC 7501; OSC wins only wh
     _ = s.setHookState(.{ .state = .waiting, .wait = .permission, .cat = .edit });
     try std.testing.expectEqual(@as(u64, 3), gen);
     try std.testing.expect(c.hasOpenQuestion());
-    try std.testing.expectEqualStrings("The agent wants to edit a file. Allow it?", c.last().?.text);
+    try std.testing.expectEqualStrings("Claude wants to edit a file. Allow it?", c.last().?.text);
     try s.writeWebKey("up", 0);
     // The transcript shows a tool result: the prompt was answered.
     mu.lockUncancelable(std.testing.io);

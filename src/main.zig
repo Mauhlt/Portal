@@ -161,15 +161,15 @@ const usage =
     \\      between open tabs but can never open or close one.
     \\
     \\  portalctl hooks install [--exe PATH] | uninstall | status
-    \\      agent integration: add (or remove) Portal's hooks in
-    \\      the agent's settings.json (%CLAUDE_CONFIG_DIR% or
+    \\      Claude Code integration: add (or remove) Portal's hooks in
+    \\      Claude Code's settings.json (%CLAUDE_CONFIG_DIR% or
     \\      %USERPROFILE%\.claude). Each hook runs `portalctl hook`, which
     \\      tells the running Portal over a local, current-user-only pipe
-    \\      when the agent in a tab works, waits for an answer or is done.
+    \\      when Claude in a tab works, waits for an answer or is done.
     \\      Everything else in the file stays as it is; a backup is kept
-    \\      next to it. In the window: Settings, "Agent integration".
+    \\      next to it. In the window: Settings, "Claude Code integration".
     \\  portalctl hook
-    \\      Run by the agent (reads the hook's JSON on stdin); does nothing
+    \\      Run by Claude Code (reads the hook's JSON on stdin); does nothing
     \\      outside a Portal tab.
     \\
     \\  portalctl ca [show]
@@ -1584,17 +1584,17 @@ const HookWatch = struct {
     fn start(gpa: Allocator, hub: *tabs.Hub, log: *Log, data_dir: []const u8) void {
         var nb: [80:0]u16 = undefined;
         const name = hookpipe.pipeNameW(&nb, data_dir) orelse {
-            log.print("hooks: cannot determine this user's SID; agent hooks are not listened to", .{});
+            log.print("hooks: cannot determine this user's SID; Claude Code hooks are not listened to", .{});
             return;
         };
         const ev = hookpipe.Server.events() catch {
-            log.print("hooks: cannot create events; agent hooks are not listened to", .{});
+            log.print("hooks: cannot create events; Claude Code hooks are not listened to", .{});
             return;
         };
         const srv = gpa.create(hookpipe.Server) catch return;
         srv.* = .{ .stop = ev[0], .conn_ev = ev[1], .read_ev = ev[2], .ctx = hub, .on_message = message };
         srv.init(name) catch |err| {
-            log.print("hooks: cannot create the hook pipe ({s}); agent hooks are not listened to", .{switch (err) {
+            log.print("hooks: cannot create the hook pipe ({s}); Claude Code hooks are not listened to", .{switch (err) {
                 error.NameTaken => "another process holds its name: another Portal with the same data folder?",
                 else => @errorName(err),
             }});

@@ -266,6 +266,10 @@ fn addPackage(b: *std.Build, wasm_bin: std.Build.LazyPath, test_step: *std.Build
             check.addFileArg(e.c.getEmittedBin());
         }
 
+        // `zig build test` compiles the ARM64 exes too (and checks their PE
+        // headers), so an aarch64-only break shows up there, not only here.
+        if (arch == .aarch64) test_step.dependOn(&check.step);
+
         const install = b.addInstallDirectory(.{ .source_dir = wf.getDirectory(), .install_dir = .prefix, .install_subdir = name });
         install.step.dependOn(&check.step);
         step.dependOn(&install.step);

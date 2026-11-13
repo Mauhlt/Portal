@@ -170,7 +170,7 @@ pub fn fromHookJson(scratch: std.mem.Allocator, key: Key, json: []const u8) ?Mes
 pub const Effect = struct {
     state: vt.ProgramState,
     wait: Wait,
-    /// PermissionRequest: the tool's category, for "The agent wants to
+    /// PermissionRequest: the tool's category, for "Claude wants to
     /// <phrase>" (null: keep what is known).
     cat: ?transcript.Category = null,
 };

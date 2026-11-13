@@ -242,7 +242,7 @@ test "settings: Show system monitor is a fifth choice (not on the first run), of
     _ = s.char(' ', .{});
     try testing.expect(s.setup.sysmon);
     try testing.expectEqual(rules.Policy.keys, s.setup.input); // the policy is untouched
-    // Enter: on to "Background art", "Agent integration", then submit.
+    // Enter: on to "Background art", "Claude Code integration", then submit.
     try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.setup_submit, s.key(.enter, .{}));

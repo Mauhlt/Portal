@@ -103,7 +103,7 @@ pub const Desk = struct {
     open_ctx: *const anyopaque,
     open_fn: *const fn (ctx: *const anyopaque, gpa: std.mem.Allocator, hub: *tabs.Hub, dir: []const u8) ?[]const u8,
     /// Portal's environment (where the agent's settings.json and the
-    /// installed portalctl are: Settings, "Agent integration").
+    /// installed portalctl are: Settings, "Claude Code integration").
     env: *const std.process.Environ.Map,
 };
 
@@ -670,7 +670,7 @@ pub const LocalHost = struct {
         defer h.gpa.free(path);
         defer h.gpa.free(exe);
         const r = agenthooks.statusFile(h.gpa, h.io, path, exe) catch |err| {
-            if (note) h.ui.setNote(.bad, "The agent's settings.json can't be used: {s}.", .{agenthooks.describe(err)});
+            if (note) h.ui.setNote(.bad, "Claude Code's settings.json can't be used: {s}.", .{agenthooks.describe(err)});
             return .unreadable;
         };
         return switch (r.state()) {
@@ -681,7 +681,7 @@ pub const LocalHost = struct {
         };
     }
 
-    /// Settings, "Agent integration": install, or remove when
+    /// Settings, "Claude Code integration": install, or remove when
     /// installed. The same code as `portalctl hooks install | uninstall`.
     fn agentHooks(h: *LocalHost) void {
         const before = h.agentStatus(true);
@@ -701,9 +701,9 @@ pub const LocalHost = struct {
         };
         defer if (ch.backup) |b| h.gpa.free(b);
         h.ui.setup.agent = h.agentStatus(true);
-        if (h.desk) |d| d.srv.log.print("settings: agent integration {s}", .{if (op == .install) "installed" else "removed"});
+        if (h.desk) |d| d.srv.log.print("settings: Claude Code integration {s}", .{if (op == .install) "installed" else "removed"});
         if (op == .install)
-            h.ui.setNote(.good, "Installed. Agent sessions in Portal tabs now report their state.{s}", .{if (ch.backup != null) " The previous settings.json is backed up next to it." else ""})
+            h.ui.setNote(.good, "Installed. Claude Code sessions in Portal tabs now report their state.{s}", .{if (ch.backup != null) " The previous settings.json is backed up next to it." else ""})
         else
             h.ui.setNote(.good, "Removed. The rest of settings.json is unchanged.", .{});
     }

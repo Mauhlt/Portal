@@ -336,7 +336,7 @@ ITEM = {"n":<u32>,"k":"<kind>","text":"<text>"
   and rules (nothing in view-only `none` mode). Questions from the
   transcript (the agent's AskUserQuestion) number their options `1`…`9`
   (`multi`: each key toggles one, `enter` submits); a permission prompt
-  (OSC 7501 `kind=permission`) is "The agent wants to <do something>. Allow
+  (OSC 7501 `kind=permission`) is "Claude wants to <do something>. Allow
   it?" with Yes = `1`, No = `esc`; any other wait is a question without
   options (the terminal shows it). The terminal stays authoritative:
   options are best effort.
