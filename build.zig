@@ -870,7 +870,7 @@ fn infoPlist(b: *std.Build, bundle_id: []const u8) []const u8 {
         \\    <key>LSRequiresIPhoneOS</key><true/>
         \\    <key>UIDeviceFamily</key><array><integer>1</integer></array>
         \\    <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string><string>metal</string></array>
-        \\    <key>UILaunchScreen</key><dict><key>UIColorName</key><string></string></dict>
+        \\    <key>UILaunchScreen</key><dict/>
         \\    <key>UIApplicationSceneManifest</key>
         \\    <dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
         \\    <key>UISupportedInterfaceOrientations</key>

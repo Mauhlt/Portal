@@ -41,6 +41,7 @@
 //! Everything read from the network is bounded and parsed defensively.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const net = Io.net;
 const http = @import("http.zig");
@@ -262,6 +263,49 @@ pub fn describe(err: anyerror) []const u8 {
         error.ResponseTooLarge => "response too large",
         else => @errorName(err),
     };
+}
+
+/// iOS: what to tell the user when a connection to `host` (IP:PORT)
+/// failed with `err`, if it looks like iOS's Local Network privacy: while
+/// Portal is not allowed Local Network access, connecting to a local
+/// address fails with EHOSTUNREACH / ENETUNREACH. Null elsewhere and for
+/// other errors or public addresses.
+pub fn localNetworkHint(err: anyerror, host: []const u8) ?[]const u8 {
+    return localNetworkHintFor(builtin.os.tag == .ios, err, host);
+}
+
+pub const local_network_text = "If iOS asked whether Portal may find devices on your local network, allow it: Settings > Privacy & Security > Local Network > Portal (on), then try again.";
+
+fn localNetworkHintFor(ios: bool, err: anyerror, host: []const u8) ?[]const u8 {
+    if (!ios) return null;
+    if (err != error.HostUnreachable and err != error.NetworkUnreachable) return null;
+    const addr = net.IpAddress.parseLiteral(host) catch return null;
+    return if (isLocalAddress(addr)) local_network_text else null;
+}
+
+/// Private, link-local and unique-local addresses: what iOS counts as the
+/// local network (the WireGuard tunnel's 10.x addresses included: without
+/// the tunnel up they are looked for on the Wi-Fi).
+fn isLocalAddress(addr: net.IpAddress) bool {
+    return switch (addr) {
+        .ip4 => |a| a.bytes[0] == 10 or
+            (a.bytes[0] == 172 and a.bytes[1] & 0xF0 == 16) or
+            (a.bytes[0] == 192 and a.bytes[1] == 168) or
+            (a.bytes[0] == 169 and a.bytes[1] == 254),
+        .ip6 => |a| (a.bytes[0] & 0xFE) == 0xFC or (a.bytes[0] == 0xFE and (a.bytes[1] & 0xC0) == 0x80),
+    };
+}
+
+test "local network hint: iOS, unreachable, local address only" {
+    try std.testing.expect(localNetworkHintFor(true, error.HostUnreachable, "192.168.1.20:8420") != null);
+    try std.testing.expect(localNetworkHintFor(true, error.NetworkUnreachable, "10.8.0.1:8420") != null);
+    try std.testing.expect(localNetworkHintFor(true, error.HostUnreachable, "172.20.0.5:8420") != null);
+    try std.testing.expect(localNetworkHintFor(true, error.HostUnreachable, "[fe80::1]:8420") != null);
+    try std.testing.expect(localNetworkHintFor(true, error.HostUnreachable, "[fd00::5]:8420") != null);
+    try std.testing.expect(localNetworkHintFor(true, error.HostUnreachable, "172.32.0.5:8420") == null);
+    try std.testing.expect(localNetworkHintFor(true, error.HostUnreachable, "203.0.113.7:8420") == null);
+    try std.testing.expect(localNetworkHintFor(true, error.ConnectionRefused, "192.168.1.20:8420") == null);
+    try std.testing.expect(localNetworkHintFor(false, error.HostUnreachable, "192.168.1.20:8420") == null);
 }
 
 pub const Client = struct {
@@ -672,7 +716,11 @@ pub const Client = struct {
         switch (classify(err)) {
             .other => return c.retryWait(backoff, describe(err)),
             .desktop_offline => c.setStatus(.desktop_offline, offline_text, .{}),
-            .network_error => c.setStatus(.network_error, "Network error: {s} \u{2014} reconnects automatically", .{describe(err)}),
+            .network_error => if (localNetworkHint(err, c.host()) != null)
+                // Short: the status detail holds 160 bytes.
+                c.setStatus(.network_error, "Network error: {s}. Allow Local Network for Portal (Settings > Privacy & Security).", .{describe(err)})
+            else
+                c.setStatus(.network_error, "Network error: {s} \u{2014} reconnects automatically", .{describe(err)}),
         }
         c.shared.mutex.lockUncancelable(c.io);
         c.shared.retry_in_ms = backoff.*;
