@@ -11,6 +11,7 @@ const Console = @import("console.zig").Console;
 const keymap = @import("keymap.zig");
 const Policy = keymap.Policy;
 const convo_model = @import("convo/model.zig");
+const Poke = @import("convo/follow.zig").Poke;
 
 pub const Session = struct {
     io: Io,
@@ -52,6 +53,10 @@ pub const Session = struct {
     /// told when the program starts or stops waiting for an answer.
     convo: ?*convo_model.Convo = null,
     wait: convo_model.Wait = .none,
+    /// Poked after every piece of output (OSC 7501 state changes are output
+    /// too): the transcript follower looks at what the program wrote. Cheap
+    /// and coalesced (follow.Poke). Null outside a hub.
+    convo_poke: ?*Poke = null,
     /// False once shutdown has begun closing the pseudo console. Distinct
     /// from `closed` (which tells viewers the session ended, and is only set
     /// after trailing output has drained): no ResizePseudoConsole may be
@@ -94,6 +99,7 @@ pub const Session = struct {
         s.mutex.unlock(s.io);
         s.cond.broadcast(s.io);
         s.notify();
+        if (s.convo_poke) |p| p.poke();
     }
 
     fn notify(s: *Session) void {

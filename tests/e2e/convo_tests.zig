@@ -8,6 +8,9 @@
 //!   * a question with its options as answer keys, answered with `k:<key>`
 //!     (no new input power), then closed;
 //!   * a permission prompt (OSC 7501) as Yes/No, answered with `k:1`;
+//!   * Portal starts the agent (here the fake, run as claude.exe) with
+//!     its own `--session-id`, and follows exactly that transcript: another
+//!     session's transcript in the same folder is not picked up;
 //!   * a tab without a transcript says so (`on`:false);
 //!   * snapshots on switching tabs, scoped to the tab watched;
 //!   * nothing in any text message leaks a path or a name (privacy rule 1).
@@ -139,10 +142,36 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const dir = try h.dataDir("convo");
     const proj = try h.dataDir("convo\\convo-acme");
     const quiet = try h.dataDir("convo\\quiet-proj");
+    // The fake session program as `claude.exe`: Portal gives it a session id.
     const self = try selfExe(gpa);
-    const args = [_][]const u8{ "--cwd", proj, "--", self, "--fake-agent" };
+    const bin = try h.dataDir("convo\\bin");
+    const agent_exe = try std.fmt.allocPrint(gpa, "{s}\\claude.exe", .{bin});
+    try std.Io.Dir.cwd().copyFile(self, std.Io.Dir.cwd(), agent_exe, h.io, .{});
+    const args = [_][]const u8{ "--cwd", proj, "--", agent_exe, "--fake-agent" };
     const inst = try proc.Instance.start(h, dir, port, &args);
     defer inst.kill();
+
+    // Another agent session in the same folder, outside Portal, writes its
+    // transcript first; then the tab's program may start writing.
+    {
+        var tb0: [1024]u8 = undefined;
+        const folder = try gpa.dupe(u8, proj);
+        for (folder) |*c| if (!std.ascii.isAlphanumeric(c.*)) {
+            c.* = '-';
+        };
+        const odir = try std.fmt.allocPrint(gpa, "{s}\\{s}", .{ h.transcriptRoot(&tb0), folder });
+        try std.Io.Dir.cwd().createDirPath(h.io, odir);
+        const opath = try std.fmt.allocPrint(gpa, "{s}\\0dd51de0-0000-4000-8000-000000000001.jsonl", .{odir});
+        var esc: std.ArrayList(u8) = .empty;
+        for (proj) |c| {
+            if (c == '\\') try esc.append(gpa, '\\');
+            try esc.append(gpa, c);
+        }
+        const line = try std.fmt.allocPrint(gpa, "{{\"type\":\"user\",\"cwd\":\"{s}\",\"sessionId\":\"0dd51de0-0000-4000-8000-000000000001\",\"message\":{{\"role\":\"user\",\"content\":\"OUTSIDE-SESSION\"}}}}\n", .{esc.items});
+        try std.Io.Dir.cwd().writeFile(h.io, .{ .sub_path = opath, .data = line });
+        const go = try std.fmt.allocPrint(gpa, "{s}\\e2e-go", .{proj});
+        try std.Io.Dir.cwd().writeFile(h.io, .{ .sub_path = go, .data = "" });
+    }
 
     var leaks = try privacy.Leaks.standard(h, dir);
     defer leaks.deinit();
@@ -151,7 +180,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     try leaks.add(h.transcriptRoot(&tb));
     try leaks.add("agent-projects");
     // Never sent at all, scrubbed or not.
-    const secrets = [_][]const u8{ "THINKING-SECRET", "ARG-SECRET", "RESULT-SECRET", "injected", "not JSON", "system-reminder", ".jsonl", "e2e00000" };
+    const secrets = [_][]const u8{ "THINKING-SECRET", "ARG-SECRET", "RESULT-SECRET", "injected", "not JSON", "system-reminder", ".jsonl", "e2e00000", "OUTSIDE-SESSION", "0dd51de0" };
 
     const creds = try client.pair(inst, "convo");
     const v = try client.Viewer.open(inst, creds.sessionCookie());
@@ -163,7 +192,14 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         return;
     };
     _ = r.check("a convo snapshot follows hello for the tab shown", v.waitText("\"t\":\"convo\"", 1, 8000), "{d} texts", .{v.texts.items.len});
+    _ = r.check("Portal starts the agent with its own --session-id", v.waitFor("FAKE-SESSION-ID", 8000) and !v.waitFor("FAKE-BAD-SESSION-ID", 1), "{s}", .{v.dump(&dump)});
     _ = r.check("the fake program asks its question", v.waitFor("FAKE-ASKED", 15_000), "{s}", .{v.dump(&dump)});
+    // The id Portal chose is desktop-only: it must never reach a device.
+    var sid_buf: [64]u8 = undefined;
+    const sid_path = try std.fmt.allocPrint(gpa, "{s}\\e2e-sid", .{proj});
+    const sid = std.Io.Dir.cwd().readFile(h.io, sid_path, &sid_buf) catch "";
+    _ = r.check("the session id is a v4 UUID", sid.len == 36 and sid[14] == '4', "{s}", .{sid});
+    if (sid.len == 36) try leaks.add(try gpa.dupe(u8, sid));
 
     // The turn, scrubbed: the project folder reads as the tab's name.
     const user_name = h.env.get("USERNAME") orelse "";

@@ -76,6 +76,17 @@ viewer connection is written to `%LOCALAPPDATA%\Portal\portal.log` (moved
 to `portal.log.1` when it passes 10 MB; lines that a peer can cause before
 signing in are rate limited, with counts of what was suppressed).
 
+## The Conversation view
+
+Devices show each tab as a conversation by default (prompts, replies,
+one-line tool activity, questions with answer buttons; the terminal is a
+toggle away), read from the agent's transcript on the desktop and
+scrubbed of paths and your user name before it is sent. Portal starts
+the agent with its own `--session-id` per tab (unless your configured
+arguments already use `--session-id`, `--resume` or `--continue`), so each
+tab follows exactly its own transcript. Details: docs/protocol.md
+section 3b.
+
 ## Security layers
 
 1. **Network**: Portal refuses to listen on `0.0.0.0` or any public address.

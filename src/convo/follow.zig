@@ -1,10 +1,26 @@
 //! Finds and follows a tab's transcript (transcript.zig) for its
-//! Conversation view, event-driven: directory change notifications
-//! (ReadDirectoryChangesW) wake the reader when a transcript grows or a new
-//! one appears; nothing is polled and there are no timers.
+//! Conversation view, event-driven; nothing is polled:
+//!   * directory change notifications (ReadDirectoryChangesW) report new
+//!     transcripts (`/clear`, `/resume`) and, where NTFS reports them,
+//!     appends;
+//!   * the tab's program producing output (or changing its OSC 7501 state,
+//!     which is output too) pokes the follower (`Poke`), which then checks
+//!     the followed transcript's size on its own handle. NTFS does not
+//!     report size changes made through a handle the writer keeps open
+//!     until its metadata is flushed, so notifications alone could lag;
+//!     the program always prints while it writes its transcript. Pokes
+//!     are coalesced: at most one size check per `poke_batch_ms` (the
+//!     viewers' frame interval), and none while the program is quiet.
 //!
-//! Which transcript is the tab's: the tab's working directory names the
-//! folder (`<projects>\<encoded cwd>`). When the tab starts, the sizes of
+//! Which transcript is the tab's: when Portal started the agent with
+//! `--session-id <uuid>` (tabs.zig, cmdline.wantsSessionId), exactly
+//! `<projects>\<encoded cwd>\<uuid>.jsonl`, waited for until it appears;
+//! nothing else is considered before it. After it (and when no id could be
+//! given, e.g. `--resume` in the configured command) the rules below decide,
+//! so `/clear` and `/resume` inside the session are followed too.
+//!
+//! The tab's working directory names the folder (`<projects>\<encoded
+//! cwd>`). When the tab starts, the sizes of
 //! the transcripts already there are noted. A transcript then belongs to
 //! the tab when it is new or has grown since (its program started or
 //! resumed it after the tab did), its records' `cwd` is the tab's folder
@@ -36,6 +52,32 @@ pub const max_initial = 32 << 20;
 pub const tail_read = 8 << 20;
 /// How much of a transcript's beginning is read to confirm whose it is.
 const confirm_bytes = 256 * 1024;
+/// Pokes closer together than this share one size check (web.zig's
+/// frame interval: output is shown at most this often anyway).
+pub const poke_batch_ms = 33;
+
+/// "The tab's program printed something": wakes the follower to look at
+/// its transcript's size. `poke` is cheap and never blocks (an atomic
+/// flag; the event is set only on the first poke after a check).
+pub const Poke = struct {
+    ev: w.HANDLE,
+    pending: std.atomic.Value(bool) = .init(false),
+
+    /// An auto-reset event; null if it cannot be made (no pokes then).
+    pub fn init() ?Poke {
+        const ev = w.validHandle(w.CreateEventW(null, 0, 0, null)) orelse return null;
+        return .{ .ev = ev };
+    }
+
+    pub fn deinit(p: *Poke) void {
+        _ = w.CloseHandle(p.ev);
+    }
+
+    pub fn poke(p: *Poke) void {
+        if (p.pending.swap(true, .acq_rel)) return;
+        _ = w.SetEvent(p.ev);
+    }
+};
 
 /// Where the follower delivers what it reads. Called on the follower's
 /// thread; each call takes whatever lock the conversation needs.
@@ -152,7 +194,16 @@ pub const Follower = struct {
     noted: bool = false,
     /// Transcripts whose `cwd` is not the tab's (owned keys).
     rejected: std.StringHashMapUnmanaged(void) = .empty,
+    /// New transcripts not yet known to be the tab's (no `cwd` written
+    /// yet): looked at again on every poke, since appends through a handle
+    /// the program keeps open may never be reported.
+    unsure: [8][36]u8 = undefined,
+    n_unsure: usize = 0,
     cur: ?Current = null,
+    /// The session id Portal gave the program (`--session-id`): its
+    /// transcript is the tab's, and nothing else is until it appeared.
+    expected: ?[36]u8 = null,
+    expected_seen: bool = false,
     line: std.ArrayList(u8) = .empty,
     line_cut: bool = false,
     /// Reading started mid-file: the first line is partial, dropped.
@@ -184,8 +235,8 @@ pub const Follower = struct {
     }
 
     /// Follows until `stop` is signalled. Never polls: it blocks on change
-    /// notifications and `stop` only.
-    pub fn run(f: *Follower, stop: w.HANDLE) void {
+    /// notifications, `poke` (the program printed) and `stop` only.
+    pub fn run(f: *Follower, stop: w.HANDLE, poke: ?*Poke) void {
         // No folder yet: nothing existed before the tab started, so the
         // first transcript to appear is new.
         f.resolveFolder() catch {};
@@ -210,9 +261,17 @@ pub const Follower = struct {
             };
             f.rescan();
             while (true) {
-                const hs = [_]w.HANDLE{ stop, dc.ev };
-                const r = w.WaitForMultipleObjects(2, &hs, 0, w.INFINITE);
+                const hs = [_]w.HANDLE{ stop, dc.ev, if (poke) |p| p.ev else stop };
+                const r = w.WaitForMultipleObjects(if (poke != null) 3 else 2, &hs, 0, w.INFINITE);
                 f.wakes +|= 1;
+                if (r == w.WAIT_OBJECT_0 + 2) {
+                    // The program printed: coalesce a burst of output into
+                    // one look at the transcript's size.
+                    if (w.WaitForSingleObject(stop, poke_batch_ms) == w.WAIT_OBJECT_0) return;
+                    poke.?.pending.store(false, .release);
+                    f.recheck();
+                    continue;
+                }
                 if (r != w.WAIT_OBJECT_0 + 1) return; // stop, or the wait failed
                 var batch = dc.collect() catch break;
                 dc.arm() catch break;
@@ -268,6 +327,7 @@ pub const Follower = struct {
     /// Sets `folder` if the transcript folder exists. Names over
     /// `max_folder` characters carry a hash suffix: matched by prefix.
     fn resolveFolder(f: *Follower) !void {
+        if (f.folder != null) return;
         var name_buf: [1024]u8 = undefined;
         const name = try transcript.folderName(f.cwd, &name_buf);
         var pb: [2048]u8 = undefined;
@@ -312,20 +372,74 @@ pub const Follower = struct {
             if (!f.grown(stem, e.size)) continue;
             if (best == null or e.time > best.?.time) best = .{ .stem = stem[0..36].*, .time = e.time };
         }
-        if (best) |b| f.consider(&b.stem);
+        if (f.waitingExpected()) {
+            const e = f.expected.?;
+            if (f.fileSize(&e) != null) f.consider(&e);
+        } else if (best) |b| f.consider(&b.stem);
         if (f.cur != null) f.readMore();
+    }
+
+    /// Portal gave the program a session id and its transcript has not
+    /// appeared yet.
+    fn waitingExpected(f: *const Follower) bool {
+        return f.expected != null and !f.expected_seen;
+    }
+
+    fn isExpected(f: *const Follower, stem: []const u8) bool {
+        const e = f.expected orelse return false;
+        return std.mem.eql(u8, &e, stem);
     }
 
     /// New since the tab started, or bigger than it was then.
     fn grown(f: *Follower, stem: []const u8, size: u64) bool {
+        if (f.isExpected(stem)) return true;
         if (f.rejected.contains(stem)) return false;
         const before = f.start_sizes.get(stem) orelse return true;
         return size > before;
     }
 
+    /// The program printed: read what the followed transcript gained (its
+    /// size on a fresh handle is current even when the directory entry is
+    /// not), and look again at new transcripts not yet confirmed.
+    fn recheck(f: *Follower) void {
+        f.readMore();
+        if (f.waitingExpected()) {
+            const e = f.expected.?;
+            f.changedStem(&e);
+        }
+        var list: [8][36]u8 = undefined;
+        const n = f.n_unsure;
+        @memcpy(list[0..n], f.unsure[0..n]);
+        for (list[0..n]) |*stem| f.changedStem(stem);
+    }
+
+    fn addUnsure(f: *Follower, stem: []const u8) void {
+        for (f.unsure[0..f.n_unsure]) |*u| if (std.mem.eql(u8, u, stem)) return;
+        if (f.n_unsure == f.unsure.len) {
+            std.mem.copyForwards([36]u8, f.unsure[0 .. f.unsure.len - 1], f.unsure[1..]);
+            f.n_unsure -= 1;
+        }
+        f.unsure[f.n_unsure] = stem[0..36].*;
+        f.n_unsure += 1;
+    }
+
+    fn dropUnsure(f: *Follower, stem: []const u8) void {
+        var i: usize = 0;
+        while (i < f.n_unsure) {
+            if (std.mem.eql(u8, &f.unsure[i], stem)) {
+                std.mem.copyForwards([36]u8, f.unsure[i .. f.n_unsure - 1], f.unsure[i + 1 .. f.n_unsure]);
+                f.n_unsure -= 1;
+            } else i += 1;
+        }
+    }
+
     /// An entry of the folder changed.
     fn changed(f: *Follower, name: []const u8) void {
         const stem = stemOf(name) orelse return;
+        f.changedStem(stem);
+    }
+
+    fn changedStem(f: *Follower, stem: []const u8) void {
         if (f.cur) |c| if (std.mem.eql(u8, &c.stem, stem)) return f.readMore();
         const size = f.fileSize(stem) orelse return;
         if (!f.grown(stem, size)) return;
@@ -335,16 +449,24 @@ pub const Follower = struct {
 
     /// Switches to transcript `stem` if it is the tab's.
     fn consider(f: *Follower, stem: []const u8) void {
-        switch (f.confirm(stem)) {
-            .unknown => return, // no `cwd` yet: looked at again when it grows
+        const expected = f.isExpected(stem);
+        // Until the session Portal started has its transcript, nothing
+        // else in the folder is the tab's (another session there, e.g. one
+        // outside Portal, is not).
+        if (f.waitingExpected() and !expected) return;
+        if (!expected) switch (f.confirm(stem)) {
+            .unknown => return f.addUnsure(stem), // no `cwd` yet: looked at again when it grows
             .no => {
+                f.dropUnsure(stem);
                 const k = f.gpa.dupe(u8, stem) catch return;
                 f.rejected.put(f.gpa, k, {}) catch f.gpa.free(k);
                 return;
             },
             .yes => {},
-        }
+        };
+        f.dropUnsure(stem);
         if (!f.sink.claim(f.sink.ctx, stem)) return;
+        if (expected) f.expected_seen = true;
         const size = f.fileSize(stem) orelse 0;
         f.cur = .{ .stem = stem[0..36].*, .offset = if (size > max_initial) size - tail_read else 0 };
         f.line.clearRetainingCapacity();
@@ -661,6 +783,40 @@ test "follower: notes old transcripts, picks the new one, reads appends and part
     try testing.expectEqualStrings("fresh|", ts.texts(&buf));
 }
 
+test "follower: with a session id, only that transcript until it appears; then /clear is followed" {
+    var t = try Tmp.init();
+    defer t.deinit();
+    const gpa = testing.allocator;
+    try t.tmp.dir.createDirPath(testing.io, "projects\\C--p");
+    var pb: [1024]u8 = undefined;
+    const projects = t.path(&pb, "projects");
+    var ts: TestSink = .{ .convo = Convo.init(gpa, .{ .root = "C:\\p", .name = "p" }) };
+    defer ts.convo.deinit();
+    var f = try Follower.init(gpa, ts.sink(), projects, "C:\\p");
+    defer f.deinit();
+    f.expected = stem_b.*;
+    try f.resolveFolder();
+    f.rescan();
+    // Another session in the same folder (outside Portal), same cwd: ignored.
+    try t.append("projects\\C--p\\" ++ stem_a ++ ".jsonl", recLine("user", "C:\\\\p", "outside"));
+    f.changed(stem_a ++ ".jsonl");
+    try testing.expect(f.cur == null);
+    // Portal's session: followed at once, even before it names its cwd.
+    try t.append("projects\\C--p\\" ++ stem_b ++ ".jsonl", "{\"type\":\"mode\"}\n");
+    f.changed(stem_b ++ ".jsonl");
+    try testing.expectEqualStrings(stem_b, &f.cur.?.stem);
+    try t.append("projects\\C--p\\" ++ stem_b ++ ".jsonl", recLine("user", "C:\\\\p", "mine"));
+    f.changed(stem_b ++ ".jsonl");
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("mine|", ts.texts(&buf));
+    // /clear: a new session file with the tab's cwd takes over.
+    const stem_c = "cccccccc-0000-0000-0000-000000000000";
+    try t.append("projects\\C--p\\" ++ stem_c ++ ".jsonl", recLine("user", "C:\\\\p", "cleared"));
+    f.changed(stem_c ++ ".jsonl");
+    try testing.expectEqualStrings(stem_c, &f.cur.?.stem);
+    try testing.expectEqualStrings("cleared|", ts.texts(&buf));
+}
+
 test "follower: a transcript claimed by another tab is left alone" {
     var t = try Tmp.init();
     defer t.deinit();
@@ -704,7 +860,7 @@ test "follower: overlong lines are cut, not kept whole" {
     try testing.expectEqualStrings("Edited 1 file|", ts.texts(&buf));
 }
 
-test "DirChanges: an append to an open file wakes the watcher" {
+test "DirChanges: a new transcript in the folder is reported by name" {
     var t = try Tmp.init();
     defer t.deinit();
     const gpa = testing.allocator;
@@ -718,22 +874,54 @@ test "DirChanges: an append to an open file wakes the watcher" {
     var nb: [256]u8 = undefined;
     try testing.expect(!b.overflow);
     try testing.expectEqualStrings(stem_a ++ ".jsonl", b.next(&nb).?);
-    // Drain, re-arm, then an append through a handle kept open (the way
-    // a program appends to its log) also wakes it.
-    try dc.arm();
-    if (w.WaitForSingleObject(dc.ev, 200) == w.WAIT_OBJECT_0) {
-        _ = try dc.collect();
-        try dc.arm();
-    }
+}
+
+test "follower: a poke (the program printed) picks up appends through a kept-open handle" {
+    var t = try Tmp.init();
+    defer t.deinit();
+    const gpa = testing.allocator;
+    const io = testing.io;
+    try t.tmp.dir.createDirPath(io, "projects\\C--kept");
     var pb: [1024]u8 = undefined;
-    const p = t.path(&pb, stem_a ++ ".jsonl");
-    const pw = try fsutil.wide(gpa, p);
+    const projects = t.path(&pb, "projects");
+    var ts: TestSink = .{ .convo = Convo.init(gpa, .{ .root = "C:\\kept", .name = "kept" }) };
+    defer ts.convo.deinit();
+    var f = try Follower.init(gpa, ts.sink(), projects, "C:\\kept");
+    defer f.deinit();
+    // The folder is noted (empty) before the program starts.
+    try f.resolveFolder();
+    f.rescan();
+    var poke = Poke.init().?;
+    defer poke.deinit();
+    const stop = w.validHandle(w.CreateEventW(null, 1, 0, null)).?;
+    defer _ = w.CloseHandle(stop);
+    const th = try std.Thread.spawn(.{}, Follower.run, .{ &f, stop, &poke });
+    defer {
+        _ = w.SetEvent(stop);
+        th.join();
+    }
+    // The program creates its transcript and keeps the handle open: the
+    // directory reports the new name (maybe while it is still empty);
+    // what it appends later may never be reported.
+    var fb: [1024]u8 = undefined;
+    const fpath = t.path(&fb, "projects\\C--kept\\" ++ stem_a ++ ".jsonl");
+    const pw = try fsutil.wide(gpa, fpath);
     defer gpa.free(pw);
     const h = w.validHandle(w.CreateFileW(pw.ptr, w.FILE_APPEND_DATA, w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL, null)).?;
     defer _ = w.CloseHandle(h);
     var n: w.DWORD = 0;
-    _ = w.WriteFile(h, "{\"a\":1}\n", 8, &n, null);
-    try testing.expectEqual(w.WAIT_OBJECT_0, w.WaitForSingleObject(dc.ev, 5000));
+    const lines = [_][]const u8{ recLine("user", "C:\\\\kept", "one"), recLine("assistant", "C:\\\\kept", "two") };
+    for (lines, 1..) |line, want| {
+        _ = w.WriteFile(h, line.ptr, @intCast(line.len), &n, null);
+        // It prints while it writes: Portal pokes the follower on output.
+        var i: u32 = 0;
+        while (ts.applied.load(.acquire) < want) : (i += 1) {
+            if (i == 200) return error.AppendNotSeen;
+            poke.poke();
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+    }
+    try testing.expectEqual(@as(u32, 2), ts.applied.load(.acquire));
 }
 
 test "follower thread: stops on its event; waits for the folder to appear" {
@@ -750,7 +938,7 @@ test "follower thread: stops on its event; waits for the folder to appear" {
     defer f.deinit();
     const stop = w.validHandle(w.CreateEventW(null, 1, 0, null)).?;
     defer _ = w.CloseHandle(stop);
-    const th = try std.Thread.spawn(.{}, Follower.run, .{ &f, stop });
+    const th = try std.Thread.spawn(.{}, Follower.run, .{ &f, stop, null });
     // The folder appears after the follower started; then a transcript,
     // appended to until the follower has read it.
     try t.tmp.dir.createDirPath(io, "projects\\C--late");
