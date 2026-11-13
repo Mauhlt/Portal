@@ -15,8 +15,8 @@ top bar.
 │ ③ Data · nothing yet          [Hide (F2)]  │  a thin strip while empty;
 │   (images, newest first, left to right)    │  grows when there is data
 ├────────────────────────────────────────────┤
-│ ② [Yes] [No] [1] [2] [3] [Esc] [Enter]     │  big enough to see and tap
-│   [ input box ......................][Send]│
+│ ② [🎤 Instruct]                            │  big enough to see and tap;
+│                                            │  opens the instruct panel
 ├────────────────────────────────────────────┤
 │ status line                                │  (native windows)
 └────────────────────────────────────────────┘
@@ -60,8 +60,12 @@ top bar.
 
 ### ② Interaction (at the bottom)
 
-* Answer buttons (Yes, No, 1–3, Esc, Enter), the input box and Send: typed,
-  Apple dictation on the iPhone, or the local NPU transcriber later
+* Native windows (the desk and the native remote viewers, owner decisions
+  2026-11-12): only the **Instruct** button; it opens the **instruct
+  panel** (the instruction line with Send, dictation, a compact key row;
+  see "Only Instruct at the bottom" below). The browser keeps its answer
+  buttons (Yes, No, 1–3, Esc, Enter), input box and Send. Typed, Apple
+  dictation on the iPhone, or the local NPU transcriber later
   (docs/audio-design.md).
 * Large enough to see and tap: native windows draw the buttons and the box
   with a 16 px font (`TermView.action_em`, the rest of the chrome is 13 px),
@@ -70,11 +74,18 @@ top bar.
   mouse, and 18 px labels.
 * Send behaviour: answer words become keys; anything else is a checked
   instruction line (`l:`), using instruct mode, the default.
-* On the desk the slice exists too: typing goes to the terminal as before
-  unless the input box has focus (click it; Esc on an empty box or a click
-  on the terminal gives the keyboard back). The desk has full control, so
-  its Send types the text and presses Enter (inputline with `policy =
-  text`); the answer buttons press their keys.
+* **The desk matches the devices** (owner decision, 2026-11-12): its
+  bottom is only Instruct too, which opens the same instruct panel. The
+  keyboard types straight into the terminal as before whenever the panel's
+  line does not have it: Instruct gives the line the keyboard, a click on
+  the terminal gives it back (the panel stays open; a click on the line
+  takes it again). The desk has full control, so its Send types the line
+  and presses Enter with no line checks (inputline with `policy = text`);
+  answer words ("yes", "two", "esc") still press their keys. Its key row
+  is not policy-limited: 1, 2, 3 (more while a question offers more), ↑,
+  ↓, Esc, Enter, always. Esc on an empty line, Send or Close shuts the
+  panel (an Esc with the terminal focused is the terminal's). The Data
+  strip, the status line and the top bar are unchanged.
 
 ## Devices: the Conversation view, minimal by default
 
@@ -142,10 +153,11 @@ keeps the terminal. In the Conversation view the window is minimal:
   drag never presses a button (view buttons fire on release).
 * **Only Instruct at the bottom, in both views** (owner decision,
   2026-11-12, for the native remote viewers: `portal connect` on a laptop
-  or Surface, and the iPhone app; the desk keeps its full bar, the browser
-  its button row): no answer bar, no Yes / No / 1 / 2 / 3 buttons, and the
-  **instruction line is hidden**. **Instruct** opens the **instruct
-  panel** (`Shell.viewerBottom`): a row with Dictate / "● Listening…"
+  or Surface, and the iPhone app; the desk got the same bottom later that
+  day, see "② Interaction"; the browser keeps its button row): no answer
+  bar, no Yes / No / 1 / 2 / 3 buttons, and the **instruction line is
+  hidden**. **Instruct** opens the **instruct panel**
+  (`Shell.instructBottom`): a row with Dictate / "● Listening…"
   (with speech-to-text) and **Close**, the instruction line with Send
   (it has the keyboard; the touch keyboard on a tablet), and a compact
   **key row** for what a line can't express (`Shell.keyRow`): **Esc** and
@@ -169,7 +181,10 @@ keeps the terminal. In the Conversation view the window is minimal:
   device's `Dictation.start` / `.stop` hook; while it runs the bottom row
   shows a red "● Listening…" (its button stops). On Windows devices Space
   toggles it only when no text field has the keyboard (in the line, Space
-  types a space); a headset's play / pause button (`media_play_pause`)
+  types a space). On the desk Space never toggles it: with the panel's
+  line unfocused the terminal has the keyboard and Space is typed there,
+  so the desk toggles dictation only with the panel's mic button and the
+  headset's media key. A headset's play / pause button (`media_play_pause`)
   toggles it only when `Shell.headsetMicPresent()` says a headset with a
   microphone is attached: a predicate hook for the audio work (../Audio,
   IMMDevice form factor), false until then. The Renderer's Win32 window
