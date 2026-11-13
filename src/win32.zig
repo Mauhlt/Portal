@@ -126,6 +126,7 @@ pub const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
 };
 
 pub extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
+pub extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 pub extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn CreatePipe(read: *HANDLE, write: *HANDLE, sa: ?*anyopaque, size: DWORD) callconv(.winapi) BOOL;
 pub extern "kernel32" fn PeekNamedPipe(h: HANDLE, buf: ?[*]u8, len: DWORD, read: ?*DWORD, avail: ?*DWORD, left: ?*DWORD) callconv(.winapi) BOOL;
