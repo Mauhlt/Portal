@@ -10,6 +10,7 @@ const Size = @import("conpty.zig").Size;
 const Console = @import("console.zig").Console;
 const keymap = @import("keymap.zig");
 const Policy = keymap.Policy;
+const convo_model = @import("convo/model.zig");
 
 pub const Session = struct {
     io: Io,
@@ -47,6 +48,10 @@ pub const Session = struct {
     /// null outside a hub).
     state: vt.ProgramState = .unknown,
     list_gen: ?*u64 = null,
+    /// The tab's Conversation view (tabs.Tab.convo; null outside a hub):
+    /// told when the program starts or stops waiting for an answer.
+    convo: ?*convo_model.Convo = null,
+    wait: convo_model.Wait = .none,
     /// False once shutdown has begun closing the pseudo console. Distinct
     /// from `closed` (which tells viewers the session ended, and is only set
     /// after trailing output has drained): no ResizePseudoConsole may be
@@ -80,6 +85,11 @@ pub const Session = struct {
         if (s.term.program_state != s.state) {
             s.state = s.term.program_state;
             if (s.list_gen) |g| g.* +%= 1;
+        }
+        const wait: convo_model.Wait = if (s.term.program_state != .waiting) .none else if (s.term.program_kind == .permission) .permission else .other;
+        if (wait != s.wait) {
+            s.wait = wait;
+            if (s.convo) |c| c.programState(wait);
         }
         s.mutex.unlock(s.io);
         s.cond.broadcast(s.io);

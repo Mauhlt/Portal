@@ -347,3 +347,71 @@ pub fn pickFolder(buf: []u16, prompt: [*:0]const u16) ?[]const u16 {
     if (n == 0) return null;
     return buf[0..n];
 }
+
+// ------------------------------------------- directory changes, file reads
+// (src/convo/follow.zig: transcripts are followed by change notifications
+// and read where they grew, never polled.)
+
+pub const FILE_LIST_DIRECTORY: DWORD = 0x0001;
+pub const FILE_SHARE_DELETE: DWORD = 0x0004;
+pub const OPEN_EXISTING: DWORD = 3;
+pub const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;
+pub const FILE_FLAG_OVERLAPPED: DWORD = 0x40000000;
+pub const FILE_NOTIFY_CHANGE_SIZE: DWORD = 0x8;
+pub const FILE_NOTIFY_CHANGE_LAST_WRITE: DWORD = 0x10;
+pub const FILE_ATTRIBUTE_DIRECTORY: DWORD = 0x10;
+pub const INVALID_FILE_ATTRIBUTES: DWORD = 0xFFFFFFFF;
+pub const ERROR_IO_PENDING: DWORD = 997;
+pub const ERROR_IO_INCOMPLETE: DWORD = 996;
+pub const FILE_BEGIN: DWORD = 0;
+
+pub const OVERLAPPED = extern struct {
+    Internal: usize = 0,
+    InternalHigh: usize = 0,
+    Offset: DWORD = 0,
+    OffsetHigh: DWORD = 0,
+    hEvent: ?HANDLE = null,
+};
+
+/// FILE_NOTIFY_INFORMATION: followed by `FileNameLength` bytes of UTF-16.
+pub const FILE_NOTIFY_INFORMATION = extern struct {
+    NextEntryOffset: DWORD,
+    Action: DWORD,
+    FileNameLength: DWORD,
+};
+pub const FILE_ACTION_ADDED: DWORD = 1;
+pub const FILE_ACTION_REMOVED: DWORD = 2;
+pub const FILE_ACTION_MODIFIED: DWORD = 3;
+pub const FILE_ACTION_RENAMED_OLD_NAME: DWORD = 4;
+pub const FILE_ACTION_RENAMED_NEW_NAME: DWORD = 5;
+
+pub const WIN32_FIND_DATAW = extern struct {
+    dwFileAttributes: DWORD,
+    ftCreationTime: FILETIME,
+    ftLastAccessTime: FILETIME,
+    ftLastWriteTime: FILETIME,
+    nFileSizeHigh: DWORD,
+    nFileSizeLow: DWORD,
+    dwReserved0: DWORD,
+    dwReserved1: DWORD,
+    cFileName: [260]u16,
+    cAlternateFileName: [14]u16,
+};
+
+pub extern "kernel32" fn ReadDirectoryChangesW(
+    dir: HANDLE,
+    buf: *anyopaque,
+    len: DWORD,
+    subtree: BOOL,
+    filter: DWORD,
+    returned: ?*DWORD,
+    overlapped: ?*OVERLAPPED,
+    completion: ?*const anyopaque,
+) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetOverlappedResult(h: HANDLE, overlapped: *OVERLAPPED, transferred: *DWORD, wait: BOOL) callconv(.winapi) BOOL;
+pub extern "kernel32" fn CancelIoEx(h: HANDLE, overlapped: ?*OVERLAPPED) callconv(.winapi) BOOL;
+pub extern "kernel32" fn FindFirstFileW(name: [*:0]const u16, data: *WIN32_FIND_DATAW) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn FindNextFileW(h: HANDLE, data: *WIN32_FIND_DATAW) callconv(.winapi) BOOL;
+pub extern "kernel32" fn FindClose(h: HANDLE) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetFileAttributesW(name: [*:0]const u16) callconv(.winapi) DWORD;
+pub extern "kernel32" fn SetFilePointerEx(h: HANDLE, distance: i64, new_pos: ?*i64, method: DWORD) callconv(.winapi) BOOL;

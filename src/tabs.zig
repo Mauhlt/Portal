@@ -35,6 +35,10 @@ const keymap = @import("keymap.zig");
 const vt = @import("vt.zig");
 const Log = @import("log.zig").Log;
 const title = @import("title.zig");
+const w32 = @import("win32.zig");
+const Convo = @import("convo/model.zig").Convo;
+const follow = @import("convo/follow.zig");
+const transcript = @import("convo/transcript.zig");
 
 pub const Id = wire.Id;
 pub const State = wire.State;
@@ -75,6 +79,18 @@ pub const Tab = struct {
     refs: std.atomic.Value(u32) = .init(1),
     /// Guarded by hub.mutex: no longer in the list.
     removed: bool = false,
+    /// The tab's folder (WTF-8), for its conversation's transcript and
+    /// scrubbing. Never sent (privacy rule 1).
+    cwd: []u8 = &.{},
+    /// The Conversation view (docs/protocol.md section 3b). Guarded by
+    /// hub.mutex, like the screen.
+    convo: Convo = undefined,
+    /// The transcript the tab follows (its session id), so two tabs in
+    /// one folder never show the same one. Guarded by hub.mutex.
+    convo_claim: [36]u8 = undefined,
+    convo_claimed: bool = false,
+    /// Set when the tab leaves the list: its transcript follower stops.
+    convo_stop: ?w32.HANDLE = null,
 
     child_code: std.atomic.Value(u32) = .init(1),
     child_done: std.atomic.Value(bool) = .init(false),
@@ -108,6 +124,9 @@ pub const Tab = struct {
     pub fn release(t: *Tab) void {
         if (t.refs.fetchSub(1, .acq_rel) != 1) return;
         const gpa = t.hub.gpa;
+        t.convo.deinit();
+        gpa.free(t.cwd);
+        if (t.convo_stop) |e| _ = w32.CloseHandle(e);
         t.session.term.deinit();
         t.local.deinit();
         t.pty.release();
@@ -188,6 +207,50 @@ pub const Tab = struct {
         t.local.run();
     }
 
+    /// Follows the tab's transcript into its conversation until the tab
+    /// leaves the list (convo_stop). Blocks on change notifications only.
+    fn convoThread(t: *Tab) void {
+        defer t.release();
+        const h = t.hub;
+        const projects = h.convo_projects orelse return;
+        const stop = t.convo_stop orelse return;
+        var f = follow.Follower.init(h.gpa, .{ .ctx = t, .apply = convoApply, .reset = convoReset, .claim = convoClaim }, projects, t.cwd) catch return;
+        defer f.deinit();
+        f.run(stop);
+    }
+
+    fn convoApply(ctx: *anyopaque, rec: *const transcript.Record) void {
+        const t: *Tab = @ptrCast(@alignCast(ctx));
+        const h = t.hub;
+        h.mutex.lockUncancelable(h.io);
+        t.convo.applyRecord(rec) catch {};
+        h.mutex.unlock(h.io);
+        h.cond.broadcast(h.io);
+    }
+
+    fn convoReset(ctx: *anyopaque, on: bool) void {
+        const t: *Tab = @ptrCast(@alignCast(ctx));
+        const h = t.hub;
+        h.mutex.lockUncancelable(h.io);
+        t.convo.reset(on);
+        h.mutex.unlock(h.io);
+        h.cond.broadcast(h.io);
+    }
+
+    fn convoClaim(ctx: *anyopaque, stem: []const u8) bool {
+        const t: *Tab = @ptrCast(@alignCast(ctx));
+        const h = t.hub;
+        if (stem.len != 36) return false;
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        for (h.tabs[0..h.n]) |o| {
+            if (o != t and o.convo_claimed and std.mem.eql(u8, &o.convo_claim, stem)) return false;
+        }
+        t.convo_claim = stem[0..36].*;
+        t.convo_claimed = true;
+        return true;
+    }
+
     /// Waits for the program, then for its output to drain and its pseudo
     /// console to close (at most `close_timeout_ms`), then takes the tab
     /// out of the list. This thread owns the process handle.
@@ -235,6 +298,12 @@ pub const Hub = struct {
     program: Program,
     /// Tab colours chosen in settings.txt (`color = NAME #rrggbb`).
     colors: []const ColorChoice = &.{},
+    /// The agent's transcript folder (`...\.claude\projects`), read for
+    /// each tab's Conversation view; null: no conversations (the view says
+    /// there is no transcript).
+    convo_projects: ?[]const u8 = null,
+    /// The user's name, scrubbed from conversation texts.
+    user_name: ?[]const u8 = null,
 
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
@@ -303,6 +372,15 @@ pub const Hub = struct {
         if (done) return error.Finished;
         if (full) return error.TooManyTabs;
 
+        // The folder as text, for the conversation (never sent).
+        const cwd_text: []u8 = if (cwd) |c|
+            (std.unicode.wtf16LeToWtf8Alloc(h.gpa, c) catch return error.OutOfMemory)
+        else blk: {
+            const here = std.process.currentPathAlloc(h.io, h.gpa) catch break :blk h.gpa.dupe(u8, "") catch return error.OutOfMemory;
+            defer h.gpa.free(here);
+            break :blk h.gpa.dupe(u8, here) catch return error.OutOfMemory;
+        };
+        errdefer h.gpa.free(cwd_text);
         const t = try h.gpa.create(Tab);
         var id: Id = undefined;
         while (true) {
@@ -314,6 +392,7 @@ pub const Hub = struct {
             .id = id,
             .color = h.colorFor(name),
             .mirror = mirror,
+            .cwd = cwd_text,
             .pty = undefined,
             .local = undefined,
             .session = .{
@@ -352,9 +431,12 @@ pub const Hub = struct {
         t.session.pty = &t.pty;
         t.local = .{ .gpa = h.gpa, .io = h.io, .session = &t.session };
         t.session.local = &t.local;
+        t.convo = Convo.init(h.gpa, .{ .root = t.cwd, .name = t.name(), .user = h.user_name });
+        t.session.convo = &t.convo;
+        if (h.convo_projects != null) t.convo_stop = w32.validHandle(w32.CreateEventW(null, 1, 0, null));
 
         // The list's reference is the initial one; each thread takes its own.
-        const threads = .{ Tab.outputThread, Tab.inputThread, Tab.supervise };
+        const threads = .{ Tab.outputThread, Tab.inputThread, Tab.supervise, Tab.convoThread };
         var failed = false;
         inline for (threads) |f| if (!failed) {
             t.acquire();
@@ -415,6 +497,7 @@ pub const Hub = struct {
             h.last_code = code;
         }
         h.mutex.unlock(h.io);
+        if (t.convo_stop) |e| _ = w32.SetEvent(e);
         h.cond.broadcast(h.io);
         h.notify();
         h.log.print("tab closed: '{s}', program exited with code {d}{s}{s} ({d} open)", .{
