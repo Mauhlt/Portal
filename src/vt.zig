@@ -276,12 +276,12 @@ fn clampDim(v: u16) u16 {
     return std.math.clamp(v, min_dim, max_dim);
 }
 
-const ansi16 = [16]u32{
-    0x000000, 0xCD0000, 0x00CD00, 0xCDCD00, 0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
-    0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00, 0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
-};
+/// The 16 ANSI colours: Portal's theme (shared/theme.zig), so every
+/// client shows the scheme the UI is drawn in.
+const ansi16 = @import("shared").theme.ansi16;
 
-/// xterm's default 256-colour palette resolved to 0x00RRGGBB.
+/// The 256-colour palette resolved to 0x00RRGGBB: the theme's 16 ANSI
+/// colours, then xterm's colour cube and grey ramp.
 pub fn paletteColor(n: u8) u32 {
     if (n < 16) return ansi16[n];
     if (n < 232) {
@@ -327,6 +327,49 @@ fn fixWide(row: []Cell) void {
     }
 }
 
+/// OSC 7501 program status (docs/tabs-design.md): `ESC ] 7501 ; state=<s>
+/// [:kind=<k>][:app=<name>][:msg=<base64>] ST`, as described at
+/// https://mitchellh.com/writing/program-status-osc7501. Only the state and
+/// the kind (as an enum) are kept; app and msg are program-controlled
+/// strings and are dropped.
+pub const ProgramState = enum { unknown, working, waiting, idle, done, failed };
+
+/// What a blocked program waits for (`kind=`): the Conversation view offers
+/// answer buttons for a permission prompt (src/convo/model.zig).
+pub const ProgramKind = enum { none, permission, question, auth, other };
+
+/// The kind in an OSC 7501 payload: `none` without one, `other` for one
+/// Portal does not know.
+pub fn parseProgramKind(payload: []const u8) ProgramKind {
+    var it = std.mem.tokenizeAny(u8, payload, ":;");
+    while (it.next()) |f| {
+        if (!std.mem.startsWith(u8, f, "kind=")) continue;
+        const v = f["kind=".len..];
+        if (std.mem.eql(u8, v, "permission")) return .permission;
+        if (std.mem.eql(u8, v, "question")) return .question;
+        if (std.mem.eql(u8, v, "auth")) return .auth;
+        return .other;
+    }
+    return .none;
+}
+
+/// The state in an OSC 7501 payload (after "7501;"). Fields are separated
+/// by ':' or ';'; an unknown or missing state is `unknown`.
+pub fn parseProgramState(payload: []const u8) ProgramState {
+    var it = std.mem.tokenizeAny(u8, payload, ":;");
+    while (it.next()) |f| {
+        if (!std.mem.startsWith(u8, f, "state=")) continue;
+        const v = f["state=".len..];
+        const map = [_]struct { []const u8, ProgramState }{
+            .{ "working", .working }, .{ "blocked", .waiting }, .{ "idle", .idle },
+            .{ "done", .done },       .{ "error", .failed },
+        };
+        for (map) |m| if (std.mem.eql(u8, v, m[0])) return m[1];
+        return .unknown;
+    }
+    return .unknown;
+}
+
 pub const Terminal = struct {
     gpa: Allocator,
     cols: u16,
@@ -353,6 +396,11 @@ pub const Terminal = struct {
     parser: Parser = .{},
     title_buf: [max_title_bytes]u8 = @splat(0),
     title_len: u16 = 0,
+    /// The program's last OSC 7501 status, and a counter bumped whenever it
+    /// changes (see `setProgramState`).
+    program_state: ProgramState = .unknown,
+    program_kind: ProgramKind = .none,
+    program_state_gen: u64 = 0,
     /// Inline images and their placements (per screen).
     images: gfx.Graphics = .{},
 
@@ -1070,8 +1118,20 @@ pub const Terminal = struct {
         p.osc_len = 0;
         const semi = std.mem.indexOfScalar(u8, data, ';') orelse return;
         const cmd = data[0..semi];
+        if (std.mem.eql(u8, cmd, "7501")) return t.setProgramState(parseProgramState(data[semi + 1 ..]), parseProgramKind(data[semi + 1 ..]));
         if (!std.mem.eql(u8, cmd, "0") and !std.mem.eql(u8, cmd, "2")) return;
         t.setTitle(data[semi + 1 ..]);
+    }
+
+    /// OSC 7501 (program status): what the program says it is doing.
+    /// Untrusted (any output can contain it): it only changes a tab's
+    /// highlight. Not a visible change, so `gen` is not bumped.
+    fn setProgramState(t: *Terminal, s: ProgramState, k: ProgramKind) void {
+        const kind: ProgramKind = if (s == .waiting) k else .none;
+        if (s == t.program_state and kind == t.program_kind) return;
+        t.program_state = s;
+        t.program_kind = kind;
+        t.program_state_gen +%= 1;
     }
 
     /// Stores a sanitised copy: valid UTF-8, no controls or zero-width
@@ -1841,8 +1901,8 @@ test "SGR combos and palette resolution" {
     t.feed("\x1b[1;3;4;9;31;42mA");
     var c = cellAt(&t, 0, 0);
     try testing.expectEqual(attr_bold | attr_italic | attr_underline | attr_strike, c.attrs);
-    try testing.expectEqual(@as(u32, 0xCD0000), c.fg);
-    try testing.expectEqual(@as(u32, 0x00CD00), c.bg);
+    try testing.expectEqual(ansi16[1], c.fg);
+    try testing.expectEqual(ansi16[2], c.bg);
     t.feed("\x1b[22;23;24;29;39;49mB");
     c = cellAt(&t, 1, 0);
     try testing.expectEqual(@as(u8, 0), c.attrs);
@@ -1864,8 +1924,8 @@ test "SGR combos and palette resolution" {
     try testing.expectEqual(@as(u32, 0x070809), cellAt(&t, 5, 0).fg);
     t.feed("\x1b[0;95;105mG");
     c = cellAt(&t, 6, 0);
-    try testing.expectEqual(@as(u32, 0xFF00FF), c.fg);
-    try testing.expectEqual(@as(u32, 0xFF00FF), c.bg);
+    try testing.expectEqual(ansi16[13], c.fg);
+    try testing.expectEqual(ansi16[13], c.bg);
     t.feed("\x1b[m\x1b[2;5;21mH");
     try testing.expectEqual(attr_dim | attr_underline, cellAt(&t, 7, 0).attrs);
     t.feed("\x1b[4:0mI");
@@ -1882,10 +1942,10 @@ test "SGR combos and palette resolution" {
     try testing.expectEqual(@as(u32, 0xFFFFFF), paletteColor(231));
     try testing.expectEqual(@as(u32, 0x5F87AF), paletteColor(67));
     try testing.expectEqual(@as(u32, 0xEEEEEE), paletteColor(255));
-    try testing.expectEqual(@as(u32, 0x5C5CFF), paletteColor(12));
+    try testing.expectEqual(ansi16[12], paletteColor(12));
     // 256+ index ignored.
     t.feed("\x1b[0;31;38;5;300mL");
-    try testing.expectEqual(@as(u32, 0xCD0000), cellAt(&t, 11, 0).fg);
+    try testing.expectEqual(ansi16[1], cellAt(&t, 11, 0).fg);
 }
 
 // --- test decoder for the wire format -------------------------------------
@@ -2014,7 +2074,7 @@ test "encodeRows round-trip" {
     try testing.expectEqualStrings("ab", r0[0].text);
     try testing.expectEqual(color_default, r0[0].fg);
     try testing.expectEqualStrings("cd", r0[1].text);
-    try testing.expectEqual(@as(u32, 0xCD0000), r0[1].fg);
+    try testing.expectEqual(ansi16[1], r0[1].fg);
     try testing.expectEqual(attr_bold, r0[1].attrs);
     try testing.expectEqualStrings("  ", r0[2].text);
     try testing.expectEqualStrings("x", r0[3].text);
@@ -2049,8 +2109,8 @@ test "inverse with explicit colours swaps" {
     var d = try decodeFrame(out.items);
     defer d.deinit();
     const runs = d.rows_list[0].runs;
-    try testing.expectEqual(@as(u32, 0x00CD00), runs[0].fg);
-    try testing.expectEqual(@as(u32, 0xCD0000), runs[0].bg);
+    try testing.expectEqual(ansi16[2], runs[0].fg);
+    try testing.expectEqual(ansi16[1], runs[0].bg);
     try testing.expectEqualStrings("   ", runs[1].text); // hidden wide = 2 spaces
 }
 
@@ -2089,7 +2149,7 @@ test "save and restore cursor" {
     defer t.deinit();
     t.feed("\x1b[2;5H\x1b[31m\x1b7\x1b[H\x1b[m\x1b8X");
     try expectCursor(&t, 5, 1);
-    try testing.expectEqual(@as(u32, 0xCD0000), cellAt(&t, 4, 1).fg);
+    try testing.expectEqual(ansi16[1], cellAt(&t, 4, 1).fg);
     t.feed("\x1b[3;3H\x1b[s\x1b[H\x1b[u");
     try expectCursor(&t, 2, 2);
     t.feed("\x1b[?25l");
@@ -2258,6 +2318,36 @@ test "generations" {
     try testing.expectEqual(g2, t.gen);
 }
 
+test "OSC 7501 program state" {
+    var t = try Terminal.init(testing.allocator, 20, 3);
+    defer t.deinit();
+    try testing.expectEqual(ProgramState.unknown, t.program_state);
+    const g0 = t.gen;
+    t.feed("\x1b]7501;state=blocked:kind=permission:app=claude\x07");
+    try testing.expectEqual(ProgramState.waiting, t.program_state);
+    try testing.expectEqual(ProgramKind.permission, t.program_kind);
+    try testing.expectEqual(@as(u64, 1), t.program_state_gen);
+    try testing.expectEqual(g0, t.gen); // not a visible change
+    try testing.expectEqualStrings("", t.title()); // nothing leaks into the title
+    t.feed("\x1b]7501;state=working\x1b\\");
+    try testing.expectEqual(ProgramState.working, t.program_state);
+    try testing.expectEqual(ProgramKind.none, t.program_kind);
+    t.feed("\x1b]7501;state=working\x07"); // unchanged: no bump
+    try testing.expectEqual(@as(u64, 2), t.program_state_gen);
+    t.feed("\x1b]7501;app=x;state=error\x07");
+    try testing.expectEqual(ProgramState.failed, t.program_state);
+    t.feed("\x1b]7501;state=evil\x07");
+    try testing.expectEqual(ProgramState.unknown, t.program_state);
+    try testing.expectEqual(ProgramState.done, parseProgramState("state=done:msg=aGk="));
+    try testing.expectEqual(ProgramState.idle, parseProgramState("state=idle"));
+    try testing.expectEqual(ProgramState.unknown, parseProgramState("kind=permission"));
+    try testing.expectEqual(ProgramKind.permission, parseProgramKind("state=blocked:kind=permission:app=claude"));
+    try testing.expectEqual(ProgramKind.question, parseProgramKind("state=blocked;kind=question"));
+    try testing.expectEqual(ProgramKind.other, parseProgramKind("state=blocked:kind=../../etc"));
+    try testing.expectEqual(ProgramKind.none, parseProgramKind("state=blocked"));
+    try testing.expectEqual(ProgramState.unknown, parseProgramState(""));
+}
+
 test "OSC title and truncation" {
     var t = try newTerm(10, 2);
     defer t.deinit();
@@ -2306,7 +2396,7 @@ test "unknown sequences do not corrupt state" {
     t.feed("\x1b[!p"); // DECSTR resets pen
     t.feed("\x1b[1;32m\x1b[12;3$zA");
     try expectRow(&t, 0, "A");
-    try testing.expectEqual(@as(u32, 0x00CD00), cellAt(&t, 0, 0).fg);
+    try testing.expectEqual(ansi16[2], cellAt(&t, 0, 0).fg);
     // C0 inside CSI executes, sequence continues.
     t.feed("\x1b[2\r;3HB");
     try expectCursor(&t, 3, 1);

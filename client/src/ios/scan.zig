@@ -1,7 +1,7 @@
 //! QR pairing on the iPhone: a full-screen camera view (AVFoundation)
 //! that reads the desk's pairing QR code (shared/pairqr.zig: the server
 //! address and the CA's SHA-256, nothing secret). The shared first-run
-//! screen (setup.zig) offers "Scan QR code" when this hook exists, and
+//! screen (ui/panels/setup.zig) offers "Scan QR code" when this hook exists, and
 //! takes the text through `take`; connect.zig then pins the CA exactly as
 //! for typed values (download while pairing is open, SHA-256 must match).
 //!
@@ -130,7 +130,7 @@ const Delegate = struct {
         have = true;
         mutex.unlock(io);
         stop();
-        // Wake the app thread: setup.zig reads it with `take`.
+        // Wake the app thread: connect.zig runSetup reads it with `take`.
         ios.postEvent(.expose);
     }
 };

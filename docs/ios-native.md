@@ -90,8 +90,8 @@ Rules:
 | 1 | No CA profile: the app pins the Portal CA itself | shared `connect.zig` / `net/pin.zig` (same as `portal connect`) | done |
 | 2 | Credential in the Keychain: `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` + `SecAccessControl` `.biometryCurrentSet` (Face ID on every read, never iCloud/backup); replaces the web passkey | `client/src/credstore.zig` (`.ios` branch of the Apple store) | done, unverified on device |
 | 3 | Third-party keyboards refused | Renderer `Window/ios.zig` (`application:shouldAllowExtensionPointIdentifier:` on the runtime app delegate), `AppOptions.block_keyboard_extensions` | done |
-| 4 | Lock on leave: cover before the app-switcher snapshot, cover while `UIScreen.isCaptured`, drop the connection in the background, Face ID before showing anything on return | Renderer `Window/ios.zig` (cover, lock, `.background`), shared `TermView.isSuspended` -> `Client.setPaused`, `client/src/ios/device.zig` (LocalAuthentication) | done |
-| 5 | QR pairing: desk shows address + CA SHA-256, the phone scans, pins, requests pairing, the owner approves the code at the desk | `shared/pairqr.zig` (text format), `src/qr.zig` (Zig QR encoder), `src/deskui.zig` (Pair panel), `TermView.PanelQr`, `client/src/setup.zig` (Scan QR code), `client/src/ios/scan.zig` (AVFoundation) | done |
+| 4 | Lock on leave: cover before the app-switcher snapshot, cover while `UIScreen.isCaptured`, drop the connection in the background, Face ID before showing anything on return | Renderer `Window/ios.zig` (cover, lock, `.background`), shared `Presenter.isSuspended` -> `Client.setPaused`, `client/src/ios/device.zig` (LocalAuthentication) | done |
+| 5 | QR pairing: desk shows address + CA SHA-256, the phone scans, pins, requests pairing, the owner approves the code at the desk | `shared/pairqr.zig` (text format), `ui/qr.zig` (Zig QR encoder, `portal_ui.qr`), `ui/panels/desk.zig` (Pair panel), `ui/frame.zig` `Panel.qr`, `ui/panels/setup.zig` (Scan QR code), `client/src/ios/scan.zig` (AVFoundation) | done |
 | 6 | Per-app tunnel on the owner's own Zig WireGuard (../WireGuard) | `client/src/ios/tunnel_ext` (extension), `client/src/ios/tunnel.zig` (app side), `client/src/ios/wgkey.zig` | extension + app side done; key delivery to the desk not yet |
 
 ### 4. Lock on leave, in detail
@@ -106,7 +106,7 @@ Rules:
 * Screen recorded / mirrored: cover while `UIScreen.isCaptured`
   (`UIScreenCapturedDidChangeNotification`).
 * Background: `.background` reaches the shared loop, which stops drawing
-  (`TermView.suspended`) and calls `Client.setPaused(true)`: the stream is
+  (`Presenter.suspended`) and calls `Client.setPaused(true)`: the stream is
   aborted through its watchdog and the network thread sleeps on an event.
   The Keychain authentication context is dropped and the lock set.
 * Return: `.foreground`; the cover stays until Face ID succeeds (the
@@ -122,11 +122,11 @@ Rules:
   per-request check, and the CA is only trusted if the downloaded
   certificate's SHA-256 matches.
 * Desk: "Pair a device" shows the QR under the instructions when Portal
-  serves TLS (`deskui.Bufs.pairQr`). Encoder: src/qr.zig (byte mode,
+  serves TLS (`ui/panels/desk.zig` `Bufs.pairQr`). Encoder: ui/qr.zig (byte mode,
   level M, versions 1-10, mask by penalty; checked module-for-module
   against a reference encoder for every block layout it uses).
 * Phone: the first-run screen offers **Scan QR code**; a scan fills address
-  and fingerprint and pairs at once (setup.zig `fromQr`, connect.zig
+  and fingerprint and pairs at once (ui/panels/setup.zig `fromQr`, connect.zig
   `Platform.take_scanned`). Camera permission: NSCameraUsageDescription.
 
 ### 6. Per-app tunnel (owner's Zig WireGuard)
@@ -212,10 +212,15 @@ Rules:
 * **Device hooks:** `connect.Platform` (sync on/off, suspend/resume,
   QR scan). The iPhone section (`client/src/ios`) fills them; everything
   they drive is shared.
-* **Shared UI changes** (client/src/view/TermView.zig, carried over by the
-  UI refactor): layout inside `insets()`, no drawing while suspended, the
-  focused text field mirrored by the native field (its edits become
-  Backspace/characters for the host, Return = Enter), `PanelQr`.
+* **Shared UI** (module `portal_ui`, ui/): layout inside `Frame.insets`,
+  the focused field as `Frame.text_slot` (`frame.textEdit` turns the
+  native field's edits into Backspace/characters, Return = Enter),
+  `Panel.qr`, grid rows scrolled back with `Frame.scrollRows`. The
+  Presenter (client/src/view/Presenter.zig) binds them to the Window:
+  `insets()` before each build, show/hide/set the native text field after
+  each present, `.background`/`.foreground` -> no drawing (`isSuspended`,
+  which connect.zig turns into `Client.setPaused`), `.scroll` (a drag on
+  the phone) -> `scrollRows`.
 
 ## Zig on iOS: one std fix
 

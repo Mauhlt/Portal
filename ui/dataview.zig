@@ -1,9 +1,9 @@
-//! The native Data slice (docs/layout-design.md): the images the session
-//! pushed, newest first, in a strip under the terminal (TermView.DataSlice)
-//! on the laptop viewer and on the desk alike. The model is the browser's
+//! The Data slice's state (docs/layout-design.md): the images the session
+//! pushed, newest first, in a strip under the main slice (frame.DataSlice)
+//! on every device. The model is the browser's
 //! (module "datafeed": bounded history, a badge for what arrived while
 //! collapsed, the slice's size rule); here the payload is the PNG bytes,
-//! which TermView decodes and scales like the terminal's inline images.
+//! which the view module decodes and scales like the terminal's inline images.
 //!
 //! Feeding: the UI thread calls `sync` with the grid's image store under
 //! the shared lock whenever it draws; every blob not seen before becomes an
@@ -11,20 +11,19 @@
 //! missed; the terminal never showed it either.)
 //!
 //! The slice is a thin header strip while empty ("Data · nothing yet") and
-//! grows when items arrive (TermView.dataHeight). F2 or its Hide button
+//! grows when items arrive (frame.dataHeight). F2 or its Hide button
 //! collapses it to the strip, which then counts what is new; Clear empties
 //! it.
 
 const std = @import("std");
 const datafeed = @import("datafeed");
-const view = @import("view");
-const TermView = view.TermView;
-const Images = view.grid.Images;
+const frame = @import("frame.zig");
+const Images = @import("grid.zig").Images;
 
 /// PNG bytes kept for the column, all items together.
 pub const max_png_bytes: usize = 24 << 20;
 
-/// Ids in `store` carry this bit, so TermView's decoded entries for the
+/// Ids in `store` carry this bit, so the renderer's decoded entries for the
 /// column never collide with the terminal's (they are drawn at other sizes).
 const store_tag: u32 = 1 << 31;
 
@@ -47,7 +46,7 @@ pub fn pngSize(png: []const u8) [2]u32 {
 
 pub const DataView = struct {
     feed: datafeed.Feed(Png) = .{},
-    /// The slice's image store for TermView: non-owning views of the
+    /// The slice's image store for the renderer: non-owning views of the
     /// feed's PNG bytes under tagged ids (rebuilt when the feed changes;
     /// only `blobs.deinit` is ever called on it).
     store: Images = .{},
@@ -59,7 +58,7 @@ pub const DataView = struct {
     taken: [datafeed.max_items * 2]u32 = undefined,
     n_taken: usize = 0,
     captions: [datafeed.max_items][48]u8 = undefined,
-    items: [datafeed.max_items]TermView.DataItem = undefined,
+    items: [datafeed.max_items]frame.DataItem = undefined,
     summary_buf: [48]u8 = undefined,
 
     pub fn deinit(d: *DataView, gpa: std.mem.Allocator) void {
@@ -124,11 +123,11 @@ pub const DataView = struct {
         d.rebuildStore(gpa);
     }
 
-    /// The slice for TermView. Slices point into `d`. `toggle_id` and
+    /// The slice for the frame. Slices point into `d`. `toggle_id` and
     /// `clear_id`: the header buttons' ids for InputSink.button.
-    pub fn slice(d: *DataView, toggle_id: u32, clear_id: u32) TermView.DataSlice {
+    pub fn slice(d: *DataView, toggle_id: u32, clear_id: u32) frame.DataSlice {
         const all = d.feed.items.items;
-        var out: TermView.DataSlice = .{
+        var out: frame.DataSlice = .{
             .collapsed = !d.shown,
             .toggle = .{ .label = if (d.shown) "Hide (F2)" else "Show (F2)", .id = toggle_id },
             .clear = if (all.len > 0) .{ .label = "Clear", .id = clear_id } else null,
@@ -237,16 +236,4 @@ test "collapsed: the strip counts new items; F2 shows and clears the count" {
     try testing.expect(!sl.collapsed);
     try testing.expectEqualStrings("\u{00B7} 1 image", sl.summary);
     try testing.expectEqual([2]u32{ 0, 0 }, pngSize("not a png at all, really not one"));
-}
-
-test "TermView's Data slice height is datafeed's rule" {
-    try testing.expectEqual(@as(f32, @floatCast(datafeed.max_share)), TermView.data_max_share);
-    const cases = [_][4]f32{
-        .{ 600, 28, 0, 0 },  .{ 600, 28, 90, 0 },   .{ 600, 28, 2000, 0 }, .{ 600, 28, 2000, 1 },
-        .{ 40, 28, 500, 0 }, .{ 10, 28, 500, 0 },   .{ 0, 0, 0, 0 },       .{ 1234, 33, 321, 0 },
-    };
-    for (cases) |c| try testing.expectEqual(
-        @as(f32, @floatCast(datafeed.sliceHeight(c[0], c[1], c[2], c[3] != 0))),
-        TermView.dataHeight(c[0], c[1], c[2], c[3] != 0),
-    );
 }

@@ -1,35 +1,39 @@
-//! The desktop's own Portal window (portal.exe): a GUI terminal for the
-//! local session, drawn by the shared view module (client/src/view, the
-//! same code as `portal connect`), plus the desk's panels (deskui.zig):
-//! first-run settings, pairing approval, the device list and the
-//! certificate export. There is no console: everything the desk sees and
-//! types goes through this window.
+//! The desktop's own Portal window (portal.exe): device glue that binds
+//! the shared UI (module "portal_ui": its shell with device `.desk`, the
+//! desk panels) to the local sessions and the server. The UI itself (layout,
+//! tabs with + and ×, the desk tools, the input box, the Data slice,
+//! selection, the panels' screens) lives in ui/; this file feeds it the hub's
+//! state each frame and performs what it asks: VT bytes to the shown tab's
+//! PTY, tab switches, the folder picker, the clipboard, and the desk
+//! panels' actions (the in-process desk API in web.zig, the device store,
+//! the CA export, settings). There is no console: everything the desk sees
+//! and types goes through this window.
+//!
+//! Project tabs (tabs.zig): Ctrl+Shift+T (or "+") opens a folder as a new
+//! tab, Ctrl+Shift+W (or a tab's ×) closes the tab shown, Ctrl+Tab /
+//! Ctrl+Shift+Tab or a click switches. Only the desk opens and closes tabs;
+//! paired devices can only switch between them.
 //!
 //! Threads: everything here runs on the main thread (window + message
-//! loop). The PTY output thread feeds `session.term`; this host copies the
-//! dirty rows into its own Grid under `session.mutex` (localgrid.zig), then
-//! builds and presents the frame without holding the lock. Keyboard, paste
-//! and resizes go to the PTY through Session.writeInput / Session.setSize.
+//! loop). Each tab's PTY output thread feeds its `session.term`; this host
+//! copies the shown tab's dirty rows into its own Grid under the hub's
+//! lock (localgrid.zig), then builds and presents the frame without
+//! holding it. Keyboard and paste go to the shown tab's PTY through
+//! Session.writeInput; resizes go to every tab (Hub.setSize).
 //! Pairing changes (a device asked, the store changed) arrive through
 //! web.Server.pairing_notify_fn, which only sets a flag and wakes the loop.
 //!
 //! The person at the desk has full control (localinput.zig), unlike remote
 //! viewers, whose input is filtered by `--input` (keymap.zig).
-//!
-//! Layout (docs/layout-design.md), as on every device: top bar, terminal,
-//! the Data slice (dataview.zig: what the session pushed; a thin strip
-//! until there is something), the interaction slice (answer buttons, the
-//! input box with Send), status line. Typing goes to the terminal unless
-//! the input box has focus (a click on it; Esc on an empty box or a click
-//! on the terminal gives the keyboard back). Send types the box's text and
-//! presses Enter (an answer word presses its key), like a remote viewer in
-//! `text` mode; the answer buttons press their keys.
 
 const std = @import("std");
 const view = @import("view");
-const TermView = view.TermView;
-const input = view.input;
-const Session = @import("session.zig").Session;
+const Presenter = view.Presenter;
+const ui = @import("portal_ui");
+const shell_mod = ui.shell;
+const input = ui.input;
+const tabs = @import("tabs.zig");
+const tabs_wire = @import("shared").tabs;
 const keymap = @import("keymap.zig");
 const localgrid = @import("localgrid.zig");
 const localinput = @import("localinput.zig");
@@ -42,8 +46,6 @@ const web = @import("web.zig");
 const sync = @import("sync.zig");
 const client = @import("client");
 const sync_manifest = client.sync.manifest;
-const inputline = client.inputline;
-const dataview = client.dataview;
 const rules = @import("inputrules");
 
 /// Font size of the local terminal, in logical pixels (zoom with Ctrl+= / -).
@@ -54,10 +56,6 @@ const max_paste_units = 256 * 1024;
 pub const Options = struct {
     /// The session program's name (e.g. the agent CLI). Not shown in the window.
     command_name: []const u8,
-    /// `--project NAME` (checked with validProject), shown as
-    /// "Portal — NAME". Null: "Portal — No project". (Tabs will supply
-    /// per-project names later.)
-    project: ?[]const u8 = null,
     /// e.g. "127.0.0.1:8420".
     listen_host: []const u8,
     /// e.g. "https://127.0.0.1:8420/", shown in the status line.
@@ -97,9 +95,13 @@ pub const Desk = struct {
     tls_dir: []const u8,
     /// settings.txt as of startup (the Settings panel edits it).
     saved: settings.Settings,
+    /// Opens a folder (absolute) as a new tab: main.openFolder. Returns
+    /// null, or why not.
+    open_ctx: *const anyopaque,
+    open_fn: *const fn (ctx: *const anyopaque, gpa: std.mem.Allocator, hub: *tabs.Hub, dir: []const u8) ?[]const u8,
 };
 
-pub const Ended = enum { window_closed, child_exited };
+pub const Ended = enum { window_closed, finished };
 
 const title = @import("title.zig");
 const win32 = @import("win32.zig");
@@ -108,55 +110,25 @@ const windowTitle = title.windowTitle;
 const max_project_bytes = title.max_project_bytes;
 const validProject = title.validProject;
 
-/// Cell selection being made with the mouse (anchor = where the drag began).
-const Select = struct {
-    anchor: [2]u16 = .{ 0, 0 },
-    head: [2]u16 = .{ 0, 0 },
-    dragging: bool = false,
-    /// True once the pointer moved off the anchor cell (a plain click
-    /// selects nothing).
-    active: bool = false,
-
-    fn range(s: Select) ?TermView.Selection {
-        if (!s.active) return null;
-        const a = s.anchor;
-        const b = s.head;
-        const a_first = a[1] < b[1] or (a[1] == b[1] and a[0] <= b[0]);
-        const lo = if (a_first) a else b;
-        const hi = if (a_first) b else a;
-        return .{ .start_col = lo[0], .start_row = lo[1], .end_col = hi[0], .end_row = hi[1] };
-    }
-};
-
-/// Ids of the window's own controls (clear of deskui.id's ranges).
-const ctl = struct {
-    const line: u32 = 30;
-    const send: u32 = 31;
-    const data_toggle: u32 = 32;
-    const data_clear: u32 = 33;
-};
-
-/// The top bar's desk actions (keyboard: Ctrl+Shift+P / D / E / S).
-const top_buttons = [_]TermView.TopButton{
-    .{ .label = "Pair a device\u{2026}", .id = deskui.id.tb_pair },
-    .{ .label = "Devices", .id = deskui.id.tb_devices },
-    .{ .label = "Export certificate\u{2026}", .id = deskui.id.tb_export },
-    .{ .label = "Settings", .id = deskui.id.tb_settings },
-};
-
 pub const LocalHost = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    tv: *TermView,
-    /// The session this window shows and types into (null until attach:
-    /// the first-run panel comes before the session). Everything goes
-    /// through this one pointer so a later tab strip (one session per
-    /// project) can switch it; nothing else names a session.
-    session: ?*Session = null,
+    p: *Presenter,
+    /// The shared UI's Portal screen (device `.desk`).
+    shell: ui.Shell = undefined,
+    /// The project tabs (null until attach: the first-run panel comes
+    /// before any session).
+    hub: ?*tabs.Hub = null,
+    /// The tab this window shows and types into, with a reference: it
+    /// follows hub.desk_active. Everything goes through this one pointer;
+    /// nothing else names a session.
+    shown: ?*tabs.Tab = null,
+    /// The tab list as of the last frame (for the top bar).
+    list: tabs_wire.List = .{},
+    list_gen: u64 = 0,
     opts: Options = .{ .command_name = "", .listen_host = "", .policy = .keys },
-    grid: view.grid.Grid = .{},
+    grid: ui.grid.Grid = .{},
     sync: localgrid.Sync = .{},
-    select: Select = .{},
     /// Snapshot of session.viewers from the last frame.
     viewers: u32 = 0,
     drawn_viewers: u32 = std.math.maxInt(u32),
@@ -171,8 +143,6 @@ pub const LocalHost = struct {
     /// loop is event-driven), and frames presented. Logged at shutdown.
     wakeups: u64 = 0,
     presents: u64 = 0,
-    /// Set by the child-exit waiter thread.
-    child_done: *const std.atomic.Value(bool),
 
     /// The desk panels and what they need.
     ui: deskui.Ui = .{},
@@ -182,26 +152,23 @@ pub const LocalHost = struct {
     until_len: usize = 0,
     /// runSetup: the panel was submitted.
     setup_submitted: bool = false,
-    /// The interaction slice's input box (text mode: the desk has full
-    /// control) and whether it has the keyboard.
-    line: inputline.Line = .{ .policy = .text },
-    line_focus: bool = false,
-    /// The Data slice.
-    data: dataview.DataView = .{},
-    panes: [1]TermView.Pane = undefined,
+    /// Whether the OS touch keyboard was last asked to show.
+    keyboard_shown: bool = false,
 
     const title_max = title.max_title_bytes;
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, child_done: *const std.atomic.Value(bool)) !*LocalHost {
-        const tv = try TermView.init(gpa, io, .{
+    pub fn init(gpa: std.mem.Allocator, io: std.Io) !*LocalHost {
+        const p = try Presenter.init(gpa, io, .{
             .title = "Portal",
             .width = 1100,
             .height = 700,
             .sizing = .{ .fixed_em = font_em },
         });
-        errdefer tv.deinit();
+        errdefer p.deinit();
         const h = try gpa.create(LocalHost);
-        h.* = .{ .gpa = gpa, .io = io, .tv = tv, .child_done = child_done };
+        h.* = .{ .gpa = gpa, .io = io, .p = p };
+        h.shell = ui.Shell.init(gpa, .desk, .{ .ctx = h, .vtable = &host_vtable });
+        h.shell.modal = .{ .ctx = h, .active = panelActive, .key = panelKey, .char = panelChar, .button = panelButton };
         return h;
     }
 
@@ -218,27 +185,25 @@ pub const LocalHost = struct {
     /// Cells that fit the window now: the PTY's initial size.
     pub fn initialSize(h: *LocalHost) [2]u16 {
         // The same slices as a running frame, so the PTY starts at its size.
-        var right_buf: [64]u8 = undefined;
-        var status_buf: [200]u8 = undefined;
-        h.tv.build(&h.grid, h.overlay(&right_buf, &status_buf));
-        const c = h.tv.capacity;
+        h.p.build(&h.grid, h.overlay());
+        const c = h.p.frame.capacity;
         return .{ @max(c[0], 20), @max(c[1], 5) };
     }
 
-    /// Points the window at `s` and hooks its change notifications. Call
-    /// before any thread that touches the session starts.
-    pub fn attach(h: *LocalHost, s: *Session) void {
-        h.session = s;
-        s.notify_ctx = h;
-        s.notify_fn = notifyThunk;
-        h.tv.reported_capacity = .{ s.size.cols, s.size.rows };
-        h.tv.setLiveRedraw(h, liveRedraw);
+    /// Points the window at the tabs and hooks their change notifications.
+    /// Call before the first tab starts.
+    pub fn attach(h: *LocalHost, hub: *tabs.Hub) void {
+        h.hub = hub;
+        hub.notify_ctx = h;
+        hub.notify_fn = notifyThunk;
+        h.p.frame.reported_capacity = .{ hub.size.cols, hub.size.rows };
+        h.p.setLiveRedraw(h, liveRedraw);
     }
 
     /// Any thread: something in the session changed.
     fn notifyThunk(ctx: *anyopaque) void {
         const h: *LocalHost = @ptrCast(@alignCast(ctx));
-        if (!h.wake_pending.swap(true, .acq_rel)) h.tv.wake();
+        if (!h.wake_pending.swap(true, .acq_rel)) h.p.wake();
     }
 
     /// web.Server.pairing_notify_fn (any thread): the pairing window or
@@ -258,19 +223,15 @@ pub const LocalHost = struct {
         h.ui.openSetup(in.first_run, in.listen, in.program, in.project, in.policy);
         if (in.problem.len > 0) h.ui.setNote(.bad, "{s}", .{in.problem});
         h.setup_submitted = false;
-        h.tv.setTitle(if (in.first_run) "Portal \u{2014} first start" else "Portal \u{2014} settings");
+        h.p.setTitle(if (in.first_run) "Portal \u{2014} first start" else "Portal \u{2014} settings");
         h.title_len = 0;
         while (true) {
-            if (!h.tv.pollEvents(h.sink())) return null;
+            if (!h.p.pollEvents(h.shell.sink())) return null;
             if (h.setup_submitted) break;
             const panel = h.ui.panel(&h.bufs, .{});
-            h.tv.build(&h.grid, .{
-                .top_bar = .{ .title = "Portal" },
-                .status = .{ .tone = .warn, .label = "not started", .extra = "the session starts when you click Start" },
-                .panel = panel,
-            });
-            h.tv.present();
-            h.tv.waitEvents(TermView.forever);
+            h.p.build(&h.grid, shell_mod.standby("Portal", "not started", "the session starts when you click Start", panel));
+            h.p.present();
+            h.p.waitEvents(Presenter.forever);
         }
         h.ui.close();
         return .{
@@ -290,21 +251,22 @@ pub const LocalHost = struct {
     /// responding" and exiting the process under a live swapchain).
     ///
     /// Purely event-driven: it sleeps until window input or a wake()
-    /// (session output, viewer count changes, pairing changes and child
-    /// exit all call notifyThunk). The only timeout is a real deadline:
-    /// the expiry of a pairing window this desk opened.
+    /// (any tab's output, the tab list, viewer count changes, pairing
+    /// changes all call notifyThunk). The only timeout is a real deadline:
+    /// the expiry of a pairing window this desk opened. Returns
+    /// `.finished` once every tab has ended.
     pub fn run(h: *LocalHost) Ended {
         h.updateTitle();
         const ended: Ended = while (true) {
-            if (!h.tv.pollEvents(h.sink())) break .window_closed;
-            if (h.child_done.load(.acquire)) break .child_exited;
+            if (!h.p.pollEvents(h.shell.sink())) break .window_closed;
+            if (h.allEnded()) break .finished;
             const changed = h.checkPairing();
             h.frame(changed);
-            h.tv.waitEvents(h.waitMs());
+            h.p.waitEvents(h.waitMs());
             h.wakeups += 1;
         };
         h.hide();
-        h.tv.releaseGpu();
+        h.p.releaseGpu();
         return ended;
     }
 
@@ -314,8 +276,8 @@ pub const LocalHost = struct {
 
     /// Until our pairing window's expiry (plus a second), else forever.
     fn waitMs(h: *LocalHost) u32 {
-        const w = h.ui.window orelse return TermView.forever;
-        if (h.ui.own_nonce == 0) return TermView.forever;
+        const w = h.ui.window orelse return Presenter.forever;
+        if (h.ui.own_nonce == 0) return Presenter.forever;
         const left = w.expires - h.nowUnix() + 1;
         if (left <= 0) {
             h.pair_dirty.store(true, .release);
@@ -339,21 +301,22 @@ pub const LocalHost = struct {
         return true;
     }
 
-    /// Any thread: the child exited (child_done is set); ends the wait in
-    /// run().
-    pub fn wakeChildExited(h: *LocalHost) void {
-        notifyThunk(h);
+    fn allEnded(h: *LocalHost) bool {
+        const hub = h.hub orelse return false;
+        hub.mutex.lockUncancelable(h.io);
+        defer hub.mutex.unlock(h.io);
+        return hub.finished;
     }
 
     /// Hides the window (shutdown can take a moment; the user already
     /// asked to close, or the program ended).
     pub fn hide(h: *LocalHost) void {
-        h.tv.window.hide();
+        h.p.window.hide();
     }
 
     fn liveRedraw(ctx: *anyopaque) void {
         const h: *LocalHost = @ptrCast(@alignCast(ctx));
-        h.tv.reportCapacity(h.sink());
+        h.p.reportCapacity(h.shell.sink());
         h.frame(true);
     }
 
@@ -361,100 +324,89 @@ pub const LocalHost = struct {
     /// builds and presents outside it.
     fn frame(h: *LocalHost, force: bool) void {
         h.wake_pending.store(false, .release);
-        const s = h.session orelse return;
-        s.mutex.lockUncancelable(s.io);
-        const changed = h.sync.sync(h.gpa, &h.grid, &s.term);
-        h.viewers = s.viewers;
-        s.mutex.unlock(s.io);
+        const hub = h.hub orelse return;
+        var old: ?*tabs.Tab = null;
+        hub.mutex.lockUncancelable(h.io);
+        // Follow the desk's tab (it moves when one is chosen, opened, or
+        // the shown one ends).
+        if (hub.desk_active) |a| if (a != h.shown) {
+            a.acquire();
+            old = h.shown;
+            h.shown = a;
+            // Another screen: copy everything again, drop its images.
+            h.sync.deinit(h.gpa);
+            h.sync = .{};
+            h.grid.deinit(h.gpa);
+            h.grid = .{};
+            h.shell.select = .{};
+        };
+        var list_changed = false;
+        if (hub.gen != h.list_gen) {
+            hub.entriesLocked(&h.list);
+            h.list_gen = hub.gen;
+            list_changed = true;
+        }
+        const changed = if (h.shown) |t| h.sync.sync(h.gpa, &h.grid, &t.session.term) else false;
+        h.viewers = hub.viewers;
+        hub.mutex.unlock(h.io);
+        if (old) |o| o.release();
         // New images become Data items (h.grid is ours: no lock needed).
-        if (changed) _ = h.data.sync(h.gpa, &h.grid.images);
+        if (changed) _ = h.shell.data.sync(h.gpa, &h.grid.images);
 
-        if (changed) h.clampSelection();
-        if (!force and !changed and !h.tv.needsRedraw() and h.viewers == h.drawn_viewers) return;
+        if (changed) h.shell.clampSelection(h.grid.cols, h.grid.rows);
+        h.shell.touch = client.touchkbd.query();
+        if (!force and !changed and !list_changed and old == null and !h.p.needsRedraw() and h.viewers == h.drawn_viewers) return;
         h.drawn_viewers = h.viewers;
         h.updateTitle();
 
-        var right_buf: [64]u8 = undefined;
-        var status_buf: [200]u8 = undefined;
-        h.tv.build(&h.grid, h.overlay(&right_buf, &status_buf));
-        h.tv.present();
+        h.p.build(&h.grid, h.overlay());
+        h.p.present();
         h.presents += 1;
+        // The on-screen keyboard follows the input box (touch, no keyboard).
+        if (h.shell.keyboard != h.keyboard_shown) {
+            h.keyboard_shown = h.shell.keyboard;
+            client.touchkbd.setVisible(h.p.nativeHandle(), h.keyboard_shown);
+        }
     }
 
-    fn viewerText(n: u32, buf: []u8) []const u8 {
-        if (n == 0) return "no remote viewers";
-        return std.fmt.bufPrint(buf, "{d} REMOTE VIEWER{s} WATCHING", .{ n, if (n == 1) "" else "S" }) catch "REMOTE VIEWERS WATCHING";
-    }
-
-    fn overlay(h: *LocalHost, right_buf: []u8, status_buf: []u8) TermView.Overlay {
-        const watching = h.viewers > 0;
-        const remote_input: []const u8 = switch (h.opts.policy) {
-            .none => "remote: view only",
-            .keys => "remote: answer keys only",
-            .instruct => "remote: answer keys + checked instructions",
-            .text => "remote: FULL CONTROL",
-        };
+    /// This frame's state for the shell: the tabs, the panel, the
+    /// viewers, the remote input policy.
+    fn overlay(h: *LocalHost) ui.Overlay {
         const d = h.desk;
-        const lv = h.line.snapshot();
-        h.panes[0] = .{ .content = .{ .field = .{
-            .label = "",
-            .value = lv.text,
-            .hint = if (h.line_focus) "Type, then Enter or Send (Esc: back to the terminal)" else "Click here to type an instruction (keys go to the terminal)",
-            .id = ctl.line,
-            .focused = h.line_focus,
-        } }, .send = .{ .label = "Send", .id = ctl.send } };
-        const line_note = h.line_focus and lv.note.len > 0;
-        return .{
-            .data = h.data.slice(ctl.data_toggle, ctl.data_clear),
-            .show_answers = true,
-            .bottom = h.panes[0..1],
-            .top_bar = .{
-                .title = windowLabel(h.opts.project, &h.label_buf),
-                .right = viewerText(h.viewers, right_buf),
-                .right_tone = if (watching) .warn else .muted,
-                .right_badge = watching,
-                .buttons = if (d != null) &top_buttons else &.{},
-            },
-            .selection = if (h.ui.open()) null else h.select.range(),
-            .status = .{
-                .tone = .good,
-                .label = "local session",
-                .extra = if (line_note) lv.note else remote_input,
-                .extra_tone = if (line_note) switch (lv.note_tone) {
-                    .neutral => .normal,
-                    .ok => .good,
-                    .bad => .bad,
-                } else if (h.opts.policy == .text) .bad else .muted,
-                .right = std.fmt.bufPrint(status_buf, "sharing on {s}", .{h.opts.url}) catch h.opts.url,
-            },
+        return h.shell.overlay(.{
+            .tabs = h.list.slice(),
+            .current = if (h.shown) |t| t.id else null,
             .panel = h.ui.panel(&h.bufs, .{
                 .fingerprint = if (d) |x| x.fingerprint else null,
                 .url = h.opts.url,
                 .until = h.until_buf[0..h.until_len],
                 .now = h.nowUnix(),
             }),
-        };
+            .desk = .{
+                .title = windowLabel(h.shownName(), &h.label_buf),
+                .viewers = h.viewers,
+                .policy = h.opts.policy,
+                .url = h.opts.url,
+                .tools = if (d != null) &deskui.tools else &.{},
+                .can_add = h.list.len < tabs.max_tabs,
+            },
+        });
+    }
+
+    /// The shown tab's name (desk-assigned, never a path).
+    fn shownName(h: *const LocalHost) ?[]const u8 {
+        const t = h.shown orelse return null;
+        return t.name();
     }
 
     /// The one place the window title is set (see windowTitle).
     fn updateTitle(h: *LocalHost) void {
         var buf: [title_max]u8 = undefined;
-        const t = windowTitle(h.opts.project, h.viewers, &buf);
+        const t = windowTitle(h.shownName(), h.viewers, &buf);
         if (std.mem.eql(u8, t, h.title_buf[0..h.title_len])) return;
         @memcpy(h.title_buf[0..t.len], t);
         h.title_len = t.len;
-        h.tv.setTitle(t);
-    }
-
-    fn clampSelection(h: *LocalHost) void {
-        if (h.grid.cols == 0 or h.grid.rows == 0) {
-            h.select = .{};
-            return;
-        }
-        for ([_]*[2]u16{ &h.select.anchor, &h.select.head }) |p| {
-            p[0] = @min(p[0], h.grid.cols - 1);
-            p[1] = @min(p[1], h.grid.rows - 1);
-        }
+        h.p.setTitle(t);
     }
 
     /// "14:32" (local time) for our pairing window's expiry.
@@ -470,12 +422,12 @@ pub const LocalHost = struct {
         switch (a) {
             .none => {},
             .paste => {
-                const raw = h.tv.window.clipboardText(h.gpa, 4096) orelse return;
+                const raw = h.p.window.clipboardText(h.gpa, 4096) orelse return;
                 defer h.gpa.free(raw);
                 h.ui.paste(raw);
             },
             .setup_submit => {
-                if (h.session == null) {
+                if (h.hub == null) {
                     h.setup_submitted = true; // runSetup takes it from here
                 } else h.saveSettings();
             },
@@ -658,7 +610,7 @@ pub const LocalHost = struct {
     fn openSettings(h: *LocalHost) void {
         const d = h.desk orelse return;
         const s = &d.saved;
-        h.ui.openSetup(false, s.listen.get() orelse h.opts.listen_host, s.program.get() orelse "", s.project.get() orelse (h.opts.project orelse ""), s.input orelse h.opts.policy);
+        h.ui.openSetup(false, s.listen.get() orelse h.opts.listen_host, s.program.get() orelse "", s.project.get() orelse "", s.input orelse h.opts.policy);
     }
 
     /// The Settings panel (during a session): checked, then saved for the
@@ -689,54 +641,56 @@ pub const LocalHost = struct {
 
     // ------------------------------------------------------------ input
 
-    fn sink(h: *LocalHost) input.InputSink {
-        return .{ .ctx = h, .vtable = &vtable };
+    /// The desk panels as the shell's modal layer: their actions are
+    /// performed here.
+    fn panelActive(ctx: *anyopaque) bool {
+        return self(ctx).ui.open();
+    }
+    fn panelKey(ctx: *anyopaque, key: input.Key, mods: input.Mods) void {
+        const h = self(ctx);
+        h.perform(h.ui.key(key, mods));
+    }
+    fn panelChar(ctx: *anyopaque, cp: u21, mods: input.Mods) void {
+        const h = self(ctx);
+        h.perform(h.ui.char(cp, mods));
+    }
+    fn panelButton(ctx: *anyopaque, b: u32) void {
+        const h = self(ctx);
+        h.perform(h.ui.button(b));
     }
 
-    const vtable: input.InputSink.VTable = .{
+    const host_vtable: shell_mod.Host.VTable = .{
         .key = onKey,
         .char = onChar,
         .answer = onAnswer,
-        .button = onButton,
-        .resized = onResized,
-        .mouse = onMouse,
+        .send = onSend,
+        .command = onCommand,
+        .shortcut = onShortcut,
     };
 
     fn self(ctx: *anyopaque) *LocalHost {
         return @ptrCast(@alignCast(ctx));
     }
 
-    /// Who gets the keyboard (and the mouse): decided here only. A modal
-    /// panel wins; then the input box while it has focus; else the
-    /// terminal.
-    pub const Focus = enum { terminal, panel, line };
-
-    fn focus(h: *const LocalHost) Focus {
-        if (h.ui.open()) return .panel;
-        return if (h.line_focus) .line else .terminal;
-    }
-
     /// The input box's frames ('k:' key names, 't:' text; see inputline)
     /// typed into the local session.
-    const LineSender = struct {
-        h: *LocalHost,
-        pub fn send(ls: LineSender, f: []const u8) bool {
-            const s = ls.h.session orelse return false;
-            if (f.len < 2) return false;
-            const body = f[2..];
-            switch (f[0]) {
-                'k' => s.writeInput(rules.keyBytes(.text, body) orelse return false),
-                't' => ls.h.typeText(body),
-                else => return false,
-            }
-            return true;
+    fn onSend(ctx: *anyopaque, f: []const u8) bool {
+        const h = self(ctx);
+        const s = h.session() orelse return false;
+        if (f.len < 2) return false;
+        const body = f[2..];
+        switch (f[0]) {
+            'k' => s.writeInput(rules.keyBytes(.text, body) orelse return false),
+            't' => h.typeText(body),
+            else => return false,
         }
-    };
+        return true;
+    }
 
     /// Types `text` into the session (as a paste when the program asked
     /// for bracketed paste, so it is taken literally).
     fn typeText(h: *LocalHost, text: []const u8) void {
-        const s = h.session orelse return;
+        const s = h.session() orelse return;
         s.mutex.lockUncancelable(s.io);
         const bracketed = s.term.bracketedPaste();
         s.mutex.unlock(s.io);
@@ -745,138 +699,137 @@ pub const LocalHost = struct {
         if (bracketed) s.writeInput(localinput.paste_end);
     }
 
+    /// A key for the shown tab's terminal: VT bytes.
     fn onKey(ctx: *anyopaque, key: input.Key, mods: input.Mods) void {
         const h = self(ctx);
-        if (h.focus() != .panel and key == .f2 and !mods.ctrl and !mods.alt and !mods.super) {
-            // F2: collapse / open the Data slice.
-            return h.data.toggle();
-        }
-        switch (h.focus()) {
-            .panel => return h.perform(h.ui.key(key, mods)),
-            .line => {
-                // Esc on an empty box: the keyboard goes back to the terminal.
-                if (key == .escape and h.line.text().len == 0) {
-                    h.line_focus = false;
-                    return;
-                }
-                _ = h.line.onKey(key, mods, LineSender{ .h = h });
-                return;
-            },
-            .terminal => {},
-        }
-        const s = h.session orelse return;
+        const s = h.session() orelse return;
         s.mutex.lockUncancelable(s.io);
         const app_cursor = s.term.appCursor();
         s.mutex.unlock(s.io);
         var buf: [localinput.max_seq]u8 = undefined;
-        h.select.active = false;
         s.writeInput(localinput.encodeKey(key, mods, app_cursor, &buf));
     }
 
     fn onChar(ctx: *anyopaque, cp: u21, mods: input.Mods) void {
         const h = self(ctx);
-        if (mods.ctrl and mods.shift and !mods.alt) {
-            // Desk shortcuts, also while a panel is open (they switch).
-            if (h.session != null and h.desk != null) switch (cp) {
-                'p', 'P' => return h.ui.openPair(),
-                'd', 'D' => return h.perform(h.ui.openDevices()),
-                'e', 'E' => return h.ui.openExport(h.desk.?.export_default),
-                's', 'S' => return h.openSettings(),
-                else => {},
-            };
-            if (h.focus() == .terminal) switch (cp) {
-                'c', 'C' => return h.copySelection(),
-                'v', 'V' => return h.paste(),
-                else => {},
-            };
-        }
-        switch (h.focus()) {
-            .panel => return h.perform(h.ui.char(cp, mods)),
-            .line => {
-                _ = h.line.onChar(cp, mods);
-                return;
-            },
-            .terminal => {},
-        }
-        const s = h.session orelse return;
+        const s = h.session() orelse return;
         var buf: [localinput.max_seq]u8 = undefined;
-        h.select.active = false;
         s.writeInput(localinput.encodeChar(cp, mods, &buf));
     }
 
     /// An answer button: its key, typed into the session.
     fn onAnswer(ctx: *anyopaque, key: []const u8) void {
         const h = self(ctx);
-        if (h.focus() == .panel) return;
-        const s = h.session orelse return;
-        h.select.active = false;
+        const s = h.session() orelse return;
         s.writeInput(rules.keyBytes(.text, key) orelse return);
     }
 
-    fn onButton(ctx: *anyopaque, b: u32) void {
+    fn onCommand(ctx: *anyopaque, c: shell_mod.Command) void {
         const h = self(ctx);
-        switch (b) {
-            deskui.id.tb_pair => if (h.desk != null) h.ui.openPair(),
-            deskui.id.tb_devices => if (h.desk != null) h.perform(h.ui.openDevices()),
-            deskui.id.tb_export => if (h.desk) |d| h.ui.openExport(d.export_default),
-            deskui.id.tb_settings => h.openSettings(),
-            else => if (h.focus() == .panel) {
-                h.perform(h.ui.button(b));
-            } else switch (b) {
-                ctl.line => h.line_focus = true,
-                ctl.send => {
-                    _ = h.line.onKey(.enter, .{}, LineSender{ .h = h });
-                },
-                ctl.data_toggle => h.data.toggle(),
-                ctl.data_clear => h.data.clear(h.gpa),
+        switch (c) {
+            .select_tab => |i| h.selectTab(i),
+            .close_tab => |i| h.closeTab(i),
+            .open_tab => h.openTab(),
+            .copy => |sel| h.copySelection(sel),
+            .paste => h.paste(),
+            .pair, .cancel_pair => {},
+            .button => |b| switch (b) {
+                deskui.id.tb_pair => if (h.desk != null) h.ui.openPair(),
+                deskui.id.tb_devices => if (h.desk != null) h.perform(h.ui.openDevices()),
+                deskui.id.tb_export => if (h.desk) |d| h.ui.openExport(d.export_default),
+                deskui.id.tb_settings => h.openSettings(),
                 else => {},
             },
+            // The window decides the PTY size (of every tab); web viewers adapt.
+            .resized => |size| if (h.hub) |hub| hub.setSize(.{ .cols = size[0], .rows = size[1] }),
         }
     }
 
-    /// The window decides the PTY size; web viewers adapt.
-    fn onResized(ctx: *anyopaque, _: u32, _: u32, cols: u16, rows: u16) void {
+    /// The desk's shortcuts (Ctrl+Shift), also while a panel is open
+    /// (they switch).
+    fn onShortcut(ctx: *anyopaque, cp: u21, _: input.Mods, f: shell_mod.Focus) bool {
         const h = self(ctx);
-        const s = h.session orelse return;
-        s.setSize(.{ .cols = cols, .rows = rows });
-    }
-
-    fn onMouse(ctx: *anyopaque, m: input.Mouse) void {
-        const h = self(ctx);
-        if (h.focus() == .panel) return; // modal: only its buttons react
-        // A click outside the controls gives the keyboard back to the terminal.
-        if (m.action == .down) h.line_focus = false;
-        switch (m.button) {
-            .left => switch (m.action) {
-                .down => {
-                    h.select = .{ .anchor = .{ m.col, m.row }, .head = .{ m.col, m.row }, .dragging = m.inside };
-                },
-                .move => if (h.select.dragging) {
-                    h.select.head = .{ m.col, m.row };
-                    if (h.select.head[0] != h.select.anchor[0] or h.select.head[1] != h.select.anchor[1]) h.select.active = true;
-                },
-                .up => h.select.dragging = false,
-            },
-            // Right-click: copy the selection if there is one, else paste
-            // (the Windows console convention).
-            .right => if (m.action == .down) {
-                if (h.select.active) h.copySelection() else h.paste();
-            },
-            .middle => {},
+        if (h.hub == null or h.desk == null) return false;
+        switch (cp) {
+            't', 'T' => h.openTab(),
+            'w', 'W' => if (f == .terminal) h.closeShown() else return false,
+            'p', 'P' => h.ui.openPair(),
+            'd', 'D' => h.perform(h.ui.openDevices()),
+            'e', 'E' => h.ui.openExport(h.desk.?.export_default),
+            's', 'S' => h.openSettings(),
+            else => return false,
         }
+        return true;
     }
 
-    fn copySelection(h: *LocalHost) void {
-        const sel = h.select.range() orelse return;
+    /// The shown tab's session.
+    fn session(h: *LocalHost) ?*@import("session.zig").Session {
+        const t = h.shown orelse return null;
+        return &t.session;
+    }
+
+    // ------------------------------------------------------------ tabs
+
+    /// Shows the tab at bar position `i`.
+    fn selectTab(h: *LocalHost, i: usize) void {
+        const hub = h.hub orelse return;
+        if (i >= h.list.len) return;
+        hub.mutex.lockUncancelable(h.io);
+        if (hub.acquireLocked(h.list.items[i].id)) |t| {
+            hub.desk_active = t;
+            t.release();
+        }
+        hub.mutex.unlock(h.io);
+        h.frame(true);
+    }
+
+    /// Closes the tab at bar position `i`: its program is asked to exit
+    /// (tabs.Tab.requestClose); the tab goes once it has.
+    fn closeTab(h: *LocalHost, i: usize) void {
+        const hub = h.hub orelse return;
+        if (i >= h.list.len) return;
+        hub.mutex.lockUncancelable(h.io);
+        const t = hub.acquireLocked(h.list.items[i].id);
+        hub.mutex.unlock(h.io);
+        const tab = t orelse return;
+        hub.log.print("desk closed tab '{s}'", .{tab.name()});
+        tab.requestClose();
+        tab.release();
+    }
+
+    fn closeShown(h: *LocalHost) void {
+        const id = (h.shown orelse return).id;
+        if (h.list.find(id)) |i| h.closeTab(i);
+    }
+
+    /// Ctrl+Shift+T / "+": the folder picker, then a new tab there.
+    fn openTab(h: *LocalHost) void {
+        const hub = h.hub orelse return;
+        const d = h.desk orelse return;
+        var buf: [32768]u16 = undefined;
+        const dir_w = win32.pickFolder(&buf, std.unicode.utf8ToUtf16LeStringLiteral("Open a project folder in a new Portal tab")) orelse return;
+        const dir = std.unicode.wtf16LeToWtf8Alloc(h.gpa, dir_w) catch return;
+        defer h.gpa.free(dir);
+        if (d.open_fn(d.open_ctx, h.gpa, hub, dir)) |why| {
+            var mb: [256]u8 = undefined;
+            const text = std.fmt.bufPrint(&mb, "Could not open the folder: {s}.", .{why}) catch "Could not open the folder.";
+            var wb: [257:0]u16 = undefined;
+            const n = std.unicode.utf8ToUtf16Le(wb[0..256], text) catch 0;
+            wb[n] = 0;
+            _ = win32.MessageBoxW(null, &wb, std.unicode.utf8ToUtf16LeStringLiteral("Portal"), 0x30);
+        }
+        h.frame(true);
+    }
+
+    fn copySelection(h: *LocalHost, sel: ui.frame.Selection) void {
         const text = localgrid.selectionText(h.gpa, &h.grid, sel) catch return;
         defer h.gpa.free(text);
-        if (text.len > 0) _ = h.tv.window.setClipboardText(text);
-        h.select = .{};
+        if (text.len > 0) _ = h.p.window.setClipboardText(text);
     }
 
     fn paste(h: *LocalHost) void {
-        const s = h.session orelse return;
-        const raw = h.tv.window.clipboardText(h.gpa, max_paste_units) orelse return;
+        const s = h.session() orelse return;
+        const raw = h.p.window.clipboardText(h.gpa, max_paste_units) orelse return;
         defer h.gpa.free(raw);
         s.mutex.lockUncancelable(s.io);
         const bracketed = s.term.bracketedPaste();
@@ -895,7 +848,7 @@ pub const LocalHost = struct {
             @memcpy(buf[n..][0..localinput.paste_end.len], localinput.paste_end);
             n += localinput.paste_end.len;
         }
-        h.select.active = false;
+        h.shell.select.active = false;
         s.writeInput(buf[0..n]);
     }
 };
@@ -923,25 +876,6 @@ fn localClock(t: i64, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ st.wHour, st.wMinute }) catch buf[0..0];
 }
 
-
-test "selection range normalises drag direction" {
-    var s: Select = .{ .anchor = .{ 5, 3 }, .head = .{ 2, 1 }, .active = true };
-    const r = s.range().?;
-    try std.testing.expectEqual(@as(u16, 2), r.start_col);
-    try std.testing.expectEqual(@as(u16, 1), r.start_row);
-    try std.testing.expectEqual(@as(u16, 5), r.end_col);
-    try std.testing.expectEqual(@as(u16, 3), r.end_row);
-    s.active = false;
-    try std.testing.expect(s.range() == null);
-}
-
-
-test "viewer text" {
-    var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("no remote viewers", LocalHost.viewerText(0, &buf));
-    try std.testing.expectEqualStrings("1 REMOTE VIEWER WATCHING", LocalHost.viewerText(1, &buf));
-    try std.testing.expectEqualStrings("3 REMOTE VIEWERS WATCHING", LocalHost.viewerText(3, &buf));
-}
 
 test "checkListen" {
     try std.testing.expect(checkListen("127.0.0.1:8420") == null);

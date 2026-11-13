@@ -1,6 +1,6 @@
-//! The one terminal session Portal exposes: PTY output fan-out to the local
-//! window (or console) and any number of web viewers, and serialised
-//! keystroke input.
+//! One terminal session (one project tab, tabs.zig): PTY output fan-out to
+//! the local window (or console) and any number of web viewers, and
+//! serialised keystroke input.
 
 const std = @import("std");
 const Io = std.Io;
@@ -10,6 +10,8 @@ const Size = @import("conpty.zig").Size;
 const Console = @import("console.zig").Console;
 const keymap = @import("keymap.zig");
 const Policy = keymap.Policy;
+const convo_model = @import("convo/model.zig");
+const Poke = @import("convo/follow.zig").Poke;
 
 pub const Session = struct {
     io: Io,
@@ -18,9 +20,6 @@ pub const Session = struct {
     /// Console in the GUI (web.zig sets its title on viewer changes).
     console: *Console,
     policy: Policy,
-    /// `--project NAME` (title.validProject), sent to viewers in hello and
-    /// shown in the window or console title.
-    project: ?[]const u8 = null,
     /// Writes the desktop's own input (window or console) into the PTY on
     /// its own thread, so the GUI thread never blocks on the pipe (a big
     /// paste, or a program not reading its input). Null in unit tests:
@@ -32,25 +31,32 @@ pub const Session = struct {
     notify_ctx: ?*anyopaque = null,
     notify_fn: ?*const fn (ctx: *anyopaque) void = null,
 
-    /// Guards everything below except `input_mutex`'s domain.
-    mutex: Io.Mutex = .init,
-    /// Broadcast on new output, resize, close, or a viewer disconnecting.
-    cond: Io.Condition = .init,
+    /// Guards everything below except `input_mutex`'s domain. Shared by
+    /// every tab (tabs.Hub.mutex), so a viewer can wait for its own
+    /// session and the tab list at once.
+    mutex: *Io.Mutex,
+    /// Broadcast on new output, resize, close, a tab list change, or a
+    /// viewer disconnecting (tabs.Hub.cond, shared like `mutex`).
+    cond: *Io.Condition,
     /// Display-only emulation of the session's screen. Web viewers receive
     /// rendered rows from it (docs/protocol.md); they never see raw output.
     term: vt.Terminal,
     size: Size,
     closed: bool = false,
     exit_code: u32 = 0,
-    viewers: u32 = 0,
-    /// Viewer sockets not yet closed: a viewer counts here from its
-    /// upgrade until its socket is closed (after the exit notice and the
-    /// closing handshake), which is later than it leaves `viewers`.
-    /// Shutdown waits for this to reach 0, so the process never exits
-    /// (which resets open sockets) while an exit notice is in flight.
-    viewer_sockets: u32 = 0,
-    /// Set on every viewer (or viewer socket) count change.
-    viewers_changed: Io.Event = .unset,
+    /// The program's OSC 7501 state as last seen (term.program_state),
+    /// and the tab list's generation, bumped when it changes (tabs.Hub.gen;
+    /// null outside a hub).
+    state: vt.ProgramState = .unknown,
+    list_gen: ?*u64 = null,
+    /// The tab's Conversation view (tabs.Tab.convo; null outside a hub):
+    /// told when the program starts or stops waiting for an answer.
+    convo: ?*convo_model.Convo = null,
+    wait: convo_model.Wait = .none,
+    /// Poked after every piece of output (OSC 7501 state changes are output
+    /// too): the transcript follower looks at what the program wrote. Cheap
+    /// and coalesced (follow.Poke). Null outside a hub.
+    convo_poke: ?*Poke = null,
     /// False once shutdown has begun closing the pseudo console. Distinct
     /// from `closed` (which tells viewers the session ended, and is only set
     /// after trailing output has drained): no ResizePseudoConsole may be
@@ -81,9 +87,19 @@ pub const Session = struct {
     pub fn appendOutput(s: *Session, data: []const u8) void {
         s.mutex.lockUncancelable(s.io);
         s.term.feed(data);
+        if (s.term.program_state != s.state) {
+            s.state = s.term.program_state;
+            if (s.list_gen) |g| g.* +%= 1;
+        }
+        const wait: convo_model.Wait = if (s.term.program_state != .waiting) .none else if (s.term.program_kind == .permission) .permission else .other;
+        if (wait != s.wait) {
+            s.wait = wait;
+            if (s.convo) |c| c.programState(wait);
+        }
         s.mutex.unlock(s.io);
         s.cond.broadcast(s.io);
         s.notify();
+        if (s.convo_poke) |p| p.poke();
     }
 
     fn notify(s: *Session) void {
@@ -234,41 +250,6 @@ pub const Session = struct {
         s.cond.broadcast(s.io);
         s.notify();
     }
-
-    pub fn viewerDelta(s: *Session, delta: i32) u32 {
-        s.mutex.lockUncancelable(s.io);
-        // Saturating both ways; @abs avoids overflow negating minInt(i32).
-        if (delta > 0) s.viewers +|= @abs(delta) else s.viewers -|= @abs(delta);
-        const n = s.viewers;
-        s.mutex.unlock(s.io);
-        s.viewers_changed.set(s.io);
-        s.notify();
-        return n;
-    }
-
-    /// A viewer socket opened (+1) or was closed (-1); see viewer_sockets.
-    pub fn viewerSocketDelta(s: *Session, delta: i32) void {
-        s.mutex.lockUncancelable(s.io);
-        if (delta > 0) s.viewer_sockets +|= @abs(delta) else s.viewer_sockets -|= @abs(delta);
-        s.mutex.unlock(s.io);
-        s.viewers_changed.set(s.io);
-    }
-
-    /// Waits until every viewer socket is closed or `deadline_ms` (awake
-    /// clock) passes. Woken by every viewer change; no polling.
-    pub fn waitViewersGone(s: *Session, deadline_ms: i64) void {
-        while (true) {
-            // Reset before checking, so a change right after is not lost.
-            s.viewers_changed.reset();
-            s.mutex.lockUncancelable(s.io);
-            const n = s.viewer_sockets;
-            s.mutex.unlock(s.io);
-            if (n == 0) return;
-            const left = deadline_ms - Io.Clock.awake.now(s.io).toMilliseconds();
-            if (left <= 0) return;
-            s.viewers_changed.waitTimeout(s.io, .{ .duration = .{ .raw = .fromMilliseconds(left), .clock = .awake } }) catch {};
-        }
-    }
 };
 
 /// The queue between the desktop's input (GUI thread, console input
@@ -380,24 +361,6 @@ test "escGapDelay" {
     try std.testing.expectEqual(@as(i64, 0), escGapDelay(900, 1000, 50)); // clock went back
 }
 
-test "viewerDelta saturates" {
-    var s: Session = .{
-        .io = std.testing.io,
-        .pty = undefined,
-        .console = undefined,
-        .policy = .keys,
-        .term = try vt.Terminal.init(std.testing.allocator, 80, 24),
-        .size = .{ .cols = 80, .rows = 24 },
-    };
-    defer s.term.deinit();
-    try std.testing.expectEqual(@as(u32, 1), s.viewerDelta(1));
-    try std.testing.expectEqual(@as(u32, 0), s.viewerDelta(-1));
-    try std.testing.expectEqual(@as(u32, 0), s.viewerDelta(-1));
-    try std.testing.expectEqual(@as(u32, 0), s.viewerDelta(std.math.minInt(i32)));
-    s.viewers = std.math.maxInt(u32);
-    try std.testing.expectEqual(std.math.maxInt(u32), s.viewerDelta(std.math.maxInt(i32)));
-}
-
 test "LocalInput writes queued items whole and in order, on its own thread" {
     const w = @import("win32.zig");
     const gpa = std.testing.allocator;
@@ -407,8 +370,12 @@ test "LocalInput writes queued items whole and in order, on its own thread" {
     defer _ = w.CloseHandle(rd);
     defer _ = w.CloseHandle(wr);
     var pty: Pty = .{ .hpc = undefined, .in_write = wr, .out_read = undefined, .process = undefined, .job = undefined };
+    var mu: Io.Mutex = .init;
+    var cv: Io.Condition = .init;
     var s: Session = .{
         .io = std.testing.io,
+        .mutex = &mu,
+        .cond = &cv,
         .pty = &pty,
         .console = undefined,
         .policy = .keys,
@@ -451,8 +418,12 @@ test "writeLocal stops at the next chunk once shutdown begins" {
     defer _ = w.CloseHandle(rd);
     defer _ = w.CloseHandle(wr);
     var pty: Pty = .{ .hpc = undefined, .in_write = wr, .out_read = undefined, .process = undefined, .job = undefined };
+    var mu: Io.Mutex = .init;
+    var cv: Io.Condition = .init;
     var s: Session = .{
         .io = std.testing.io,
+        .mutex = &mu,
+        .cond = &cv,
         .pty = &pty,
         .console = undefined,
         .policy = .keys,

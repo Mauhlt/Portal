@@ -1,15 +1,14 @@
-//! The remote viewer's first-run screen, inside its window: the server
-//! address and the Portal CA to trust (a .pem/.cer file exported at the
-//! desk, or the SHA-256 fingerprint the desk shows, to download the CA
-//! while a pairing window is open). A state machine with no I/O; connect.zig
-//! checks what was entered and shows any problem in `note`.
+//! A device's first-run panel (`portal connect`, the iPhone app): the
+//! desktop's address and the Portal CA to trust (a .pem/.cer file exported
+//! at the desk, or the SHA-256 fingerprint the desk shows, to download the
+//! CA while a pairing window is open). A state machine with no I/O; the
+//! client (client/src/connect.zig) checks what was entered and shows any
+//! problem in `note`.
 
 const std = @import("std");
-const view = @import("view");
-const TermView = view.TermView;
-const form = view.form;
-const input = view.input;
-const x509check = @import("net/x509check.zig");
+const frame = @import("../frame.zig");
+const form = @import("../form.zig");
+const input = @import("../input.zig");
 const pairqr = @import("shared").pairqr;
 
 pub const id_server: u32 = 100;
@@ -20,23 +19,6 @@ pub const id_scan: u32 = 2;
 /// `scan`: the user asked to scan the desk's pairing QR code (only offered
 /// where the platform has a camera scanner, `Setup.scan_offered`).
 pub const Event = enum { none, submit, paste, scan };
-
-/// How the certificate field reads.
-pub const Cert = union(enum) {
-    /// Nothing entered: use the CA pinned earlier for this server.
-    pinned,
-    /// A fingerprint: download the CA and check it against this.
-    sha256: []const u8,
-    /// A file path (.pem or .cer).
-    file: []const u8,
-};
-
-pub fn classify(text: []const u8) Cert {
-    const t = std.mem.trim(u8, text, " \"");
-    if (t.len == 0) return .pinned;
-    if (x509check.parseFingerprint(t)) |_| return .{ .sha256 = t } else |_| {}
-    return .{ .file = t };
-}
 
 pub const Setup = struct {
     server: form.TextField(64) = .{},
@@ -144,11 +126,11 @@ pub const Setup = struct {
     }
 
     pub const Bufs = struct {
-        fields: [2]TermView.PanelField = undefined,
-        buttons: [2]TermView.PanelButton = undefined,
+        fields: [2]frame.PanelField = undefined,
+        buttons: [2]frame.PanelButton = undefined,
     };
 
-    pub fn panel(s: *const Setup, b: *Bufs) TermView.Panel {
+    pub fn panel(s: *const Setup, b: *Bufs) frame.Panel {
         b.fields[0] = .{ .label = "Desktop address (IP:PORT inside the tunnel)", .value = s.server.text(), .hint = "e.g. 10.8.0.1:8420", .id = id_server, .focused = s.focus.index == 0 };
         b.fields[1] = .{ .label = "Portal certificate: a portal-ca.pem / .cer file, or its SHA-256", .value = s.cert.text(), .hint = "path to portal-ca.pem, or AB:CD:... as the desk shows it (empty: the one trusted before)", .id = id_cert, .focused = s.focus.index == 1 };
         var nb: usize = 0;
@@ -167,20 +149,13 @@ pub const Setup = struct {
         };
     }
 
-    const lines = [_]TermView.PanelText{
+    const lines = [_]frame.PanelText{
         .{ .text = "This window shows a Portal session running on your desktop. Nothing is trusted on first use: give it the certificate exported there (Export certificate in the Portal window), or the SHA-256 the desk shows while pairing to download it then." },
         .{ .text = "Then open Pair a device in the Portal window on the desktop and click Pair here. The desk approves this device; nothing secret is typed here." },
     };
 };
 
 const testing = std.testing;
-
-test "classify the certificate field" {
-    try testing.expect(classify("  ") == .pinned);
-    const fp = "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89";
-    try testing.expect(classify(fp) == .sha256);
-    try testing.expectEqualStrings("C:\\Users\\me\\portal-ca.pem", classify("\"C:\\Users\\me\\portal-ca.pem\"").file);
-}
 
 test "setup form" {
     var s = Setup.init("", "");
@@ -214,6 +189,6 @@ test "setup from a scanned pairing QR code" {
     const fp = "00070E151C232A31383F464D545B626970777E858C939AA1A8AFB6BDC4CBD2D9";
     try testing.expect(s.fromQr("portal-pair 1 10.8.0.1:8420 " ++ fp));
     try testing.expectEqualStrings("10.8.0.1:8420", s.server.text());
-    try testing.expect(classify(s.cert.text()) == .sha256);
+    try testing.expectEqualStrings(fp, s.cert.text());
     try testing.expectEqual(@as(usize, 0), s.note_len);
 }

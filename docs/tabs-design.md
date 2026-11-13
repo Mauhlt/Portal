@@ -1,4 +1,32 @@
-# Project tabs: design notes (next step after the GUI terminal lands)
+# Project tabs: design notes
+
+**Status (2026-11-12): implemented**, except the per-device recent list
+and the hooks / terminal-bell fallbacks for "waiting". What exists:
+
+* `src/tabs.zig`: the tab hub (one program, pseudo console and screen per
+  tab, reference counted, random 128-bit ids, display names from the
+  folder's basename, "Home" for the profile folder). Colours from the name
+  (`shared/tabs.zig`, `colorFromName`) or `color = NAME #rrggbb` in
+  settings.txt.
+* Desk: Ctrl+Shift+T / "+" (folder picker), Ctrl+Shift+W / "×",
+  Ctrl+Tab; `portal open <dir>` and `portalctl open <dir>`
+  (`src/openreq.zig`: a request file in the data folder, answered by the
+  running Portal).
+* Protocol v2 (docs/protocol.md): `hello` lists the sessions, `tabs`,
+  `session`, `nosession`, `ended`; `s:<id>` from viewers. Both clients
+  (`portal connect`, the browser) draw the same top bar and switch tabs;
+  neither can open or close one.
+* OSC 7501 is parsed per session (`src/vt.zig`, `parseProgramState`) and
+  only highlights a tab (`waiting` = `state=blocked`). **Not confirmed**
+  that the agent emits it inside Portal's ConPTY without a capability
+  probe; if it doesn't, nothing is highlighted and the hook below is where
+  a fallback would plug in (Session.state / Hub.gen). No agent settings
+  were changed.
+* Privacy rules 1, 2, 3, 5, 6 and 7 are covered by `tests/e2e/privacy.zig`
+  and `tests/e2e/tabs_tests.zig` (no paths in hello/tabs/session/ended,
+  unknown, malformed and closed ids all get the same `nosession`, rejected
+  ids logged locally, no message opens or closes a tab). Rule 4 has
+  nothing to test until the recent list exists.
 
 ## Goal
 
@@ -80,6 +108,12 @@ These are hard requirements for the tabs and recent-projects work, enforced by
 4. **Per-device history.** A device sees only its own recent list. Closed
    entries carry name + colour + last-used time only (no id, no path), and
    can't be subscribed to. Closed sessions keep no screen buffer to replay.
+   The Conversation view (protocol section 3b) is the one place program
+   text leaves the grid as text, by the owner's decision (2026-11-12): it
+   is scrubbed on the desktop first (src/convo/scrub.zig: the tab's
+   folder becomes its name, other absolute paths `[path]`, the user's
+   name `[user]`), and tool arguments, results and thinking are never
+   sent. Covered by tests/e2e/convo_tests.zig and privacy.zig.
 5. **Program-controlled strings stay in the grid.** Window titles set by
    programs (OSC 0/2, which the agent uses and which can contain paths) are
    not sent as metadata. Tab names are desk-assigned. Inline images are
@@ -94,10 +128,12 @@ These are hard requirements for the tabs and recent-projects work, enforced by
 7. **Logs stay local.** Rejected probes are logged on the desktop (rate
    limited) and never echoed back to the client.
 
-## Protocol changes (v2)
+## Protocol changes (v2) — implemented
 
 * `hello` lists sessions: `{id, name, color, state}`. A new `tabs` message
   announces any change: open/close, rename, state.
-* Grid frames carry a session id. A viewer subscribes to one session at a
-  time (`s:<id>`), and input goes to the selected session. There is no
-  message that opens or closes a session.
+* Grid and image frames are scoped to the session the viewer watches: the
+  server announces a switch with `session` and sends a full snapshot right
+  after it. A viewer subscribes to one session at a time (`s:<id>`), and
+  input goes to the selected session. There is no message that opens or
+  closes a session.

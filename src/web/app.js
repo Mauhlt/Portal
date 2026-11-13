@@ -12,6 +12,7 @@
   const $ = (id) => document.getElementById(id);
   const cvs = [$('screen'), $('data')], ctxs = cvs.map((c) => c.getContext('2d')); // Canvas order in main.zig
   const box = $('box'), safe = $('safe');
+  const ptabs = document.querySelectorAll('[data-ptab]'); // project tabs, in order
   const enc = new TextEncoder(), dec = new TextDecoder();
   let X = null, ws = null; // wasm exports; the one WebSocket
   const mem = () => new Uint8Array(X.memory.buffer); // re-made: memory can grow
@@ -46,6 +47,9 @@
       el.textContent = str(p, n);
       el.className = el.id + ['', ' ok', ' bad'][cls];
     },
+    set_tab: (i, p, n, c, cn, s, sn) => { // project tab button i: text, classes, colour
+      const b = ptabs[i]; b.textContent = str(p, n); b.className = str(c, cn); b.style.cssText = str(s, sn);
+    },
     set_layout: (p, n) => { document.body.style.cssText = str(p, n); },
     set_class: (p, n) => { document.body.className = str(p, n); },
     box_read: (p, cap) => enc.encodeInto(box.value, mem().subarray(p, p + cap)).written,
@@ -73,8 +77,10 @@
   const dpr = () => matchMedia('(resolution: ' + devicePixelRatio + 'dppx)').addEventListener('change', () => { size(); dpr(); }, { once: true });
   dpr();
   // Buttons carry a number for wasm: data-cmd (Fit / A− / A+, the Data
-  // slice's Hide·Show / Clear), data-btn (inputbox.Button).
+  // slice's Hide·Show / Clear), data-ptab (project tab position), data-btn
+  // (inputbox.Button).
   for (const b of document.querySelectorAll('[data-cmd]')) b.onclick = () => X.on_cmd(+b.dataset.cmd);
+  for (const b of ptabs) b.onclick = () => X.on_ptab(+b.dataset.ptab);
   for (const b of document.querySelectorAll('[data-btn]')) {
     b.onclick = () => X.on_button(+b.dataset.btn);
     b.onpointerdown = (e) => e.preventDefault(); // keeps focus (and the keyboard) in the box

@@ -37,6 +37,11 @@ pub const Harness = struct {
         io.random(&rnd);
         const root = try std.fmt.allocPrint(gpa, "{s}\\portal-e2e-{x}", .{ temp, &rnd });
         try Io.Dir.cwd().createDirPath(io, root);
+        // Transcripts (the Conversation view) are read from here, never
+        // from the user's own agent folder.
+        const projects = try std.fmt.allocPrint(gpa, "{s}\\agent-projects", .{root});
+        defer gpa.free(projects);
+        try Io.Dir.cwd().createDirPath(io, projects);
 
         // Kill everything we start when this process ends, however it ends.
         const job = w.CreateJobObjectW(null, null);
@@ -72,8 +77,15 @@ pub const Harness = struct {
         return d;
     }
 
+    /// Where every instance reads session transcripts
+    /// (PORTAL_AGENT_PROJECTS); the fake session program writes there.
+    pub fn transcriptRoot(h: *const Harness, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{s}\\agent-projects", .{h.root}) catch unreachable;
+    }
+
     /// Environment block: the harness's environment with LOCALAPPDATA
-    /// pointing at `local_app_data`, a short cmd.exe prompt, and no
+    /// pointing at `local_app_data`, transcripts read from the scratch
+    /// tree (PORTAL_AGENT_PROJECTS), a short cmd.exe prompt, and no
     /// ZIG_PROGRESS.
     fn envBlock(h: *Harness, local_app_data: []const u8) ![:0]const u16 {
         var m = try h.env.clone(h.gpa);
@@ -85,6 +97,9 @@ pub const Harness = struct {
         const roaming = try std.fmt.allocPrint(h.gpa, "{s}\\Roaming", .{local_app_data});
         try m.put("APPDATA", roaming);
         try m.put("PROMPT", "E2E$G");
+        var tb: [1024]u8 = undefined;
+        try m.put("PORTAL_AGENT_PROJECTS", h.transcriptRoot(&tb));
+        _ = m.swapRemove("CLAUDE_CONFIG_DIR");
         const block = try m.createWindowsBlock(h.gpa, .{});
         return block.slice;
     }

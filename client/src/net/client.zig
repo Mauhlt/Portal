@@ -45,10 +45,13 @@ const Io = std.Io;
 const net = Io.net;
 const http = @import("http.zig");
 const ws = @import("shared").ws;
+const tabs_wire = @import("shared").tabs;
+const convo_wire = @import("shared").convo;
 const tlsconn = @import("tlsconn.zig");
 const x509check = @import("x509check.zig");
 const watchdog = @import("watchdog.zig");
-const Grid = @import("view").grid.Grid;
+const ui = @import("portal_ui");
+const Grid = ui.grid.Grid;
 const gframe = @import("../gframe.zig");
 const keys = @import("../keys.zig");
 const credstore = @import("../credstore.zig");
@@ -58,6 +61,7 @@ const sync_manifest = @import("../sync/manifest.zig");
 
 pub const max_frame_payload = 8 << 20;
 pub const http_Cookie = http.Cookie;
+pub const TabList = tabs_wire.List;
 
 pub const connect_timeout_ms = 15_000;
 pub const request_timeout_ms = 15_000;
@@ -110,17 +114,45 @@ pub fn classify(err: anyerror) Reach {
     };
 }
 
-/// The user-facing sentences for the session-ended and offline states.
-pub fn endedText(code: i64, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Session ended on the desktop (exit code {d})", .{code}) catch "Session ended on the desktop";
+/// The user-facing sentences for the session-ended and offline states
+/// (the shared UI's, which shows them too).
+pub const endedText = ui.shell.endedText;
+pub const offline_text = ui.shell.offline_text;
+
+/// Errors that mean "this is not the Portal we trust" (or not Portal's
+/// TLS at all), as opposed to the network being down.
+pub fn isTrustError(err: anyerror) bool {
+    const list = [_]anyerror{
+        error.NotIssuedByPinnedCa,    error.HostMismatch,          error.CertificateExpired,
+        error.CertificateNotYetValid, error.CaExpired,             error.BadCertificate,
+        error.UnsupportedCertificate, error.NotTls13,              error.UnsupportedCipherSuite,
+        error.HelloRetryRequest,      error.TlsHandshakeMalformed, error.TlsUnexpectedMessage,
+        error.TlsDecodeError,         error.TlsAlert,              error.TlsConnectionTruncated,
+        error.NoServerCertificate,
+    };
+    for (list) |e| if (e == err) return true;
+    return false;
 }
-pub const offline_text = "Desktop offline \u{2014} reconnects automatically";
+
+test "trust errors" {
+    try std.testing.expect(isTrustError(error.HostMismatch));
+    try std.testing.expect(!isTrustError(error.TimedOut));
+}
 
 pub const Shared = struct {
     mutex: Io.Mutex = .init,
     grid: Grid = .{},
+    /// The conversation of the tab shown (convo / convo+ messages).
+    convo: ui.convo.Conversation = .{},
     /// hello's `input` (null before hello and while disconnected).
     mode: ?keys.Policy = null,
+    /// The desktop's open project tabs (hello, then `tabs`), the one shown
+    /// (the server's `session`), and the one this device chose (kept
+    /// across reconnects: the first hello after one switches back to it).
+    /// Devices can only switch between open tabs (docs/protocol.md).
+    tabs: tabs_wire.List = .{},
+    current: ?tabs_wire.Id = null,
+    chosen: ?tabs_wire.Id = null,
     /// The last {"t":"rejected"} reason (a LineError name) and a counter
     /// bumped with each one, for the UI thread's instruction field.
     rejected_buf: [32]u8 = undefined,
@@ -169,6 +201,13 @@ pub const Shared = struct {
 
     pub fn detail(s: *const Shared) []const u8 {
         return s.detail_buf[0..s.detail_len];
+    }
+
+    /// Caller holds `mutex`. The name of the tab shown, if known.
+    pub fn project(s: *const Shared) ?[]const u8 {
+        const id = s.current orelse return null;
+        const i = s.tabs.find(id) orelse return null;
+        return s.tabs.items[i].name();
     }
 };
 
@@ -300,6 +339,21 @@ pub const Client = struct {
         if (status == .connected) s.last_error = null;
         if (status != .connected) s.mode = if (status == .session_ended) s.mode else null;
         s.mutex.unlock(c.io);
+        c.notify();
+    }
+
+    /// A `convo` / `convo+` message: parsed strictly (malformed: ignored)
+    /// and kept in Shared.convo for the Conversation view.
+    fn applyConvo(c: *Client, payload: []const u8) void {
+        if (payload.len > convo_wire.max_message) return;
+        const scratch = c.gpa.create(convo_wire.Scratch) catch return;
+        defer c.gpa.destroy(scratch);
+        scratch.text = c.gpa.alloc(u8, payload.len) catch return;
+        defer c.gpa.free(scratch.text);
+        const m = convo_wire.parse(payload, scratch) orelse return;
+        c.shared.mutex.lockUncancelable(c.io);
+        c.shared.convo.apply(c.gpa, m) catch {};
+        c.shared.mutex.unlock(c.io);
         c.notify();
     }
 
@@ -972,17 +1026,61 @@ pub const Client = struct {
                 c.notify();
             },
             .text => {
-                if (frame.payload.len > 4096) return null;
+                // The conversation of the tab shown (larger than the
+                // other messages; its own strict parser).
+                if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"convo")) {
+                    c.applyConvo(frame.payload);
+                    return null;
+                }
+                if (frame.payload.len > 8192) return null;
                 const parsed = std.json.parseFromSlice(Msg, c.gpa, frame.payload, .{ .ignore_unknown_fields = true }) catch return null;
                 defer parsed.deinit();
                 const m = parsed.value;
                 if (std.mem.eql(u8, m.t, "hello")) {
                     c.shared.mutex.lockUncancelable(c.io);
                     c.shared.mode = keys.parsePolicy(m.input orelse "none");
+                    c.shared.tabs = tabs_wire.parseList(frame.payload) orelse .{};
+                    c.shared.current = tabs_wire.idField(frame.payload, "session");
+                    // Reconnected: back to the tab this device was on, if
+                    // it is still open.
+                    const back = c.shared.chosen;
                     c.shared.mutex.unlock(c.io);
+                    if (back) |id| if (!sameId(c.shared.current, id)) c.sendTabIfOpen(id);
                     backoff.* = 1000;
                     c.notify();
                     c.signalSync(); // look for updates on every (re)connect
+                } else if (std.mem.eql(u8, m.t, "tabs")) {
+                    c.shared.mutex.lockUncancelable(c.io);
+                    if (tabs_wire.parseList(frame.payload)) |l| c.shared.tabs = l;
+                    c.shared.mutex.unlock(c.io);
+                    c.notify();
+                } else if (std.mem.eql(u8, m.t, "session")) {
+                    // The server now shows this tab; its full screen
+                    // follows. Images belong to the old tab: drop them.
+                    c.shared.mutex.lockUncancelable(c.io);
+                    c.shared.current = tabs_wire.idField(frame.payload, "id");
+                    c.shared.grid.images.deinit(c.gpa);
+                    c.shared.grid.images = .{};
+                    c.shared.mutex.unlock(c.io);
+                    c.notify();
+                } else if (std.mem.eql(u8, m.t, "nosession") or std.mem.eql(u8, m.t, "ended")) {
+                    // The tab asked for (or shown) is gone: input goes
+                    // nowhere until another one is chosen. Choose the one
+                    // shown if it is still open, else the first.
+                    const gone = tabs_wire.idField(frame.payload, "id");
+                    c.shared.mutex.lockUncancelable(c.io);
+                    var pick: ?tabs_wire.Id = null;
+                    if (c.shared.current) |cur| if (!sameId(gone, cur) and c.shared.tabs.find(cur) != null) {
+                        pick = cur;
+                    };
+                    if (pick == null) for (c.shared.tabs.slice()) |e| if (!sameId(gone, e.id)) {
+                        pick = e.id;
+                        break;
+                    };
+                    const was_current = gone != null and sameId(c.shared.current, gone.?);
+                    c.shared.mutex.unlock(c.io);
+                    if (pick) |p| if (m.t[0] == 'n' or was_current) c.selectTab(p);
+                    c.notify();
                 } else if (std.mem.eql(u8, m.t, "rejected")) {
                     // An instruction line was refused (docs/protocol.md §4).
                     const why = m.reason orelse "";
@@ -1016,6 +1114,23 @@ pub const Client = struct {
         return null;
     }
 
+    /// Shows tab `id` (one of Shared.tabs): "s:<id>". Remembered as this
+    /// device's choice. Callable from any thread.
+    pub fn selectTab(c: *Client, id: tabs_wire.Id) void {
+        c.shared.mutex.lockUncancelable(c.io);
+        c.shared.chosen = id;
+        c.shared.mutex.unlock(c.io);
+        const f = tabs_wire.subscribeFrame(id);
+        _ = c.sendInput(&f);
+    }
+
+    fn sendTabIfOpen(c: *Client, id: tabs_wire.Id) void {
+        c.shared.mutex.lockUncancelable(c.io);
+        const open = c.shared.tabs.find(id) != null;
+        c.shared.mutex.unlock(c.io);
+        if (open) c.selectTab(id);
+    }
+
     /// Queues an input frame ("k:...", "t:..." or "l:...") for the stream's writer;
     /// callable from the UI thread and never blocks on the socket. False
     /// when not connected, too long, or the queue is full (a server that
@@ -1039,6 +1154,11 @@ pub const Client = struct {
         c.wd.poke(); // ends a held /pair/wait (the watchdog's abort flag)
     }
 };
+
+fn sameId(a: ?tabs_wire.Id, b: tabs_wire.Id) bool {
+    const x = a orelse return false;
+    return std.mem.eql(u8, &x, &b);
+}
 
 /// Frames waiting for the stream's writer task. Bounded: when the socket
 /// is stuck, input is refused rather than piling up or blocking.

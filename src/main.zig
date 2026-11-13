@@ -41,7 +41,9 @@ const conpty = @import("conpty.zig");
 const console_mod = @import("console.zig");
 const Console = console_mod.Console;
 const Session = @import("session.zig").Session;
-const LocalInput = @import("session.zig").LocalInput;
+const tabs = @import("tabs.zig");
+const tabs_wire = @import("shared").tabs;
+const openreq = @import("openreq.zig");
 const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
 const fsutil = @import("fsutil.zig");
@@ -147,6 +149,13 @@ const usage =
     \\                         debugging only; WireGuard is then the only
     \\                         protection for cookies and keystrokes).
     \\
+    \\  portalctl open <folder> [--name NAME]
+    \\      Open <folder> as a new project tab in the running Portal (the
+    \\      same program, started in that folder). The tab is named after
+    \\      the folder (or NAME); remote devices see the name and colour,
+    \\      never the path. In the window: Ctrl+Shift+T. Devices can switch
+    \\      between open tabs but can never open or close one.
+    \\
     \\  portalctl ca [show]
     \\      Show the private CA that signs Portal's HTTPS certificate.
     \\  portalctl ca init [--permit CIDR]... [--permit-dns NAME]... [--force]
@@ -200,6 +209,8 @@ const gui_usage =
     \\                           the window, with options overriding the saved settings
     \\                           (--listen, --input, --project, --cwd, --no-tls,
     \\                            --allow-remote-shell, --allow-elevated)
+    \\portal open <folder> [--name NAME]
+    \\                           open a folder as a new tab in the running Portal
     \\portal connect [--server IP:PORT]
     \\                           watch a Portal on another machine
     \\
@@ -233,6 +244,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "unpair")) return cmdUnpair(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "token")) fatal("access tokens were replaced by device pairing: run `portalctl pair <name>` (see `portalctl`)", .{});
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(gpa, io, init.environ_map, args[1..]);
+    if (std.mem.eql(u8, cmd, "open")) return cmdOpen(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "connect")) fatal("the remote viewer is a window: run `portal connect` (portal.exe)", .{});
     if (std.mem.eql(u8, cmd, "ca")) return cmdCa(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "show")) std.process.exit(@import("show.zig").main(gpa, io, args[1..]));
@@ -257,6 +269,7 @@ fn guiMain(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     if (args.len == 0) return cmdRun(gpa, io, env, args);
     const cmd = args[0];
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(gpa, io, env, args[1..]);
+    if (std.mem.eql(u8, cmd, "open")) return cmdOpen(gpa, io, env, args[1..]);
     if (std.mem.startsWith(u8, cmd, "--")) return cmdRun(gpa, io, env, args); // `portal --listen ...`
     if (std.mem.eql(u8, cmd, "connect")) {
         const client = @import("client");
@@ -1474,113 +1487,96 @@ const text_warning =
     \\
 ;
 
-/// Consecutive non-EOF read failures after which the drain thread gives up
-/// (about 10 s at 10 ms apart). Without a limit a permanently failing handle
-/// would spin forever; without retries one transient failure would stop
-/// draining and could leave ClosePseudoConsole waiting on conhost.
-const max_read_failures = 1000;
-
-/// How long shutdown waits for ClosePseudoConsole plus the output drain
-/// before exiting anyway (process exit closes the job, which kills the child).
-/// Also how long a program gets to exit after the window was closed.
-const shutdown_timeout_ms = 10_000;
-/// After ending a program that did not exit in time (the job), how long
-/// to wait for it to be gone.
-const terminate_timeout_ms = 5_000;
 /// How long viewers get to receive the exit notice and close their end
 /// (web.goodbye_ms each, concurrently), plus the TLS close and socket
 /// close after it. Shutdown returns as soon as the last viewer socket is
 /// closed; this only bounds a viewer that never answers.
 const viewer_goodbye_ms = web.goodbye_ms + 1_500;
 
-/// Set by each shutdown step as it finishes (output drained, pseudo console
-/// closed, child exited), so the main thread sleeps until one finishes or
-/// the shutdown deadline passes instead of polling.
-var shutdown_wake: Io.Event = .unset;
-
-fn shutdownStepDone(io: Io, flag: *std.atomic.Value(bool)) void {
-    flag.store(true, .release);
-    shutdown_wake.set(io);
-}
-
-/// Waits until every flag is set or `deadline_ms` (awake clock) passes.
-/// Returns true if all were set.
-fn waitShutdown(io: Io, flags: []const *std.atomic.Value(bool), deadline_ms: i64) bool {
-    while (true) {
-        // Reset before checking: a step finishing after the check sets the
-        // event again, so no wake-up is lost.
-        shutdown_wake.reset();
-        var all = true;
-        for (flags) |f| all = all and f.load(.acquire);
-        if (all) return true;
-        const left = deadline_ms - Io.Clock.awake.now(io).toMilliseconds();
-        if (left <= 0) return false;
-        shutdown_wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(left), .clock = .awake } }) catch {};
-    }
-}
-
-
 const Threads = struct {
-    fn ptyOutput(session: *Session, console: *Console, pty: *conpty.Pty, io: Io, done: *std.atomic.Value(bool)) void {
-        defer shutdownStepDone(io, done);
-        var buf: [32 * 1024]u8 = undefined;
-        var failures: u32 = 0;
-        while (true) {
-            const n = pty.read(&buf) catch {
-                // Keep draining until EOF: see max_read_failures.
-                failures +|= 1;
-                if (failures >= max_read_failures) return;
-                io.sleep(.fromMilliseconds(10), .awake) catch {};
-                continue;
-            };
-            failures = 0;
-            if (n == 0) return;
-            console.mirror(buf[0..n]);
-            session.appendOutput(buf[0..n]);
-        }
-    }
-
     /// Console mode: one thread blocks on the console input handle and wakes
     /// only for keystrokes or window size/focus changes (no resize polling).
     /// After a resize event it re-reads the size once more when a single
     /// 150 ms deadline passes: the classic console host can report a buffer
     /// change before the window has finished growing, and growing the
     /// window alone sends no event. With nothing happening it waits forever.
-    fn consoleInput(session: *Session, console: *Console) void {
+    /// Keystrokes go to the first tab (the one the console shows); every
+    /// tab gets the console's size.
+    fn consoleInput(hub: *tabs.Hub, session: *Session, console: *Console) void {
         var buf: [Console.events_buf_len]u8 = undefined;
-        session.setSize(console.size());
+        hub.setSize(console.size());
         var settle_pending = false;
         while (true) {
             const timeout: u32 = if (settle_pending) 150 else std.math.maxInt(u32);
             if (!console.waitInput(timeout)) {
                 // Deadline passed with no input: the one follow-up check.
                 settle_pending = false;
-                session.setSize(console.size());
+                hub.setSize(console.size());
                 continue;
             }
             const e = console.readEvents(&buf) catch return;
             if (e.n > 0) session.writeInput(buf[0..e.n]);
             if (e.resized) {
-                session.setSize(console.size());
+                hub.setSize(console.size());
                 settle_pending = true;
             }
         }
     }
+};
 
-    fn closePty(session: *Session, done: *std.atomic.Value(bool)) void {
-        session.shutdownPty();
-        shutdownStepDone(session.io, done);
+/// `portal open` / `portalctl open` requests (openreq.zig) for the running
+/// Portal: each opens a tab.
+const OpenWatch = struct {
+    hub: *tabs.Hub,
+    log: *Log,
+    env: *const std.process.Environ.Map,
+    gpa: Allocator,
+
+    fn open(ctx: *anyopaque, req: openreq.Request) ?[]const u8 {
+        const ow: *OpenWatch = @ptrCast(@alignCast(ctx));
+        return openFolder(ow.gpa, ow.hub, ow.env, req.dir, req.name);
     }
 
-    /// GUI mode: the main thread runs the window, so the child is waited
-    /// for here. This thread owns the process handle (Pty.waitExit closes
-    /// it); shutdown only ever touches the job.
-    fn waitChild(io: Io, pty: *conpty.Pty, code: *std.atomic.Value(u32), done: *std.atomic.Value(bool), host: *gui.LocalHost) void {
-        code.store(pty.waitExit(), .release);
-        shutdownStepDone(io, done);
-        host.wakeChildExited(); // the GUI loop sleeps until woken
+    fn lost(ctx: *anyopaque, err: anyerror) void {
+        const ow: *OpenWatch = @ptrCast(@alignCast(ctx));
+        ow.log.print("ERROR: cannot watch for `portal open` requests ({t}); open folders with Ctrl+Shift+T in the window", .{err});
     }
 };
+
+/// The agent's transcript folder, read (never written) for each tab's
+/// Conversation view (src/convo/follow.zig): %PORTAL_AGENT_PROJECTS%
+/// (tests point it at a scratch folder), else %CLAUDE_CONFIG_DIR%\projects,
+/// else %USERPROFILE%\.claude\projects. Lives as long as the process.
+fn convoProjects(gpa: Allocator, env: *const std.process.Environ.Map) ?[]const u8 {
+    if (env.get("PORTAL_AGENT_PROJECTS")) |p| if (p.len > 0) return p;
+    if (env.get("CLAUDE_CONFIG_DIR")) |d| if (d.len > 0) return std.fs.path.join(gpa, &.{ d, "projects" }) catch null;
+    const home = env.get("USERPROFILE") orelse return null;
+    return std.fs.path.join(gpa, &.{ home, ".claude", "projects" }) catch null;
+}
+
+/// Opens `dir` (absolute) as a new tab named `name` (or its display
+/// name). Returns null, or why it was not opened (no path in it).
+pub fn openFolder(gpa: Allocator, hub: *tabs.Hub, env: *const std.process.Environ.Map, dir: []const u8, name: ?[]const u8) ?[]const u8 {
+    if (!std.fs.path.isAbsolute(dir)) return "the folder must be an absolute path";
+    {
+        var d = Io.Dir.cwd().openDir(hub.io, dir, .{}) catch return "not an existing folder";
+        d.close(hub.io);
+    }
+    var nb: [tabs_wire.max_name]u8 = undefined;
+    const tab_name = if (name) |n|
+        (if (title.validProject(n)) n else return "the name must be 1-64 bytes of printable text")
+    else
+        tabs.displayName(dir, env.get("USERPROFILE"), env.get("USERNAME"), &nb);
+    const cwd_w = std.unicode.wtf8ToWtf16LeAllocZ(gpa, dir) catch return "bad folder name";
+    defer gpa.free(cwd_w);
+    _ = hub.open(cwd_w, tab_name, false) catch |err| return switch (err) {
+        error.TooManyTabs => "too many tabs are open",
+        error.Finished => "Portal is shutting down",
+        error.OutOfMemory => "out of memory",
+        error.SpawnFailed => "the program could not be started there",
+    };
+    return null;
+}
 
 /// The child's working directory as WTF-16 for CreateProcessW, or null to
 /// inherit Portal's. `--cwd` (or settings.txt `cwd`) must name an existing
@@ -1682,14 +1678,11 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     var cfg: RunConfig = .{};
     var problem: ?[]const u8 = mergeConfig(&cfg, &opts, &saved);
 
-    var child_done: std.atomic.Value(bool) = .init(false);
-    var child_code: std.atomic.Value(u32) = .init(1);
-
     // The window opens before anything else that can fail because of the
     // configuration, so a first run, or a bad address or program, is
     // answered inside it (deskui.zig's setup panel) instead of a dialog.
     var host: ?*gui.LocalHost = null;
-    if (gui_app) host = gui.LocalHost.init(gpa, io, &child_done) catch |err| fatal("cannot open the Portal window: {t}", .{err});
+    if (gui_app) host = gui.LocalHost.init(gpa, io) catch |err| fatal("cannot open the Portal window: {t}", .{err});
 
     var err_buf: [512]u8 = undefined;
     var prep: Prepared = undefined;
@@ -1796,40 +1789,47 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .listen_host = listen_host,
             .url = url,
             .policy = cfg.policy,
-            .project = cfg.project,
         });
         const sz = h.initialSize();
         initial = .{ .cols = sz[0], .rows = sz[1] };
     }
     // ---- end GUI / console split --------------------------------------
 
-    var attr_buf: [256]u8 align(@alignOf(usize)) = undefined;
-    var pty = conpty.Pty.spawn(resolved.app, resolved.cmdline, cwd_w, initial, &attr_buf) catch |err|
-        fatal("could not start '{s}': {t}", .{ command[0], err });
-    // From here on the child is running. Exit only via fatal()/ExitProcess:
-    // process exit closes the job handle, which kills the child's tree.
-
-    var session: Session = .{
+    // Every tab runs the same program; only its folder differs.
+    var colors_buf: [settings.max_colors]tabs.Hub.ColorChoice = undefined;
+    const hub = gpa.create(tabs.Hub) catch fatal("out of memory", .{});
+    hub.* = .{
+        .gpa = gpa,
         .io = io,
-        .pty = &pty,
+        .log = &log,
         .console = &console,
         .policy = cfg.policy,
-        .project = cfg.project,
-        // Owned by the session for the life of the process (exit is via
-        // ExitProcess, so it is never freed explicitly).
-        .term = vt.Terminal.init(gpa, initial.cols, initial.rows) catch fatal("out of memory", .{}),
+        .program = .{ .app = resolved.app, .cmdline = resolved.cmdline, .command_name = std.fs.path.basename(command[0]), .session_id = cmdline.wantsSessionId(command) },
+        .colors = saved.colorChoices(&colors_buf),
+        .convo_projects = convoProjects(gpa, env),
+        .user_name = env.get("USERNAME"),
         .size = initial,
     };
-    // Desktop input reaches the PTY through its own writer thread.
-    const local_input = gpa.create(LocalInput) catch fatal("out of memory", .{});
-    local_input.* = .{ .gpa = gpa, .io = io, .session = &session };
-    session.local = local_input;
-    if (host) |h| h.attach(&session);
+    if (host) |h| h.attach(hub);
+    // The first tab: --project, or the folder's name (never a path).
+    var first_name_buf: [tabs_wire.max_name]u8 = undefined;
+    const first_name: []const u8 = cfg.project orelse blk: {
+        const dir_utf8: ?[]u8 = if (cwd_w) |c|
+            (std.unicode.wtf16LeToWtf8Alloc(gpa, c) catch null)
+        else
+            (std.process.currentPathAlloc(io, gpa) catch null);
+        const d = dir_utf8 orelse break :blk "Project";
+        break :blk tabs.displayName(d, env.get("USERPROFILE"), env.get("USERNAME"), &first_name_buf);
+    };
+    const first = hub.open(cwd_w, first_name, opts.console) catch |err|
+        fatal("could not start '{s}': {t}", .{ command[0], err });
+    // From here on the child is running. Exit only via fatal()/ExitProcess:
+    // process exit closes the job handles, which kills every tab's tree.
 
     var server: web.Server = .{
         .gpa = gpa,
         .io = io,
-        .session = &session,
+        .hub = hub,
         .log = &log,
         .listener = listener,
         .cfg = .{
@@ -1858,7 +1858,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         ca_server = .{
             .gpa = gpa,
             .io = io,
-            .session = &session,
+            .hub = hub,
             .log = &log,
             .listener = undefined,
             .cfg = .{
@@ -1895,6 +1895,8 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .export_default = export_dir,
             .tls_dir = tls_dir,
             .saved = saved,
+            .open_ctx = env,
+            .open_fn = deskOpen,
         });
         server.pairing_notify_ctx = h;
         server.pairing_notify_fn = gui.LocalHost.pairingNotify;
@@ -1910,22 +1912,15 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         // Project name only, never the program's title or a path; web.zig
         // keeps it current with the viewer count (title.zig).
         var tb: [title.max_title_bytes]u8 = undefined;
-        console.setTitle(title.windowTitle(cfg.project, 0, &tb));
+        console.setTitle(title.windowTitle(first.name(), 0, &tb));
     }
 
     // ------------------------------------------------------------------
     // Threads below use stack and heap memory owned by this frame. After the
     // first spawn this function must never return (no `try`, no `return`):
     // every exit goes through fatal() or ExitProcess.
-    var out_done: std.atomic.Value(bool) = .init(false);
-    const out_thread = std.Thread.spawn(.{}, Threads.ptyOutput, .{ &session, &console, &pty, io, &out_done }) catch |err|
-        fatal("cannot start output thread: {t}", .{err});
-    out_thread.detach(); // waited for via out_done, with a timeout
-    const input_thread = std.Thread.spawn(.{}, LocalInput.run, .{local_input}) catch |err|
-        fatal("cannot start input writer thread: {t}", .{err});
-    input_thread.detach(); // ends when shutdownPty closes the queue
     if (opts.console) {
-        const in_thread = std.Thread.spawn(.{}, Threads.consoleInput, .{ &session, &console }) catch |err|
+        const in_thread = std.Thread.spawn(.{}, Threads.consoleInput, .{ hub, &first.session, &console }) catch |err|
             fatal("cannot start input thread: {t}", .{err});
         in_thread.detach(); // parked in ReadConsoleInputW; ends with the process
     }
@@ -1942,79 +1937,88 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         const t = std.Thread.spawn(.{}, PairWatch.watch, .{&pair_watch}) catch |err|
             fatal("cannot start the pairing watcher thread: {t}", .{err});
         t.detach();
+        // `portal open <dir>`: requests through the data directory.
+        const ow = gpa.create(OpenWatch) catch fatal("out of memory", .{});
+        ow.* = .{ .hub = hub, .log = &log, .env = env, .gpa = gpa };
+        const owt = gpa.create(openreq.Watch) catch fatal("out of memory", .{});
+        owt.* = .{
+            .gpa = gpa,
+            .io = io,
+            .folder = std.fs.path.join(gpa, &.{ dir, openreq.dir_name }) catch fatal("out of memory", .{}),
+            .ctx = ow,
+            .open_fn = OpenWatch.open,
+            .lost_fn = OpenWatch.lost,
+        };
+        const ot = std.Thread.spawn(.{}, openreq.Watch.run, .{owt}) catch |err|
+            fatal("cannot start the open-request watcher thread: {t}", .{err});
+        ot.detach();
     }
 
-    // Two ways the session ends, kept apart:
-    //   * the program exits (either mode): the pseudo console is closed
-    //     at once, its remaining output drains to EOF, viewers get the
-    //     program's exit code;
-    //   * the window is closed while the program runs (GUI): closing the
-    //     pseudo console is the program's cue to exit (its console goes
-    //     away), and Portal WAITS for it to exit, up to
-    //     shutdown_timeout_ms; only a program still running then is ended
-    //     through its job. The waiter thread owns the process handle
-    //     throughout, so no wait races a close.
-    var window_closed = false;
+    // Two ways Portal ends, kept apart:
+    //   * the last tab's program exits (either mode): each tab closes its
+    //     pseudo console at once, drains its output and leaves the list;
+    //     viewers get the last program's exit code;
+    //   * the window is closed while programs run (GUI): every tab's
+    //     pseudo console is closed, the programs' cue to exit, and Portal
+    //     WAITS for them, up to tabs.close_timeout_ms; only a program still
+    //     running then is ended through its job (tabs.zig).
     if (host) |h| {
-        // GUI: the window owns the main thread; a waiter thread watches
-        // the child.
-        const waiter = std.Thread.spawn(.{}, Threads.waitChild, .{ io, &pty, &child_code, &child_done, h }) catch |err|
-            fatal("cannot start child waiter thread: {t}", .{err});
-        waiter.detach();
         switch (h.run()) {
-            .child_exited => {},
+            .finished => {},
             .window_closed => {
-                window_closed = true;
                 h.hide();
-                log.print("local window closed: asking the program to exit and waiting for it", .{});
+                log.print("local window closed: asking every tab's program to exit and waiting for them", .{});
+                hub.closeAll();
             },
         }
         log.print("local window: {d} wake-ups, {d} frames presented", .{ h.wakeups, h.presents }); // [fix2/desk]
-    } else {
-        child_code.store(pty.waitExit(), .release);
-        child_done.store(true, .release);
     }
-
-    // ClosePseudoConsole can block (pre-24H2 it waits for conhost to flush),
-    // so run it on its own thread and stop waiting after a timeout rather
-    // than leaving the user's console hung. Session.shutdownPty stops resizes
-    // and writes first, so nothing touches the freed HPCON or input pipe.
-    // The output thread keeps draining meanwhile: everything the program
-    // wrote reaches the terminal (and viewers) before EOF.
-    var close_done: std.atomic.Value(bool) = .init(false);
-    if (std.Thread.spawn(.{}, Threads.closePty, .{ &session, &close_done })) |t| {
-        t.detach();
-    } else |_| {
-        Threads.closePty(&session, &close_done);
-    }
-    // One deadline for the whole shutdown; each step wakes this thread.
-    var shutdown_deadline = Io.Clock.awake.now(io).toMilliseconds() + shutdown_timeout_ms;
-    var ended_by_portal = false;
-    if (window_closed and !waitShutdown(io, &.{&child_done}, shutdown_deadline)) {
-        log.print("the program did not exit within {d} s of the window closing: ending it", .{shutdown_timeout_ms / 1000});
-        pty.terminate();
-        ended_by_portal = true;
-        shutdown_deadline = Io.Clock.awake.now(io).toMilliseconds() + terminate_timeout_ms;
-        _ = waitShutdown(io, &.{&child_done}, shutdown_deadline);
-    }
-    const clean = waitShutdown(io, &.{ &close_done, &out_done }, shutdown_deadline);
-    const code: u32 = if (child_done.load(.acquire)) child_code.load(.acquire) else 1;
-
-    session.markClosed(code);
-    log.print("stop: child exited with code {d}{s}{s}", .{
-        code,
-        if (ended_by_portal) " (ended by Portal after the window closed)" else "",
-        if (clean) "" else " (pseudo console did not close in time)",
-    });
+    // Event-driven: each tab's end wakes this thread. Bounded after the
+    // window closed (every tab is ending); unbounded in the console mode,
+    // which runs until its programs exit.
+    const all_ended = hub.waitFinished(if (host != null)
+        Io.Clock.awake.now(io).toMilliseconds() + tabs.close_timeout_ms + tabs.terminate_timeout_ms + 2_000
+    else
+        null);
+    hub.mutex.lockUncancelable(io);
+    const code: u32 = if (all_ended) hub.last_code else 1;
+    hub.mutex.unlock(io);
+    // The last tab's program's code (the same line as before tabs).
+    if (all_ended) {
+        log.print("stop: child exited with code {d} (every tab has ended)", .{code});
+    } else log.print("stop: tabs did not end in time, exit code {d}", .{code});
     // Viewers receive the exit notice, then disconnect: wait for that
     // (event-driven), at most viewer_goodbye_ms.
-    session.waitViewersGone(Io.Clock.awake.now(io).toMilliseconds() + viewer_goodbye_ms);
+    hub.waitViewersGone(Io.Clock.awake.now(io).toMilliseconds() + viewer_goodbye_ms);
     // Do NOT close the listener: the accept thread is blocked on it and std
     // hits `unreachable` on the cancelled accept. Process exit reclaims it.
     console.restore();
     // Full 32-bit exit code (std.process.exit takes a u8). Exiting here, not
     // returning, also keeps every thread's memory valid to the very end.
     w.ExitProcess(code);
+}
+
+/// The window's folder picker (gui.zig): opens a tab like `portal open`.
+fn deskOpen(ctx: *const anyopaque, gpa: Allocator, hub: *tabs.Hub, dir: []const u8) ?[]const u8 {
+    const env: *const std.process.Environ.Map = @ptrCast(@alignCast(ctx));
+    return openFolder(gpa, hub, env, dir, null);
+}
+
+/// `portal open <dir>` / `portalctl open <dir>`: asks the running Portal
+/// (openreq.zig).
+fn cmdOpen(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
+    const paths = devicePaths(gpa, io, env) catch |err| fatal("cannot find the data directory: {t}", .{err});
+    const say = struct {
+        fn f(text: []const u8) void {
+            // The window says nothing when it worked (the tab appears).
+            if (gui_app) {
+                if (!std.mem.startsWith(u8, text, "opened")) messageBox(text);
+            } else std.debug.print("portal: {s}\n", .{text});
+        }
+    }.f;
+    const code = openreq.command(gpa, io, paths.dir, args, say);
+    if (gui_app) w.ExitProcess(code);
+    std.process.exit(code);
 }
 
 test {
@@ -2026,7 +2030,6 @@ test {
     _ = @import("workdir.zig");
     _ = @import("settings.zig");
     _ = @import("deskui.zig");
-    _ = @import("qr.zig");
     _ = @import("keymap.zig");
     _ = @import("auth.zig");
     _ = @import("guard.zig");
@@ -2034,6 +2037,8 @@ test {
     _ = @import("cmdline.zig");
     _ = @import("console.zig");
     _ = @import("session.zig");
+    _ = @import("tabs.zig");
+    _ = @import("openreq.zig");
     _ = @import("log.zig");
     _ = @import("devices.zig");
     _ = @import("vt.zig");
@@ -2048,6 +2053,10 @@ test {
     _ = @import("fsutil.zig");
     _ = @import("bucket.zig");
     _ = @import("title.zig");
+    _ = @import("convo/scrub.zig");
+    _ = @import("convo/transcript.zig");
+    _ = @import("convo/model.zig");
+    _ = @import("convo/follow.zig");
 }
 
 test "isYes" {

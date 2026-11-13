@@ -76,6 +76,17 @@ viewer connection is written to `%LOCALAPPDATA%\Portal\portal.log` (moved
 to `portal.log.1` when it passes 10 MB; lines that a peer can cause before
 signing in are rate limited, with counts of what was suppressed).
 
+## The Conversation view
+
+Devices show each tab as a conversation by default (prompts, replies,
+one-line tool activity, questions with answer buttons; the terminal is a
+toggle away), read from the agent's transcript on the desktop and
+scrubbed of paths and your user name before it is sent. Portal starts
+the agent with its own `--session-id` per tab (unless your configured
+arguments already use `--session-id`, `--resume` or `--continue`), so each
+tab follows exactly its own transcript. Details: docs/protocol.md
+section 3b.
+
 ## Security layers
 
 1. **Network**: Portal refuses to listen on `0.0.0.0` or any public address.
@@ -188,11 +199,31 @@ the program asks for it), Ctrl+= / Ctrl+- / Ctrl+0 to zoom. Resizing the
 window resizes the session; remote viewers adapt. There is no scrollback
 yet.
 
+**Project tabs.** One Portal window holds several projects. Each is a tab
+in the top bar, in a colour derived from its name (or `color = NAME
+#rrggbb` lines in settings.txt), with its own program (the configured one,
+started in that folder), its own pseudo console and its own screen. A tab
+whose program waits for an answer (it reports OSC 7501 `state=blocked`) is
+outlined in amber with a dot. Only the desk opens and closes projects:
+Ctrl+Shift+T or **+** (folder picker), `portal open <folder> [--name NAME]`
+or `portalctl open <folder>` from a terminal (handed to the running Portal
+through its data folder), Ctrl+Shift+W or a tab's **×** to close one (its
+program is asked to exit, and ended after 10 s). Ctrl+Tab /
+Ctrl+Shift+Tab or a click switches. When a tab's program exits the tab
+goes; when the last one goes (or the window is closed) Portal ends as
+before. A tab is named after its folder (the home folder is "Home"); paired
+devices see that name and the colour, never a path, and can switch
+between open tabs and answer, but nothing they send can open, close or
+start a project (docs/tabs-design.md).
+
 The desk's own tools are in the top bar, and on these keys (they never
 reach the session):
 
 | Key | Top bar | What |
 |---|---|---|
+| Ctrl+Shift+T | + | open a project folder in a new tab |
+| Ctrl+Shift+W | × on the tab | close the tab shown (its program is asked to exit) |
+| Ctrl+Tab / Ctrl+Shift+Tab | click a tab | the next / previous tab |
 | Ctrl+Shift+P | Pair a device… | open a 2-minute pairing window and approve or deny each request |
 | Ctrl+Shift+D | Devices | paired devices with address and last use; Unpair |
 | Ctrl+Shift+E | Export certificate… | write portal-ca.cer / .pem / .mobileconfig to a folder (default `%USERPROFILE%\Downloads\Portal-CA`) |
@@ -351,7 +382,9 @@ timers). The CSP allows `'wasm-unsafe-eval'` for exactly this; see `web.zig`.
 The page is made of **slices**, the same on every platform:
 
 * **Terminal**: the live terminal (fit to width, A−/A+ zoom, drag or
-  scroll to pan) under a status line: project name (`--project`), viewer
+  scroll to pan) under the project tabs (the desktop's open projects, in
+  their colours, amber while one waits for an answer; tap one to switch,
+  left of the zoom buttons) and a status line: the project shown, viewer
   state, input mode, and the session state (working / waiting for you /
   done; a placeholder until the program reports it, see
   `docs/protocol.md`).
