@@ -104,6 +104,10 @@ pub const Convo = struct {
     /// Set while Portal adds its own question (askFromState).
     asking: bool = false,
     wait: Wait = .none,
+    /// The tool category an agent hook named for the permission
+    /// prompt (session.setHookState), used when the transcript has not
+    /// shown the tool yet. Cleared when the wait ends.
+    hint_cat: ?transcript.Category = null,
 
     pub fn init(gpa: Allocator, ctx: scrub.Context) Convo {
         var c: Convo = .{ .gpa = gpa, .ctx = ctx };
@@ -120,7 +124,7 @@ pub const Convo = struct {
     }
 
     /// The newest item still shown.
-    fn last(c: *Convo) ?*Slot {
+    pub fn last(c: *Convo) ?*Slot {
         var i = c.len;
         while (i > 0) {
             i -= 1;
@@ -538,11 +542,24 @@ pub const Convo = struct {
     pub fn programState(c: *Convo, wait: Wait) void {
         c.wait = wait;
         if (wait == .none) {
+            c.hint_cat = null;
             if (c.synthetic_n != 0) c.closeSynthetic();
             return;
         }
         if (c.synthetic_n != 0 or c.openQuestion()) return;
         c.askFromState(wait) catch {};
+    }
+
+    /// A hook named the tool of the permission prompt (only a category
+    /// travels: the phrase comes from transcript.permissionPhrase's fixed
+    /// table, never the name). If Portal already asked without knowing
+    /// the tool, it asks again with the phrase.
+    pub fn permissionHint(c: *Convo, cat: transcript.Category) void {
+        c.hint_cat = cat;
+        if (c.wait != .permission or c.synthetic_n == 0 or c.synthetic_tool != 0 or c.n_pending != 0) return;
+        if (c.find(c.synthetic_n)) |s| c.remove(s);
+        c.synthetic_n = 0;
+        c.askFromState(.permission) catch {};
     }
 
     fn askFromState(c: *Convo, kind: Wait) Allocator.Error!void {
@@ -554,6 +571,9 @@ pub const Convo = struct {
             var pb: [96]u8 = undefined;
             const text = if (p) |pp|
                 std.fmt.bufPrint(&buf, "Claude wants to {s}. Allow it?", .{transcript.permissionPhrase(&pb, pp.cat, pp.tool[0..pp.tool_len])}) catch "Claude needs your permission to continue."
+            else if (c.hint_cat) |cat|
+                // From a hook: the category's phrase; `other` is "use a tool".
+                std.fmt.bufPrint(&buf, "Claude wants to {s}. Allow it?", .{transcript.permissionPhrase(&pb, cat, "")}) catch "Claude needs your permission to continue."
             else
                 "Claude needs your permission to continue.";
             c.makeRoom(text.len, 2);
@@ -910,4 +930,25 @@ test "cleanText" {
     defer out.deinit(testing.allocator);
     try cleanText(testing.allocator, "a\r\nb\rc\x1b[31md\x00e\u{202e}f\u{2028}g\xffh\t", &out);
     try testing.expectEqualStrings("a\nb\nc[31mde" ++ "f\ng\u{FFFD}h\t", out.items);
+}
+
+test "a hook's tool category names the permission prompt; never the tool's name" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    f.c.reset(true);
+    var buf: [1024]u8 = undefined;
+    // Notification (permission_prompt) first: Portal asks without a tool.
+    f.c.programState(.permission);
+    try testing.expectEqualStrings("question:Claude needs your permission to continue.(open)|", try f.texts(&buf));
+    // PermissionRequest names a Bash call: asked again with its phrase.
+    f.c.permissionHint(.command);
+    try testing.expectEqualStrings("question:Claude wants to run a command. Allow it?(open)|", try f.texts(&buf));
+    f.c.programState(.none);
+    try testing.expect(f.c.hint_cat == null);
+    // An unknown tool (MCP...) is "use a tool".
+    f.c.permissionHint(.other);
+    f.c.programState(.permission);
+    try testing.expect(std.mem.endsWith(u8, try f.texts(&buf), "question:Claude wants to use a tool. Allow it?(open)|"));
+    try testing.expectEqualStrings("1", f.c.last().?.options[0].key);
+    try testing.expectEqualStrings("esc", f.c.last().?.options[1].key);
 }
