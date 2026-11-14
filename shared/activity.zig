@@ -472,6 +472,11 @@ test "malformed activity is rejected whole" {
     try testing.expect(!parse(w.buffered(), &a));
 }
 
+test "activity text refuses bidi controls, C1 controls and separators" {
+    try testing.expect(validText("Reading files"));
+    for ([_][]const u8{ "a\u{202e}b", "a\u{2067}b", "a\u{9b}b", "a\u{2029}b", "\u{feff}a", "a\tb" }) |bad| try testing.expect(!validText(bad));
+}
+
 test "validModel and text cutting" {
     try testing.expect(validModel("model-small-4-5[1m]"));
     try testing.expect(!validModel("<synthetic>"));

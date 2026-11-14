@@ -118,11 +118,19 @@ pub fn validName(s: []const u8) bool {
     if (s.len == 0 or s.len > max_name) return false;
     const v = std.unicode.Utf8View.init(s) catch return false;
     var it = v.iterator();
-    while (it.nextCodepoint()) |cp| switch (cp) {
-        0x00...0x1F, 0x7F...0x9F, 0x2028, 0x2029, 0x202A...0x202E, 0x2066...0x2069, 0x200E, 0x200F, 0x061C, 0xFEFF => return false,
-        else => {},
-    };
+    while (it.nextCodepoint()) |cp| if (blocked(cp)) return false;
     return std.mem.trim(u8, s, " ").len > 0;
+}
+
+/// Code points no shown text may hold: C0 and C1 controls and DEL, line
+/// and paragraph separators, bidi embeddings, overrides, isolates and
+/// marks, and the BOM. Tab names, and (but for line feed and tab)
+/// conversation and activity texts (convo.printable).
+pub fn blocked(cp: u21) bool {
+    return switch (cp) {
+        0x00...0x1F, 0x7F...0x9F, 0x2028, 0x2029, 0x202A...0x202E, 0x2066...0x2069, 0x200E, 0x200F, 0x061C, 0xFEFF => true,
+        else => false,
+    };
 }
 
 // --------------------------------------------------------------- entries
