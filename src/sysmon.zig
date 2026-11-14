@@ -285,7 +285,14 @@ const ProcessMemory = extern struct {
     pagefile_peak: usize = 0,
 };
 
-extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn LoadLibraryExW(name: [*:0]const u16, file: ?*anyopaque, flags: u32) callconv(.winapi) ?*anyopaque;
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x00000800;
+
+/// A system DLL from System32 only (never the current or the
+/// executable's folder, so a planted copy is not loaded).
+fn loadSystemLibrary(comptime name: []const u8) ?*anyopaque {
+    return LoadLibraryExW(std.unicode.utf8ToUtf16LeStringLiteral(name), null, LOAD_LIBRARY_SEARCH_SYSTEM32);
+}
 extern "kernel32" fn FreeLibrary(m: *anyopaque) callconv(.winapi) w.BOOL;
 /// FARPROC: a function pointer, so casts to the typed pointers below keep
 /// their alignment (an `*const anyopaque` result fails to cast on aarch64,
@@ -382,7 +389,7 @@ pub const WinBackend = struct {
     /// The hardware adapters (DXGI, software ones skipped) and their VRAM.
     fn readAdapters(b: *WinBackend) void {
         b.n_adapters = 0;
-        const lib = LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("dxgi.dll")) orelse return;
+        const lib = loadSystemLibrary("dxgi.dll") orelse return;
         defer _ = FreeLibrary(lib);
         const create: CreateDXGIFactory1 = @ptrCast(GetProcAddress(lib, "CreateDXGIFactory1") orelse return);
         var fac: ?*anyopaque = null;
@@ -415,7 +422,7 @@ pub const WinBackend = struct {
     }
 
     fn openPdh(b: *WinBackend) void {
-        const lib = LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("pdh.dll")) orelse return;
+        const lib = loadSystemLibrary("pdh.dll") orelse return;
         b.pdh = lib;
         const open: PdhOpenQueryW = @ptrCast(GetProcAddress(lib, "PdhOpenQueryW") orelse return);
         const add: PdhAddEnglishCounterW = @ptrCast(GetProcAddress(lib, "PdhAddEnglishCounterW") orelse return);
@@ -678,4 +685,10 @@ test "deadlines align to the next period; CPU and job math" {
     try testing.expectEqual(@as(?u64, 0x1_0000_0002), parseLuid("luid_0x00000001_0x00000002_phys_0"));
     try testing.expect(parseLuid("luid_0xZZ") == null);
     try testing.expectEqualStrings("3D", afterTag("pid_1_luid_0x0_0x0_phys_0_eng_0_engtype_3D", "engtype_").?);
+}
+
+test "system DLLs load from System32 only" {
+    const lib = loadSystemLibrary("pdh.dll") orelse return error.TestUnexpectedResult;
+    _ = FreeLibrary(lib);
+    try std.testing.expect(loadSystemLibrary("portal-no-such-system.dll") == null);
 }
