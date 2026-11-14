@@ -143,8 +143,10 @@ fn cli(h: *proc.Harness, dir: []const u8, cmd: []const u8, tab: ?[]const u8, pay
     return .{ .code = code, .out = h.gpa.dupe(u8, c.output()) catch "" };
 }
 
-fn statusJson(gpa: std.mem.Allocator, week: f64, five: f64) []const u8 {
-    return std.fmt.allocPrint(gpa, "{{\"transcript_path\":\"C:\\\\TRANSCRIPT-SECRET.jsonl\",\"rate_limits\":{{\"five_hour\":{{\"used_percentage\":{d},\"resets_at\":1900000000}},\"seven_day\":{{\"used_percentage\":{d},\"resets_at\":1900500000}}}}}}", .{ five, week }) catch "";
+/// Reset times relative to now: usage_desk drops implausible ones.
+fn statusJson(gpa: std.mem.Allocator, io: std.Io, week: f64, five: f64) []const u8 {
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    return std.fmt.allocPrint(gpa, "{{\"transcript_path\":\"C:\\\\TRANSCRIPT-SECRET.jsonl\",\"rate_limits\":{{\"five_hour\":{{\"used_percentage\":{d},\"resets_at\":{d}}},\"seven_day\":{{\"used_percentage\":{d},\"resets_at\":{d}}}}}}}", .{ five, now + 3600, week, now + 3 * 86400 }) catch "";
 }
 
 fn lastUsage(v: *const client.Viewer) ?planusage.Usage {
@@ -202,12 +204,12 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
 
     // ---- throttle: within 5 minutes a small change is held ...
     const before = v.countText("\"t\":\"usage\"");
-    const held = cli(h, dir, "statusline", key, statusJson(gpa, 45, 20));
+    const held = cli(h, dir, "statusline", key, statusJson(gpa, h.io, 45, 20));
     _ = r.check("portalctl statusline exits 0 and prints the line", held.code == 0 and std.mem.eql(u8, held.out, "5-hour 20% \u{00B7} week 45%"), "{?d} '{s}'", .{ held.code, held.out });
     v.pump(3000);
     _ = r.check("a second update within 5 minutes is held back", v.countText("\"t\":\"usage\"") == before, "{d} -> {d}", .{ before, v.countText("\"t\":\"usage\"") });
     // ... a threshold crossing goes at once.
-    _ = cli(h, dir, "statusline", key, statusJson(gpa, 80, 20));
+    _ = cli(h, dir, "statusline", key, statusJson(gpa, h.io, 80, 20));
     _ = r.check("crossing 75 % goes out at once", v.waitText("\"t\":\"usage\"", before + 1, 3000) and lastUsage(v).?.week.?.pct == 80, "{?s}", .{v.lastText("\"t\":\"usage\"")});
 
     // ---- the limit: StopFailure rate_limit, then a finished turn
@@ -226,8 +228,8 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
 
     // ---- outside a Portal tab: nothing changes
     const n_out = v.countText("\"t\":\"usage\"");
-    const outside = cli(h, dir, "statusline", null, statusJson(gpa, 99, 99));
-    const unknown = cli(h, dir, "statusline", "0123456789abcdef0123456789abcdef", statusJson(gpa, 99, 99));
+    const outside = cli(h, dir, "statusline", null, statusJson(gpa, h.io, 99, 99));
+    const unknown = cli(h, dir, "statusline", "0123456789abcdef0123456789abcdef", statusJson(gpa, h.io, 99, 99));
     const garbage = cli(h, dir, "statusline", key, "not json {");
     _ = r.check("no / unknown PORTAL_TAB, or garbage: exit 0", outside.code == 0 and unknown.code == 0 and garbage.code == 0 and garbage.out.len == 0, "{?d} {?d} {?d}", .{ outside.code, unknown.code, garbage.code });
     v.pump(2000);
