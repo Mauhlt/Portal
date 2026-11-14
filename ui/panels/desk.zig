@@ -144,6 +144,10 @@ pub fn Panels(comptime devices: type) type {
             /// "Claude Code integration" (Settings only): applies at once
             /// (Action.agent_hooks), not with the other settings.
             agent: AgentHooks = .unknown,
+            /// "Admin prompts at the desk" (Settings only): settings.txt's
+            /// `block_elevation_desk`; the agent's hook reads it each time,
+            /// so it applies as soon as it is saved.
+            block_elevation: bool = false,
         };
 
         pub const Ui = struct {
@@ -364,7 +368,7 @@ pub fn Panels(comptime devices: type) type {
             /// Fields of the current screen, in focus order (fields come first).
             fn fieldCount(ui: *const Ui) u8 {
                 return switch (ui.screen) {
-                    .setup => if (ui.setup.first_run) 4 else 8,
+                    .setup => if (ui.setup.first_run) 4 else 9,
                     .pair_name => 2,
                     .export_form => 1,
                     else => 0,
@@ -377,7 +381,7 @@ pub fn Panels(comptime devices: type) type {
                         0 => ref(5, &ui.setup.tunnel_port),
                         1 => ref(1024, &ui.setup.program),
                         2 => ref(64, &ui.setup.project),
-                        7 => ref(259, &ui.setup.tunnel_endpoint),
+                        8 => ref(259, &ui.setup.tunnel_endpoint),
                         else => .choice,
                     },
                     .pair_name => if (i == 0) ui.nameRef() else ref(64, &ui.key_text),
@@ -499,6 +503,8 @@ pub fn Panels(comptime devices: type) type {
                             ui.setup.bg_art = !ui.setup.bg_art;
                         } else if (ui.screen == .setup and ui.focus.index == 6) {
                             return .agent_hooks;
+                        } else if (ui.screen == .setup and ui.focus.index == 7) {
+                            ui.setup.block_elevation = !ui.setup.block_elevation;
                         } else if (ui.focusedField() == null) {
                             if (k == .left) ui.focus.prev() else ui.focus.next();
                         }
@@ -528,7 +534,12 @@ pub fn Panels(comptime devices: type) type {
                         .text => |t| _ = t.insert_cp(t.ctx, cp),
                         .choice => if (cp == ' ') {
                             if (ui.focus.index == 6) return .agent_hooks;
-                            if (ui.focus.index == 4) ui.setup.sysmon = !ui.setup.sysmon else if (ui.focus.index == 5) ui.setup.bg_art = !ui.setup.bg_art else ui.setup.input = cyclePolicy(ui.setup.input, true);
+                            switch (ui.focus.index) {
+                                4 => ui.setup.sysmon = !ui.setup.sysmon,
+                                5 => ui.setup.bg_art = !ui.setup.bg_art,
+                                7 => ui.setup.block_elevation = !ui.setup.block_elevation,
+                                else => ui.setup.input = cyclePolicy(ui.setup.input, true),
+                            }
                         },
                     }
                     return .none;
@@ -550,6 +561,7 @@ pub fn Panels(comptime devices: type) type {
                     if (ui.screen == .setup and i == 3 and ui.focus.index == 3) ui.setup.input = cyclePolicy(ui.setup.input, true);
                     if (ui.screen == .setup and i == 4 and ui.focus.index == 4) ui.setup.sysmon = !ui.setup.sysmon;
                     if (ui.screen == .setup and i == 5 and ui.focus.index == 5) ui.setup.bg_art = !ui.setup.bg_art;
+                    if (ui.screen == .setup and i == 7 and ui.focus.index == 7) ui.setup.block_elevation = !ui.setup.block_elevation;
                     const act: Action = if (ui.screen == .setup and i == 6 and ui.focus.index == 6) .agent_hooks else .none;
                     ui.focus.index = i;
                     return act;
@@ -673,7 +685,7 @@ pub fn Panels(comptime devices: type) type {
                 lines: [14]frame.PanelText = undefined,
                 after: [8 + devices.max_devices]frame.PanelText = undefined,
                 rows: [@max(devices.max_devices, max_pkgs)]frame.PanelRow = undefined,
-                fields: [8]frame.PanelField = undefined,
+                fields: [9]frame.PanelField = undefined,
                 buttons: [4]frame.PanelButton = undefined,
                 txt: [14 + devices.max_devices][200]u8 = undefined,
                 row_txt: [@max(devices.max_devices, max_pkgs)][120]u8 = undefined,
@@ -769,12 +781,14 @@ pub fn Panels(comptime devices: type) type {
                             bufs.fields[4] = .{ .label = "Show system monitor (Left/Right to change; applies now)", .value = if (ui.setup.sysmon) "On: a System button shows CPU, memory, GPU and each tab's load" else "Off", .id = id.field0 + 4, .focused = f == 4, .choice = true };
                             bufs.fields[5] = .{ .label = "Background art (Left/Right to change; applies now)", .value = if (ui.setup.bg_art) "On: the Portal art, faint, behind the terminal" else "Off", .id = id.field0 + 5, .focused = f == 5, .choice = true };
                             bufs.fields[6] = .{ .label = "Claude Code integration (Left/Right or click to install or remove; applies now)", .value = agentLabel(ui.setup.agent), .id = id.field0 + 6, .focused = f == 6, .choice = true };
-                            bufs.fields[7] = .{ .label = "Tunnel endpoint for devices (HOST:PORT)", .value = ui.setup.tunnel_endpoint.text(), .hint = "your public IP or dynamic-DNS name, and the port the router forwards, e.g. home.example.org:51820", .id = id.field0 + 7, .focused = f == 7 };
-                            p.fields = bufs.fields[0..8];
+                            bufs.fields[7] = .{ .label = "Admin prompts at the desk (Left/Right to change; applies now)", .value = if (ui.setup.block_elevation) "Refused: also refuse admin-prompt commands in projects started at the desk" else "Allowed: they run, and the tab asks for you at the desk", .id = id.field0 + 7, .focused = f == 7, .choice = true };
+                            bufs.fields[8] = .{ .label = "Tunnel endpoint for devices (HOST:PORT)", .value = ui.setup.tunnel_endpoint.text(), .hint = "your public IP or dynamic-DNS name, and the port the router forwards, e.g. home.example.org:51820", .id = id.field0 + 8, .focused = f == 8 };
+                            p.fields = bufs.fields[0..9];
                             ui.tunnelLines(bufs, &na, c);
                         }
                         L.add(&bufs.after, &na, .{ .text = policyHelp(ui.setup.input), .tone = if (ui.setup.input == .text) .bad else .muted });
                         if (!ui.setup.first_run and f == 6) L.add(&bufs.after, &na, .{ .text = "Adds Portal's hooks to Claude Code's settings.json (a backup is kept next to it): each runs `portalctl hook`, which tells this Portal, over a pipe only you can open, when Claude in a tab works, waits for an answer or is done. Nothing is sent outside this computer." });
+                        if (!ui.setup.first_run and f == 7) L.add(&bufs.after, &na, .{ .text = "Also refuse admin-prompt commands in projects started at the desk. Off, such a command runs and its tab shows a card until you answer the Windows prompt here. Projects a device started always refuse them: nobody may be at the desk to answer." });
                         if (ui.setup.sysmon and !ui.setup.first_run) L.add(&bufs.after, &na, .{ .text = "The monitor measures only while a System panel is open (once a second); off, it never measures." });
                     },
                     .pair_name => {

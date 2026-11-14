@@ -174,7 +174,7 @@ test "settings: Show system monitor is a fifth choice (not on the first run), of
     try testing.expect(!s.setup.sysmon);
     var b2: Ui.Bufs = .{};
     const p = s.panel(&b2, .{}).?;
-    try testing.expectEqual(@as(usize, 8), p.fields.len);
+    try testing.expectEqual(@as(usize, 9), p.fields.len);
     try testing.expectEqualStrings("Off", p.fields[4].value);
     // A click focuses it, a second click flips it; Left/Right and space too.
     _ = s.button(id.field0 + 4);
@@ -186,8 +186,9 @@ test "settings: Show system monitor is a fifth choice (not on the first run), of
     _ = s.char(' ', .{});
     try testing.expect(s.setup.sysmon);
     try testing.expectEqual(rules.Policy.keys, s.setup.input); // the policy is untouched
-    // Enter: on to "Background art", "Claude Code integration", the
-    // tunnel endpoint, then submit.
+    // Enter: on to "Background art", "Claude Code integration", "Admin
+    // prompts at the desk", the tunnel endpoint, then submit.
+    try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.none, s.key(.enter, .{}));
@@ -251,6 +252,37 @@ test "settings: agent integration is a seventh choice that acts at once (not on 
     f.openSetup(true, "a", "b", "c", .keys);
     var fb: Ui.Bufs = .{};
     try testing.expectEqual(@as(usize, 4), f.panel(&fb, .{}).?.fields.len);
+}
+
+test "settings: admin prompts at the desk is a choice next to the agent integration, off by default" {
+    var s: Ui = .{};
+    s.openSetup(false, "a", "b", "c", .keys);
+    var b: Ui.Bufs = .{};
+    var p = s.panel(&b, .{}).?;
+    try testing.expectEqual(@as(usize, 9), p.fields.len);
+    try testing.expect(p.fields[7].choice);
+    try testing.expect(std.mem.startsWith(u8, p.fields[7].value, "Allowed"));
+    try testing.expect(!s.setup.block_elevation);
+    // The first click focuses it, the second flips it; keys and space too.
+    _ = s.button(id.field0 + 7);
+    try testing.expect(!s.setup.block_elevation);
+    _ = s.button(id.field0 + 7);
+    try testing.expect(s.setup.block_elevation);
+    p = s.panel(&b, .{}).?;
+    try testing.expect(std.mem.indexOf(u8, p.fields[7].value, "also refuse admin-prompt commands in projects started at the desk") != null);
+    var explained = false;
+    for (p.after) |t| explained = explained or std.mem.startsWith(u8, t.text, "Also refuse admin-prompt commands in projects started at the desk");
+    try testing.expect(explained);
+    try testing.expectEqual(Action.none, s.key(.left, .{}));
+    try testing.expect(!s.setup.block_elevation);
+    try testing.expectEqual(Action.none, s.char(' ', .{}));
+    try testing.expect(s.setup.block_elevation);
+    // Nothing else changed; the tunnel endpoint is the text field after it.
+    try testing.expect(!s.setup.sysmon and s.setup.bg_art and s.setup.input == .keys);
+    _ = s.key(.down, .{});
+    typeText(&s, "home.example.org:51820");
+    try testing.expectEqualStrings("home.example.org:51820", s.setup.tunnel_endpoint.text());
+    try testing.expectEqual(Action.setup_submit, s.button(id.save));
 }
 
 test "setup: the button says Start on first run and Save in Settings" {

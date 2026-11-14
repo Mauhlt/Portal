@@ -801,6 +801,8 @@ pub const LocalHost = struct {
         h.loadDevices(); // the tunnel's peers
         h.ui.setup.sysmon = s.system_monitor orelse false;
         h.ui.setup.bg_art = s.background_art orelse true;
+        // As the hook reads it now (the file may have been edited by hand).
+        h.ui.setup.block_elevation = (settings.loadOrNull(h.gpa, h.io, d.paths.dir) orelse s.*).block_elevation_desk orelse false;
         h.ui.setup.agent = h.agentStatus(false);
     }
 
@@ -888,6 +890,8 @@ pub const LocalHost = struct {
         s.input = st.input;
         s.system_monitor = st.sysmon;
         s.background_art = st.bg_art;
+        // Read by the agent's PreToolUse hook on each hit: saved, it applies.
+        s.block_elevation_desk = st.block_elevation;
         settings.save(h.gpa, h.io, d.paths.dir, &s) catch |err|
             return h.ui.setNote(.bad, "Could not save the settings: {t}.", .{err});
         h.desk.?.saved = s;
@@ -896,7 +900,7 @@ pub const LocalHost = struct {
         if (d.srv.sysmon) |m| m.setEnabled(st.sysmon);
         if (h.hub) |hub| hub.setSysmon(st.sysmon);
         h.p.setBackgroundArt(st.bg_art);
-        d.srv.log.print("settings: system monitor {s}", .{if (st.sysmon) "on" else "off"});
+        d.srv.log.print("settings: system monitor {s}, admin prompts at the desk {s}", .{ if (st.sysmon) "on" else "off", if (st.block_elevation) "refused" else "allowed" });
         h.ui.close();
     }
 

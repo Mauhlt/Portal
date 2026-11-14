@@ -25,8 +25,9 @@
 //! guard (elevation.zig, `portalctl hook` at PreToolUse) also denies
 //! commands that would open an administrator prompt in sessions started
 //! at the desk; off, they run and the tab gets a "needs desk" card.
-//! Sessions a paired device started are always denied. Read by the hook
-//! each time it finds such a command, so a change applies at once.
+//! Sessions a paired device started are always denied. Set by Settings'
+//! "Admin prompts at the desk" (or by hand); read by the hook each time
+//! it finds such a command, so a saved change applies at once.
 //!
 //! `startable = NAME | MODE | FOLDER` (one line each, at most
 //! projects.max_projects): the projects a paired device may start

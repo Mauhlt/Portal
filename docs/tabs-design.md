@@ -375,7 +375,8 @@ with yes / no (src/foryou_ws.zig), shown under the latest reply
   answer the UAC prompt. In a session started at the desk it runs and the
   tab gets a `needs_desk` card until the command's result or the turn's
   end; the desk's `block_elevation_desk = on` (settings.txt, default off,
-  read by the hook each time) denies it there too. The command never
+  the desk's Settings "Admin prompts at the desk"; read by the hook each
+  time, so a save applies at once) denies it there too. The command never
   leaves the hook process; the desk logs only the verdict. It is a guard
   against a stuck session, not a sandbox.
 * **Long runs.** One shell command (PreToolUse) running 3 minutes with no

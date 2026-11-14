@@ -507,6 +507,30 @@ fn deskBlocks(io: std.Io, data_dir: ?[]const u8) bool {
     return settings.load(std.heap.page_allocator, io, dir).block_elevation_desk orelse false;
 }
 
+test "block_elevation_desk: the Settings panel's merged save is what the hook reads next" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [1024]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try testing.expect(!deskBlocks(io, dir)); // no file: off
+    try tmp.dir.writeFile(io, .{ .sub_path = settings.file_name, .data = "program = agent\r\nsystem_monitor = on\r\n" });
+    try testing.expect(!deskBlocks(io, dir)); // not set: off
+    // As gui.saveSettings does: load, merge the toggle, save.
+    var s = settings.loadOrNull(gpa, io, dir).?;
+    s.block_elevation_desk = true;
+    try settings.save(gpa, io, dir, &s);
+    try testing.expect(deskBlocks(io, dir));
+    const back = settings.load(gpa, io, dir);
+    try testing.expectEqualStrings("agent", back.program.get().?);
+    try testing.expect(back.system_monitor.?);
+    s.block_elevation_desk = false;
+    try settings.save(gpa, io, dir, &s);
+    try testing.expect(!deskBlocks(io, dir));
+    try testing.expect(!deskBlocks(io, null));
+}
+
 /// The PreToolUse deny decision on stdout (the agent's documented hook
 /// output; exit code 0).
 pub fn decisionJson(reason: []const u8, out: *std.Io.Writer) !void {
