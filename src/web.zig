@@ -139,7 +139,45 @@ pub const Peer = struct {
     ip: tunnelnet.Ip4,
     id: devices.DeviceId,
     name: devices.Text,
+    /// Its address may still carry an older key in the tunnel (the store
+    /// changed and the tunnel's peer table has not caught up,
+    /// tunneldesk.Applier): nothing is admitted from it and no connection
+    /// counts as this record's.
+    refused: bool = false,
 };
+
+/// The two WebSockets (`GET /ws`, `GET /ws/bulk`).
+pub const Channel = enum { interactive, bulk };
+
+/// `peers` from store `st`, those at `refused` addresses marked refused.
+fn setPeers(peers: *[devices.max_devices]?Peer, st: *const devices.Store, refused: []const tunnelnet.Ip4) void {
+    for (peers, st.devices) |*p, d| p.* = if (d) |dev| .{
+        .ip = dev.ip,
+        .id = dev.id,
+        .name = dev.name,
+        .refused = for (refused) |ip| {
+            if (std.mem.eql(u8, &ip, &dev.ip)) break true;
+        } else false,
+    } else null;
+}
+
+/// The record admitted from address `ip`: none if refused.
+fn peerAt(peers: *const [devices.max_devices]?Peer, ip: tunnelnet.Ip4) ?Peer {
+    for (peers) |slot| if (slot) |p| if (std.mem.eql(u8, &p.ip, &ip)) return if (p.refused) null else p;
+    return null;
+}
+
+/// Null while record `p` is still the one at its address (and not
+/// refused); else why its connections end: `replaced` if its name is
+/// still paired (under another record), `unpaired` if not.
+fn endReasonIn(peers: *const [devices.max_devices]?Peer, p: *const Peer) ?Server.EndReason {
+    var replaced = false;
+    for (peers) |slot| if (slot) |q| {
+        if (std.mem.eql(u8, &q.id, &p.id) and std.mem.eql(u8, &q.ip, &p.ip) and !q.refused) return null;
+        if (std.mem.eql(u8, q.name.get(), p.name.get())) replaced = true;
+    };
+    return if (replaced) .replaced else .unpaired;
+}
 
 // ------------------------------------------------------------ pure helpers
 
@@ -412,7 +450,11 @@ pub const Server = struct {
 
     // ------------------------------------------------------ paired devices
 
-    /// The paired device at tunnel address `addr`, if any.
+    /// The paired device at tunnel address `addr`, if any (and not
+    /// refused). By address only: the stream does not carry the WireGuard
+    /// key, so this relies on the tunnel letting each address in only
+    /// with its record's key, which `refused` covers while the peer table
+    /// catches up with the store.
     pub fn deviceAt(srv: *Server, addr: net.IpAddress) ?Peer {
         const ip: tunnelnet.Ip4 = switch (addr) {
             .ip4 => |a| a.bytes,
@@ -420,31 +462,33 @@ pub const Server = struct {
         };
         srv.peer_mutex.lockUncancelable(srv.io);
         defer srv.peer_mutex.unlock(srv.io);
-        for (srv.peers) |slot| if (slot) |p| if (std.mem.eql(u8, &p.ip, &ip)) return p;
-        return null;
+        return peerAt(&srv.peers, ip);
     }
 
-    /// Null while record `p` is still paired; else why its connections end.
+    /// Null while record `p` is still paired at its address (and not
+    /// refused); else why its connections end.
     pub fn endReason(srv: *Server, p: *const Peer) ?EndReason {
         srv.peer_mutex.lockUncancelable(srv.io);
         defer srv.peer_mutex.unlock(srv.io);
-        var replaced = false;
-        for (srv.peers) |slot| if (slot) |q| {
-            if (std.mem.eql(u8, &q.id, &p.id)) return null;
-            if (std.mem.eql(u8, q.name.get(), p.name.get())) replaced = true;
-        };
-        return if (replaced) .replaced else .unpaired;
+        return endReasonIn(&srv.peers, p);
     }
 
-    /// Called by the store watcher with a freshly read store (only a
-    /// successful read gets here, so a store error never ends anyone):
-    /// refreshes the paired devices, then wakes every connection so those
-    /// of removed records say goodbye.
-    pub fn applyStore(srv: *Server, st: *const devices.Store) void {
+    /// Called by the store watcher (tunneldesk.Applier) with a freshly
+    /// read store (only a successful read gets here, so a store error
+    /// never ends anyone): refreshes the paired devices, marking those at
+    /// `refused` addresses refused, then wakes every connection so those
+    /// of removed, replaced or refused records say goodbye.
+    pub fn applyStore(srv: *Server, st: *const devices.Store, refused: []const tunnelnet.Ip4) void {
         srv.peer_mutex.lockUncancelable(srv.io);
-        for (&srv.peers, st.devices) |*p, d| p.* = if (d) |dev| .{ .ip = dev.ip, .id = dev.id, .name = dev.name } else null;
+        setPeers(&srv.peers, st, refused);
         srv.peer_mutex.unlock(srv.io);
         srv.wakeViewers();
+        srv.storeChanged();
+    }
+
+    /// Calls `store_notify_fn`: the paired devices, or how they are
+    /// applied, may have changed.
+    pub fn storeChanged(srv: *Server) void {
         if (srv.store_notify_fn) |f| if (srv.store_notify_ctx) |c| f(c);
     }
 
@@ -664,6 +708,12 @@ pub const Server = struct {
                 } else if (revoked_since == null) {
                     revoked_since = now;
                 }
+            } else if (srv.endReason(&conn.device) != null) {
+                // Not a WebSocket yet: there is no logout to deliver, so a
+                // connection whose record went (or whose address is
+                // refused) ends now, not at its head timeout.
+                reason = "unpaired";
+                break;
             }
             if (revoked_since) |r| {
                 if (now -| r >= revoke_grace_ms) {
@@ -874,8 +924,6 @@ pub const Server = struct {
         try srv.webSocket(conn, w, req, channel, leftover);
         return false;
     }
-
-    const Channel = enum { interactive, bulk };
 
     // ---------------------------------------------------------- responses
 
@@ -1999,3 +2047,37 @@ test "ip key" {
     try testing.expect(!std.mem.eql(u8, &ipKey(a), &ipKey(c)));
 }
 
+test "peers: a refused address admits nothing, and a record replaced at its address ends" {
+    var st: devices.Store = .{};
+    var k1: devices.Key = @splat(7);
+    k1[0] = 1;
+    var k2: devices.Key = @splat(8);
+    k2[0] = 1;
+    const old = (try st.pair("phone", k1, @splat(9), @splat(1), 0)).device;
+    var peers: [devices.max_devices]?Peer = @splat(null);
+    setPeers(&peers, &st, &.{});
+    const admitted = peerAt(&peers, old.ip).?;
+    try testing.expect(endReasonIn(&peers, &admitted) == null);
+
+    // Re-paired: the same name and address, a new record. While the
+    // tunnel may still have the old key the address is refused.
+    const new = (try st.pair("phone", k2, @splat(9), @splat(2), 0)).device;
+    try testing.expectEqual(old.ip, new.ip);
+    setPeers(&peers, &st, &.{new.ip});
+    try testing.expect(peerAt(&peers, new.ip) == null);
+    try testing.expectEqual(Server.EndReason.replaced, endReasonIn(&peers, &admitted).?);
+    // A connection admitted as the new record during the refusal could
+    // not exist (peerAt refused it); after it, the new record is let in.
+    setPeers(&peers, &st, &.{});
+    const now_admitted = peerAt(&peers, new.ip).?;
+    try testing.expect(endReasonIn(&peers, &now_admitted) == null);
+    try testing.expectEqual(Server.EndReason.replaced, endReasonIn(&peers, &admitted).?);
+    // A record id found at another address is not this connection's.
+    var moved = now_admitted;
+    moved.ip = .{ 10, 8, 0, 99 };
+    try testing.expect(endReasonIn(&peers, &moved) != null);
+    // Unpaired: nothing of that name is left.
+    _ = st.remove("phone");
+    setPeers(&peers, &st, &.{});
+    try testing.expectEqual(Server.EndReason.unpaired, endReasonIn(&peers, &now_admitted).?);
+}

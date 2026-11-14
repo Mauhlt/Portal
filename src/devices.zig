@@ -403,7 +403,9 @@ pub const Desk = struct {
         return out;
     }
 
-    /// A device forgot this desktop: removes record `id` only.
+    /// Removes record `id` only (a device forgetting this desktop, or
+    /// Unpair at the desk: a record paired again under the same name
+    /// meanwhile stays). True if it was there.
     pub fn forget(d: Desk, id: DeviceId) !bool {
         var removed = false;
         const Ctx = struct { id: DeviceId, out: *bool };

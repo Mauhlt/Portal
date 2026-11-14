@@ -100,6 +100,9 @@ pub fn Panels(comptime devices: type) type {
         pub const AgentHooks = enum { unknown, not_installed, installed, partly, other_exe, unreadable };
 
         pub const DevRow = struct {
+            /// The record (Unpair removes exactly this one, never a
+            /// record paired again under the same name meanwhile).
+            id: devices.DeviceId = @splat(0),
             name: devices.Text = .{},
             ip: devices.Text = .{},
             /// Its WireGuard key's check code.

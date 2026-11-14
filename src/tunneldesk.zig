@@ -8,6 +8,9 @@
 //!    only to start the tunnel, then wiped.
 //!  * Peers: derived from the device store and nothing else (one source of
 //!    truth): every paired device's key, allowed only its own 10.8.0.x/32.
+//!    A store change reaches the server and the tunnel in the order
+//!    `Applier` keeps (an address is refused while an old key may still
+//!    use it).
 //!  * UDP: the tunnel port (settings `tunnel_port`, default 51820) on all
 //!    interfaces, or on 127.0.0.1 only for tests (`--tunnel-loopback`).
 //!    Inbound UDP on that port needs one firewall rule the owner adds once
@@ -109,6 +112,55 @@ pub fn peersFrom(st: *const devices.Store, out: []tunnel.Peer) []tunnel.Peer {
     for (st.devices) |slot| if (slot) |d| {
         out[n] = .{ .public_key = d.key, .address = d.ip };
         n += 1;
+    };
+    return out[0..n];
+}
+
+/// How long the connections of a device that went (or whose address now
+/// has another key) get to read their `logout` before the key leaves the
+/// tunnel.
+pub const logout_wait_ms = 3000;
+
+/// Brings a new device store to the server (web.Server) and the tunnel
+/// (tunnel.Tunnel), in an order that never lets an address name one record
+/// at the server while another key may still use it in the tunnel (a
+/// re-paired name keeps its address):
+///   1. the server gets the new list with every address whose key in the
+///      tunnel is not the store's refused: nothing more is admitted from
+///      it, and its connections end with their `logout`;
+///   2. they get `logout_wait_ms` to go;
+///   3. the tunnel gets the new peer table;
+///   4. only once it took it does the server get the full list.
+/// If the tunnel refuses the table, those addresses stay refused and the
+/// error is returned; `in_tunnel` is unchanged, so every later apply
+/// refuses them again until a table goes through (fail closed).
+/// Not thread-safe: the caller serializes applies.
+pub const Applier = struct {
+    /// The store the tunnel's peer table was last made from.
+    in_tunnel: devices.Store = .{},
+
+    pub fn apply(a: *Applier, srv: anytype, tun: anytype, st: *const devices.Store) !void {
+        var buf: [devices.max_devices]tunnelnet.Ip4 = undefined;
+        const refused = staleAddresses(&a.in_tunnel, st, &buf);
+        srv.applyStore(st, refused);
+        if (refused.len > 0) srv.awaitGone(refused, logout_wait_ms);
+        var peers: [devices.max_devices]tunnel.Peer = undefined;
+        try tun.setPeers(peersFrom(st, &peers));
+        a.in_tunnel = st.*;
+        if (refused.len > 0) srv.applyStore(st, &.{});
+    }
+};
+
+/// The addresses whose key in `have` (the tunnel's) is not the one `want`
+/// has there, or that `want` no longer has. `out` holds max_devices.
+pub fn staleAddresses(have: *const devices.Store, want: *const devices.Store, out: []tunnelnet.Ip4) []tunnelnet.Ip4 {
+    var n: usize = 0;
+    for (have.devices) |slot| if (slot) |d| {
+        const same = if (want.findIp(d.ip)) |i| std.mem.eql(u8, &want.devices[i].?.key, &d.key) else false;
+        if (!same) {
+            out[n] = d.ip;
+            n += 1;
+        }
     };
     return out[0..n];
 }
@@ -220,4 +272,93 @@ test "a lost desk.pub is derived from desk.key, not replaced by a new pair" {
     // A public half whose key is gone is an error, not a new key.
     try Io.Dir.cwd().deleteFile(io, try keyPath(paths, &pb, "desk.key"));
     try std.testing.expectError(error.TunnelKeyMissing, loadOrCreate(gpa, io, paths));
+}
+
+/// Records what the Applier does, in order.
+const FakeDesk = struct {
+    const Step = union(enum) {
+        server: struct { n_peers: usize, refused: [devices.max_devices]tunnelnet.Ip4, n_refused: usize },
+        await_gone: usize,
+        set_peers: usize,
+    };
+    steps: [16]Step = undefined,
+    n: usize = 0,
+    fail_set_peers: bool = false,
+
+    fn add(f: *FakeDesk, s: Step) void {
+        f.steps[f.n] = s;
+        f.n += 1;
+    }
+    pub fn applyStore(f: *FakeDesk, st: *const devices.Store, refused: []const tunnelnet.Ip4) void {
+        var s: Step = .{ .server = .{ .n_peers = st.count(), .refused = undefined, .n_refused = refused.len } };
+        @memcpy(s.server.refused[0..refused.len], refused);
+        f.add(s);
+    }
+    pub fn awaitGone(f: *FakeDesk, ips: []const tunnelnet.Ip4, max_ms: i64) void {
+        std.debug.assert(max_ms == logout_wait_ms);
+        f.add(.{ .await_gone = ips.len });
+    }
+    pub fn setPeers(f: *FakeDesk, peers: []const tunnel.Peer) !void {
+        f.add(.{ .set_peers = peers.len });
+        if (f.fail_set_peers) return error.OutOfMemory;
+    }
+};
+
+test "store apply: a re-paired address is refused until the tunnel dropped the old key" {
+    var old: devices.Store = .{};
+    var k1: Key = @splat(7);
+    k1[0] = 1;
+    var k2: Key = @splat(8);
+    k2[0] = 1;
+    const first = try old.pair("phone", k1, @splat(9), @splat(1), 0);
+    var new = old;
+    const second = try new.pair("phone", k2, @splat(9), @splat(2), 0);
+    // The name keeps its address: only the key in the tunnel tells them apart.
+    try std.testing.expectEqual(first.device.ip, second.device.ip);
+
+    var a: Applier = .{ .in_tunnel = old };
+    var f: FakeDesk = .{};
+    try a.apply(&f, &f, &new);
+    try std.testing.expectEqual(@as(usize, 4), f.n);
+    const s0 = f.steps[0].server;
+    try std.testing.expectEqual(@as(usize, 1), s0.n_refused);
+    try std.testing.expectEqual(first.device.ip, s0.refused[0]);
+    try std.testing.expectEqual(@as(usize, 1), f.steps[1].await_gone);
+    try std.testing.expectEqual(@as(usize, 1), f.steps[2].set_peers);
+    try std.testing.expectEqual(@as(usize, 0), f.steps[3].server.n_refused);
+
+    // Nothing changed: no refusal, no wait.
+    f = .{};
+    try a.apply(&f, &f, &new);
+    try std.testing.expectEqual(@as(usize, 2), f.n);
+    try std.testing.expectEqual(@as(usize, 0), f.steps[0].server.n_refused);
+    try std.testing.expectEqual(@as(usize, 1), f.steps[1].set_peers);
+}
+
+test "store apply: a failed peer table keeps the address refused, also on the next apply" {
+    var old: devices.Store = .{};
+    var k1: Key = @splat(7);
+    k1[0] = 1;
+    _ = try old.pair("phone", k1, @splat(9), @splat(1), 0);
+    var gone = old;
+    _ = gone.remove("phone");
+    var a: Applier = .{ .in_tunnel = old };
+    var f: FakeDesk = .{ .fail_set_peers = true };
+    try std.testing.expectError(error.OutOfMemory, a.apply(&f, &f, &gone));
+    // Refused, waited, the table refused: no full list was published.
+    try std.testing.expectEqual(@as(usize, 3), f.n);
+    try std.testing.expectEqual(@as(usize, 1), f.steps[0].server.n_refused);
+    try std.testing.expect(f.steps[2] == .set_peers);
+    // The same store again (a retry): still refused until it goes through.
+    f = .{ .fail_set_peers = true };
+    try std.testing.expectError(error.OutOfMemory, a.apply(&f, &f, &gone));
+    try std.testing.expectEqual(@as(usize, 1), f.steps[0].server.n_refused);
+    f = .{};
+    try a.apply(&f, &f, &gone);
+    try std.testing.expectEqual(@as(usize, 4), f.n);
+    try std.testing.expectEqual(@as(usize, 0), f.steps[3].server.n_refused);
+    // Now the tunnel has it: nothing is refused any more.
+    f = .{};
+    try a.apply(&f, &f, &gone);
+    try std.testing.expectEqual(@as(usize, 0), f.steps[0].server.n_refused);
 }
