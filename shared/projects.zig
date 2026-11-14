@@ -258,6 +258,11 @@ pub const Result = enum {
     too_many_tabs,
     /// Start: the program could not be started.
     failed,
+    /// Start: another request is starting it right now.
+    starting,
+    /// Start: the desk could not set up the guard that holds a device
+    /// start to its mode (Portal's settings layer), so it was not started.
+    no_guard,
 
     pub fn wire(r: Result) []const u8 {
         return @tagName(r);
@@ -281,6 +286,8 @@ pub const Result = enum {
             .not_running => "It is not running.",
             .too_many_tabs => "The desk has no room for another tab.",
             .failed => "The desk could not start it.",
+            .starting => "It is starting: wait a moment.",
+            .no_guard => "The desk could not set up its guard for device starts (see the desk's log).",
         };
     }
 

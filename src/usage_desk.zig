@@ -2,15 +2,11 @@
 //! docs/tabs-design.md "The plan-usage bar"):
 //!
 //!   * Where the numbers come from: the agent's status line. Portal gives
-//!     the sessions it launches a settings file of its own with
-//!     `--settings <data>\agent-statusline.json`, holding only
-//!     `statusLine` = `portalctl statusline` (statusline.zig). The agent
-//!     layers it over the user's settings for that session only; the
-//!     user's own files are never touched, and since the file has no
-//!     `hooks` key their hooks stay as they are (keys a settings layer
-//!     leaves out keep their values; hook entries merge across layers).
-//!     When the program setting already passes `--settings`, Portal adds
-//!     nothing.
+//!     the sessions it launches a settings layer of its own with
+//!     `--settings` (agentsettings.zig), holding `statusLine` = `portalctl
+//!     statusline` (statusline.zig). The user's own files are never
+//!     touched. When the program setting already passes `--settings`,
+//!     Portal adds nothing to desk starts.
 //!   * `State`: the latest windows (`report`), the limit (`limitReached`
 //!     from a StopFailure hook with `error` = `rate_limit`, cleared by a
 //!     later finished turn or the window's reset).
@@ -153,64 +149,11 @@ pub fn commandFor(exe: []const u8, buf: []u8) ?[]const u8 {
     return buf[0 .. exe.len + tail.len];
 }
 
-/// The settings file's content: `statusLine` and nothing else.
-pub fn settingsJson(command: []const u8, buf: []u8) ![]const u8 {
-    // commandFor's characters need no JSON escaping.
-    return std.fmt.bufPrint(buf, "{{\"statusLine\":{{\"type\":\"command\",\"command\":\"{s}\",\"padding\":0}}}}\n", .{command});
-}
-
-/// Writes `<data_dir>\agent-statusline.json` for `portalctl.exe` next to
-/// this executable and returns the file's path (caller frees), or null
-/// with the reason in `why` (the bar then stays off; logged by the caller).
-pub fn prepare(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, why: *[]const u8) ?[]u8 {
-    if (builtin.os.tag != .windows) return null;
-    const w = @import("win32.zig");
-    const fsutil = @import("fsutil.zig");
-    var exe_w: [1024]u16 = undefined;
-    const n = w.GetModuleFileNameW(null, &exe_w, exe_w.len);
-    if (n == 0 or n >= exe_w.len) {
-        why.* = "this program's path is unknown";
-        return null;
-    }
-    const self = std.unicode.wtf16LeToWtf8Alloc(gpa, exe_w[0..n]) catch return null;
-    defer gpa.free(self);
-    const dir = std.fs.path.dirname(self) orelse return null;
-    const exe = std.fs.path.join(gpa, &.{ dir, "portalctl.exe" }) catch return null;
-    defer gpa.free(exe);
-    std.Io.Dir.cwd().access(io, exe, .{}) catch {
-        why.* = "portalctl.exe is not next to this program";
-        return null;
-    };
-    var cb: [1100]u8 = undefined;
-    const cmd = commandFor(exe, &cb) orelse blk: {
-        // A path with spaces: its 8.3 short form, if the volume has one.
-        const short = shortPath(gpa, exe) orelse break :blk null;
-        defer gpa.free(short);
-        break :blk commandFor(short, &cb);
-    } orelse {
-        why.* = "portalctl.exe's path has characters a shell would misread (and no short name)";
-        return null;
-    };
-    var jb: [1300]u8 = undefined;
-    const json = settingsJson(cmd, &jb) catch return null;
-    const path = std.fs.path.join(gpa, &.{ data_dir, settings_name }) catch return null;
-    fsutil.writeAtomic(gpa, io, path, json) catch {
-        why.* = "the settings file could not be written";
-        gpa.free(path);
-        return null;
-    };
-    return path;
-}
-
-extern "kernel32" fn GetShortPathNameW(long: [*:0]const u16, short: [*]u16, len: u32) callconv(.winapi) u32;
-
-fn shortPath(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
-    const wide = std.unicode.wtf8ToWtf16LeAllocZ(gpa, path) catch return null;
-    defer gpa.free(wide);
-    var out: [1024]u16 = undefined;
-    const n = GetShortPathNameW(wide.ptr, &out, out.len);
-    if (n == 0 or n >= out.len) return null;
-    return std.unicode.wtf16LeToWtf8Alloc(gpa, out[0..n]) catch null;
+/// The `statusLine` member (no braces) for `command` (commandFor's
+/// characters need no JSON escaping): agentsettings.zig puts it in
+/// Portal's settings layer.
+pub fn writeStatusLine(w: *std.Io.Writer, command: []const u8) std.Io.Writer.Error!void {
+    try w.print("\"statusLine\":{{\"type\":\"command\",\"command\":\"{s}\",\"padding\":0}}", .{command});
 }
 
 // ------------------------------------------------------------------ tests
@@ -278,18 +221,19 @@ test "Throttle: connect, 5 minutes, threshold crossings (fake clock)" {
     try testing.expectEqual(Throttle.Decision.now, t.decide(d, std.math.maxInt(i64)));
 }
 
-test "commandFor and the settings file" {
+test "commandFor and the status line member" {
     var b: [256]u8 = undefined;
     const c = commandFor("C:\\Users\\bob\\AppData\\Local\\Portal\\bin\\portalctl.exe", &b).?;
     try testing.expectEqualStrings("C:/Users/bob/AppData/Local/Portal/bin/portalctl.exe statusline", c);
     var jb: [512]u8 = undefined;
-    const j = try settingsJson(c, &jb);
-    try testing.expectEqualStrings("{\"statusLine\":{\"type\":\"command\",\"command\":\"C:/Users/bob/AppData/Local/Portal/bin/portalctl.exe statusline\",\"padding\":0}}\n", j);
-    // Valid JSON with exactly one key: no hooks, nothing else layered.
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, j, .{});
+    var w: std.Io.Writer = .fixed(&jb);
+    try w.writeAll("{");
+    try writeStatusLine(&w, c);
+    try w.writeAll("}");
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, w.buffered(), .{});
     defer parsed.deinit();
-    try testing.expectEqual(@as(usize, 1), parsed.value.object.count());
-    try testing.expect(parsed.value.object.get("hooks") == null);
-    for ([_][]const u8{ "C:\\Program Files\\p.exe", "C:\\a&b\\p.exe", "C:\\$x\\p.exe", "C:\\a(1)\\p.exe", "C:\\a'b\\p.exe", "C:\\a\"b\\p.exe", "" }) |bad|
+    try testing.expectEqualStrings(c, parsed.value.object.get("statusLine").?.object.get("command").?.string);
+    // 8.3 short names (`PROGRA~1`) are refused like any other `~`.
+    for ([_][]const u8{ "C:\\Program Files\\p.exe", "C:\\PROGRA~1\\p.exe", "C:\\a&b\\p.exe", "C:\\$x\\p.exe", "C:\\a(1)\\p.exe", "C:\\a'b\\p.exe", "C:\\a\"b\\p.exe", "" }) |bad|
         try testing.expect(commandFor(bad, &b) == null);
 }

@@ -33,7 +33,9 @@
 //! Start such consoles hidden or with SW_SHOWMINNOACTIVE.)
 //!
 //! It prints the `--permission-mode` it was given (FAKE-PERMISSION-MODE=
-//! <mode>, or FAKE-NO-PERMISSION-MODE), for the projects group.
+//! <mode>, or FAKE-NO-PERMISSION-MODE), for the projects group, and runs
+//! the device guard hook of Portal's settings layer if it got one
+//! (FAKE-GUARD-...: projects_tests.fakeGuard).
 //!
 //! A tab whose folder's name contains "quiet" writes no transcript at all.
 //! A tab whose folder's name contains "probe" only does OSC 7501 feature
@@ -259,6 +261,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
         say(m);
         say("\r\n");
     } else say("FAKE-NO-PERMISSION-MODE\r\n");
+    // A device start's guard layer, run as the agent would (projects group).
+    @import("projects_tests.zig").fakeGuard(gpa, io, args, &say);
     const cwd = std.process.currentPathAlloc(io, gpa) catch return 2;
     openInputLog(gpa, cwd);
     if (session_id) |s| say(if (validUuid(s)) "FAKE-SESSION-ID\r\n" else "FAKE-BAD-SESSION-ID\r\n") else say("FAKE-NO-SESSION-ID\r\n");

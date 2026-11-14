@@ -294,9 +294,20 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
 
 /// Portal's matcher group for `e`, at nesting `level`.
 fn writeGroup(w: *std.Io.Writer, st: Style, level: usize, e: hookmsg.Event, exe: []const u8) !void {
+    return writeGroupWith(w, st, level, matcherOf(e), exe, &.{"hook"});
+}
+
+/// A matcher group of Portal's shape, compact (no line breaks): the one
+/// builder for Portal's `--settings` layer too (agentsettings.zig), which
+/// gives the guard hook its own `matcher` and `args`.
+pub fn writeCompactGroup(w: *std.Io.Writer, matcher: ?[]const u8, exe: []const u8, args: []const []const u8) !void {
+    return writeGroupWith(w, .{ .nl = "", .unit = "" }, 0, matcher, exe, args);
+}
+
+fn writeGroupWith(w: *std.Io.Writer, st: Style, level: usize, matcher: ?[]const u8, exe: []const u8, args: []const []const u8) !void {
     try w.writeAll("{");
     try w.writeAll(st.nl);
-    if (matcherOf(e)) |m| {
+    if (matcher) |m| {
         try st.indent(w, level + 1);
         try w.writeAll("\"matcher\": ");
         try writeJsonString(w, m);
@@ -320,8 +331,14 @@ fn writeGroup(w: *std.Io.Writer, st: Style, level: usize, e: hookmsg.Event, exe:
     try st.indent(w, level + 3);
     try w.writeAll("\"args\": [");
     try w.writeAll(st.nl);
-    try st.indent(w, level + 4);
-    try w.writeAll("\"hook\"");
+    for (args, 0..) |arg, i| {
+        if (i > 0) {
+            try w.writeAll(",");
+            try w.writeAll(st.nl);
+        }
+        try st.indent(w, level + 4);
+        try writeJsonString(w, arg);
+    }
     try w.writeAll(st.nl);
     try st.indent(w, level + 3);
     try w.writeAll("],");

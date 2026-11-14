@@ -49,7 +49,9 @@ pub const Event = enum {
     /// it fires only for the Bash and PowerShell tools, not for every tool
     /// call): the admin-prompt guard and the long-running deadline
     /// (docs/tabs-design.md). `guard` says what the hook did about an
-    /// elevating command; no state change.
+    /// elevating command; no state change. (A device start's own guard
+    /// hook sees every tool, but tells Portal only about shell commands:
+    /// hookpipe.hookCommand.)
     PreToolUse,
     UserPromptSubmit,
     PermissionRequest,
@@ -79,9 +81,15 @@ pub const pretool_matcher = "Bash|PowerShell";
 pub const Guard = enum { none, marked, denied };
 
 /// The environment variable Portal sets for a tab a paired device started
-/// (value `device`): its hook denies elevating commands. Added after
-/// childenv's filter like PORTAL_TAB, so it is never inherited.
+/// (value `device`): its hook denies elevating commands, and the plain
+/// hook leaves telling Portal about PreToolUse to the device guard. Added
+/// after childenv's filter like PORTAL_TAB, so it is never inherited. Not
+/// what the device guard trusts: its mode comes from its own arguments.
 pub const guard_env_name = "PORTAL_GUARD";
+
+/// `portalctl hook --device ask|plan`: the device guard, from Portal's own
+/// settings layer for a device start (agentsettings.zig, hookpipe.zig).
+pub const device_flag = "--device";
 
 /// `[A-Za-z0-9_-]{1,64}`: the only names that travel.
 pub fn validName(s: []const u8) bool {

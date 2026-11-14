@@ -146,19 +146,22 @@ on stdin (`rate_limits.five_hour` / `rate_limits.seven_day`:
 subscriptions, only after the session's first reply, each window may be
 absent).
 
-* **Portal's own status line, for its own sessions only.** At start Portal
-  writes `%LOCALAPPDATA%\Portal\agent-statusline.json`, holding exactly
+* **Portal's own status line, for its own sessions only.** Right before
+  each desk launch Portal checks `%LOCALAPPDATA%\Portal\agent-statusline.json`
+  against what it would write, exactly
   `{"statusLine":{"type":"command","command":"<...>/portalctl.exe
-  statusline","padding":0}}`, and launches the agent with `--settings
-  <that file>` (cmdline.launchArgs; the path quoted, cmdline.pathArg). The
-  agent layers it over the user's settings for that session: the user's
-  files are never written, their `statusLine` stays theirs everywhere
-  else, and their hooks still run (the file has no `hooks` key: keys a
-  layer leaves out keep their values, and hook entries merge across
-  layers). The command runs in the agent's shell (Git Bash or
-  PowerShell), so its path has forward slashes and only `[A-Za-z0-9/:._-]`
-  (else its 8.3 short form; else no bar, logged). A program setting that
-  passes its own `--settings`, or that is not the agent, gets nothing.
+  statusline","padding":0}}`, rewrites it if it differs (src/
+  agentsettings.zig: nothing written there meanwhile is trusted), and
+  launches the agent with `--settings <that file>` (cmdline.launchArgs;
+  the path quoted, cmdline.pathArg). The agent layers it over the user's
+  settings for that session: the user's files are never written, their
+  `statusLine` stays theirs everywhere else, and their hooks still run
+  (the file has no `hooks` key: keys a layer leaves out keep their
+  values, and hook entries merge across layers). The command runs in the
+  agent's shell (Git Bash or PowerShell), so its path has forward slashes
+  and only `[A-Za-z0-9/:._-]` (else no bar, logged). A program setting
+  that passes its own `--settings`, or that is not the agent, gets
+  nothing on desk starts. Device starts get their own layer (below).
 * **`portalctl statusline`** (src/statusline.zig) reads stdin (at most
   256 KB), keeps only the two windows (percent floored, so 99.6 % is not
   the limit), sends them with the tab's `PORTAL_TAB` over the hook pipe
@@ -172,8 +175,14 @@ absent).
   is `rate_limit` (only that value travels). The desk then marks the
   window closer to its limit as reached; a finished turn (`Stop`), a new
   window (another reset time) or its reset time clears it.
-* **The desk** keeps the latest values (`Hub.usage`, src/usage_desk.zig)
-  and shows the strip itself; each device viewer sends `{"t":"usage"}`
+* **The desk** keeps the latest report per tab (`Hub.usage`,
+  src/usage_desk.zig: `reportFrom`, keyed by the tab's hook key) and
+  shows each window from the newest one; a tab's reports go when it
+  closes, and a report whose reset time does not fit its window is
+  dropped. Any process in a tab can read `PORTAL_TAB` and send a report,
+  so this bounds a made-up number (replaced by the next real report from
+  any tab, gone with its tab) rather than preventing it. The desk shows
+  the strip itself; each device viewer sends `{"t":"usage"}`
   on connect, then at most every 5 minutes, at once on 75 %, 90 %, 100 %
   or a limit change (docs/protocol.md section 3h). Only percentages and
   Unix times leave the desk.
@@ -304,22 +313,55 @@ chose. What exists:
   the request but the name is used, and answers carry the desk's own
   spelling, never the device's text.
 * **Never a permissive session.** Portal itself adds `--permission-mode
-  default` (Ask: every edit and command asks) or `--permission-mode plan`
-  (Plan: read-only planning) to the launch (cmdline.launchArgs), and only
-  for the agent: a device start is refused (`unsafe_program`) when the
-  program setting is not the agent or its arguments hold a flag that
-  skips, widens or pre-answers permission prompts, or picks the mode
-  itself (`--dangerously-*`, `--allow-dangerously-*`, `--permission-mode`,
-  `--allowedTools` / `--allowed-tools`, `--permission-prompt-tool`;
-  cmdline.deviceStart). The program is found on PATH again for every tab
-  (tabs.Program, Hub.open), so a reopened project runs the agent installed
-  now even if an update moved it, and the check runs again on the program
-  as found (cmdline.deviceStartResolved).
+  default` (Ask) or `--permission-mode plan` (Plan) to the launch, right
+  after the program so a configured `--` can't turn it into prompt text
+  (cmdline.launchArgs, withArgs), and only for the agent: a device start
+  is refused (`unsafe_program`) when the program setting is not the agent
+  or its arguments hold a flag that skips, widens or pre-answers
+  permission prompts, picks the mode itself, or brings in settings,
+  folders, tools or agents Portal did not choose (`--dangerously-*`,
+  `--allow-dangerously-*`, `--permission-mode`, `--allowedTools` /
+  `--allowed-tools`, `--permission-prompt-tool`, `--settings`,
+  `--setting-sources`, `--add-dir`, `--mcp-config`, `--plugin-dir`,
+  `--agents`; cmdline.deviceStart). The program is found on PATH again
+  for every tab, the check runs again on the program as found
+  (cmdline.deviceStartResolved), and a device start runs only the very
+  program PATH found when Portal started (Program.device_program; after
+  an update moved it, device starts are refused until Portal restarts).
+* **Portal holds the session to its mode, not the agent's dialogs.**
+  The agent's own prompts offer mode changes under keys a device may
+  press (a plan's "auto-accept edits", "allow all edits during this
+  session", a command's "don't ask again", which writes an allow rule),
+  and allow rules in the user's or the project's settings skip prompts
+  under `--permission-mode default`. So every device start gets Portal's
+  own settings layer (`--settings %LOCALAPPDATA%\Portal\agent-device-
+  ask.json` / `-plan.json`, src/agentsettings.zig, checked and rewritten
+  right before each launch): `"disableAllHooks": false` and one
+  PreToolUse hook for every tool (`"matcher": "*"`, exec form
+  `portalctl.exe hook --device ask|plan`). The command-line layer is
+  above the project's and the user's files (and below managed settings),
+  so a repository's `"disableAllHooks": true` does not switch it off;
+  hook groups merge across layers, so nothing a lower file says removes
+  it. The mode is in the hook's own arguments: nothing the session can
+  set (its environment, a settings file) changes it. The hook
+  (hookpipe.modeDecision) lets read-only tools take their normal way
+  (Read, Glob, Grep, LS, the todo list, a question, a subagent, whose
+  own tool calls pass the same hook); everything else (edits, shell
+  commands, web access, MCP tools, ExitPlanMode, any tool it does not
+  know) is **denied in Plan**, and in **Ask** answered `ask`, so the
+  agent asks every time whatever allow rule or mode would let it through.
+  Input it cannot read or parse is denied. Without `portalctl.exe` next
+  to Portal, or when the file can't be written, the start is refused
+  (`no_guard`). The user's own `portalctl hook` (if installed) still
+  runs; in a device start it leaves PreToolUse reports to Portal's hook,
+  so nothing is counted twice.
 * **Bounded.** Refused in input mode `none`; at most 3 starts and 3 stops
   a minute per paired device, across its connections (timestamps only,
   no timer); a malformed or unknown name counts too, so probing is
   limited. An already running project is not started twice: the device
-  is switched to it (`switched`).
+  is switched to it (`switched`); a request while another one is still
+  opening it is told so (`starting`; marked under the same lock as the
+  check).
 * **Only what a device started can a device stop.** `p:stop` of a
   session started at the desk is `not_device_started`; a device-started
   one is asked to exit like the desk's ×, and ended after 10 s.
@@ -331,25 +373,42 @@ chose. What exists:
 
 Residual risks (accepted by design, or outside Portal's reach):
 
-* **Ask is the agent's own guard.** `--permission-mode default` only
-  makes the agent ask; what it asks and how it enforces the answer is
-  the agent's. Its settings files (`~/.claude/settings.json`, a project's
-  `.claude/settings.json` / `settings.local.json`) can pre-allow tools
-  (`permissions.allow`) or hooks that then run without a question; Portal
-  checks its own command line, not those files. Plan mode is likewise
-  enforced by the agent.
-* **Input mode `text` can leave Ask or Plan.** In `text` mode a device may
-  send Shift+Tab, which cycles the agent's permission modes. `text` is
-  full remote control by definition (README); `instruct` and `keys` can't.
+* **Ask means the device approves each call.** Portal's hook makes the
+  agent ask before every non-read-only tool; whoever answers that prompt
+  (a device in `keys` mode or above) approves it, and an approved command
+  runs as the user. The prompt still offers "don't ask again", which
+  writes an allow rule into the project's `.claude/settings.local.json`:
+  it changes nothing in device starts (the hook asks anyway) but does
+  skip that prompt in later sessions started at the desk in that project.
+  Likewise "allow all edits during this session" or Shift+Tab (input mode
+  `text`) change the agent's mode in the session, which the hook
+  overrides; they do not carry over.
+* **What the agent enforces.** Portal relies on the agent honouring its
+  documented command-line settings layer, hook decisions (`deny`, `ask`)
+  and `disableAllHooks` precedence. A managed settings policy is above
+  Portal's layer (it may disable hooks altogether). A hook that times out
+  or crashes lets the call go on to the agent's normal permission flow
+  (in Plan the agent's own mode still holds); Portal's hook takes
+  milliseconds. Hooks a project or user file adds still run next to
+  Portal's (and could `allow`, but the agent takes the strictest hook
+  decision: deny over ask over allow). An installed agent mod (plugin)
+  that approves tool calls itself is not held by hook decisions in a
+  setup without managed settings: Portal does not disable the user's
+  plugins, so such a mod is trusted like the program setting.
+* **The settings layer is a file.** Portal checks and rewrites it right
+  before each launch; a process of the same user that rewrites it in the
+  moment between that and the agent reading it at startup is not caught.
 * **A started session is driven by the same device rules as any tab.**
   Approving prompts from the device (keys, For you) is as strong as the
   input mode allows; a stolen paired device gains "start an allowed
   project" on top of what it could already do in open tabs, until it is
   unpaired.
 * **PATH decides which `claude` runs.** Portal runs what PATH finds when
-  the tab opens (never the current folder); a program planted earlier on
-  PATH under the agent's name would run, exactly as for a desk start. The
-  name check (deviceStartResolved) does not authenticate the binary.
+  the tab opens (never the current folder); a device start only the
+  program found when Portal started. A program planted on PATH under the
+  agent's name before Portal started would run, exactly as for a desk
+  start. The name check (deviceStartResolved) does not authenticate the
+  binary.
 * **settings.txt is the user's file.** Any process running as the user can
   add startable folders, the same trust as the program setting.
 * **Any device can stop any device-started session**, not only its own;
@@ -406,20 +465,26 @@ with yes / no (src/foryou_ws.zig), shown under the latest reply
   the fixed recap.prompt into the tab as an instruction line; `instruct`
   or `text` mode, the agent's tabs only, at most once a minute per tab.
 * **The admin-prompt guard.** A PreToolUse hook (matcher
-  `Bash|PowerShell`) checks the shell command in the hook process
-  (src/elevation.zig, one tested table): RunAs / `-Verb RunAs` / runas,
-  sudo, gsudo, msiexec, `.msi` / `.msp`, installer executables
-  (`setup*.exe`, `*install*.exe`), Set-ExecutionPolicy, and writes under
-  Program Files or into HKLM. In a session a device started (Portal sets
-  `PORTAL_GUARD=device` in its environment, after the child-environment
-  filter, so it is never inherited) such a command is **denied** with the
+  `Bash|PowerShell`; in a device start also Portal's own every-tool hook,
+  above) checks the shell command in the hook process (src/elevation.zig,
+  one tested table): RunAs / `-Verb RunAs` (also spelled in pieces,
+  `('Run'+'As')`) / runas, sudo, gsudo, msiexec, `.msi` / `.msp`,
+  installer executables (`setup*.exe`, `*install*.exe`), winget and
+  choco install / upgrade / uninstall, Add-/Remove-WindowsCapability,
+  Enable-/Disable-WindowsOptionalFeature, dism, bcdedit,
+  Set-ExecutionPolicy, and writes under Program Files or into HKLM. In a
+  session a device started (Portal's hook, and `PORTAL_GUARD=device` in
+  its environment, after the child-environment filter, so it is never
+  inherited) such a command is **denied** with the
   hook's decision output (`permissionDecision: deny`) and a reason telling
   the agent it can only run at the desk: nobody is at the desktop to
   answer the UAC prompt. In a session started at the desk it runs and the
   tab gets a `needs_desk` card until the command's result or the turn's
   end; the desk's `block_elevation_desk = on` (settings.txt, default off,
   the desk's Settings "Admin prompts at the desk"; read by the hook each
-  time, so a save applies at once) denies it there too. The command never
+  time, so a save applies at once) denies it there too. Input the hook
+  can't read or parse (over 1 MiB, not JSON) is denied in a device start
+  or while that setting is on. The command never
   leaves the hook process; the desk logs only the verdict. It is a guard
   against a stuck session, not a sandbox.
 * **Long runs.** One shell command (PreToolUse) running 3 minutes with no
