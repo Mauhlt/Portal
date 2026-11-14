@@ -48,32 +48,58 @@ pub fn loadPublic(io: Io, paths: devices.Paths) !?Key {
 }
 
 /// The desk's key pair, created on first use. Caller wipes it.
+///
+/// Under the device store's lock (devices.lockPath), so a Portal starting
+/// and a `portalctl pair` cannot each make a pair. The key is written
+/// first, then its public half: a crash in between leaves desk.key alone,
+/// and the public half is derived from it next time (a new key would
+/// lock out every paired device). A public half without its key is an
+/// error, never a silent new key.
 pub fn loadOrCreate(gpa: Allocator, io: Io, paths: devices.Paths) !KeyPair {
+    var lb: [1024]u8 = undefined;
+    const lock = fsutil.FileLock.acquire(io, try devices.lockPath(paths, &lb)) catch |err| return switch (err) {
+        error.LockBusy => error.DeviceStoreBusy,
+        else => err,
+    };
+    defer lock.release(io);
     var pb: [1024]u8 = undefined;
-    if (try loadPublic(io, paths)) |public| {
-        const plain = try dpapi.readSealedFile(gpa, io, try keyPath(paths, &pb, "desk.key"), key_magic, key_purpose);
-        defer {
-            std.crypto.secureZero(u8, plain);
-            gpa.free(plain);
-        }
-        if (plain.len != wgkeys.key_len) return error.BadTunnelKey;
-        var kp = KeyPair.fromPrivate(plain[0..wgkeys.key_len].*);
-        // The public half on disk must be this key's (fail closed).
-        if (!std.mem.eql(u8, &kp.public, &public)) {
-            kp.wipe();
-            return error.TunnelKeyMismatch;
-        }
-        return kp;
+    const public = try loadPublic(io, paths);
+    const plain = dpapi.readSealedFile(gpa, io, try keyPath(paths, &pb, "desk.key"), key_magic, key_purpose) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (public != null) return error.TunnelKeyMissing;
+            return create(gpa, io, paths);
+        },
+        else => return err,
+    };
+    defer {
+        std.crypto.secureZero(u8, plain);
+        gpa.free(plain);
     }
+    if (plain.len != wgkeys.key_len) return error.BadTunnelKey;
+    var kp = KeyPair.fromPrivate(plain[0..wgkeys.key_len].*);
+    errdefer kp.wipe();
+    if (public) |p| {
+        // The public half on disk must be this key's (fail closed).
+        if (!std.mem.eql(u8, &kp.public, &p)) return error.TunnelKeyMismatch;
+    } else try writePublic(gpa, io, paths, &kp);
+    return kp;
+}
+
+/// A new pair (the lock is held, neither file exists).
+fn create(gpa: Allocator, io: Io, paths: devices.Paths) !KeyPair {
+    var pb: [1024]u8 = undefined;
     try Io.Dir.cwd().createDirPath(io, try paths.join(&pb, &.{"tunnel"}));
     var kp = KeyPair.generate(io);
     errdefer kp.wipe();
-    // The key first, then its public half: a crash in between leaves no
-    // public key, and the next start makes a new pair.
     try dpapi.writeSealedFile(gpa, io, try keyPath(paths, &pb, "desk.key"), key_magic, &kp.private, key_purpose);
+    try writePublic(gpa, io, paths, &kp);
+    return kp;
+}
+
+fn writePublic(gpa: Allocator, io: Io, paths: devices.Paths, kp: *const KeyPair) !void {
+    var pb: [1024]u8 = undefined;
     const text = kp.publicText() ++ "\n".*;
     try fsutil.writeAtomic(gpa, io, try keyPath(paths, &pb, "desk.pub"), &text);
-    return kp;
 }
 
 /// The tunnel's peer table: every paired device, its key allowed only its
@@ -172,4 +198,26 @@ test "the desk key is sealed with DPAPI, survives a reload, and a swapped public
     const text = other.publicText() ++ "\n".*;
     try fsutil.writeAtomic(gpa, io, try keyPath(paths, &pb, "desk.pub"), &text);
     try std.testing.expectError(error.TunnelKeyMismatch, loadOrCreate(gpa, io, paths));
+}
+
+test "a lost desk.pub is derived from desk.key, not replaced by a new pair" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db: [1024]u8 = undefined;
+    const dir = db[0..try tmp.dir.realPath(io, &db)];
+    const paths: devices.Paths = .{ .dir = dir };
+    var a = try loadOrCreate(gpa, io, paths);
+    defer a.wipe();
+    var pb: [1024]u8 = undefined;
+    try Io.Dir.cwd().deleteFile(io, try keyPath(paths, &pb, "desk.pub"));
+    try std.testing.expect((try loadPublic(io, paths)) == null);
+    var b = try loadOrCreate(gpa, io, paths);
+    defer b.wipe();
+    try std.testing.expectEqualSlices(u8, &a.private, &b.private);
+    try std.testing.expectEqualSlices(u8, &a.public, &(try loadPublic(io, paths)).?);
+    // A public half whose key is gone is an error, not a new key.
+    try Io.Dir.cwd().deleteFile(io, try keyPath(paths, &pb, "desk.key"));
+    try std.testing.expectError(error.TunnelKeyMissing, loadOrCreate(gpa, io, paths));
 }
