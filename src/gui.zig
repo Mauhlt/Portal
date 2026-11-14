@@ -56,6 +56,8 @@ const subtabs_wire = @import("shared").subtabs;
 const convo_wire = @import("shared").convo;
 const deskspeech = @import("deskspeech.zig");
 const deskprojects = @import("deskprojects.zig");
+const foryou_ws = @import("foryou_ws.zig");
+const frames_wire = @import("shared").frames;
 const projects_panel = ui.panels.projects;
 
 /// The desk's top-bar tools: the desk panels', then Projects.
@@ -187,16 +189,27 @@ pub const LocalHost = struct {
     sys: sysinfo.Snapshot = .{},
     sys_gen: u64 = 0,
     /// The shown tab's subagent sub-tabs (section 3e) as of `subs_gen`,
-    /// and the one shown instead of the terminal (null: none): its
-    /// read-only conversation, copied the way a device gets it (the same
-    /// `convo` writer and parser) into the desk's Conversation view.
+    /// and the one shown instead of the terminal (null: none).
     subs: subtabs_wire.List = .{},
     subs_gen: u64 = 0,
     sub_shown: ?subtabs_wire.Id = null,
+    /// The conversation in the desk's Conversation view: the sub-tab's
+    /// shown (read-only), or, with the Conversation button on, the tab's
+    /// own; copied the way a device gets it (the same `convo` writer and
+    /// parser). `convo_src` is whose it is (null: none), `sub_epoch` /
+    /// `sub_rev` how far it was copied.
+    convo_src: ?tabs.Id = null,
     sub_epoch: u32 = 0,
     sub_rev: u64 = 0,
     sub_convo: ui.convo.Conversation = .{},
     convo_view: ui.convoview.View = undefined,
+    /// For you on the desk: every open tab's cards, copied from the tabs
+    /// (foryou_desk.State) in process as of the hub's `fy_gen`, and the
+    /// panel under the latest reply in the Conversation view; its answers
+    /// go to foryou_ws.handle as the desk's own (deskForYouSend).
+    fy_store: ui.foryou.Store = .{},
+    fy_panel: ui.foryou.Panel = undefined,
+    fy_gen: u64 = 0,
     /// Speech input: the 🎤, the Audio panel, the microphone thread and
     /// stt.Home (deskspeech.zig); null until attachDesk.
     speech: ?*deskspeech.DeskSpeech = null,
@@ -222,9 +235,13 @@ pub const LocalHost = struct {
         h.* = .{ .gpa = gpa, .io = io, .p = p };
         h.shell = ui.Shell.init(gpa, .desk, .{ .ctx = h, .vtable = &host_vtable });
         h.shell.modal = .{ .ctx = h, .active = panelActive, .key = panelKey, .char = panelChar, .button = panelButton };
-        // Sub-tabs only: the desk's main slice is the terminal otherwise.
+        // A sub-tab's conversation, or (the Conversation button) the tab's
+        // own with its For-you panel; the terminal otherwise.
         h.convo_view = ui.convoview.View.init(gpa);
         h.convo_view.answers = false;
+        h.fy_panel = ui.foryou.Panel.init(gpa);
+        h.fy_panel.sender = .{ .ctx = h, .send = deskForYouSend };
+        h.convo_view.foryou = &h.fy_panel;
         h.shell.conversation = h.convo_view.contentView();
         return h;
     }
@@ -349,7 +366,7 @@ pub const LocalHost = struct {
             h.frame(changed);
             // A sub-tab's conversation may animate (scrolling to new
             // items): its real deadline.
-            const anim: u32 = if (h.sub_shown != null) (h.convo_view.frameTimeout() orelse Presenter.forever) else Presenter.forever;
+            const anim: u32 = if (h.convo_src != null) (h.convo_view.frameTimeout() orelse Presenter.forever) else Presenter.forever;
             // Speech: a toast ending, the Audio panel's Test (real deadlines).
             const sp: u32 = if (h.speech) |s| (if (s.deadlineMs()) |ms| @intCast(@min(ms, 3600 * 1000)) else Presenter.forever) else Presenter.forever;
             // The usage toast's end.
@@ -426,7 +443,9 @@ pub const LocalHost = struct {
             _ = h.projects.notesLocked(hub);
             h.list_gen = hub.gen;
             list_changed = true;
+            h.fy_store.retain(h.list.slice());
         }
+        const fy_changed = h.copyForYouLocked(hub);
         const projects_changed = hub.projects_gen != h.projects_gen;
         h.projects_gen = hub.projects_gen;
         const changed = if (h.shown) |t| h.sync.sync(h.gpa, &h.grid, &t.session.term) else false;
@@ -440,26 +459,32 @@ pub const LocalHost = struct {
                 h.subs_gen = t.subs.gen;
                 sub_changed = true;
             }
-            if (h.sub_shown) |id| {
-                if (t.subs.byId(id)) |s| {
-                    const cv = &s.convo;
-                    if (cv.epoch != h.sub_epoch) {
-                        cv.writeSnapshot(&sub_msg.writer, s.id) catch {};
-                    } else if (cv.rev != h.sub_rev) {
-                        _ = cv.writeSince(&sub_msg.writer, s.id, h.sub_rev) catch {};
-                    }
-                    h.sub_epoch = cv.epoch;
-                    h.sub_rev = cv.rev;
-                } else {
-                    // It went (the tab's conversation started over).
-                    h.sub_shown = null;
-                    sub_changed = true;
+            if (h.sub_shown) |id| if (t.subs.byId(id) == null) {
+                // It went (the tab's conversation started over).
+                h.sub_shown = null;
+                sub_changed = true;
+            };
+            // The sub-tab's conversation, else the tab's own while the
+            // Conversation button is on.
+            const src: ?struct { cv: *@import("convo/model.zig").Convo, id: tabs.Id } = if (h.sub_shown) |id|
+                .{ .cv = &t.subs.byId(id).?.convo, .id = id }
+            else if (h.shell.main == .conversation) .{ .cv = &t.convo, .id = t.id } else null;
+            if (src) |sc| {
+                const same = if (h.convo_src) |c| std.mem.eql(u8, &c, &sc.id) else false;
+                if (!same or sc.cv.epoch != h.sub_epoch) {
+                    sc.cv.writeSnapshot(&sub_msg.writer, sc.id) catch {};
+                } else if (sc.cv.rev != h.sub_rev) {
+                    _ = sc.cv.writeSince(&sub_msg.writer, sc.id, h.sub_rev) catch {};
                 }
-            }
-        } else if (h.subs.len > 0 or h.sub_shown != null) {
+                h.convo_src = sc.id;
+                h.sub_epoch = sc.cv.epoch;
+                h.sub_rev = sc.cv.rev;
+            } else h.convo_src = null;
+        } else {
+            if (h.subs.len > 0 or h.sub_shown != null) sub_changed = true;
             h.subs = .{};
             h.sub_shown = null;
-            sub_changed = true;
+            h.convo_src = null;
         }
         h.viewers = hub.viewers;
         var act_changed = false;
@@ -483,6 +508,9 @@ pub const LocalHost = struct {
             h.applySubConvo(sub_msg.written());
             sub_changed = true;
         }
+        // The For-you panel follows the tab shown (none under a sub-tab,
+        // whose conversation is read-only); the desk answers as `text`.
+        h.fy_panel.sync(&h.fy_store, if (h.shown) |t| (if (h.sub_shown == null) t.id else null) else null, "text", h.sub_shown == null);
         // Speech: transcripts into the line, the microphone list, toasts.
         const speech_changed = if (h.speech) |s| s.poll(&h.shell) else false;
         // New images become Data items (h.grid is ours: no lock needed).
@@ -492,7 +520,7 @@ pub const LocalHost = struct {
         // The session shows something: the splash may end.
         if (changed and h.shown != null) h.p.splashDone();
         h.shell.touch = client.touchkbd.query();
-        if (!force and !changed and !list_changed and !projects_changed and !act_changed and !sub_changed and !speech_changed and old == null and !h.p.needsRedraw() and h.viewers == h.drawn_viewers) return;
+        if (!force and !changed and !list_changed and !projects_changed and !act_changed and !sub_changed and !fy_changed and !speech_changed and old == null and !h.p.needsRedraw() and h.viewers == h.drawn_viewers) return;
         h.drawn_viewers = h.viewers;
         h.updateTitle();
 
@@ -522,9 +550,42 @@ pub const LocalHost = struct {
     /// Shows sub-tab `i` of the shown tab (null: its terminal again).
     fn selectSub(h: *LocalHost, i: ?usize) void {
         h.sub_shown = if (i) |j| (if (j < h.subs.len) h.subs.items[j].id else null) else null;
-        h.sub_epoch = 0;
-        h.sub_rev = 0;
+        h.convo_src = null;
         h.frame(true);
+    }
+
+    /// Caller holds the hub's mutex. Copies the cards of every tab whose
+    /// For-you list changed since the last look (all of them the first
+    /// time) into the desk's store, as a device's writer would send them,
+    /// but in process. True if any did.
+    fn copyForYouLocked(h: *LocalHost, hub: *tabs.Hub) bool {
+        if (hub.foryou_gen == h.fy_gen) return false;
+        for (hub.tabs[0..hub.n]) |t| {
+            if (h.fy_gen != 0 and t.foryou.gen <= h.fy_gen) continue;
+            var l = t.foryou.list;
+            l.tab = t.id;
+            _ = h.fy_store.put(h.gpa, &l);
+        }
+        h.fy_gen = hub.foryou_gen;
+        return true;
+    }
+
+    /// The For-you panel's `i:` / `r:` frames from the desk's own window:
+    /// the one path device frames take (foryou_ws.handle), as the desk
+    /// (input mode `text`, no rate limit), in process. The answer's text
+    /// goes into the store like a device's `item` / `recap` message.
+    fn deskForYouSend(ctx: *anyopaque, f: []const u8) bool {
+        const h = self(ctx);
+        const hub = h.hub orelse return false;
+        const d = h.desk orelse return false;
+        const fr = frames_wire.classify(f) orelse return false;
+        if (fr.prefix != .item and fr.prefix != .recap) return false;
+        var buf: [frames_wire.max_answer]u8 = undefined;
+        const answer = foryou_ws.handle(.{ .hub = hub, .log = d.srv.log, .from = .desk, .now_ms = std.Io.Clock.awake.now(h.io).toMilliseconds() }, fr, &buf);
+        _ = h.fy_store.applyResult(answer);
+        h.fy_panel.sync(&h.fy_store, h.fy_panel.tab, "text", h.sub_shown == null);
+        notifyThunk(h);
+        return true;
     }
 
     /// This frame's state for the shell: the tabs, the panel, the

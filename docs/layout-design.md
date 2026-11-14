@@ -85,7 +85,7 @@ top bar.
   panel (an Esc with the terminal focused is the terminal's). The Data
   strip, the status line and the top bar are unchanged.
 
-## For you (devices; the owner's mockup, screen 1)
+## For you (devices and the desk; the owner's mockup, screen 1)
 
 Under the latest reply the Conversation view draws the tab's **For you**
 panel (ui/foryou.zig; the cards: docs/tabs-design.md, "For you"):
@@ -116,6 +116,16 @@ panel (ui/foryou.zig; the cards: docs/tabs-design.md, "For you"):
   A suggestion's yes in `keys` mode is refused on the device already.
 * **One approval UI:** while the panel holds the tab's permission prompt,
   the conversation's own permission card is not drawn.
+* **The desk too.** The desk window's top bar has a **Conversation**
+  button (after the desk tools) that toggles its main slice between the
+  terminal (the default: the desk keeps the terminal) and the tab's
+  conversation, with the same panel under the latest reply: the same
+  swipe, toggle and keys. It is fed from the desk's own For-you state
+  (src/foryou_desk.zig) in process, with no network, and its answers take
+  the one path device `i:` / `r:` frames take (foryou_ws.handle) as the
+  desk: input mode `text` (the owner at the keyboard may do anything a
+  `text`-mode device could), no rate limit, its lines and keys typed as
+  the desk's own. A sub-tab's read-only conversation has no panel.
 
 ## Devices: the Conversation view, minimal by default
 

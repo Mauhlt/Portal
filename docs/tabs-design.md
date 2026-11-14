@@ -396,7 +396,9 @@ with yes / no (src/foryou_ws.zig), shown under the latest reply
   question's yes / no types "Yes." / "No."; a permission card presses `1`
   / `esc`. The input mode decides what is allowed (Effect.allowedIn:
   dismissing always, answering from `keys`, messages from `instruct`).
-  Requests are rate limited per device (30 a minute).
+  Requests are rate limited per device (30 a minute). The desk's own
+  window shows and answers the same cards (its Conversation button), as
+  input mode `text` and without a rate limit, through the same code.
 * **Dismissing is for every device**, not per device: one list per tab,
   so the owner never answers the same thing twice on two devices. A card
   answered or dismissed stays gone while its reply is the last one.

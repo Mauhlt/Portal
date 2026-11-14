@@ -1,22 +1,29 @@
-//! "For you" and recap on a viewer's interactive WebSocket (docs/protocol.md
-//! sections 3g, 4a, 4b): the `i:yes <id>` / `i:no <id>` and `r:recap <tab>`
-//! frames, and the `foryou` messages a viewer's writer sends. web.zig only
-//! calls in; the cards themselves are foryou_desk.zig's, per tab.
+//! "For you" and recap answers (docs/protocol.md sections 3g, 4a, 4b): the
+//! `i:yes <id>` / `i:no <id>` and `r:recap <tab>` frames, from a viewer's
+//! interactive WebSocket (web.zig) or from the desk's own window (gui.zig,
+//! in process: its For-you panel's frames come straight here), and the
+//! `foryou` messages a viewer's writer sends. The cards themselves are
+//! foryou_desk.zig's, per tab. Both sources take the one code path
+//! (`handle`); only `From` differs.
 //!
 //! An answer:
 //!   * names a current card of any open tab, else `stale` (replaced,
 //!     answered elsewhere, gone, malformed: all the same, nothing echoed);
-//!   * is allowed by the desk's input mode for devices (Effect.allowedIn),
-//!     else `refused`;
-//!   * is rate limited per device (`max_per_minute`, both families
-//!     together), else `rate_limited`;
+//!   * is allowed by the input mode (Effect.allowedIn): a device's is the
+//!     desk's input mode for devices; the desk's own is `text` (the owner
+//!     at the keyboard may do anything a `text`-mode device could), else
+//!     `refused`;
+//!   * from a device, is rate limited per device (`max_per_minute`, both
+//!     families together), else `rate_limited`; the desk's is not;
 //!   * then does what its kind says, through the tab's own input paths: a
 //!     suggestion's yes types the fixed message (foryou.runMessage /
-//!     gotoMessage) as an instruction line (Session.writeWebLine, under the
-//!     line rules), a permission card's yes / no presses `1` / `esc`
-//!     (Session.writeWebKey, as the permission card does), a question's yes
-//!     / no types "Yes." / "No."; anything else dismisses. Answered or
-//!     dismissed, the card is gone for every device.
+//!     gotoMessage) as an instruction line (Session.writeWebLine from a
+//!     device, writeDeskLine from the desk: the line rules either way), a
+//!     permission card's yes / no presses `1` / `esc` (Session.writeWebKey,
+//!     as the permission card does; from the desk, the keys its Instruct
+//!     panel types), a question's yes / no types "Yes." / "No."; anything
+//!     else dismisses. Answered or dismissed, the card is gone for every
+//!     device and the desk.
 //! A recap types recap.prompt into the tab as an instruction line (input
 //! mode `instruct` or `text`, the agent's tabs only, at most one per tab
 //! a minute: foryou_desk.recap_interval_ms). An instruction line that is
@@ -33,6 +40,8 @@ const devices = @import("devices.zig");
 const Log = @import("log.zig").Log;
 const foryou_desk = @import("foryou_desk.zig");
 const ratelimit = @import("ratelimit.zig");
+const keymap = @import("keymap.zig");
+const rules = @import("inputrules");
 
 /// Requests (`i:` and `r:`) one device may make in a minute.
 pub const max_per_minute = 30;
@@ -42,14 +51,63 @@ const window_ms: i64 = 60_000;
 /// together (both families count in the one lane).
 pub const Limits = ratelimit.PerDevice(enum { request }, max_per_minute, window_ms);
 
+/// Who asks: a paired device (its connection's), or the desk's own window.
+pub const From = union(enum) {
+    device: struct {
+        limits: *Limits,
+        id: devices.DeviceId,
+        name: []const u8,
+    },
+    desk,
+};
+
 /// Who asks, and where.
 pub const Ctx = struct {
     hub: *tabs.Hub,
-    limits: *Limits,
     log: *Log,
-    device: devices.DeviceId,
-    device_name: []const u8,
+    from: From,
     now_ms: i64,
+
+    /// The input mode the answer is checked against: the desk's for
+    /// devices, or `text` for the desk itself.
+    pub fn policy(c: Ctx) keymap.Policy {
+        return switch (c.from) {
+            .device => c.hub.policy,
+            .desk => .text,
+        };
+    }
+
+    /// Counts one request (the desk's are not limited).
+    fn allow(c: Ctx) bool {
+        return switch (c.from) {
+            .device => |d| d.limits.allow(c.hub.io, d.id, .request, c.now_ms).ok,
+            .desk => true,
+        };
+    }
+
+    /// Who, for the log.
+    fn who(c: Ctx, buf: []u8) []const u8 {
+        return switch (c.from) {
+            .device => |d| std.fmt.bufPrint(buf, "device '{s}'", .{d.name}) catch "a device",
+            .desk => "the desk",
+        };
+    }
+
+    /// An instruction line into tab `t`, as this source types one.
+    fn line(c: Ctx, t: *tabs.Tab, text: []const u8) !void {
+        return switch (c.from) {
+            .device => t.session.writeWebLine(text),
+            .desk => t.session.writeDeskLine(text),
+        };
+    }
+
+    /// A named key (`1`, `esc`) into tab `t`, as this source presses one.
+    fn key(c: Ctx, t: *tabs.Tab, name: []const u8) !void {
+        switch (c.from) {
+            .device => try t.session.writeWebKey(name, c.now_ms),
+            .desk => t.session.writeInput(rules.keyBytes(.text, name) orelse return error.UnknownKey),
+        }
+    }
 };
 
 /// The answer to an `i:` or `r:` frame (`fr` from frames.classify), in `buf`.
@@ -78,15 +136,11 @@ fn answerRecap(buf: *[frames.max_answer]u8, r: recap.Result, tab: ?tabs.Id) []co
     return w.buffered();
 }
 
-fn policyName(h: *const tabs.Hub) []const u8 {
-    return @tagName(h.policy);
-}
-
 fn item(c: Ctx, rest: []const u8, buf: *[frames.max_answer]u8) []const u8 {
     const h = c.hub;
     const req = foryou.parseRequest(rest) orelse
         return answerItem(buf, if (std.mem.startsWith(u8, rest, "no ")) .no else .yes, .stale, null);
-    if (!c.limits.allow(h.io, c.device, .request, c.now_ms).ok) return answerItem(buf, req.op, .rate_limited, null);
+    if (!c.allow()) return answerItem(buf, req.op, .rate_limited, null);
 
     // The card, of whichever open tab holds it.
     h.mutex.lockUncancelable(h.io);
@@ -103,7 +157,7 @@ fn item(c: Ctx, rest: []const u8, buf: *[frames.max_answer]u8) []const u8 {
     defer t.release();
     const it = &taken.item;
     const effect = it.kind.effect(req.op);
-    if (!effect.allowedIn(policyName(h))) return answerItem(buf, req.op, .refused, it.id);
+    if (!effect.allowedIn(@tagName(c.policy()))) return answerItem(buf, req.op, .refused, it.id);
 
     const result: foryou.Result = switch (effect) {
         .dismiss => .dismissed,
@@ -111,12 +165,12 @@ fn item(c: Ctx, rest: []const u8, buf: *[frames.max_answer]u8) []const u8 {
             var mb: [foryou.max_cmd + 16]u8 = undefined;
             var gb: [foryou.max_name + 40]u8 = undefined;
             const msg = (if (it.kind == .suggest_run) foryou.runMessage(it.cmd(), &mb) else foryou.gotoMessage(it.project(), &gb)) orelse break :blk .failed;
-            t.session.writeWebLine(msg) catch break :blk .failed;
+            c.line(t, msg) catch break :blk .failed;
             break :blk .sent;
         },
         .answer => blk: {
             if (it.kind == .waiting_permission) {
-                t.session.writeWebKey(if (req.op == .yes) "1" else "esc", c.now_ms) catch break :blk .failed;
+                c.key(t, if (req.op == .yes) "1" else "esc") catch break :blk .failed;
             } else {
                 t.session.writeDeskLine(if (req.op == .yes) "Yes." else "No.") catch break :blk .failed;
             }
@@ -124,7 +178,8 @@ fn item(c: Ctx, rest: []const u8, buf: *[frames.max_answer]u8) []const u8 {
         },
     };
     if (result.ok()) t.forYouDismiss(taken.sig);
-    c.log.print("for you: device '{s}' answered {t} {t} in tab '{s}': {t}", .{ c.device_name, it.kind, req.op, t.name(), result });
+    var wb: [96]u8 = undefined;
+    c.log.print("for you: {s} answered {t} {t} in tab '{s}': {t}", .{ c.who(&wb), it.kind, req.op, t.name(), result });
     return answerItem(buf, req.op, result, it.id);
 }
 
@@ -137,7 +192,7 @@ fn recapFrame(c: Ctx, rest: []const u8, buf: *[frames.max_answer]u8) []const u8 
     h.mutex.unlock(h.io);
     const tab = t orelse {
         // Counted like any request, so probing costs the same.
-        _ = c.limits.allow(h.io, c.device, .request, c.now_ms);
+        _ = c.allow();
         return answerRecap(buf, .unknown, null);
     };
     defer tab.release();
@@ -148,9 +203,10 @@ fn recapFrame(c: Ctx, rest: []const u8, buf: *[frames.max_answer]u8) []const u8 
 /// watched; null: none watched).
 pub fn recapTab(c: Ctx, tab: ?*tabs.Tab, buf: *[frames.max_answer]u8) []const u8 {
     const h = c.hub;
-    if (!c.limits.allow(h.io, c.device, .request, c.now_ms).ok) return answerRecap(buf, .rate_limited, null);
+    if (!c.allow()) return answerRecap(buf, .rate_limited, null);
     const t = tab orelse return answerRecap(buf, .unknown, null);
-    if ((h.policy != .instruct and h.policy != .text) or h.program.device_start == .not_agent)
+    const mode = c.policy();
+    if ((mode != .instruct and mode != .text) or h.program.device_start == .not_agent)
         return answerRecap(buf, .refused, t.id);
     h.mutex.lockUncancelable(h.io);
     const open = !t.removed and !t.session.closed;
@@ -158,8 +214,9 @@ pub fn recapTab(c: Ctx, tab: ?*tabs.Tab, buf: *[frames.max_answer]u8) []const u8
     h.mutex.unlock(h.io);
     if (!open) return answerRecap(buf, .unknown, null);
     if (!allowed) return answerRecap(buf, .rate_limited, t.id);
-    t.session.writeWebLine(recap.prompt) catch return answerRecap(buf, .refused, t.id);
-    c.log.print("for you: device '{s}' asked tab '{s}' for a recap", .{ c.device_name, t.name() });
+    c.line(t, recap.prompt) catch return answerRecap(buf, .refused, t.id);
+    var wb: [96]u8 = undefined;
+    c.log.print("for you: {s} asked tab '{s}' for a recap", .{ c.who(&wb), t.name() });
     return answerRecap(buf, .ok, t.id);
 }
 
@@ -231,6 +288,30 @@ test "limits: per device, a minute's window" {
     try testing.expect(!l.allow(testing.io, a, .request, 100).ok);
     try testing.expect(l.allow(testing.io, b, .request, 100).ok);
     try testing.expect(l.allow(testing.io, a, .request, window_ms + 1).ok);
+}
+
+test "who asks: the desk answers as `text` and is never rate limited; a device under the desk's mode and its limit" {
+    var hub: tabs.Hub = undefined;
+    hub.io = testing.io;
+    hub.policy = .none;
+    var log: Log = undefined;
+    var l: Limits = .{};
+    const desk: Ctx = .{ .hub = &hub, .log = &log, .from = .desk, .now_ms = 0 };
+    const dev: Ctx = .{ .hub = &hub, .log = &log, .from = .{ .device = .{ .limits = &l, .id = @splat(3), .name = "phone" } }, .now_ms = 0 };
+    // The desk is the owner at the keyboard: everything `text` allows,
+    // whatever the devices may.
+    try testing.expectEqual(keymap.Policy.text, desk.policy());
+    try testing.expectEqual(keymap.Policy.none, dev.policy());
+    for ([_]foryou.Effect{ .dismiss, .answer, .send_message }) |e| {
+        try testing.expect(e.allowedIn(@tagName(desk.policy())));
+        try testing.expectEqual(e == .dismiss, e.allowedIn(@tagName(dev.policy())));
+    }
+    for (0..max_per_minute) |_| try testing.expect(dev.allow());
+    try testing.expect(!dev.allow());
+    for (0..2 * max_per_minute) |_| try testing.expect(desk.allow());
+    var b: [96]u8 = undefined;
+    try testing.expectEqualStrings("the desk", desk.who(&b));
+    try testing.expectEqualStrings("device 'phone'", dev.who(&b));
 }
 
 test "the recap line is exactly `recap`" {

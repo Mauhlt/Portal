@@ -51,7 +51,9 @@ pub const ids = struct {
 /// What a device keeps of `foryou`, `item` and `recap` messages: every
 /// open tab's cards (heap: the lists are large), and the last answer's
 /// text. The network thread writes it under the device's lock; the panel
-/// copies the shown tab's list when it changed.
+/// copies the shown tab's list when it changed. The desk's window keeps
+/// one too, filled in process from the tabs' own cards (`put`) and its
+/// answers (`applyResult`), with no network.
 pub const Store = struct {
     lists: std.ArrayList(foryou.List) = .empty,
     /// Bumped on every change.
@@ -74,6 +76,11 @@ pub const Store = struct {
         const l = gpa.create(foryou.List) catch return false;
         defer gpa.destroy(l);
         if (!foryou.parse(text, l)) return false;
+        return s.put(gpa, l);
+    }
+
+    /// Tab `l.tab`'s cards are `l` now. False if they could not be kept.
+    pub fn put(s: *Store, gpa: std.mem.Allocator, l: *const foryou.List) bool {
         for (s.lists.items) |*have| if (std.mem.eql(u8, &have.tab, &l.tab)) {
             have.* = l.*;
             s.generation +%= 1;
@@ -125,6 +132,32 @@ pub const Store = struct {
         return s.result_buf[0..s.result_len];
     }
 };
+
+test "store: put replaces a tab's cards or adds them; the desk's own feed" {
+    const gpa = std.testing.allocator;
+    var s: Store = .{};
+    defer s.deinit(gpa);
+    const a: Id = @splat(1);
+    const b: Id = @splat(2);
+    var l = testList(a);
+    const g0 = s.generation;
+    try std.testing.expect(s.put(gpa, &l));
+    try std.testing.expect(s.generation != g0);
+    try std.testing.expectEqual(l.len, s.get(a).?.len);
+    var l2: foryou.List = .{ .tab = a };
+    try std.testing.expect(s.put(gpa, &l2));
+    try std.testing.expectEqual(@as(usize, 0), s.get(a).?.len);
+    try std.testing.expectEqual(@as(usize, 1), s.lists.items.len);
+    var lb: foryou.List = .{ .tab = b };
+    try std.testing.expect(s.put(gpa, &lb));
+    try std.testing.expectEqual(@as(usize, 2), s.lists.items.len);
+    // The desk's answers' texts land as a device's do.
+    var w_buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&w_buf);
+    try foryou.writeResult(&w, .yes, .sent, null);
+    try std.testing.expect(s.applyResult(w.buffered()));
+    try std.testing.expect(s.result_ok);
+}
 
 // ------------------------------------------------------------ the panel
 

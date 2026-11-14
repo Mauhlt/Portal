@@ -544,7 +544,8 @@ pub const Shell = struct {
         sub_labels: [subtabs_wire.max_subs][subtabs_wire.max_name + 16]u8 = undefined,
         sub_status: [subtabs_wire.max_name + 48]u8 = undefined,
         tab_labels: [tabs_wire.max_tabs][tabs_wire.max_name + 96]u8 = undefined,
-        buttons: [8]frame.TopButton = undefined,
+        buttons: [10]frame.TopButton = undefined,
+        desk_tools: [8]frame.TopButton = undefined,
         badges: [tabs_wire.max_tabs][8]u8 = undefined,
         tasks: [64]u8 = undefined,
         info: status_panels.Bufs = .{},
@@ -578,13 +579,19 @@ pub const Shell = struct {
         // terminal or a line.
         if (sh.sub_at != null and sh.conversation != null) return .view;
         switch (sh.device) {
-            .desk => return if (sh.line_focus) .line else .terminal,
+            .desk => return if (sh.line_focus) .line else sh.deskMain(),
             .viewer => {
                 if (sh.status == .need_pairing or sh.status == .pair_closed) return .pair_screen;
                 if (sh.status == .pairing or sh.status == .pair_waiting) return .wait_screen;
                 return viewerFocus(sh.main == .conversation and sh.conversation != null, sh.status, sh.mode, sh.instructing);
             },
         }
+    }
+
+    /// The desk's main slice: its terminal, or (the Conversation button)
+    /// the tab's conversation with its For-you panel.
+    fn deskMain(sh: *const Shell) Focus {
+        return if (sh.main == .conversation and sh.conversation != null) .view else .terminal;
     }
 
     fn viewerFocus(conversation: bool, st: Status, mode: ?rules.Policy, instructing: bool) Focus {
@@ -823,7 +830,7 @@ pub const Shell = struct {
         if (st.panel != null or sh.info != .none or sh.sheet != .none or sh.proj_sheet.open) return .panel;
         if (sh.sub_at != null and sh.conversation != null) return .view;
         return switch (sh.device) {
-            .desk => if (sh.line_focus) .line else .terminal,
+            .desk => if (sh.line_focus) .line else sh.deskMain(),
             .viewer => viewerFocus(sh.main == .conversation and sh.conversation != null, st.viewer.status, st.viewer.mode, sh.instructing),
         };
     }
@@ -1076,7 +1083,17 @@ pub const Shell = struct {
         };
         const lv = sh.line.snapshot();
         const line_note = sh.instructing and lv.note.len > 0;
+        // The desk tools, then Conversation (it toggles the main slice
+        // between the terminal and the tab's conversation).
+        var nt = @min(d.tools.len, sh.bufs.desk_tools.len - 1);
+        @memcpy(sh.bufs.desk_tools[0..nt], d.tools[0..nt]);
+        if (sh.conversation != null and st.current != null) {
+            sh.bufs.desk_tools[nt] = .{ .label = "Conversation", .id = ids.view_conversation, .active = sh.main == .conversation };
+            nt += 1;
+        }
+        const conversation = sh.deskMain() == .view and st.current != null;
         return .{
+            .screen = if (conversation) .{ .view = sh.conversation.? } else .grid,
             .data = sh.data.slice(ids.data_toggle, ids.data_clear),
             // Like the devices: only Instruct; its panel has the line and
             // the keys.
@@ -1088,9 +1105,9 @@ pub const Shell = struct {
                 .right = viewerText(d.viewers, &sh.bufs.right),
                 .right_tone = if (watching) .warn else .muted,
                 .right_badge = watching,
-                .buttons = sh.statusButtons(st, d.tools),
+                .buttons = sh.statusButtons(st, sh.bufs.desk_tools[0..nt]),
             },
-            .selection = sh.select.range(),
+            .selection = if (conversation) null else sh.select.range(),
             .status = .{
                 .tone = .good,
                 .label = "local session",
@@ -1488,7 +1505,8 @@ pub const Shell = struct {
                 sh.main = .terminal;
                 sh.instructing = false;
             },
-            ids.view_conversation => sh.main = .conversation,
+            // On the desk the one button toggles.
+            ids.view_conversation => sh.main = if (sh.device == .desk and sh.main == .conversation) .terminal else .conversation,
             ids.instruct => if (sh.instructing and sh.transcribing and !sh.dictating)
                 sh.cancelTranscription()
             else if (sh.instructing) sh.toggleDictation() else sh.instructPressed(),
@@ -1884,6 +1902,47 @@ test "desk: tabs with close and +, viewer badge, a tool button, a close box" {
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("no remote viewers", viewerText(0, &buf));
     try testing.expectEqualStrings("1 REMOTE VIEWER WATCHING", viewerText(1, &buf));
+}
+
+test "desk: the Conversation button shows the tab's conversation (For you under it) and toggles back" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    var list: [1]tabs_wire.Entry = .{.{ .id = @splat(1), .color = 0x3366CC }};
+    list[0].setName("Alpha");
+    const tools = [_]frame.TopButton{.{ .label = "Devices", .id = 11 }};
+    const st: State = .{ .tabs = &list, .current = @splat(1), .desk = .{ .tools = &tools } };
+    // No conversation view: no button, the terminal as ever.
+    var o = sh.overlay(st);
+    try testing.expectEqual(@as(usize, 1), o.top_bar.?.buttons.len);
+    var sv: StubView = .{};
+    sh.conversation = sv.view();
+    o = sh.overlay(st);
+    const tb = o.top_bar.?;
+    try testing.expectEqual(@as(usize, 2), tb.buttons.len);
+    try testing.expectEqual(@as(u32, 11), tb.buttons[0].id);
+    try testing.expectEqual(ids.view_conversation, tb.buttons[1].id);
+    try testing.expect(!tb.buttons[1].active);
+    try testing.expect(o.screen == .grid);
+    try testing.expectEqual(Focus.terminal, sh.focus());
+    // On: the main slice is the conversation, the keys go to it (the
+    // For-you panel's arrows and Enter), no cell selection.
+    Shell.onButton(&sh, ids.view_conversation);
+    o = sh.overlay(st);
+    try testing.expect(o.screen == .view);
+    try testing.expect(o.top_bar.?.buttons[1].active);
+    try testing.expect(o.selection == null);
+    try testing.expectEqual(Focus.view, sh.focus());
+    // Instruct still takes the line; a click back on the slice returns
+    // the keys to the conversation.
+    try testing.expectEqual(@as(usize, 1), o.bottom.len);
+    // Off again: the terminal.
+    Shell.onButton(&sh, ids.view_conversation);
+    o = sh.overlay(st);
+    try testing.expect(o.screen == .grid);
+    try testing.expectEqual(Focus.terminal, sh.focus());
+    // No tab shown: nothing to show, no button.
+    try testing.expectEqual(@as(usize, 1), sh.overlay(.{ .tabs = &.{}, .desk = .{ .tools = &tools } }).top_bar.?.buttons.len);
 }
 
 test "desk bottom: only Instruct; its panel types with full control and has every key; the keyboard is the terminal's otherwise" {

@@ -1606,7 +1606,7 @@ pub const Server = struct {
         }
     }
     fn fyCtx(srv: *Server, ws: *const WsConn) foryou_ws.Ctx {
-        return .{ .hub = srv.hub, .limits = &srv.fy_limits, .log = srv.log, .device = ws.device.id, .device_name = ws.device.name.get(), .now_ms = srv.nowMs() };
+        return .{ .hub = srv.hub, .log = srv.log, .from = .{ .device = .{ .limits = &srv.fy_limits, .id = ws.device.id, .name = ws.device.name.get() } }, .now_ms = srv.nowMs() };
     }
 
     /// `p:start <name>` / `p:stop <name>` (projects_ws.handle): the answer,

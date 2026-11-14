@@ -357,7 +357,10 @@ pub const Tab = struct {
         const t: *Tab = @ptrCast(@alignCast(ctx));
         const h = t.hub;
         h.mutex.lockUncancelable(h.io);
+        const convo_rev = t.convo.rev;
         t.convo.applyRecord(rec) catch {};
+        // The desk's Conversation view follows it too (not only viewers).
+        const conv = t.convo.rev != convo_rev;
         const rev = t.activity.rev;
         t.activity.applyRecord(rec);
         const act = t.activity.rev != rev;
@@ -385,7 +388,7 @@ pub const Tab = struct {
         h.mutex.unlock(h.io);
         if (poke) h.fy_watch.poke();
         h.cond.broadcast(h.io);
-        if (act or moved or fy) h.notify();
+        if (act or moved or fy or conv) h.notify();
     }
 
     /// Caller holds hub.mutex. Rebuilds the tab's For-you cards from its
