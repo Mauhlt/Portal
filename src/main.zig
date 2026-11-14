@@ -1809,6 +1809,7 @@ test {
     _ = @import("workdir.zig");
     _ = @import("settings.zig");
     _ = @import("deskui.zig");
+    _ = @import("deskprojects.zig");
     _ = @import("keymap.zig");
     _ = @import("guard.zig");
     _ = @import("tunneldesk.zig");

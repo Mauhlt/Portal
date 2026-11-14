@@ -2052,3 +2052,19 @@ test "badges, the status line's task summary and panel buttons are hit by what w
     f.build(&fs, .{ 1200, 800 }, 1, &g, o);
     try expectHits(&f, &.{ 1310, 1300 }, &.{ 1000, 1200, 912, 910 });
 }
+
+test "a panel row's two buttons and its dot: both buttons are hit, the text keeps room" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    const rows = [_]PanelRow{
+        .{ .text = "Notes  [Plan]", .dot = .{ 0xFF, 0xC9, 0x40 }, .button = .{ .label = "Open", .id = 1810 }, .button2 = .{ .label = "Stop", .id = 1830, .tone = .bad } },
+        .{ .text = "Portal  [Ask]", .dot = .{ 0x4D, 0xA3, 0xFF }, .button = .{ .label = "Start", .id = 1811 } },
+    };
+    const o: Overlay = .{ .panel = .{ .title = "Projects", .rows = &rows } };
+    f.build(&fs, .{ 1200, 800 }, 1, &g, o);
+    try expectHits(&f, &.{ 1810, 1830, 1811 }, &.{1831});
+}

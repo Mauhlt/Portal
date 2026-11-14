@@ -198,6 +198,10 @@ pub const Desk = struct {
     tools: []const frame.TopButton = &.{},
     /// Room for another tab ("+").
     can_add: bool = true,
+    /// Per tab, in bar order: who started or stopped it from a device
+    /// ("started by iPhone", "stopped by iPhone"; "" for none), shown on
+    /// the desk's tab after its name. Never sent to devices.
+    notes: []const []const u8 = &.{},
 };
 
 /// What a device's window shows about its connection.
@@ -509,6 +513,7 @@ pub const Shell = struct {
         top_tabs: [tabs_wire.max_tabs + subtabs_wire.max_subs]frame.TopTab = undefined,
         sub_labels: [subtabs_wire.max_subs][subtabs_wire.max_name + 16]u8 = undefined,
         sub_status: [subtabs_wire.max_name + 48]u8 = undefined,
+        tab_labels: [tabs_wire.max_tabs][tabs_wire.max_name + 96]u8 = undefined,
         buttons: [8]frame.TopButton = undefined,
         badges: [tabs_wire.max_tabs][8]u8 = undefined,
         tasks: [64]u8 = undefined,
@@ -788,8 +793,10 @@ pub const Shell = struct {
             if (active) sh.shown = i;
             sh.tab_ids[i] = e.id;
             const act: ?*const activity_wire.Tab = if (st.activity) |a| a.find(e.id) else null;
+            // The desk's note on a tab a device started or stopped.
+            const note: []const u8 = if (sh.device == .desk and i < st.desk.notes.len) st.desk.notes[i] else "";
             sh.bufs.top_tabs[k] = .{
-                .label = e.name(),
+                .label = if (note.len == 0) e.name() else std.fmt.bufPrint(&sh.bufs.tab_labels[i], "{s} \u{00B7} {s}", .{ e.name(), note }) catch e.name(),
                 .color = theme.fromU32(e.color),
                 // A sub-tab shown: the tab is its parent, not shown itself.
                 .active = active and sh.sub_at == null,
@@ -2600,4 +2607,22 @@ test "projects sheet (devices): the top bar's Projects, its rows' keys and butto
     desk.proj_list = &pl;
     Shell.onButton(&desk, ids.projects);
     try testing.expect(!desk.proj_sheet.open);
+}
+
+test "desk: a device-started tab says who started it; devices never get the note" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    var list: [2]tabs_wire.Entry = undefined;
+    var a: activity_wire.Activity = undefined;
+    activityFixture(&list, &a);
+    const notes = [_][]const u8{ "", "started by iPhone (plan)" };
+    const o = sh.overlay(.{ .tabs = &list, .current = @splat(1), .desk = .{ .notes = &notes } });
+    try testing.expectEqualStrings(list[0].name(), o.top_bar.?.tabs[0].label);
+    try testing.expect(std.mem.endsWith(u8, o.top_bar.?.tabs[1].label, " \u{00B7} started by iPhone (plan)"));
+    var vr: Rec = .{};
+    var dev = Shell.init(testing.allocator, .viewer, vr.host());
+    defer dev.deinit();
+    const vo = dev.overlay(.{ .tabs = &list, .current = @splat(1), .desk = .{ .notes = &notes }, .viewer = .{ .status = .connected, .mode = .instruct, .host = "h", .has_grid = true } });
+    try testing.expectEqualStrings(list[1].name(), vo.top_bar.?.tabs[1].label);
 }

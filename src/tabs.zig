@@ -784,7 +784,7 @@ pub const Hub = struct {
 
     /// Caller holds `mutex`. The open tab running startable entry `e`
     /// (its folder), if any.
-    fn runningLocked(h: *Hub, e: *const settings.StartableEntry) ?*Tab {
+    pub fn runningLocked(h: *Hub, e: *const settings.StartableEntry) ?*Tab {
         const path = e.path.get() orelse return null;
         for (h.tabs[0..h.n]) |t| if (settings.samePath(t.cwd, path)) return t;
         return null;

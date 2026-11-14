@@ -12,7 +12,8 @@
 //!   frame      layout, widgets and draw-list generation (Overlay: the
 //!              description of one frame), hit-testing, cell mapping
 //!   draw       the draw list: rects, glyphs, text runs, images
-//!   panels     desk (setup, pairing, devices, export), setup (a device's
+//!   panels     desk (setup, pairing, devices, export), projects (which
+//!              folders devices may start), setup (a device's
 //!              first run), sync (approvals, packages), status (background
 //!              tasks, usage, system): state machines / builders that
 //!              describe frame.Panels
@@ -57,6 +58,7 @@ pub const panels = struct {
     pub const sync = @import("panels/sync.zig");
     pub const status = @import("panels/status.zig");
     pub const audio = @import("panels/audio.zig");
+    pub const projects = @import("panels/projects.zig");
 };
 
 pub const Shell = shell.Shell;
@@ -80,5 +82,6 @@ test {
     _ = panels.desk;
     _ = panels.status;
     _ = panels.audio;
+    _ = panels.projects;
     _ = dictation;
 }
