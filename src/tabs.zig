@@ -582,9 +582,16 @@ pub const Hub = struct {
             t.session_uuid = cmdline.uuidV4(rnd);
         }
         // The hook key, passed to the program (and so to the agent's
-        // hooks) as PORTAL_TAB, added after childenv's filter.
+        // hooks) as PORTAL_TAB, added after childenv's filter. It
+        // authenticates hook messages, so without secure randomness the
+        // tab is not started (no guessable fallback).
         while (true) {
-            h.io.randomSecure(&t.hook_key) catch h.io.random(&t.hook_key);
+            h.io.randomSecure(&t.hook_key) catch |err| {
+                h.log.print("tab '{s}': no secure randomness for its hook key ({t}); not started", .{ t.name(), err });
+                t.session.term.deinit();
+                h.gpa.destroy(t);
+                return error.SpawnFailed;
+            };
             if (!std.mem.allEqual(u8, &t.hook_key, 0)) break;
         }
         const line = (if (t.session_uuid) |*u| cmdline.withSessionId(h.gpa, h.program.cmdline, u) else h.gpa.dupeSentinel(u16, h.program.cmdline, 0)) catch {
