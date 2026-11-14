@@ -432,6 +432,10 @@ pub const Mic = struct {
 
     fn put(ctx: *anyopaque, samples: []const i16) void {
         const m: *Mic = @ptrCast(@alignCast(ctx));
+        // A read that found nothing new (any command reads first) says
+        // nothing about the level: keep the last one, so the meter doesn't
+        // drop to zero between packets.
+        if (samples.len == 0) return;
         m.lock.lock();
         defer m.lock.unlock();
         m.snap.level = peakLevel(samples);
