@@ -13,6 +13,9 @@
         // Portal's shared protocol code (../shared/root.zig), also used by
         // the server and the browser client.
         .shared = .{ .path = "../shared" },
+        // The owner's pure-Zig WireGuard (the in-process tunnel,
+        // src/tunnel): the de-facto checkout next to Portal, no pin.
+        .WireGuard = .{ .path = "../../WireGuard" },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "tools", "README.md" },
 }

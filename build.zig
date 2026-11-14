@@ -39,25 +39,11 @@ fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     return .{ .root = root, .gui = gui_mods };
 }
 
-/// The owner's Zig WireGuard (../WireGuard): the device, its UDP socket and
-/// the userspace TCP/IP stack (`netstack`) Portal's tunnel runs on.
-fn wireguardModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    return b.dependency("WireGuard", .{ .target = target, .optimize = optimize }).module("WireGuard");
-}
-
-/// `-Dnetstack-ready=false`: build against a WireGuard whose netstack is
-/// still a stub; the tunnel then refuses to start and the e2e groups report
-/// PENDING instead of running.
-var tunnel_options_module: ?*std.Build.Module = null;
-
-fn tunnelOptions(b: *std.Build) *std.Build.Module {
-    if (tunnel_options_module) |m| return m;
-    const ready = b.option(bool, "netstack-ready", "The WireGuard netstack is implemented (default true)") orelse true;
-    const o = b.addOptions();
-    o.addOption(bool, "netstack_ready", ready);
-    tunnel_options_module = o.createModule();
-    return tunnel_options_module.?;
-}
+/// The owner's Zig WireGuard (../WireGuard) and the tunnel's build options
+/// (-Dnetstack-ready): one definition, in client/build.zig.
+const client_build = @import("client/build.zig");
+const wireguardModule = client_build.wireguardModule;
+const tunnelOptions = client_build.tunnelOptions;
 
 /// portal-show.exe: `portal-show <file.png>` (src/show.zig), a console
 /// program because it runs inside sessions and writes to their terminal.
@@ -638,7 +624,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
         .root_source_file = b.path("client/src/ios/tunnel_ext/backend.zig"),
         .target = b.graph.host,
         .optimize = .Debug,
-        .imports = &.{.{ .name = "WireGuard", .module = b.dependency("WireGuard", .{ .target = b.graph.host, .optimize = .Debug }).module("WireGuard") }},
+        .imports = &.{.{ .name = "WireGuard", .module = wireguardModule(b, b.graph.host, .Debug) }},
     }) })).step);
 
     // The app icon (drawn by src/tools/icon_art.zig) and the tools' own tests.
@@ -820,7 +806,7 @@ fn tunnelExtModule(b: *std.Build, t: std.Build.ResolvedTarget, optimize: std.bui
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "WireGuard", .module = b.dependency("WireGuard", .{ .target = t, .optimize = optimize }).module("WireGuard") },
+            .{ .name = "WireGuard", .module = wireguardModule(b, t, optimize) },
             .{ .name = "IosObjC", .module = rendererDep(b, t, optimize).module("IosObjC") },
         },
     });
