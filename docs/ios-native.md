@@ -232,18 +232,16 @@ Rules:
   which connect.zig turns into `Client.setPaused`), `.scroll` (a drag on
   the phone) -> `scrollRows`.
 
-## Zig on iOS: one std fix
+## Zig on iOS: the stock lib dir
 
-Zig 0.18.0-dev.4's `std.Io.Threaded` does not compile for iOS
-(`getDevNullFd` reads `null_file.fd`, which the iOS `NullFile` lacks; it is
-reached from process spawning and from the default panic handler). Instead
-of overriding the panic handler (which would still leave std.Io broken),
-`zig build ios` / `ios-check` compile against a copy of the Zig lib dir
-with that one line fixed (src/tools/ios_zig_lib.zig, made and cached by
-the build). With it the app and the extension keep std's default panic
-handler. When Zig fixes it upstream the tool copies unchanged and says so.
-Zig 0.18.0-dev.1005 has the fix (only wasi, tvOS and watchOS keep the
-fd-less `NullFile`), so the copy is now unchanged and the helper can go.
+Zig 0.18.0-dev.4's `std.Io.Threaded` did not compile for iOS
+(`getDevNullFd` read `null_file.fd`, which the iOS `NullFile` lacked; it
+is reached from process spawning and from the default panic handler), so
+the iOS builds once compiled against a patched copy of the Zig lib dir.
+Zig 0.18.0-dev.1005 has the fix upstream (only wasi, tvOS and watchOS keep
+the fd-less `NullFile`), so `zig build ios` / `ios-check` now use the
+stock Zig lib dir, and the app and the extension keep std's default panic
+handler.
 
 ## Build, sign, install (owner's Mac)
 

@@ -39,25 +39,11 @@ fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     return .{ .root = root, .gui = gui_mods };
 }
 
-/// The owner's Zig WireGuard (../WireGuard): the device, its UDP socket and
-/// the userspace TCP/IP stack (`netstack`) Portal's tunnel runs on.
-fn wireguardModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    return b.dependency("WireGuard", .{ .target = target, .optimize = optimize }).module("WireGuard");
-}
-
-/// `-Dnetstack-ready=false`: build against a WireGuard whose netstack is
-/// still a stub; the tunnel then refuses to start and the e2e groups report
-/// PENDING instead of running.
-var tunnel_options_module: ?*std.Build.Module = null;
-
-fn tunnelOptions(b: *std.Build) *std.Build.Module {
-    if (tunnel_options_module) |m| return m;
-    const ready = b.option(bool, "netstack-ready", "The WireGuard netstack is implemented (default true)") orelse true;
-    const o = b.addOptions();
-    o.addOption(bool, "netstack_ready", ready);
-    tunnel_options_module = o.createModule();
-    return tunnel_options_module.?;
-}
+/// The owner's Zig WireGuard (../WireGuard) and the tunnel's build options
+/// (-Dnetstack-ready): one definition, in client/build.zig.
+const client_build = @import("client/build.zig");
+const wireguardModule = client_build.wireguardModule;
+const tunnelOptions = client_build.tunnelOptions;
 
 /// portal-show.exe: `portal-show <file.png>` (src/show.zig), a console
 /// program because it runs inside sessions and writes to their terminal.
@@ -594,10 +580,6 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
 ///                            signer for aarch64-macos and README.txt, to
 ///                            build on any host (iOS SDK copied from the
 ///                            Mac) and sign + install on a Mac without Zig
-///
-/// Both build against a copy of Zig's lib dir with one std line fixed
-/// (src/tools/ios_zig_lib.zig: std.Io.Threaded does not compile for iOS
-/// in this Zig).
 fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Build.Step) void {
     const bundle_id = b.option([]const u8, "ios-bundle-id", "iPhone app bundle id (default local.portal.Portal; must match the provisioning profile)") orelse "local.portal.Portal";
     const tunnel = b.option(bool, "ios-tunnel", "iPhone app: control the per-app WireGuard tunnel extension (needs the Network Extension entitlement, paid account)") orelse false;
@@ -614,21 +596,10 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
         .os_version_min = .{ .semver = .{ .major = 16, .minor = 0, .patch = 0 } },
     });
 
-    // The Zig lib dir with the std fix (cached by the build system).
-    const lib_tool = b.addExecutable(.{ .name = "ios-zig-lib", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/tools/ios_zig_lib.zig"),
-        .target = b.graph.host,
-        .optimize = .ReleaseSafe,
-    }) });
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lib_tool.root_module })).step);
-    const lib_run = b.addRunArtifact(lib_tool);
-    lib_run.addDirectoryArg(.zig_lib);
-    const zig_lib = lib_run.addOutputDirectoryArg("zig-lib");
-
     // Compile check (object): the whole iPhone app and its tunnel extension
     // without the SDK.
-    const check = b.addObject(.{ .name = "portal-ios-check", .root_module = iosModule(b, t, .Debug, bundle_id, tunnel), .zig_lib_dir = zig_lib });
-    const ext_check = b.addObject(.{ .name = "portal-tunnel-check", .root_module = tunnelExtModule(b, t, .Debug), .zig_lib_dir = zig_lib });
+    const check = b.addObject(.{ .name = "portal-ios-check", .root_module = iosModule(b, t, .Debug, bundle_id, tunnel) });
+    const ext_check = b.addObject(.{ .name = "portal-tunnel-check", .root_module = tunnelExtModule(b, t, .Debug) });
     const ios_check = b.step("ios-check", "Compile the iPhone app and its tunnel extension for aarch64-ios (objects only, no SDK needed)");
     ios_check.dependOn(&check.step);
     ios_check.dependOn(&ext_check.step);
@@ -638,7 +609,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
         .root_source_file = b.path("client/src/ios/tunnel_ext/backend.zig"),
         .target = b.graph.host,
         .optimize = .Debug,
-        .imports = &.{.{ .name = "WireGuard", .module = b.dependency("WireGuard", .{ .target = b.graph.host, .optimize = .Debug }).module("WireGuard") }},
+        .imports = &.{.{ .name = "WireGuard", .module = wireguardModule(b, b.graph.host, .Debug) }},
     }) })).step);
 
     // The app icon (drawn by src/tools/icon_art.zig) and the tools' own tests.
@@ -699,7 +670,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     // MoltenVK is opened from the bundle at run time (the Vulkan package's
     // loader); the rpath lets a framework build of MoltenVK find itself.
     mod.addRPathSpecial("@executable_path/Frameworks");
-    const exe = b.addExecutable(.{ .name = "Portal", .root_module = mod, .zig_lib_dir = zig_lib });
+    const exe = b.addExecutable(.{ .name = "Portal", .root_module = mod });
     exe.headerpad_max_install_names = true;
     // The packet tunnel extension (with -Dios-tunnel): Foundation +
     // NetworkExtension, no UIKit window.
@@ -709,7 +680,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
         em.linkFramework("Foundation", .{});
         em.linkFramework("NetworkExtension", .{});
         em.linkSystemLibrary("objc", .{});
-        break :blk b.addExecutable(.{ .name = "PortalTunnel", .root_module = em, .zig_lib_dir = zig_lib });
+        break :blk b.addExecutable(.{ .name = "PortalTunnel", .root_module = em });
     } else null;
     // This Zig requires darwin_sdk_dir for Darwin targets; it is also the
     // linker's sysroot (absolute install names of re-exported libraries).
@@ -820,7 +791,7 @@ fn tunnelExtModule(b: *std.Build, t: std.Build.ResolvedTarget, optimize: std.bui
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "WireGuard", .module = b.dependency("WireGuard", .{ .target = t, .optimize = optimize }).module("WireGuard") },
+            .{ .name = "WireGuard", .module = wireguardModule(b, t, optimize) },
             .{ .name = "IosObjC", .module = rendererDep(b, t, optimize).module("IosObjC") },
         },
     });

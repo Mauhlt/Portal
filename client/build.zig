@@ -28,6 +28,14 @@
 //!                                (used by portal_ui).
 //!   "shared" ../shared/root.zig  protocol code shared with Portal's server
 //!                                (a path dependency).
+//!   "WireGuard"                  the owner's Zig WireGuard (../../WireGuard,
+//!                                a path dependency): the in-process tunnel
+//!                                (src/tunnel).
+//!   "tunnel_options"             build options of the tunnel
+//!                                (-Dnetstack-ready).
+//!
+//! Portal's root build.zig imports this file for wireguardModule and
+//! tunnelOptions, so both builds wire the tunnel the same way.
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -84,7 +92,9 @@ pub const Modules = struct {
     ui: *std.Build.Module,
     shared: *std.Build.Module,
     inputrules: *std.Build.Module,
-    imports: [4]std.Build.Module.Import = undefined,
+    wireguard: *std.Build.Module,
+    tunnel_options: *std.Build.Module,
+    imports: [6]std.Build.Module.Import = undefined,
 
     /// The client's imports (src/main.zig, src/tests.zig).
     pub fn clientImports(m: *Modules) []const std.Build.Module.Import {
@@ -93,6 +103,8 @@ pub const Modules = struct {
             .{ .name = "portal_ui", .module = m.ui },
             .{ .name = "shared", .module = m.shared },
             .{ .name = "inputrules", .module = m.inputrules },
+            .{ .name = "WireGuard", .module = m.wireguard },
+            .{ .name = "tunnel_options", .module = m.tunnel_options },
         };
         return &m.imports;
     }
@@ -155,8 +167,37 @@ pub fn modules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     // The hero art for the start-up splash (../docs/brand).
     view.addAnonymousImport("portal_hero", .{ .root_source_file = b.path("../docs/brand/portal-hero-768.png") });
     const m = b.allocator.create(Modules) catch @panic("OOM");
-    m.* = .{ .view = view, .ui = ui, .shared = shared, .inputrules = inputrules };
+    m.* = .{
+        .view = view,
+        .ui = ui,
+        .shared = shared,
+        .inputrules = inputrules,
+        .wireguard = wireguardModule(b, target, optimize),
+        .tunnel_options = tunnelOptions(b),
+    };
     return m;
+}
+
+/// The owner's Zig WireGuard (the "WireGuard" path dependency): the device,
+/// its UDP socket and the userspace TCP/IP stack (`netstack`) Portal's
+/// tunnel runs on. Also used by Portal's root build.
+pub fn wireguardModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.dependency("WireGuard", .{ .target = target, .optimize = optimize }).module("WireGuard");
+}
+
+/// "tunnel_options": `-Dnetstack-ready=false` builds against a WireGuard
+/// whose netstack is still a stub; the tunnel then refuses to start and the
+/// e2e groups report PENDING instead of running. One module per build (the
+/// option may be declared only once). Also used by Portal's root build.
+var tunnel_options_module: ?*std.Build.Module = null;
+
+pub fn tunnelOptions(b: *std.Build) *std.Build.Module {
+    if (tunnel_options_module) |m| return m;
+    const ready = b.option(bool, "netstack-ready", "The WireGuard netstack is implemented (default true)") orelse true;
+    const o = b.addOptions();
+    o.addOption(bool, "netstack_ready", ready);
+    tunnel_options_module = o.createModule();
+    return tunnel_options_module.?;
 }
 
 /// The input policy and input line, shared with Portal's server:
