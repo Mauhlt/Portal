@@ -56,6 +56,9 @@ const dataview = @import("dataview.zig");
 const activity_wire = @import("shared").activity;
 const sysinfo = @import("shared").sysinfo;
 const status_panels = @import("panels/status.zig");
+const hidden_tabs = @import("hidden_tabs.zig");
+const usage_strip = @import("usage_strip.zig");
+const planusage = @import("shared").planusage;
 
 pub const Device = enum { desk, viewer };
 
@@ -87,6 +90,8 @@ pub const ids = struct {
     pub const usage: u32 = 913;
     pub const system: u32 = 914;
     pub const tasks: u32 = 915;
+    /// The plan-usage strip under the top bar (toggles its detail).
+    pub const usage_strip: u32 = 916;
     /// badge0 + position: that tab's background-task badge.
     pub const badge0: u32 = 1200;
     /// tab0 + position: show that tab; close0 + position: close it.
@@ -247,6 +252,16 @@ pub const State = struct {
     sys: ?*const sysinfo.Snapshot = null,
     /// Unix seconds now (task ages in the panel).
     now: i64 = 0,
+    /// The glue's awake clock (ms): the usage toast's deadline.
+    now_ms: i64 = 0,
+    /// The local time zone's offset from UTC (seconds) now: reset times.
+    utc_offset_s: i32 = 0,
+    /// The plan's usage (`usage`, section 3h; the desk's own on the desk);
+    /// null: none known (no usage strip).
+    usage: ?planusage.Usage = null,
+    /// Tabs with For-you items that need the desk (a hidden one makes the
+    /// "⋯ N hidden" button amber); empty when the device has none.
+    needs_desk: []const tabs_wire.Id = &.{},
 };
 
 /// Who gets the keyboard, decided here only. `view`: the Conversation view
@@ -350,6 +365,9 @@ pub const Command = union(enum) {
     /// The System panel opened (true) or closed: the glue subscribes to
     /// the system monitor (desk) or sends `y:on` / `y:off` (devices).
     system_panel: bool,
+    /// Devices: the hidden tabs changed (Shell.hidden): the glue stores
+    /// the list (ui/hidden_tabs.zig).
+    hidden_changed,
 };
 
 /// The device's side: what the shell's input turns into.
@@ -479,6 +497,18 @@ pub const Shell = struct {
     info_first: ?tabs_wire.Id = null,
     /// The tabs' ids as of the last overlay (badge clicks name a position).
     tab_ids: [tabs_wire.max_tabs]tabs_wire.Id = undefined,
+    /// The tabs as of the last overlay (the hidden-tabs sheet and menu
+    /// name them by position).
+    tab_list: [tabs_wire.max_tabs]tabs_wire.Entry = undefined,
+    /// Devices: the tabs hidden from this device's tab bar (the glue
+    /// loads and stores it: Command.hidden_changed), and the sheet open
+    /// (the list, or a tab's menu).
+    hidden: hidden_tabs.List = .{},
+    sheet: hidden_tabs.Sheet = .none,
+    /// The plan-usage strip (its detail, its toasts), and the value it
+    /// last saw.
+    usage: usage_strip.Strip = .{},
+    usage_seen: ?planusage.Usage = null,
     bufs: Bufs = .{},
 
     const Bufs = struct {
@@ -498,6 +528,8 @@ pub const Shell = struct {
         badges: [tabs_wire.max_tabs][8]u8 = undefined,
         tasks: [64]u8 = undefined,
         info: status_panels.Bufs = .{},
+        hidden: hidden_tabs.Bufs = .{},
+        hidden_label: [32]u8 = undefined,
     };
 
     pub fn init(gpa: std.mem.Allocator, device: Device, host: Host) Shell {
@@ -520,7 +552,7 @@ pub const Shell = struct {
     }
 
     pub fn focus(sh: *const Shell) Focus {
-        if (sh.modalActive() != null or sh.info != .none) return .panel;
+        if (sh.modalActive() != null or sh.info != .none or sh.sheet != .none) return .panel;
         // A sub-tab: its conversation (scrolling), nothing reaches a
         // terminal or a line.
         if (sh.sub_at != null and sh.conversation != null) return .view;
@@ -704,7 +736,23 @@ pub const Shell = struct {
         };
         if (sh.sub_at) |i| sh.subOverlay(st, st.subs[i], &o);
         sh.view_shown = o.screen == .view;
+        // The usage strip, wherever the tabs are (a device: connected).
+        if (!usageEql(st.usage, sh.usage_seen)) {
+            sh.usage.update(st.usage, st.now_ms, st.now, st.utc_offset_s);
+            sh.usage_seen = st.usage;
+        }
+        if (o.top_bar != null) {
+            o.usage = sh.usage.strip(st.usage, ids.usage_strip, st.now, st.utc_offset_s);
+            if (o.toast == null) o.toast = sh.usage.toast(st.now_ms);
+        }
+        // A device's hidden tabs: the button, and the sheet while open.
+        const hidden = hidden_tabs.summarize(&sh.hidden, st.tabs, st.needs_desk);
+        if (sh.device != .viewer or o.top_bar == null or (sh.sheet == .list and hidden.count == 0)) sh.sheet = .none;
+        if (sh.device == .viewer and hidden.count > 0) if (o.top_bar) |*tb| {
+            tb.hidden = .{ .label = hidden_tabs.buttonLabel(hidden, &sh.bufs.hidden_label), .alert = hidden.alert, .id = hidden_tabs.ids.button };
+        };
         o.panel = st.panel;
+        if (o.panel == null) o.panel = hidden_tabs.panel(sh.sheet, &sh.hidden, st.tabs, st.needs_desk, &sh.bufs.hidden);
         if (o.panel == null) o.panel = status_panels.panel(sh.info, .{
             .desk = sh.device == .desk,
             .tabs = st.tabs,
@@ -721,6 +769,16 @@ pub const Shell = struct {
         return o;
     }
 
+    /// Milliseconds until the usage toast goes (the glue's wake for it).
+    pub fn usageDeadline(sh: *const Shell, now_ms: i64) ?u32 {
+        return sh.usage.deadline(now_ms);
+    }
+
+    fn usageEql(a: ?planusage.Usage, b: ?planusage.Usage) bool {
+        if (a == null or b == null) return a == null and b == null;
+        return a.?.eql(b.?);
+    }
+
     /// Whether the shown tab's program waits for an answer, as of `st`.
     fn shownWaiting(st: State) bool {
         if (st.viewer.question_open) return true;
@@ -732,7 +790,7 @@ pub const Shell = struct {
     /// `focus` as of `st` (without asking the modal: the glue may hold its
     /// lock while building the overlay).
     fn focusFor(sh: *const Shell, st: State) Focus {
-        if (st.panel != null or sh.info != .none) return .panel;
+        if (st.panel != null or sh.info != .none or sh.sheet != .none) return .panel;
         if (sh.sub_at != null and sh.conversation != null) return .view;
         return switch (sh.device) {
             .desk => if (sh.line_focus) .line else .terminal,
@@ -762,6 +820,10 @@ pub const Shell = struct {
             const active = if (st.current) |id| std.mem.eql(u8, &id, &e.id) else false;
             if (active) sh.shown = i;
             sh.tab_ids[i] = e.id;
+            sh.tab_list[i] = e.*;
+            // A device's hidden tabs stay out of its bar (the one shown
+            // stays until the user switches away).
+            if (sh.device == .viewer and !active and sh.hidden.contains(e.name())) continue;
             const act: ?*const activity_wire.Tab = if (st.activity) |a| a.find(e.id) else null;
             sh.bufs.top_tabs[k] = .{
                 .label = e.name(),
@@ -773,6 +835,7 @@ pub const Shell = struct {
                 .close_id = if (closable) ids.close0 + @as(u32, @intCast(i)) else null,
                 .badge = if (act) |t| status_panels.badgeText(t, &sh.bufs.badges[i]) else "",
                 .badge_id = ids.badge0 + @as(u32, @intCast(i)),
+                .menu_id = if (sh.device == .viewer) hidden_tabs.ids.menu0 + @as(u32, @intCast(i)) else null,
             };
             k += 1;
             // The shown tab's sub-tabs right after it: "▸ <description>",
@@ -1154,14 +1217,46 @@ pub const Shell = struct {
     /// Shows the tab `step` places on (Ctrl+Tab / Ctrl+Shift+Tab).
     fn cycleTab(sh: *Shell, step: i32) void {
         if (sh.n_tabs < 2) return;
-        const at: i64 = @intCast(sh.shown orelse 0);
-        const next = @mod(at + step, @as(i64, @intCast(sh.n_tabs)));
-        sh.command(.{ .select_tab = @intCast(next) });
+        var at: i64 = @intCast(sh.shown orelse 0);
+        const n: i64 = @intCast(sh.n_tabs);
+        // A device skips its hidden tabs.
+        for (0..sh.n_tabs) |_| {
+            at = @mod(at + step, n);
+            const i: usize = @intCast(at);
+            if (sh.device != .viewer or !sh.hidden.contains(sh.tab_list[i].name())) return sh.command(.{ .select_tab = i });
+        }
+    }
+
+    /// Hides the tab at bar position i on this device; if it is the one
+    /// shown, the next visible tab is shown instead.
+    fn hideTab(sh: *Shell, i: usize) void {
+        sh.sheet = .none;
+        if (sh.device != .viewer or i >= sh.n_tabs) return;
+        if (!sh.hidden.hide(sh.tab_list[i].name())) return;
+        sh.command(.hidden_changed);
+        if (sh.shown != i) return;
+        for (1..sh.n_tabs) |d| {
+            const j = (i + d) % sh.n_tabs;
+            if (!sh.hidden.contains(sh.tab_list[j].name())) return sh.command(.{ .select_tab = j });
+        }
+    }
+
+    /// The sheet's Show: the tab comes back to the bar and is shown.
+    fn showTab(sh: *Shell, i: usize) void {
+        if (i >= sh.n_tabs) return;
+        if (sh.hidden.show(sh.tab_list[i].name())) sh.command(.hidden_changed);
+        sh.sheet = .none;
+        sh.command(.{ .select_tab = i });
     }
 
     fn onKey(ctx: *anyopaque, key: input.Key, mods: input.Mods) void {
         const sh = self(ctx);
         if (sh.modalActive()) |m| return m.key(m.ctx, key, mods);
+        // The hidden-tabs sheet or a tab's menu: Esc closes it.
+        if (sh.sheet != .none) {
+            if (key == .escape) sh.sheet = .none;
+            return;
+        }
         // A status panel: Esc or Enter closes it; nothing else is typed.
         if (sh.info != .none) {
             if (key == .escape or key == .enter) sh.setInfo(.none);
@@ -1253,6 +1348,11 @@ pub const Shell = struct {
         if (mods.ctrl and mods.shift and !mods.alt) {
             // The device's shortcuts (the desk's also while a panel is open).
             if (sh.host.vtable.shortcut(sh.host.ctx, cp, mods, f)) return;
+            // Ctrl+Shift+H: hide the tab shown (devices).
+            if (sh.device == .viewer and (cp == 'h' or cp == 'H') and f != .panel) {
+                if (sh.shown) |i| sh.hideTab(i);
+                return;
+            }
             if (sh.device == .desk and f == .terminal) switch (cp) {
                 'c', 'C' => return sh.copy(),
                 'v', 'V' => return sh.command(.paste),
@@ -1326,6 +1426,21 @@ pub const Shell = struct {
             ids.usage => sh.toggleInfo(.usage, null),
             ids.system => sh.toggleInfo(.system, null),
             ids.tasks => sh.toggleInfo(.tasks, if (sh.shown) |i| sh.tab_ids[i] else null),
+            ids.usage_strip => sh.usage.toggle(),
+            hidden_tabs.ids.button => if (sh.device == .viewer) {
+                sh.setInfo(.none);
+                sh.sheet = if (sh.sheet == .list) .none else .list;
+            },
+            hidden_tabs.ids.close => sh.sheet = .none,
+            hidden_tabs.ids.hide => switch (sh.sheet) {
+                .menu => |i| sh.hideTab(i),
+                else => {},
+            },
+            hidden_tabs.ids.show0...hidden_tabs.ids.show0 + tabs_wire.max_tabs - 1 => if (sh.sheet == .list) sh.showTab(id - hidden_tabs.ids.show0),
+            hidden_tabs.ids.menu0...hidden_tabs.ids.menu0 + tabs_wire.max_tabs - 1 => if (sh.device == .viewer and id - hidden_tabs.ids.menu0 < sh.n_tabs) {
+                sh.setInfo(.none);
+                sh.sheet = .{ .menu = id - hidden_tabs.ids.menu0 };
+            },
             ids.badge0...ids.badge0 + tabs_wire.max_tabs - 1 => if (id - ids.badge0 < sh.n_tabs) sh.toggleInfo(.tasks, sh.tab_ids[id - ids.badge0]),
             status_panels.ids.close => sh.setInfo(.none),
             // Desk only, from its Usage panel: the panel closes and the
@@ -2468,4 +2583,102 @@ test "sub-tabs: after the shown tab, read-only (no Instruct, no keys), labelled;
         o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2), .subs = &subs, .sub_shown = @splat(9) });
         try testing.expect(o.bottom.len > 0);
     }
+}
+
+test "hidden tabs (devices): the menu hides, the bar skips them, the amber button's sheet shows them again" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .viewer, r.host());
+    defer sh.deinit();
+    var list: [3]tabs_wire.Entry = .{ .{ .id = @splat(1) }, .{ .id = @splat(2) }, .{ .id = @splat(3), .state = .waiting } };
+    list[0].setName("Alpha");
+    list[1].setName("Beta");
+    list[2].setName("Gamma");
+    const v: Viewer = .{ .status = .connected, .mode = .instruct, .host = "h", .has_grid = true };
+    var o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(1) });
+    try testing.expectEqual(@as(usize, 3), o.top_bar.?.tabs.len);
+    try testing.expect(o.top_bar.?.hidden == null);
+    try testing.expectEqual(hidden_tabs.ids.menu0 + 1, o.top_bar.?.tabs[1].menu_id.?);
+    // Beta's menu (a long press or right-click), then Hide.
+    Shell.onButton(&sh, hidden_tabs.ids.menu0 + 1);
+    o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(1) });
+    try testing.expectEqualStrings("Beta", o.panel.?.title);
+    try testing.expectEqual(Focus.panel, sh.focus());
+    Shell.onButton(&sh, hidden_tabs.ids.hide);
+    try testing.expect(r.cmds[r.n_cmds - 1] == .hidden_changed);
+    try testing.expect(sh.hidden.contains("Beta"));
+    o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(1) });
+    try testing.expect(o.panel == null);
+    try testing.expectEqual(@as(usize, 2), o.top_bar.?.tabs.len);
+    try testing.expectEqualStrings("Gamma", o.top_bar.?.tabs[1].label);
+    // Positions stay the desk's: Gamma is still tab0 + 2.
+    try testing.expectEqual(ids.tab0 + 2, o.top_bar.?.tabs[1].id);
+    try testing.expectEqualStrings("\u{22EF} 1 hidden", o.top_bar.?.hidden.?.label);
+    try testing.expect(!o.top_bar.?.hidden.?.alert);
+    // Ctrl+Tab skips the hidden tab.
+    Shell.onKey(&sh, .tab, .{ .ctrl = true });
+    try testing.expectEqual(@as(usize, 2), r.cmds[r.n_cmds - 1].select_tab);
+    // Ctrl+Shift+H hides the tab shown (Gamma, waiting) and shows the next visible one.
+    _ = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(3) });
+    Shell.onChar(&sh, 'H', .{ .ctrl = true, .shift = true });
+    try testing.expect(sh.hidden.contains("Gamma"));
+    try testing.expect(r.cmds[r.n_cmds - 2] == .hidden_changed);
+    try testing.expectEqual(@as(usize, 0), r.cmds[r.n_cmds - 1].select_tab);
+    // A hidden tab waiting: the button is amber; the sheet lists both.
+    o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(1) });
+    try testing.expect(o.top_bar.?.hidden.?.alert);
+    try testing.expectEqual(@as(usize, 1), o.top_bar.?.tabs.len);
+    Shell.onButton(&sh, hidden_tabs.ids.button);
+    o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(1) });
+    try testing.expectEqual(@as(usize, 2), o.panel.?.rows.len);
+    // Esc closes it; Show puts Gamma back and switches to it.
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expect(sh.sheet == .none);
+    Shell.onButton(&sh, hidden_tabs.ids.button);
+    _ = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(1) });
+    Shell.onButton(&sh, hidden_tabs.ids.show0 + 2);
+    try testing.expect(!sh.hidden.contains("Gamma"));
+    try testing.expectEqual(@as(usize, 2), r.cmds[r.n_cmds - 1].select_tab);
+    try testing.expect(r.cmds[r.n_cmds - 2] == .hidden_changed);
+    try testing.expect(sh.sheet == .none);
+    // For-you items that need the desk, in hidden Beta: amber too.
+    o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(3), .needs_desk = &.{@as(tabs_wire.Id, @splat(2))} });
+    try testing.expect(o.top_bar.?.hidden.?.alert);
+    // The desk has no menu and hides nothing.
+    var dr: Rec = .{};
+    var desk = Shell.init(testing.allocator, .desk, dr.host());
+    defer desk.deinit();
+    desk.hidden = sh.hidden;
+    const d = desk.overlay(.{ .tabs = &list, .current = @splat(1) });
+    try testing.expectEqual(@as(usize, 3), d.top_bar.?.tabs.len);
+    try testing.expect(d.top_bar.?.tabs[0].menu_id == null and d.top_bar.?.hidden == null);
+}
+
+test "usage strip in the shell: shown with data on both, toggles, toasts once" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .viewer, r.host());
+    defer sh.deinit();
+    var list: [1]tabs_wire.Entry = .{.{ .id = @splat(1) }};
+    list[0].setName("Alpha");
+    const v: Viewer = .{ .status = .connected, .mode = .instruct, .host = "h", .has_grid = true };
+    // No data (an API key): no strip.
+    try testing.expect(sh.overlay(.{ .viewer = v, .tabs = &list }).usage == null);
+    const u: planusage.Usage = .{ .week = .{ .pct = 81 }, .five_hour = .{ .pct = 10 } };
+    var o = sh.overlay(.{ .viewer = v, .tabs = &list, .usage = u, .now_ms = 100 });
+    try testing.expectEqualStrings("Week 81%", o.usage.?.label);
+    try testing.expectEqual(frame.Tone.warn, o.usage.?.tone);
+    try testing.expectEqualStrings("Week usage passed 75%", o.toast.?.text);
+    try testing.expect(sh.usageDeadline(100) != null);
+    // Later frames with the same value: the toast ends at its deadline.
+    o = sh.overlay(.{ .viewer = v, .tabs = &list, .usage = u, .now_ms = 100 + usage_strip.toast_ms });
+    try testing.expect(o.toast == null);
+    Shell.onButton(&sh, ids.usage_strip);
+    o = sh.overlay(.{ .viewer = v, .tabs = &list, .usage = u, .now_ms = 200 + usage_strip.toast_ms });
+    try testing.expectEqual(@as(usize, 2), o.usage.?.rows.len);
+    // Not connected: no strip.
+    try testing.expect(sh.overlay(.{ .viewer = .{ .status = .retrying }, .usage = u }).usage == null);
+    // The desk shows it too.
+    var dr: Rec = .{};
+    var desk = Shell.init(testing.allocator, .desk, dr.host());
+    defer desk.deinit();
+    try testing.expect(desk.overlay(.{ .tabs = &list, .usage = u }).usage != null);
 }

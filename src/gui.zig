@@ -174,6 +174,8 @@ pub const LocalHost = struct {
     /// Every tab's background tasks and usage, as of hub.activity_gen.
     act: activity_wire.Activity = .{},
     act_gen: u64 = 0,
+    /// The plan's usage as last drawn (Hub.usage).
+    usage: @import("shared").planusage.Usage = .{},
     /// The System panel is open here and the monitor accepted it; its
     /// latest sample.
     sys_sub: bool = false,
@@ -341,7 +343,9 @@ pub const LocalHost = struct {
             const anim: u32 = if (h.sub_shown != null) (h.convo_view.frameTimeout() orelse Presenter.forever) else Presenter.forever;
             // Speech: a toast ending, the Audio panel's Test (real deadlines).
             const sp: u32 = if (h.speech) |s| (if (s.deadlineMs()) |ms| @intCast(@min(ms, 3600 * 1000)) else Presenter.forever) else Presenter.forever;
-            h.p.waitEvents(@min(anim, sp));
+            // The usage toast's end.
+            const ut: u32 = h.shell.usageDeadline(std.Io.Clock.awake.now(h.io).toMilliseconds()) orelse Presenter.forever;
+            h.p.waitEvents(@min(@min(anim, sp), ut));
             h.wakeups += 1;
         };
         h.hide();
@@ -452,6 +456,11 @@ pub const LocalHost = struct {
             h.act_gen = hub.activity_gen;
             act_changed = true;
         }
+        // The plan-usage strip: the desk's own latest values.
+        if (!hub.usage.latest.eql(h.usage)) {
+            h.usage = hub.usage.latest;
+            act_changed = true;
+        }
         hub.mutex.unlock(h.io);
         if (h.sys_sub) if (h.desk) |d| if (d.srv.sysmon) |m| if (m.gen.load(.acquire) != h.sys_gen) {
             h.sys_gen = m.latest(&h.sys);
@@ -535,8 +544,13 @@ pub const LocalHost = struct {
             .activity = if (h.hub != null) &h.act else null,
             .sys = if (h.sys_sub and h.sys_gen != 0) &h.sys else null,
             .now = h.nowUnix(),
+            .now_ms = std.Io.Clock.awake.now(h.io).toMilliseconds(),
+            .utc_offset_s = client.localtime.offsetAt(h.nowUnix()),
+            .usage = if (h.usage.week != null or h.usage.five_hour != null) h.usage else null,
         });
-        if (sp) |s| o.toast = s.toast();
+        if (sp) |s| if (s.toast()) |t| {
+            o.toast = t;
+        };
         return o;
     }
 
@@ -1023,6 +1037,8 @@ pub const LocalHost = struct {
             .resized => |size| if (h.hub) |hub| hub.setSize(.{ .cols = size[0], .rows = size[1] }),
             .usage_slash => |i| h.usageSlash(i),
             .system_panel => |on| h.systemPanel(on),
+            // The desk hides no tabs.
+            .hidden_changed => {},
         }
     }
 

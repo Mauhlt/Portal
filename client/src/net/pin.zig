@@ -79,6 +79,29 @@ pub fn deviceSettingsPath(out: *[max_path]u8) Error![]const u8 {
     return std.fmt.bufPrint(out, "{s}" ++ std.fs.path.sep_str ++ "settings.txt", .{parent}) catch error.PathTooLong;
 }
 
+/// The tabs this device hides from its tab bar (ui/hidden_tabs.zig), next
+/// to the settings file: one name per line.
+pub fn hiddenTabsPath(out: *[max_path]u8) Error![]const u8 {
+    var dir_buf: [max_path]u8 = undefined;
+    const sdir = try serversDir(&dir_buf);
+    const parent = std.fs.path.dirname(sdir) orelse return error.NoConfigDir;
+    return std.fmt.bufPrint(out, "{s}" ++ std.fs.path.sep_str ++ "hidden-tabs.txt", .{parent}) catch error.PathTooLong;
+}
+
+/// The hidden tabs file's text (empty if there is none), into `buf`.
+pub fn loadHiddenTabs(io: Io, buf: []u8) []const u8 {
+    var pbuf: [max_path]u8 = undefined;
+    const p = hiddenTabsPath(&pbuf) catch return "";
+    return Io.Dir.cwd().readFile(io, p, buf) catch "";
+}
+
+pub fn saveHiddenTabs(io: Io, text: []const u8) !void {
+    var pbuf: [max_path]u8 = undefined;
+    const p = try hiddenTabsPath(&pbuf);
+    if (std.fs.path.dirname(p)) |d| try Io.Dir.cwd().createDirPath(io, d);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = text });
+}
+
 /// The device's settings text (empty if there is no file), into `buf`.
 pub fn loadDeviceSettings(io: Io, buf: []u8) []const u8 {
     var pbuf: [max_path]u8 = undefined;

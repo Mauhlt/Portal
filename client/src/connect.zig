@@ -45,6 +45,7 @@ pub const sync = @import("sync/root.zig");
 pub const inputline = ui.inputline;
 /// Touch input and the on-screen keyboard (Windows), shared with the desk.
 pub const touchkbd = @import("touchkbd.zig");
+pub const localtime = @import("localtime.zig");
 pub const dataview = ui.dataview;
 // For portalctl's headless sync-device (src/sync_cli.zig).
 pub const net_client = client_mod;
@@ -203,6 +204,7 @@ const Host = struct {
         h.activity = s.activity;
         if (s.has_sys) h.sys = s.sys;
         const qk = h.convo_view.questionKeys();
+        const now_unix = std.Io.Timestamp.now(h.client.io, .real).toSeconds();
         const o = h.shell.overlay(.{
             .tabs = if (st == .connected) h.tabs.slice() else &.{},
             .current = s.current,
@@ -211,7 +213,10 @@ const Host = struct {
             .panel = panel,
             .activity = if (s.has_activity) &h.activity else null,
             .sys = if (s.has_sys) &h.sys else null,
-            .now = std.Io.Timestamp.now(h.client.io, .real).toSeconds(),
+            .now = now_unix,
+            .now_ms = watchdog.nowMs(h.client.io),
+            .utc_offset_s = localtime.offsetAt(now_unix),
+            .usage = if (s.has_usage) s.usage else null,
             .viewer = .{
                 .status = uiStatus(st),
                 .mode = s.mode,
@@ -317,7 +322,16 @@ const Host = struct {
             .usage_slash => {},
             // The System panel: the desktop samples only while one is open.
             .system_panel => |on| h.client.setSysPanel(on),
+            // This device's hidden tabs: stored next to its settings.
+            .hidden_changed => saveHidden(h),
         }
+    }
+
+    fn saveHidden(h: *Host) void {
+        var buf: [ui.hidden_tabs.max_file]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        h.shell.hidden.write(&w) catch return;
+        pin_mod.saveHiddenTabs(h.client.io, w.buffered()) catch |err| report("portal: could not store the hidden tabs: {t}", .{err});
     }
 
     /// Ctrl+Shift+K opens Packages (not over another panel).
@@ -471,6 +485,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
         if (ui.convoview.parseSwipeSetting(text)) |side| host_ui.convo_view.yes_side = side;
         // `background_art = off` hides the faint hero art (on by default).
         if (ui.convoview.parseOnOffSetting(text, "background_art")) |on| tv.setBackgroundArt(on);
+        // The tabs this device hides (ui/hidden_tabs.zig).
+        var hbuf: [ui.hidden_tabs.max_file]u8 = undefined;
+        host_ui.shell.hidden = ui.hidden_tabs.List.parse(pin_mod.loadHiddenTabs(io, &hbuf));
     }
     host_ui.shell.conversation = host_ui.convo_view.contentView();
     // Portal sync (docs/sync-design.md): a worker that runs a pass on
@@ -533,7 +550,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
         // (Client.notify), input wakes us too; no idle polling. Only a
         // swipe card's fly-off / spring-back (at most ~200 ms) sets a
         // frame deadline.
-        tv.waitEvents(host_ui.convo_view.frameTimeout() orelse Presenter.forever);
+        // The usage toast's end is the other deadline.
+        const toast_ms = host_ui.shell.usageDeadline(watchdog.nowMs(io)) orelse Presenter.forever;
+        tv.waitEvents(@min(host_ui.convo_view.frameTimeout() orelse Presenter.forever, toast_ms));
     }
     tv.deinit();
     std.process.exit(0);

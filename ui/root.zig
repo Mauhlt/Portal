@@ -23,6 +23,8 @@
 //!   convo      the conversation items a device keeps (shared/convo.zig)
 //!   convoview  the Conversation view (a frame.ContentView): the items as a
 //!              scrollable list, question cards, Yes/No swipe cards
+//!   hidden_tabs a device's hidden tabs: the list, the sheet and the menu
+//!   usage_strip the plan-usage strip under the top bar, its toasts
 //!   grid       the terminal snapshot model the frame draws
 //!   form       text fields and focus rings for panels
 //!   qr         QR code encoder (the desk's pairing code, Panel.qr)
@@ -47,6 +49,8 @@ pub const dataview = @import("dataview.zig");
 pub const convo = @import("convo.zig");
 pub const convoview = @import("convoview.zig");
 pub const dictation = @import("dictation.zig");
+pub const hidden_tabs = @import("hidden_tabs.zig");
+pub const usage_strip = @import("usage_strip.zig");
 pub const theme = @import("shared").theme;
 pub const panels = struct {
     pub const desk = @import("panels/desk.zig");
@@ -72,6 +76,8 @@ test {
     _ = dataview;
     _ = convo;
     _ = convoview;
+    _ = hidden_tabs;
+    _ = usage_strip;
     _ = panels.setup;
     _ = panels.desk;
     _ = panels.status;
