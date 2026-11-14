@@ -27,7 +27,7 @@
 //!   convoview  the Conversation view (a frame.ContentView): the items as a
 //!              scrollable list, question cards, Yes/No swipe cards
 //!   hidden_tabs a device's hidden tabs: the list, the sheet and the menu
-//!   usage_strip the plan-usage strip under the top bar, its toasts
+//!   usage_strip the plan-usage strip above the top bar, its toasts
 //!   foryou     the For-you panel under the latest reply (its rows swipe
 //!              with convoview's gesture) and the device's store of cards
 //!   grid       the terminal snapshot model the frame draws

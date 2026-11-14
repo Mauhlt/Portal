@@ -94,7 +94,7 @@ pub const ids = struct {
     pub const tasks: u32 = 915;
     /// A device's top bar: Projects (the Projects sheet, projects_sheet.zig).
     pub const projects: u32 = 916;
-    /// The plan-usage strip under the top bar (toggles its detail).
+    /// The plan-usage strip above the top bar (toggles its detail).
     pub const usage_strip: u32 = 917;
     /// badge0 + position: that tab's background-task badge.
     pub const badge0: u32 = 1200;

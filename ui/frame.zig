@@ -88,7 +88,8 @@ pub const HiddenButton = struct {
     id: u32,
 };
 
-/// The plan-usage strip under the top bar (ui/usage_strip.zig): one line
+/// The plan-usage strip above the top bar (ui/usage_strip.zig), the
+/// window's first line (on a phone right under the system's clock): one line
 /// and a slim meter, or (expanded) a row per window and a note. A click
 /// anywhere on it reaches the sink as InputSink.button(id).
 pub const UsageStrip = struct {
@@ -243,7 +244,7 @@ pub const Layout = struct {
     /// The Data slice (Overlay.data), full width between the main slice and
     /// the bottom region; zero-sized without one.
     data: Rect = .{},
-    /// The plan-usage strip (Overlay.usage), under the top bar; zero-sized
+    /// The plan-usage strip (Overlay.usage), above the top bar; zero-sized
     /// without one.
     usage: Rect = .{},
     /// Each bottom pane's rectangle (same order as Overlay.bottom).
@@ -354,7 +355,7 @@ pub const Overlay = struct {
     /// The Data slice under the main slice.
     data: ?DataSlice = null,
     top_bar: ?TopBar = null,
-    /// The plan-usage strip under the top bar; null: hidden (no data).
+    /// The plan-usage strip above the top bar; null: hidden (no data).
     usage: ?UsageStrip = null,
     selection: ?Selection = null,
     /// The bottom region under the main slice (at most `max_panes`).
@@ -708,8 +709,9 @@ pub const Frame = struct {
         const act = fonts.metrics(@round(action_em * s));
         const status_h: f32 = @round(@as(f32, @floatFromInt(ui.cell_h)) * 1.6);
         const bar_top_h: f32 = if (overlay.top_bar != null) topBarHeight(ui, overlay.touch, s) else 0;
-        // The usage strip sits under the top bar; below it all is as if the
-        // top bar were that much taller.
+        // The usage strip is the first line, the top bar under it; below
+        // them all is as if the top bar were that much taller. Hidden, the
+        // top bar is the first line again and nothing moves.
         const usage_h: f32 = if (overlay.usage) |u| usageHeight(ui, u, s) else 0;
         const top_h = bar_top_h + usage_h;
         // The bottom region (interaction slice): its panes' heights, but never
@@ -741,8 +743,8 @@ pub const Frame = struct {
         const data_h: f32 = if (overlay.data) |d| dataHeight(middle, dataHeaderHeight(ui), dataContentHeight(ui, d, W, s), d.collapsed) else 0;
         const grid_h = @max(0, middle - data_h);
         f.regions = .{
-            .top = .{ .w = W, .h = bar_top_h },
-            .usage = .{ .y = bar_top_h, .w = W, .h = usage_h },
+            .top = .{ .y = usage_h, .w = W, .h = bar_top_h },
+            .usage = .{ .w = W, .h = usage_h },
             .terminal = .{ .y = top_h, .w = W, .h = grid_h },
             .data = .{ .y = top_h + grid_h, .w = W, .h = data_h },
             .bottom = .{ .y = top_h + middle, .w = W, .h = bar_h },
@@ -772,7 +774,13 @@ pub const Frame = struct {
                 v.draw(v.ctx, &p, f.regions.terminal);
             },
         }
-        if (overlay.top_bar) |tb| f.drawTopBar(ui, tb, W, bar_top_h, s);
+        if (overlay.top_bar) |tb| {
+            // Drawn at the top, then moved under the usage strip.
+            const c0 = f.list.cmds.items.len;
+            const h0 = f.n_hits;
+            f.drawTopBar(ui, tb, W, bar_top_h, s);
+            f.shiftDrawn(c0, h0, 0, usage_h);
+        }
         if (overlay.usage) |u| f.drawUsage(ui, u, f.regions.usage, s);
         if (overlay.data) |d| if (data_h > 0) f.drawData(ui, d, f.regions.data, s);
         for (panes[0..n_panes], 0..) |p, i| f.drawPane(act, p, f.regions.panes[i], s);
@@ -789,7 +797,29 @@ pub const Frame = struct {
     /// Moves everything built this frame by (dx, dy) (see Insets).
     fn shift(f: *Frame, dx: f32, dy: f32) void {
         if (dx == 0 and dy == 0) return;
-        for (f.list.cmds.items) |*c| switch (c.*) {
+        f.shiftDrawn(0, 0, dx, dy);
+        const rs = [_]*Rect{ &f.regions.top, &f.regions.terminal, &f.regions.bottom, &f.regions.status, &f.regions.data, &f.regions.usage };
+        for (rs) |r| {
+            r.x += dx;
+            r.y += dy;
+        }
+        for (f.regions.panes[0..f.regions.n_panes]) |*r| {
+            r.x += dx;
+            r.y += dy;
+        }
+        f.cells.ox += dx;
+        f.cells.oy += dy;
+        if (f.text_slot) |*t| {
+            t.rect.x += dx;
+            t.rect.y += dy;
+        }
+    }
+
+    /// Moves the draw commands from `cmd0` and the hits from `hit0` on by
+    /// (dx, dy).
+    fn shiftDrawn(f: *Frame, cmd0: usize, hit0: usize, dx: f32, dy: f32) void {
+        if (dx == 0 and dy == 0) return;
+        for (f.list.cmds.items[cmd0..]) |*c| switch (c.*) {
             inline .rect, .glyph => |*v| {
                 v.x += dx;
                 v.y += dy;
@@ -813,24 +843,9 @@ pub const Frame = struct {
                 v.clip[3] += dy;
             },
         };
-        for (f.hits[0..f.n_hits]) |*b| {
+        for (f.hits[hit0..f.n_hits]) |*b| {
             b.x += dx;
             b.y += dy;
-        }
-        const rs = [_]*Rect{ &f.regions.top, &f.regions.terminal, &f.regions.bottom, &f.regions.status, &f.regions.data, &f.regions.usage };
-        for (rs) |r| {
-            r.x += dx;
-            r.y += dy;
-        }
-        for (f.regions.panes[0..f.regions.n_panes]) |*r| {
-            r.x += dx;
-            r.y += dy;
-        }
-        f.cells.ox += dx;
-        f.cells.oy += dy;
-        if (f.text_slot) |*t| {
-            t.rect.x += dx;
-            t.rect.y += dy;
         }
     }
 
@@ -2304,23 +2319,49 @@ test "tab strip: the hidden button's hit, a tab's menu by right-click and by lon
     try std.testing.expectEqual(@as(?u32, 1700), r.last());
 }
 
-test "usage strip: under the top bar, clickable, pushes the main slice down" {
+test "usage strip: above the top bar, clickable, moves the top bar and the main slice down" {
     const gpa = std.testing.allocator;
     var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
     defer fs.deinit();
     var f = Frame.init(gpa, .{ .fixed_em = 14 });
     defer f.deinit();
     var g: Grid = .{};
-    var o: Overlay = .{ .top_bar = .{ .title = "Portal" } };
+    var o: Overlay = .{ .top_bar = .{ .title = "Portal", .buttons = &.{.{ .label = "Usage", .id = 910 }} } };
     f.build(&fs, .{ 800, 600 }, 1, &g, o);
     const plain_top = f.regions.terminal.y;
+    const plain_btn = hitCentre(&f, 910).?;
     try std.testing.expectEqual(@as(f32, 0), f.regions.usage.h);
+    try std.testing.expectEqual(@as(f32, 0), f.regions.top.y);
     o.usage = .{ .label = "Week 62% \u{00B7} resets Mon", .pct = 62, .id = 916 };
     f.build(&fs, .{ 800, 600 }, 1, &g, o);
-    try std.testing.expect(f.regions.usage.h > 0);
-    try std.testing.expectEqual(f.regions.top.h, f.regions.usage.y);
-    try std.testing.expectEqual(plain_top + f.regions.usage.h, f.regions.terminal.y);
-    try expectHits(&f, &.{916}, &.{});
+    const uh = f.regions.usage.h;
+    try std.testing.expect(uh > 0);
+    // The strip is the first line, the top bar right under it.
+    try std.testing.expectEqual(@as(f32, 0), f.regions.usage.y);
+    try std.testing.expectEqual(uh, f.regions.top.y);
+    try std.testing.expectEqual(plain_top + uh, f.regions.terminal.y);
+    try expectHits(&f, &.{ 916, 910 }, &.{});
+    // Hit tests follow: the strip's hit lies in its own rows, the top
+    // bar's button moved down by the strip's height.
+    const strip = hitCentre(&f, 916).?;
+    try std.testing.expect(strip[1] >= 0 and strip[1] < uh);
+    const btn = hitCentre(&f, 910).?;
+    try std.testing.expectEqual(plain_btn[0], btn[0]);
+    try std.testing.expectEqual(plain_btn[1] + uh, btn[1]);
+    var r: IdRec = .{};
+    const sink: input.InputSink = .{ .ctx = &r, .vtable = &IdRec.vt };
+    f.pointerDown(strip[0], strip[1], .left, .{}, sink);
+    f.pointerUp(strip[0], strip[1], .left, sink);
+    try std.testing.expectEqual(@as(?u32, 916), r.last());
+    f.pointerDown(btn[0], btn[1], .left, .{}, sink);
+    f.pointerUp(btn[0], btn[1], .left, sink);
+    try std.testing.expectEqual(@as(?u32, 910), r.last());
+    // Hidden again: nothing moves.
+    o.usage = null;
+    f.build(&fs, .{ 800, 600 }, 1, &g, o);
+    try std.testing.expectEqual(plain_top, f.regions.terminal.y);
+    try std.testing.expectEqual(plain_btn[1], hitCentre(&f, 910).?[1]);
+    o.usage = .{ .label = "Week 62% \u{00B7} resets Mon", .pct = 62, .id = 916 };
     const collapsed = f.regions.usage.h;
     const rows = [_]UsageRow{ .{ .name = "Week 62%", .pct = 62, .right = "resets Mon 09:00" }, .{ .name = "5-hour 91%", .pct = 91, .tone = .bad } };
     o.usage.?.rows = &rows;

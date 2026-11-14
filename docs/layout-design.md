@@ -7,8 +7,8 @@ top bar.
 
 ```
 ┌────────────────────────────────────────────┐
-│ top bar (project name, project tabs later) │
 │ usage strip (plan limits; hidden w/o data) │
+│ top bar (project name, project tabs later) │
 ├────────────────────────────────────────────┤
 │ ① terminal                                 │  the biggest share
 │                                            │
@@ -242,14 +242,17 @@ keeps the terminal. In the Conversation view the window is minimal:
 
 ## The usage strip (every screen)
 
-A thin strip under the top bar, desk and devices alike (`ui/usage_strip.zig`,
-drawn by `frame.drawUsage`; owner-approved mockup, 2026-11-14):
+A thin strip above the top bar, desk and devices alike: the window's first
+line, on a phone directly under the system's clock and status line
+(`ui/usage_strip.zig`, drawn by `frame.drawUsage`; owner-approved mockup,
+2026-11-14). While it shows, the top bar is drawn that much lower; hidden
+(no data), the top bar is the first line again and nothing moves.
 
 ```
 ┌────────────────────────────────────────────┐
-│ ● Portal  ● WireGuard          [⋯ 3 hidden]│  top bar (tabs)
 │ Week 62% · resets Mon                      │  the usage strip: one line
 │ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬───────────────│  and a slim meter
+│ ● Portal  ● WireGuard          [⋯ 3 hidden]│  top bar (tabs)
 ├────────────────────────────────────────────┤
 ```
 

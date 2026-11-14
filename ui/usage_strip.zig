@@ -1,5 +1,5 @@
 //! The plan-usage strip (docs/layout-design.md, "The usage strip";
-//! docs/protocol.md section 3h): a thin line under the top bar on every
+//! docs/protocol.md section 3h): a thin line above the top bar on every
 //! screen, desk and devices alike, "Week 62% · resets Mon" over a slim
 //! meter, showing whichever window is closer to its limit. Neutral below
 //! 75 %, amber from 75, red from 90 (and at the limit). A tap toggles the
