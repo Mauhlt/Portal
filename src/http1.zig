@@ -290,15 +290,15 @@ test "framing checks" {
     try testing.expectEqual(Status.bad_request, framingError(&get_body, 512).?.status);
     const put = try parseHead("PUT / HTTP/1.1\r\n\r\n");
     try testing.expectEqual(Status.method_not_allowed, framingError(&put, 512).?.status);
-    const te = try parseHead("POST /login HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n");
+    const te = try parseHead("POST /ws HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n");
     try testing.expectEqual(Status.bad_request, framingError(&te, 512).?.status);
-    const ex = try parseHead("POST /login HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n");
+    const ex = try parseHead("POST /ws HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n");
     try testing.expectEqual(Status.expectation_failed, framingError(&ex, 512).?.status);
-    const no_len = try parseHead("POST /login HTTP/1.1\r\n\r\n");
+    const no_len = try parseHead("POST /ws HTTP/1.1\r\n\r\n");
     try testing.expectEqual(Status.length_required, framingError(&no_len, 512).?.status);
-    const big = try parseHead("POST /login HTTP/1.1\r\nContent-Length: 513\r\n\r\n");
+    const big = try parseHead("POST /ws HTTP/1.1\r\nContent-Length: 513\r\n\r\n");
     try testing.expectEqual(Status.payload_too_large, framingError(&big, 512).?.status);
-    const post = try parseHead("POST /login HTTP/1.1\r\nContent-Length: 512\r\n\r\n");
+    const post = try parseHead("POST /ws HTTP/1.1\r\nContent-Length: 512\r\n\r\n");
     try testing.expect(framingError(&post, 512) == null);
 }
 

@@ -12,9 +12,8 @@ What is in it
   portalctl.exe    console tool: pair, devices, unpair, ca, version, sync.
   portal-show.exe  shows a PNG inside a session (must stay next to portal.exe).
   The icon is built into the exes. Nothing else is needed: no installer,
-  no DLLs. The tunnel is the official WireGuard for Windows app
-  (https://www.wireguard.com/install/), which brings its own driver.
-  The window needs a Vulkan GPU driver (current Windows GPU drivers,
+  no DLLs, no WireGuard app or driver (Portal runs its own WireGuard
+  tunnel inside the process). The window needs a Vulkan GPU driver (current Windows GPU drivers,
   including Qualcomm Adreno on Snapdragon X, include it).
 
 Install (each Windows device)
@@ -30,16 +29,15 @@ Install (each Windows device)
 
 Pairing, in order (full steps: docs/pairing.md in the source tree)
 ----------------------------------------------------------------------
-  1. Desktop: WireGuard tunnel up (10.8.0.1, UDP 51820 forwarded), firewall
-     rule for TCP 8420,8421 from 10.8.0.2,10.8.0.3,10.8.0.4 only. Start
-     portal.exe; first run: Listen address 10.8.0.1:8420, the program to
-     run, Start.
-  2. Laptop (tunnel 10.8.0.2 on): at the desk click Pair a device...
-     (Ctrl+Shift+P), name `laptop`, Open pairing. On the laptop run
-     `portal connect`, enter 10.8.0.1:8420 and the SHA-256 the desk shows,
-     click Pair. At the desk check address 10.8.0.2 and the request code,
-     Approve.
-  3. Surface (tunnel 10.8.0.4 on): the same, named `surface`.
-  4. iPhone (tunnel 10.8.0.3 on): Pair a device, name `iphone`. In the
-     Portal app: Scan QR code on the desk's Pair panel. Approve at the desk.
-  Approve only when the address and the code match the device in your hand.
+  1. Desktop: forward UDP 51820 to it and add the one inbound UDP firewall
+     rule (docs/wireguard.md). Start portal.exe; first run: the program to
+     run, Start. In Settings, set the tunnel endpoint devices reach.
+  2. Laptop: run `portal connect`; it shows its key and check code. At the
+     desk: Pair a device... (Ctrl+Shift+P), name `laptop`, type the key,
+     Check key, and approve only if the check code matches the laptop's.
+     Enter the pairing code the desk then shows on the laptop, compare the
+     desk's check code, Connect.
+  3. Surface: the same, named `surface`.
+  4. iPhone: the Portal app shows its key and check code; pair it at the
+     desk as above (name `iphone`), then Scan QR code on the desk's
+     pairing code and Connect.
