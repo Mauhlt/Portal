@@ -66,7 +66,8 @@ const settings = @import("settings.zig");
 const sysmon = @import("sysmon.zig");
 const sync = @import("sync.zig");
 const sync_cli = @import("sync_cli.zig");
-const ScrubIdentity = @import("convo/scrub.zig").Identity;
+const scrub = @import("convo/scrub.zig");
+const ScrubIdentity = scrub.Identity;
 
 /// True in portal.exe (the window), false in portalctl.exe (build.zig).
 pub const gui_app = @import("build_options").gui;
@@ -1270,7 +1271,7 @@ fn cmdStartable(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, arg
             d.close(io);
         }
         var nb: [tabs_wire.max_name]u8 = undefined;
-        const n = name orelse tabs.displayName(folder, env.get("USERPROFILE"), env.get("USERNAME"), &nb);
+        const n = name orelse tabs.displayName(folder, env.get("USERPROFILE"), env.get("USERNAME"), scrubIdentity(gpa, io, env).users, &nb);
         s.addStartable(n, mode, folder) catch |err| fatal("not added: {s}", .{switch (err) {
             error.BadName => "the name must be 1-64 bytes of printable text without \\ / : | \" and not start with - or .",
             error.BadFolder => "the folder must be an absolute path",
@@ -1357,9 +1358,11 @@ const HookWatch = struct {
 };
 
 /// The user's names and home folders for the conversation scrubber
-/// (convo/scrub.zig): %USERNAME%, %USERPROFILE% and the OneDrive folders,
-/// each also in its 8.3 short form. Lives as long as the process.
-fn scrubIdentity(gpa: Allocator, env: *const std.process.Environ.Map) ScrubIdentity {
+/// (convo/scrub.zig) and tab names (tabs.displayName): %USERNAME%,
+/// %USERPROFILE% and the OneDrive folders, each also in its 8.3 short
+/// form; git's global `user.name` / `user.email` (read here, once) and
+/// %COMPUTERNAME%. Lives as long as the process.
+fn scrubIdentity(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) ScrubIdentity {
     const profile = env.get("USERPROFILE");
     var others: [6]?[]const u8 = @splat(null);
     for ([_][]const u8{ "OneDrive", "OneDriveConsumer", "OneDriveCommercial" }, 0..) |name, i| {
@@ -1367,12 +1370,38 @@ fn scrubIdentity(gpa: Allocator, env: *const std.process.Environ.Map) ScrubIdent
         others[2 * i] = d;
         others[2 * i + 1] = shortPath(gpa, d);
     }
+    const git = gitUser(gpa, io, env);
     return ScrubIdentity.init(gpa, .{
         .user_name = env.get("USERNAME"),
         .profile = profile,
         .profile_short = if (profile) |p| shortPath(gpa, p) else null,
         .other_homes = &others,
+        .git_name = git.name,
+        .git_email = git.email,
+        .computer_name = env.get("COMPUTERNAME"),
     }) catch .{};
+}
+
+/// git's global identity: `%USERPROFILE%\.gitconfig`, else the XDG file
+/// (`%XDG_CONFIG_HOME%\git\config` or `%USERPROFILE%\.config\git\config`)
+/// for what it lacks. Read once at startup; never written. Lives as long
+/// as the process.
+fn gitUser(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) scrub.GitUser {
+    var out: scrub.GitUser = .{};
+    const home = env.get("USERPROFILE") orelse return out;
+    const xdg: ?[]const u8 = if (env.get("XDG_CONFIG_HOME")) |x|
+        std.fs.path.join(gpa, &.{ x, "git", "config" }) catch null
+    else
+        std.fs.path.join(gpa, &.{ home, ".config", "git", "config" }) catch null;
+    const global = std.fs.path.join(gpa, &.{ home, ".gitconfig" }) catch null;
+    for ([_]?[]const u8{ global, xdg }) |maybe| {
+        const path = maybe orelse continue;
+        const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 * 1024)) catch continue;
+        const u = scrub.parseGitUser(text);
+        if (out.name == null) out.name = u.name;
+        if (out.email == null) out.email = u.email;
+    }
+    return out;
 }
 
 /// The 8.3 short form of existing path `p` (`C:\Users\JOHNSM~1`), if
@@ -1415,7 +1444,7 @@ pub fn openFolder(gpa: Allocator, hub: *tabs.Hub, env: *const std.process.Enviro
     const tab_name = if (name) |n|
         (if (title.validProject(n)) n else return "the name must be 1-64 bytes of printable text")
     else
-        tabs.displayName(dir, env.get("USERPROFILE"), env.get("USERNAME"), &nb);
+        tabs.displayName(dir, env.get("USERPROFILE"), env.get("USERNAME"), hub.identity.users, &nb);
     const cwd_w = std.unicode.wtf8ToWtf16LeAllocZ(gpa, dir) catch return "bad folder name";
     defer gpa.free(cwd_w);
     _ = hub.open(cwd_w, tab_name, .{}) catch |err| return switch (err) {
@@ -1664,7 +1693,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .colors = saved.colorChoices(&colors_buf),
         .convo_projects = convoProjects(gpa, env),
         .user_name = env.get("USERNAME"),
-        .identity = scrubIdentity(gpa, env),
+        .identity = scrubIdentity(gpa, io, env),
         .size = initial,
         .sysmon_on = saved.system_monitor orelse false,
     };
@@ -1691,7 +1720,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         else
             (std.process.currentPathAlloc(io, gpa) catch null);
         const d = dir_utf8 orelse break :blk "Project";
-        break :blk tabs.displayName(d, env.get("USERPROFILE"), env.get("USERNAME"), &first_name_buf);
+        break :blk tabs.displayName(d, env.get("USERPROFILE"), env.get("USERNAME"), hub.identity.users, &first_name_buf);
     };
     const first = hub.open(cwd_w, first_name, .{ .mirror = opts.console }) catch |err|
         fatal("could not start '{s}': {t}", .{ command[0], err });

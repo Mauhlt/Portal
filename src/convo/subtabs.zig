@@ -156,8 +156,13 @@ pub const SubTabs = struct {
     fn setName(st: *SubTabs, s: *Sub, raw: []const u8) void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(st.gpa);
-        // At most a few hundred bytes are ever shown: scrub only those.
-        scrub.scrub(st.gpa, st.ctx, raw[0..@min(raw.len, transcript.max_desc)], &out) catch return;
+        // Scrubbed whole, cut after (as model.zig's texts are): a name or
+        // path cut first could slip past the scrubber in pieces. The
+        // transcript keeps at most max_desc bytes; a description cut
+        // there loses its last (maybe partial) word too.
+        var src = raw;
+        if (src.len >= transcript.max_desc) src = src[0 .. std.mem.lastIndexOfScalar(u8, src, ' ') orelse 0];
+        scrub.scrub(st.gpa, st.ctx, src, &out) catch return;
         var nb: [wire.max_name]u8 = undefined;
         const n = wire.displayName(out.items, &nb);
         @memcpy(s.name_buf[0..n.len], n);

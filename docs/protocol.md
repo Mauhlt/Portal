@@ -492,8 +492,8 @@ ITEM = {"id":"<32 hex>","k":"<kind>","text":"<summary>"
 
 | `k` | yes | no | input mode needed |
 |---|---|---|---|
-| `waiting_permission` | allows the agent's permission prompt | denies it | `keys`, `instruct`, `text` |
-| `suggest_run` (has `cmd`: one line, no backtick) | sends the agent ``Please run `<cmd>`.`` | dismisses | yes: `instruct`, `text`; no: any |
+| `waiting_permission` (only a hook's prompt whose first choice is a plain one-time yes; any other prompt is a `needs_desk` card) | allows the agent's permission prompt (`1`) | denies it (`esc`) | `keys`, `instruct`, `text` |
+| `suggest_run` (has `cmd`, and `text` is exactly `cmd`: printable ASCII, at most 120 bytes, no backtick, no run of 3+ spaces, no `;`, pipe, `&`, `<`, `>`, `$(`, no `iex` / `Invoke-Expression` / encoded command, no shell interpreter as the command: `foryou.runnable`) | sends the agent ``Please run `<cmd>`.`` | dismisses | yes: `instruct`, `text`; no: any |
 | `suggest_goto` (has `project`) | sends the agent `Please switch to the <project> project.` | dismisses | yes: `instruct`, `text`; no: any |
 | `answer` (a yes/no question in `text`) | answers yes | answers no | `keys`, `instruct`, `text` |
 | `needs_desk` | dismisses | dismisses | any |

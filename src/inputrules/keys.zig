@@ -253,8 +253,21 @@ fn modePrefix(cp: u21) ?LineError {
     };
 }
 
+/// Blanks the agent's input may skip before it looks for a mode prefix:
+/// space and tab, Unicode White_Space (no-break, ogham, en/em and the
+/// other typographic spaces, line/paragraph separators, ideographic) and
+/// the zero-width characters (U+200B..U+200D, U+2060, U+FEFF).
+pub fn leadingBlank(cp: u21) bool {
+    return switch (cp) {
+        ' ', '\t', 0xA0, 0x1680, 0x2000...0x200D, 0x2028, 0x2029, 0x202F, 0x205F, 0x2060, 0x3000, 0xFEFF => true,
+        else => false,
+    };
+}
+
 /// Validates a remote instruction line (`l:<text>`). Returns the text to
-/// type, with surrounding blanks trimmed.
+/// type, with surrounding blanks trimmed. The mode prefixes (`!`, `/`,
+/// `#`) are looked for after any leading blanks (`leadingBlank`), so a
+/// no-break or zero-width space in front does not hide one.
 pub fn validateLine(line_in: []const u8) LineError![]const u8 {
     if (line_in.len > max_line_bytes) return error.TooLong;
     if (!std.unicode.utf8ValidateSlice(line_in)) return error.InvalidUtf8;
@@ -268,7 +281,7 @@ pub fn validateLine(line_in: []const u8) LineError![]const u8 {
         // could hide or reorder text in what the owner reads.
         if (cp == 0x2028 or cp == 0x2029 or (cp >= 0x202A and cp <= 0x202E) or (cp >= 0x2066 and cp <= 0x2069))
             return error.ControlCharacter;
-        if (first) {
+        if (first and !leadingBlank(cp)) {
             if (modePrefix(cp)) |e| return e;
             first = false;
         }
@@ -298,7 +311,7 @@ pub const TextGuard = struct {
         var t = text;
         if (g.at_line_start) {
             while (true) {
-                t = std.mem.trimStart(u8, t, " ");
+                t = trimBlanks(t);
                 if (t.len > 0 and t[0] == '!') {
                     t = t[1..];
                 } else if (std.mem.startsWith(u8, t, "\u{FF01}")) {
@@ -310,6 +323,19 @@ pub const TextGuard = struct {
         return t;
     }
 };
+
+/// `t` without its leading blanks (`leadingBlank`).
+fn trimBlanks(t: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < t.len) {
+        const n = std.unicode.utf8ByteSequenceLength(t[i]) catch break;
+        if (i + n > t.len) break;
+        const cp = std.unicode.utf8Decode(t[i..][0..n]) catch break;
+        if (!leadingBlank(cp)) break;
+        i += n;
+    }
+    return t[i..];
+}
 
 /// Text-mode typing: keeps printable characters only (valid UTF-8; no C0,
 /// DEL or C1 controls, so no escape sequences and no Enter). Returns the
@@ -525,4 +551,23 @@ test "sanitizeText strips every control" {
     try testing.expectEqualStrings("a6n", sanitizeText(.text, "a\xc2\x9b6n", &buf)); // C1 CSI
     try testing.expectEqualStrings("", sanitizeText(.text, "bad\xff", &buf)); // invalid UTF-8
     try testing.expectEqualStrings("", sanitizeText(.keys, "hello", &buf));
+}
+
+test "validateLine and TextGuard: Unicode blanks never hide a mode prefix" {
+    const blanks = [_][]const u8{ "\u{00A0}", "\u{1680}", "\u{2000}", "\u{2005}", "\u{200A}", "\u{202F}", "\u{205F}", "\u{3000}", "\u{200B}", "\u{200C}", "\u{200D}", "\u{2060}", "\u{FEFF}" };
+    for (blanks) |b| {
+        var buf: [32]u8 = undefined;
+        const bang = try std.fmt.bufPrint(&buf, "{s} {s}!dir", .{ b, b });
+        try testing.expectError(error.ShellEscape, validateLine(bang));
+        var buf2: [32]u8 = undefined;
+        try testing.expectError(error.SlashCommand, validateLine(try std.fmt.bufPrint(&buf2, "{s}/config", .{b})));
+        var buf3: [32]u8 = undefined;
+        try testing.expectError(error.MemoryShortcut, validateLine(try std.fmt.bufPrint(&buf3, "{s}#x", .{b})));
+        var g: TextGuard = .{};
+        try testing.expectEqualStrings("dir", g.filter(bang));
+    }
+    // Line and paragraph separators are refused outright.
+    try testing.expectError(error.ControlCharacter, validateLine("\u{2028}!dir"));
+    // A blank in front of ordinary text is fine, and later `!` stays.
+    try testing.expectEqualStrings("\u{00A0}hello!", try validateLine("\u{00A0}hello!"));
 }

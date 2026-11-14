@@ -65,7 +65,10 @@ the desk marked startable, "Starting projects from a device" below.)
      cannot win the race against conhost's own DA reply.
    * Treat the message as untrusted. Program output can contain anything, so
      a hostile file the agent prints could fake a status. It only changes a
-     highlight; it never grants input.
+     highlight; it never grants input. In particular `blocked:kind=permission`
+     never makes a permission card (a Yes = `1` question, a For-you
+     `waiting_permission` card): that is a plain wait without answer keys
+     (session.oscWait). Permission cards come only from the hooks below.
 2. **Fallback: agent hooks (implemented).** Hooks inherit the agent process environment, so Portal sets `PORTAL_TAB=<32 hex>` for each tab's program:
    a random 128-bit value per tab launch, added after childenv.zig's
    filter (which still drops every inherited `PORTAL_*`, an inherited

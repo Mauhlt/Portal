@@ -407,7 +407,7 @@ pub const Tab = struct {
         };
         t.foryou.setReply(t.convo.lastReply(&reply), .{ .tabs = open[0..h.n], .startable = startable[0..ns], .own = t.name() });
         const st = t.session.state;
-        t.foryou.setProgram(st == .working or st == .waiting, st == .waiting and t.session.wait == .permission, t.convo.permissionQuestion());
+        t.foryou.setProgram(st == .working or st == .waiting, st == .waiting and t.session.wait == .permission, t.convo.permissionPrompt());
         if (t.foryou.rebuild(h.io)) {
             h.foryou_gen +%= 1;
             t.foryou.gen = h.foryou_gen;
@@ -437,16 +437,21 @@ pub const Tab = struct {
         }
     }
 
-    /// Card `sig` was answered or dismissed (foryou_ws.zig): gone for
-    /// every device.
-    pub fn forYouDismiss(t: *Tab, sig: u64) void {
+    /// Caller holds hub.mutex: the tab's cards changed (a card claimed
+    /// for an answer, foryou_ws.zig); viewers send them. Wake them after
+    /// unlocking (Hub.broadcast).
+    pub fn forYouChangedLocked(t: *Tab) void {
+        t.hub.foryou_gen +%= 1;
+        t.foryou.gen = t.hub.foryou_gen;
+    }
+
+    /// Card `sig`, claimed for an answer that could not be delivered
+    /// (foryou_ws.zig), comes back for every device.
+    pub fn forYouRestore(t: *Tab, sig: u64) void {
         const h = t.hub;
         h.mutex.lockUncancelable(h.io);
-        const changed = t.foryou.dismiss(h.io, sig);
-        if (changed) {
-            h.foryou_gen +%= 1;
-            t.foryou.gen = h.foryou_gen;
-        }
+        const changed = t.foryou.restore(h.io, sig);
+        if (changed) t.forYouChangedLocked();
         h.mutex.unlock(h.io);
         if (changed) {
             h.cond.broadcast(h.io);
@@ -1210,6 +1215,8 @@ pub const Hub = struct {
         }
         // Desktop log only: the tab's name (shown on the desk anyway),
         // the event and the new state; never the key or anything else.
+        // For you: every permission hook is a prompt of its own (a new card).
+        if (e.wait == .permission) t.forYouEvent(.{ .permission = .{ .key = m.input_hash } });
         if (t.session.setHookState(e)) h.log.print("hooks: tab '{s}': {t} -> {t}", .{ t.name(), m.event, stateOf(e.state) });
         // For you: a turn's end (or a new one) ends what ran.
         switch (m.event) {
@@ -1348,8 +1355,10 @@ pub fn localDay(t: i64) i64 {
 /// The tab name for a folder: its basename, made printable and cut to 64
 /// bytes. Never the path, and never the user's name: the home folder
 /// itself is "Home" (its basename is the user name), a drive root or
-/// anything with no usable characters is "Project".
-pub fn displayName(path: []const u8, home: ?[]const u8, user: ?[]const u8, buf: *[wire.max_name]u8) []const u8 {
+/// anything with no usable characters is "Project", and so is a name
+/// holding any of the user's names as a word (`users`: scrub.Identity's,
+/// so git's name, the computer's name...; scrub.containsUser).
+pub fn displayName(path: []const u8, home: ?[]const u8, user: ?[]const u8, users: []const []const u8, buf: *[wire.max_name]u8) []const u8 {
     var p = path;
     while (p.len > 1 and (p[p.len - 1] == '\\' or p[p.len - 1] == '/')) p = p[0 .. p.len - 1];
     if (home) |hm| {
@@ -1369,19 +1378,25 @@ pub fn displayName(path: []const u8, home: ?[]const u8, user: ?[]const u8, buf: 
         n += cs.len;
     }
     const out = std.mem.trim(u8, buf[0..n], " ");
-    if (!wire.validName(out)) return "Project";
+    if (!wire.validName(out) or scrub.containsUser(out, .{ .user = user, .users = users })) return "Project";
     return out;
 }
 
 test "displayName: basename only, never a path or the user name" {
     var buf: [wire.max_name]u8 = undefined;
-    try std.testing.expectEqualStrings("acme-api", displayName("C:\\code\\acme-api", null, null, &buf));
-    try std.testing.expectEqualStrings("acme-api", displayName("C:\\code\\acme-api\\", null, null, &buf));
-    try std.testing.expectEqualStrings("Home", displayName("C:\\Users\\bob", "C:\\Users\\bob\\", "bob", &buf));
-    try std.testing.expectEqualStrings("Home", displayName("D:\\backup\\BOB", null, "bob", &buf));
-    try std.testing.expectEqualStrings("Project", displayName("C:\\", null, null, &buf));
-    try std.testing.expectEqualStrings("ab", displayName("C:\\x\\a\u{202e}b", null, null, &buf));
+    try std.testing.expectEqualStrings("acme-api", displayName("C:\\code\\acme-api", null, null, &.{}, &buf));
+    try std.testing.expectEqualStrings("acme-api", displayName("C:\\code\\acme-api\\", null, null, &.{}, &buf));
+    try std.testing.expectEqualStrings("Home", displayName("C:\\Users\\bob", "C:\\Users\\bob\\", "bob", &.{}, &buf));
+    try std.testing.expectEqualStrings("Home", displayName("D:\\backup\\BOB", null, "bob", &.{}, &buf));
+    try std.testing.expectEqualStrings("Project", displayName("C:\\", null, null, &.{}, &buf));
+    try std.testing.expectEqualStrings("ab", displayName("C:\\x\\a\u{202e}b", null, null, &.{}, &buf));
     var long_dir: [3 + 100]u8 = @splat('q');
     long_dir[0..3].* = "C:\\".*;
-    try std.testing.expectEqual(@as(usize, 64), displayName(&long_dir, null, null, &buf).len);
+    try std.testing.expectEqual(@as(usize, 64), displayName(&long_dir, null, null, &.{}, &buf).len);
+    // Any of the user's names as a word (git's, the computer's...).
+    const users = [_][]const u8{ "Ann Example", "Ann", "Example", "DESKTOP-Q1" };
+    try std.testing.expectEqualStrings("Project", displayName("C:\\code\\ann-tools", null, "u1", &users, &buf));
+    try std.testing.expectEqualStrings("Project", displayName("C:\\code\\desktop-q1 backup", null, "u1", &users, &buf));
+    try std.testing.expectEqualStrings("Project", displayName("C:\\code\\U1 stuff", null, "u1", &users, &buf));
+    try std.testing.expectEqualStrings("annex", displayName("C:\\code\\annex", null, "u1", &users, &buf));
 }

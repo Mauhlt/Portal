@@ -99,7 +99,7 @@ pub const DeskProjects = struct {
                 const dir = std.unicode.wtf16LeToWtf8Alloc(c.gpa, dir_w) catch return;
                 defer c.gpa.free(dir);
                 var nb: [tabs_wire.max_name]u8 = undefined;
-                const name = tabs.displayName(dir, c.env.get("USERPROFILE"), c.env.get("USERNAME"), &nb);
+                const name = tabs.displayName(dir, c.env.get("USERPROFILE"), c.env.get("USERNAME"), c.hub.identity.users, &nb);
                 d.add(c, name, dir);
             },
             .add_shown => {
