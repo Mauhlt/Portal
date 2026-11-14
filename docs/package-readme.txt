@@ -3,7 +3,7 @@ Which folder goes where
   portal-x86_64-windows   the desktop (the hub, WireGuard 10.8.0.1)
   portal-aarch64-windows  the Snapdragon X laptop (10.8.0.2) and the
                           Surface (10.8.0.4)
-  iPhone (10.8.0.3)       no folder: Safari, or the Portal app (zig build ios)
+  iPhone (10.8.0.3)       no folder: the Portal app (zig build ios)
 
 What is in it
 -------------
@@ -40,8 +40,6 @@ Pairing, in order (full steps: docs/pairing.md in the source tree)
      click Pair. At the desk check address 10.8.0.2 and the request code,
      Approve.
   3. Surface (tunnel 10.8.0.4 on): the same, named `surface`.
-  4. iPhone (tunnel 10.8.0.3 on): Pair a device, name `iphone`. Safari:
-     http://10.8.0.1:8421/ to install and fully trust the Portal CA (check
-     the fingerprint), then https://10.8.0.1:8420/ and Pair this device.
+  4. iPhone (tunnel 10.8.0.3 on): Pair a device, name `iphone`. In the
      Portal app: Scan QR code on the desk's Pair panel. Approve at the desk.
   Approve only when the address and the code match the device in your hand.

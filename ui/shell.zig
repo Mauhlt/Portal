@@ -1537,7 +1537,7 @@ test "viewer bottom: only Instruct in both views; the panel's key row follows th
     try testing.expectEqual(@as(usize, 1), r.answers);
 }
 
-test "viewer per input mode: the same features as the browser" {
+test "viewer per input mode: answer buttons, line and refusals" {
     var r: Rec = .{};
     var sh = Shell.init(testing.allocator, .viewer, r.host());
     defer sh.deinit();

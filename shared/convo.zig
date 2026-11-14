@@ -1,9 +1,8 @@
 //! The Conversation view on the wire (docs/protocol.md section 3b): what the
 //! session program (the agent) and the owner said in the tab a viewer
 //! watches, as readable items instead of a terminal grid. One writer and
-//! one parser for the server (src/convo/model.zig, web.zig), the native
-//! client and the browser client, so both ends agree on the format and its
-//! limits.
+//! one parser for the server (src/convo/model.zig, web.zig) and the native
+//! client, so both ends agree on the format and its limits.
 //!
 //!   {"t":"convo","id":"<32 hex>","on":true,"items":[ITEM,...]}
 //!       the whole conversation of tab `id` (sent after `hello`/`session`

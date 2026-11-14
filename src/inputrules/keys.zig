@@ -1,6 +1,6 @@
 //! Remote input policy and the one list of key names (docs/protocol.md §4),
-//! shared by the server (src/keymap.zig re-exports it), the native client
-//! (client/src/keys.zig) and the browser client (src/wasm/keys.zig).
+//! shared by the server (src/keymap.zig re-exports it) and the native
+//! client (client/src/keys.zig).
 //!
 //! Clients never send raw terminal bytes. They send a key *name* (`k:enter`)
 //! or, in text mode only, plain text (`t:hello`). Portal produces every byte

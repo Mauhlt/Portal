@@ -22,13 +22,12 @@
 //!   client   src/main.zig        pairing, refresh, WebSocket, 'G' decoding.
 //!   "inputrules"  ../src/inputrules/root.zig   the input policy, key names
 //!                                and input line, shared with Portal's server
-//!                                and browser client (Portal's own source
-//!                                tree: this build lives inside it).
-//!   "datafeed"    ../src/datafeed/root.zig     the Data slice's model,
-//!                                shared with the browser client (used by
-//!                                portal_ui).
+//!                                (Portal's own source tree: this build
+//!                                lives inside it).
+//!   "datafeed"    ../src/datafeed/root.zig     the Data slice's model
+//!                                (used by portal_ui).
 //!   "shared" ../shared/root.zig  protocol code shared with Portal's server
-//!                                and browser client (a path dependency).
+//!                                (a path dependency).
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -160,16 +159,16 @@ pub fn modules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     return m;
 }
 
-/// The input policy and input line, shared with Portal's server and
-/// browser client: Portal's src/inputrules (one directory up; Zig allows a
+/// The input policy and input line, shared with Portal's server:
+/// Portal's src/inputrules (one directory up; Zig allows a
 /// module root outside the build root, and this build only ever runs from
 /// inside the Portal checkout).
 pub fn inputrulesModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     return b.createModule(.{ .root_source_file = b.path("../src/inputrules/root.zig"), .target = target, .optimize = optimize });
 }
 
-/// The Data slice's model, shared with Portal's browser client:
-/// Portal's src/datafeed (one directory up, as inputrules).
+/// The Data slice's model: Portal's src/datafeed (one directory up, as
+/// inputrules).
 pub fn datafeedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     return b.createModule(.{ .root_source_file = b.path("../src/datafeed/root.zig"), .target = target, .optimize = optimize });
 }

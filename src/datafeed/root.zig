@@ -1,10 +1,10 @@
 //! Module "datafeed": the Data slice's model (docs/layout-design.md ③),
-//! shared by the browser client (src/wasm/data.zig) and the native client
-//! (client/src/dataview.zig). A small history of the data the session
+//! used by the native clients (ui/dataview.zig). A small history of the
+//! data the session
 //! pushed, newest last, with bounded memory and a badge count for items
 //! that arrived while the slice was hidden. Each client keeps what it needs
-//! to draw an item as its `Payload` (decoded pixels in the browser, PNG
-//! bytes natively) and draws it its own way. Pure logic, std only.
+//! to draw an item as its `Payload` (PNG bytes) and draws it its own way.
+//! Pure logic, std only.
 //!
 //! Today the only kind is an image: every inline image blob the session
 //! sends ('I' frames, docs/protocol.md §3) becomes an item. Tables and

@@ -14,7 +14,7 @@ and the terminal-bell fallback for "waiting". What exists:
   running Portal).
 * Protocol v2 (docs/protocol.md): `hello` lists the sessions, `tabs`,
   `session`, `nosession`, `ended`; `s:<id>` from viewers. Both clients
-  (`portal connect`, the browser) draw the same top bar and switch tabs;
+  (`portal connect`, the iPhone app) draw the same top bar and switch tabs;
   neither can open or close one.
 * OSC 7501 is parsed per session (`src/vt.zig`, `parseProgramState`) and
   only highlights a tab (`waiting` = `state=blocked`). Portal answers the
@@ -210,8 +210,7 @@ value equals a known id; no message text was printed, copied or kept.
   colour, no close box). Shown, the main slice is its conversation, the
   bottom is empty (no Instruct), the status line says "subagent: <name>
   · read-only", and keys reach nothing; a click on the parent tab
-  goes back. The browser page has no Conversation view yet, so no
-  sub-tabs either.
+  goes back.
 * Privacy: names and texts are scrubbed on the desktop; no path, user
   name, subagent id, session id, tool argument or result leaves it
   (tests/e2e/subtabs_tests.zig checks every message).
@@ -221,7 +220,7 @@ value equals a known id; no message text was printed, copied or kept.
 * The desktop keeps a recent-projects list for each paired device: the
   projects that device viewed, with name, colour and last-used time. It is
   stored server-side alongside the device record, so the phone needs no
-  browser storage (no extra JS) and the list survives cache clears.
+  storage of its own.
 * A device sees its own list. Projects that are currently open are jumpable
   (switch tab). Closed ones are shown greyed out as history only.
 * **Devices never reopen or start projects** (owner chose "switch open tabs

@@ -1,8 +1,9 @@
-//! The browser's input box against a real server in its DEFAULT input
-//! mode (no --input): what Send produces is decided by the clients'
-//! own input-line logic (src/inputrules/send.zig, module "inputrules"), then
-//! sent over the socket exactly as the page would. The child is `cmd.exe
-//! /k` (prompt "E2E>"), so what reaches it shows on the prompt line.
+//! The input line against a real server in its DEFAULT input mode (no
+//! --input): what Send produces is decided by the clients' own input-line
+//! logic (src/inputrules/send.zig, module "inputrules"), then sent over the
+//! socket as a client would, and the native client's instruction line is
+//! driven the way its window does. The child is `cmd.exe /k` (prompt
+//! "E2E>"), so what reaches it shows on the prompt line.
 
 const std = @import("std");
 const net = @import("net.zig");
@@ -50,8 +51,7 @@ fn waitLine(v: *client.Viewer, want: []const u8, ms: u32) bool {
     return ok and std.mem.eql(u8, v.cursorLine(), want);
 }
 
-/// Sends what the page sends for `d` (main.zig sendBox). False if the
-/// decision was not to send.
+/// Sends the frames for `d`. False if the decision was not to send.
 fn sendDecision(v: *client.Viewer, d: inputbox.Decision) bool {
     var buf: [inputbox.max_frame]u8 = undefined;
     const frame = switch (d) {
@@ -65,7 +65,7 @@ fn sendDecision(v: *client.Viewer, d: inputbox.Decision) bool {
     return true;
 }
 
-/// The box's text through Send in `policy`; returns the decision.
+/// `text` through Send in `policy`; returns the decision.
 fn box(v: *client.Viewer, policy: inputbox.Policy, text: []const u8, scratch: []u8) inputbox.Decision {
     const d = inputbox.decide(policy, text, scratch);
     _ = sendDecision(v, d);
@@ -149,7 +149,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = waitLine(v, "E2E>", 5000);
 
         // The native client's instruction line, fed keystrokes the way its
-        // window does: the same features as the box.
+        // window does: the same features as above.
         {
             const line = try std.heap.page_allocator.create(inputline.Line);
             defer std.heap.page_allocator.destroy(line);

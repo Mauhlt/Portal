@@ -1,6 +1,6 @@
 //! Module "imgdec": PNG bytes -> RGBA8 pixels for drawing inline images,
-//! in every client (the local window and `portal connect` via the view
-//! module, the browser client in wasm).
+//! in every client (the local window, `portal connect` and the iPhone app
+//! via the view module).
 //!
 //! The decoder is the owner's Image package (module "Image"; see
 //! build.zig.zon), used read-only. It is wrapped defensively:

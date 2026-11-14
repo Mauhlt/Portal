@@ -9,7 +9,7 @@ const std = @import("std");
 /// Both are the same code with a different entry dispatch.
 const App = enum { gui, ctl };
 
-fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, app: App, wasm_bin: std.Build.LazyPath) struct { root: *std.Build.Module, gui: GuiModules } {
+fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, app: App) struct { root: *std.Build.Module, gui: GuiModules } {
     const root = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -22,7 +22,7 @@ fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // ReleaseSafe builds releases are made of.
     opts.addOption(bool, "test_env", optimize == @TypeOf(optimize).Debug);
     root.addOptions("build_options", opts);
-    root.addAnonymousImport("app_wasm", .{ .root_source_file = wasm_bin });
+    root.addAnonymousImport("app_wasm", .{ .root_source_file = browserStub(b) });
     root.addImport("shared", sharedModule(b, target, optimize));
     // src/vt.zig (a file of the root module) takes its cell widths from it.
     root.addImport("Font", fontModule(b, target, optimize));
@@ -97,23 +97,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Browser client: Zig compiled to wasm32-freestanding (src/wasm), with
-    // the bundled font embedded, itself embedded into portal.exe and served
-    // at /static/app.wasm. No WASI, no libc: the module's only imports are
-    // the host functions in src/web/app.js (checked by a test in web.zig).
-    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
-    const wasm = b.addExecutable(.{
-        .name = "portal-app",
-        .root_module = clientModule(b, "src/wasm/main.zig", wasm_target, .ReleaseSmall),
-    });
-    wasm.entry = .disabled; // a library of exports, no _start
-    wasm.rdynamic = true; // keep every `export fn`
-    b.step("wasm", "Build the browser client (zig-out/web/app.wasm)").dependOn(
-        &b.addInstallFile(wasm.getEmittedBin(), "web/app.wasm").step,
-    );
-
-    const gui_root = rootModule(b, target, optimize, .gui, wasm.getEmittedBin());
-    const ctl_root = rootModule(b, target, optimize, .ctl, wasm.getEmittedBin());
+    const gui_root = rootModule(b, target, optimize, .gui);
+    const ctl_root = rootModule(b, target, optimize, .ctl);
 
     const exe = b.addExecutable(.{ .name = "portal", .root_module = gui_root.root });
     exe.subsystem = .windows; // no console window, ever
@@ -182,18 +167,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&exe.step);
     test_step.dependOn(&ctl_exe.step);
     test_step.dependOn(&show_exe.step);
-    const safe_gui = rootModule(b, target, .ReleaseSafe, .gui, wasm.getEmittedBin());
+    const safe_gui = rootModule(b, target, .ReleaseSafe, .gui);
     const exe_safe = b.addExecutable(.{ .name = "portal-releasesafe-check", .root_module = safe_gui.root });
     exe_safe.subsystem = .windows;
     test_step.dependOn(&exe_safe.step);
-    const ctl_safe = b.addExecutable(.{ .name = "portalctl-releasesafe-check", .root_module = rootModule(b, target, .ReleaseSafe, .ctl, wasm.getEmittedBin()).root });
+    const ctl_safe = b.addExecutable(.{ .name = "portalctl-releasesafe-check", .root_module = rootModule(b, target, .ReleaseSafe, .ctl).root });
     test_step.dependOn(&ctl_safe.step);
-    // Browser client: its pure logic (decoder, layout, keys, reconnects,
-    // font parser, rasteriser, renderer) runs natively in Debug, where
-    // safety checks catch what would be a wasm trap or silent corruption.
-    const client_tests = b.addTest(.{ .root_module = clientModule(b, "src/wasm/tests.zig", target, .Debug) });
-    test_step.dependOn(&b.addRunArtifact(client_tests).step);
-    test_step.dependOn(&wasm.step);
     const gui_mods = gui_root.gui;
     // The shared UI (ui/: layout, draw list, shell, panels, theme use) and
     // the GUI modules' own unit tests (client/src/view, client/src).
@@ -251,7 +230,22 @@ pub fn build(b: *std.Build) void {
     addE2e(b, target, optimize, gui_mods, ctl_exe, show_exe);
     addIos(b, optimize, test_step);
     addBrand(b, test_step);
-    addPackage(b, wasm.getEmittedBin(), test_step);
+    addPackage(b, test_step);
+}
+
+/// TEMPORARY: src/web.zig still embeds "app_wasm" (and tests its imports
+/// and exports) until feat/inproc-tunnel drops the browser routes. The
+/// browser client is gone; this is a do-nothing module with the same
+/// interface (src/web/app_stub.zig). Delete both with those routes.
+fn browserStub(b: *std.Build) std.Build.LazyPath {
+    const stub = b.addExecutable(.{ .name = "portal-app-stub", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/web/app_stub.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+        .optimize = .ReleaseSmall,
+    }) });
+    stub.entry = .disabled;
+    stub.rdynamic = true;
+    return stub.getEmittedBin();
 }
 
 /// Windows: links docs/brand/portal.ico as icon resource 1 (Explorer,
@@ -270,11 +264,11 @@ fn addAppIcon(b: *std.Build, exe: *std.Build.Step.Compile) void {
 ///   zig-out/portal-x86_64-windows/   the desktop
 ///   zig-out/portal-aarch64-windows/  the Snapdragon X laptop and the Surface
 /// Each holds portal.exe, portalctl.exe, portal-show.exe, README.txt
-/// (docs/package-readme.txt) and the bundled font's licence. No DLLs: the
+/// (docs/package-readme.txt). No DLLs: the
 /// tunnel is the WireGuard app's own, Vulkan comes with the GPU driver.
 /// src/tools/pecheck.zig checks every exe's PE machine and subsystem and
 /// writes zig-out/portal-<arch>-windows-check.txt.
-fn addPackage(b: *std.Build, wasm_bin: std.Build.LazyPath, test_step: *std.Build.Step) void {
+fn addPackage(b: *std.Build, test_step: *std.Build.Step) void {
     const step = b.step("package", "Build ReleaseSafe folders for x86_64 and aarch64 Windows (zig-out/portal-<arch>-windows)");
     const pecheck_mod = b.createModule(.{
         .root_source_file = b.path("src/tools/pecheck.zig"),
@@ -287,8 +281,8 @@ fn addPackage(b: *std.Build, wasm_bin: std.Build.LazyPath, test_step: *std.Build
         // Baseline CPU (no -mcpu=native): the folder runs on any machine of
         // that architecture, not only the one that built it.
         const t = b.resolveTargetQuery(.{ .cpu_arch = arch, .os_tag = .windows });
-        const gui_root = rootModule(b, t, .ReleaseSafe, .gui, wasm_bin);
-        const ctl_root = rootModule(b, t, .ReleaseSafe, .ctl, wasm_bin);
+        const gui_root = rootModule(b, t, .ReleaseSafe, .gui);
+        const ctl_root = rootModule(b, t, .ReleaseSafe, .ctl);
         const exe = b.addExecutable(.{ .name = "portal", .root_module = gui_root.root });
         exe.subsystem = .windows;
         addAppIcon(b, exe);
@@ -302,7 +296,6 @@ fn addPackage(b: *std.Build, wasm_bin: std.Build.LazyPath, test_step: *std.Build
         _ = wf.addCopyFile(ctl.getEmittedBin(), "portalctl.exe");
         _ = wf.addCopyFile(show.getEmittedBin(), "portal-show.exe");
         _ = wf.add("README.txt", b.fmt("Portal for {t} Windows (ReleaseSafe)\r\n\r\n{s}", .{ arch, crlf(b, @embedFile("docs/package-readme.txt")) }));
-        _ = wf.addCopyFile(b.path("src/web/fonts/LICENSE.txt"), "licenses/DejaVu-fonts-LICENSE.txt");
 
         const check = b.addRunArtifact(pecheck);
         check.addArg(@tagName(arch));
@@ -392,15 +385,15 @@ fn laptopClientCheck(b: *std.Build, t: std.Build.ResolvedTarget) *std.Build.Step
 
 /// "inputrules" (src/inputrules): the input policy, the allowed key names
 /// and the input line (answer words, what Send does, refusal texts), shared
-/// by the server (src/keymap.zig), the native client (client/src) and the
-/// browser client (src/wasm). std only.
+/// by the server (src/keymap.zig) and the native clients (client/src,
+/// ui/). std only.
 fn inputrulesModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     return b.createModule(.{ .root_source_file = b.path("src/inputrules/root.zig"), .target = target, .optimize = optimize });
 }
 
 /// "datafeed" (src/datafeed): the Data slice's model (bounded history of
-/// what the session pushed, the "new" badge), shared by the browser client
-/// (src/wasm/data.zig) and the shared UI (ui/dataview.zig).
+/// what the session pushed, the "new" badge), used by the shared UI
+/// (ui/dataview.zig).
 fn datafeedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     return b.createModule(.{ .root_source_file = b.path("src/datafeed/root.zig"), .target = target, .optimize = optimize });
 }
@@ -451,41 +444,12 @@ fn sharedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     return b.dependency("shared", .{ .target = target, .optimize = optimize }).module("shared");
 }
 
-/// The browser client's module graph: `vt` (src/vt.zig, for the colour
-/// sentinels, cell widths and, in tests, real server frames), `inputrules`
-/// (src/inputrules: the input policy, key names and input line, shared
-/// with the server and the native client), `datafeed`, the Renderer's
-/// `Font` module (TrueType parser + rasteriser) and the bundled fonts as
-/// `font_regular` / `font_bold`.
-fn clientModule(b: *std.Build, root_src: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    const img = imageModules(b, target, optimize);
-    const m = b.createModule(.{ .root_source_file = b.path(root_src), .target = target, .optimize = optimize });
-    const font = fontModule(b, target, optimize);
-    const vt_mod = b.createModule(.{ .root_source_file = b.path("src/vt.zig"), .target = target, .optimize = optimize });
-    vt_mod.addImport("imgcheck", img.imgcheck);
-    vt_mod.addImport("Font", font);
-    // The theme's ANSI colours (shared/theme.zig).
-    vt_mod.addImport("shared", sharedModule(b, target, optimize));
-    m.addImport("vt", vt_mod);
-    m.addImport("Font", font);
-    // Keys and the input box follow the server's own rules.
-    m.addImport("inputrules", inputrulesModule(b, target, optimize));
-    m.addImport("datafeed", datafeedModule(b, target, optimize));
-    m.addImport("imgdec", img.imgdec);
-    m.addImport("imgcheck", img.imgcheck);
-    // The screen-frame decoder, shared with the native client.
-    m.addImport("shared", sharedModule(b, target, optimize));
-    m.addAnonymousImport("font_regular", .{ .root_source_file = b.path("src/web/fonts/DejaVuSansMono.ttf") });
-    m.addAnonymousImport("font_bold", .{ .root_source_file = b.path("src/web/fonts/DejaVuSansMono-Bold.ttf") });
-    return m;
-}
-
 // ---- fonts ----
 
 /// The Renderer's "Font" module (TrueType parser, rasteriser, cell-width
 /// table, system font set, glyph atlas). It imports nothing but std, so the
-/// wasm32 browser client and the server's terminal emulator (src/vt.zig)
-/// use it without compiling the Renderer's Vulkan module; the native view
+/// server's terminal emulator (src/vt.zig) uses it without compiling the
+/// Renderer's Vulkan module; the native view
 /// gets the same module instance. The dependency arguments must match
 /// addGuiModules' exactly, so every user shares one Font module (a file in
 /// two modules of one compilation is an error).
@@ -506,11 +470,8 @@ const ImageModules = struct { imgcheck: *std.Build.Module, imgdec: *std.Build.Mo
 /// imported by src/vt_gfx.zig) and "imgdec" (client/src/image: bounded
 /// PNG -> RGBA8 on top of the owner's Image package).
 ///
-/// Natively, imgdec imports Image's own published "Image" module. For
-/// wasm32 it gets a module built from the same source (Image's
-/// src/root.zig) with a stub "Vulkan" (client/src/image/vk_stub.zig: just
-/// `Format`, the only Vulkan type the PNG path touches), so the browser
-/// build never compiles or links the Vulkan bindings.
+/// imgdec imports a module equal to Image's own published "Image" (see
+/// below for why it is built here).
 fn imageModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) ImageModules {
     // Same target and optimize as the Renderer dependency: Image passes them
     // on to ../Vulkan exactly as Renderer does, so both share one "Vulkan"
@@ -523,23 +484,8 @@ fn imageModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         .optimize = optimize,
         .imports = &.{.{ .name = "ImageCheck", .module = check }},
     });
-    const image = if (target.result.cpu.arch.isWasm()) blk: {
-        const opts = b.addOptions();
-        // 16-byte vectors: wasm32 without simd128 scalarises them anyway,
-        // and narrow ones keep the module small.
-        opts.addOption(usize, "vector_bytes", 16);
-        break :blk b.createModule(.{
-            .root_source_file = dep.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "Vulkan", .module = b.createModule(.{ .root_source_file = b.path("client/src/image/vk_stub.zig"), .target = target, .optimize = optimize }) },
-                .{ .name = "build_options", .module = opts.createModule() },
-                .{ .name = "ImageCheck", .module = check },
-            },
-        });
-    } else blk: {
-        // Natively the same module as Image's own "Image" (its root, its
+    const image = blk: {
+        // The same module as Image's own "Image" (its root, its
         // ImageCheck, the shared Vulkan), but with build options of
         // Portal's: Image's options file has exactly the content of
         // ../Audio's (`vector_bytes = 0`), and stt brings Audio into the

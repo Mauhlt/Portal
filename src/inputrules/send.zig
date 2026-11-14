@@ -1,6 +1,5 @@
-//! The input line, as every client has it: the browser's <textarea> under
-//! the terminal (src/wasm/inputbox.zig) and the native client's instruction
-//! field (client/src/remote.zig). What Send (Enter) does with the text, the
+//! The input line, as every client has it: the native clients' instruction
+//! line (ui/inputline.zig). What Send (Enter) does with the text, the
 //! answer words, the answer buttons, and the refusal texts. Pure logic, no
 //! state; the e2e tests use it to drive a real server the way the clients do.
 //!
@@ -24,9 +23,8 @@ pub const Policy = keymap.Policy;
 
 pub const AnswerButton = struct { label: []const u8, key: []const u8 };
 
-/// The answer buttons, in order, on every client: the browser's button row
-/// (index.html data-btn 0..6, then Send) and the native remote viewers'
-/// instruct panel in keys mode.
+/// The answer buttons, in order, on every client: the native remote
+/// viewers' instruct panel in keys mode.
 pub const answer_buttons = [_]AnswerButton{
     .{ .label = "Yes", .key = "y" },
     .{ .label = "No", .key = "n" },
@@ -40,7 +38,7 @@ pub const answer_buttons = [_]AnswerButton{
 /// Up and Down for arrow-select menus (keys.menu_keys), after the answer
 /// buttons: shown in `instruct` mode only while the shown tab's program
 /// waits for an answer (`showMenuButtons`), since only then does the
-/// server take them. (index.html data-btn 8 and 9, after Send.)
+/// server take them.
 pub const menu_buttons = [_]AnswerButton{
     .{ .label = "\u{2191}", .key = "up" },
     .{ .label = "\u{2193}", .key = "down" },
@@ -317,24 +315,14 @@ pub fn serverRefusal(reason: []const u8) ?Refusal {
 pub const Tone = enum(u32) { neutral = 0, ok = 1, bad = 2 };
 pub const Note = struct { text: []const u8, tone: Tone = .neutral };
 
-/// The line under the box while typing: what Send would do. `buf` holds
-/// formatted text.
-/// Where the input line is, for the help texts.
-pub const Device = enum {
-    /// Phone or tablet browser: on-screen keyboard with a dictation mic.
-    touch,
-    /// Desktop browser: a <textarea>, Shift+Enter adds a line.
-    browser,
-    /// The native client's one-line field.
-    native,
-};
-
-pub fn preview(policy: Policy, text: []const u8, device: Device, buf: []u8) Note {
+/// The line under the input line while typing: what Send would do. `buf`
+/// holds formatted text.
+pub fn preview(policy: Policy, text: []const u8, buf: []u8) Note {
     if (policy == .none) return .{ .text = "" };
     if (answerKey(text)) |k|
         return .{ .text = std.fmt.bufPrint(buf, "Send presses {s}.", .{keyLabel(k)}) catch "", .tone = .ok };
     const blank = std.mem.trim(u8, text, " \t\r\n").len == 0;
-    if (blank) return .{ .text = help(policy, device) };
+    if (blank) return .{ .text = help(policy) };
     return switch (policy) {
         .none => unreachable,
         .keys => .{ .text = refusalText(.answers_only), .tone = .bad },
@@ -350,29 +338,12 @@ pub fn preview(policy: Policy, text: []const u8, device: Device, buf: []u8) Note
     };
 }
 
-/// Help shown under an empty box.
-pub fn help(policy: Policy, device: Device) []const u8 {
+/// Help shown under an empty input line.
+pub fn help(policy: Policy) []const u8 {
     return switch (policy) {
         .none => "",
-        .keys => switch (device) {
-            .touch => "Answers only: say or type yes, no, a number, esc or enter, or tap a button.",
-            .browser, .native => "Answers only: type or dictate (Win+H on Windows) yes, no, a number, esc or enter.",
-        },
-        .instruct, .text => switch (device) {
-            .touch => "Dictate with the keyboard mic, or type. Saying \"yes\", \"no\" or a number presses that key.",
-            .browser => "Enter sends, Shift+Enter adds a line (sent as spaces). Dictate with Win+H on Windows. \"yes\", \"no\" or a number press that key.",
-            .native => "Enter sends (on an empty line it presses Enter), Esc clears. Dictate with Win+H on Windows. \"yes\", \"no\" or a number press that key.",
-        },
-    };
-}
-
-/// Placeholder inside the empty box.
-pub fn placeholder(policy: Policy) []const u8 {
-    return switch (policy) {
-        .none => "",
-        .keys => "answers only",
-        .instruct => "Instruction, or yes / no / a number",
-        .text => "Text to type, or yes / no / a number",
+        .keys => "Answers only: type or dictate (Win+H on Windows) yes, no, a number, esc or enter.",
+        .instruct, .text => "Enter sends (on an empty line it presses Enter), Esc clears. Dictate with Win+H on Windows. \"yes\", \"no\" or a number press that key.",
     };
 }
 
@@ -508,15 +479,14 @@ test "server rejection reasons and notes" {
     // Every refusal has a message.
     for (std.enums.values(Refusal)) |r| try testing.expect(refusalText(r).len > 0);
     var buf: [256]u8 = undefined;
-    try testing.expectEqualStrings("Send presses Yes.", preview(.instruct, "Yes.", .touch, &buf).text);
-    try testing.expectEqual(Tone.bad, preview(.instruct, "/config", .touch, &buf).tone);
-    try testing.expectEqual(Tone.bad, preview(.keys, "do things", .touch, &buf).tone);
-    try testing.expectEqual(Tone.neutral, preview(.instruct, "do things", .touch, &buf).tone);
-    try testing.expect(std.mem.indexOf(u8, preview(.instruct, "", .browser, &buf).text, "Win+H") != null);
-    try testing.expect(std.mem.indexOf(u8, help(.keys, .browser), "Win+H") != null);
-    try testing.expect(std.mem.indexOf(u8, help(.instruct, .native), "Shift+Enter") == null);
-    try testing.expectEqualStrings("", preview(.none, "yes", .touch, &buf).text);
-    try testing.expectEqualStrings("answers only", placeholder(.keys));
+    try testing.expectEqualStrings("Send presses Yes.", preview(.instruct, "Yes.", &buf).text);
+    try testing.expectEqual(Tone.bad, preview(.instruct, "/config", &buf).tone);
+    try testing.expectEqual(Tone.bad, preview(.keys, "do things", &buf).tone);
+    try testing.expectEqual(Tone.neutral, preview(.instruct, "do things", &buf).tone);
+    try testing.expect(std.mem.indexOf(u8, preview(.instruct, "", &buf).text, "Win+H") != null);
+    try testing.expect(std.mem.indexOf(u8, help(.keys), "Win+H") != null);
+    try testing.expect(std.mem.indexOf(u8, help(.instruct), "Shift+Enter") == null);
+    try testing.expectEqualStrings("", preview(.none, "yes", &buf).text);
 }
 
 test "answer buttons and words press answer keys" {

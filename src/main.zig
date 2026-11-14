@@ -1,5 +1,5 @@
 //! Portal: watch (and answer prompts in) a terminal session running on this
-//! desktop from a browser elsewhere, over a private network (WireGuard).
+//! desktop from a laptop or iPhone elsewhere, over a private network (WireGuard).
 //!
 //! One source, two programs (build option `gui`, see build.zig):
 //!
@@ -133,7 +133,7 @@ const usage =
     \\                                 lines that Portal checks first: no
     \\                                 ! shell escape, no / slash commands,
     \\                                 no # memory, no control characters.
-    \\                                 The browser's input box (typing or
+    \\                                 A device's instruction line (typing or
     \\                                 dictation) sends these lines
     \\                           text: FULL REMOTE CONTROL: new prompts,
     \\                                 slash commands, permission-mode

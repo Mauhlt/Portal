@@ -355,19 +355,6 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("session opens the viewer page over HTTPS", resp.status == 200 and resp.bodyContains("app.js"), "{d}", .{resp.status});
         scan.look("/", resp.raw);
     }
-    for ([_][2][]const u8{
-        .{ "/static/app.wasm", "application/wasm" },
-        .{ "/static/app.js", "text/javascript; charset=utf-8" },
-        .{ "/static/app.css", "text/css; charset=utf-8" },
-    }) |a| {
-        var resp = try client.get(inst, a[0], null);
-        defer resp.deinit();
-        const wasm_ok = !std.mem.endsWith(u8, a[0], ".wasm") or std.mem.startsWith(u8, resp.body, "\x00asm");
-        var name_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "{s} is served over HTTPS", .{a[0]});
-        _ = r.check(name, resp.status == 200 and wasm_ok and resp.body.len > 0 and std.mem.eql(u8, resp.header("content-type") orelse "", a[1]), "{d} {d} bytes", .{ resp.status, resp.body.len });
-        scan.look(a[0], resp.raw);
-    }
     {
         var resp = try client.get(inst, "/", creds.deviceCookie());
         defer resp.deinit();
