@@ -46,10 +46,14 @@ pub const Resolved = struct {
     app: [:0]u16,
     /// Mutable command line for CreateProcessW.
     cmdline: [:0]u16,
+    /// The program found for argv[0] (UTF-8; for a .cmd program the
+    /// script, not cmd.exe): what deviceStartResolved checks.
+    program: []u8,
 
     pub fn deinit(r: *Resolved, gpa: Allocator) void {
         gpa.free(r.app);
         gpa.free(r.cmdline);
+        gpa.free(r.program);
     }
 };
 
@@ -104,7 +108,7 @@ pub fn resolve(
 ) !Resolved {
     std.debug.assert(argv.len > 0);
     const program = try findProgram(gpa, io, argv[0], path_env);
-    defer gpa.free(program);
+    errdefer gpa.free(program);
 
     var app_utf8: []u8 = undefined;
     var line_utf8: []u8 = undefined;
@@ -141,7 +145,7 @@ pub fn resolve(
     const app = try std.unicode.utf8ToUtf16LeAllocZ(gpa, app_utf8);
     errdefer gpa.free(app);
     const cmdline = try std.unicode.utf8ToUtf16LeAllocZ(gpa, line_utf8);
-    return .{ .app = app, .cmdline = cmdline };
+    return .{ .app = app, .cmdline = cmdline, .program = program };
 }
 
 /// The agent (`claude`, `claude.exe`, `claude.cmd`, any case, any folder).
@@ -198,8 +202,16 @@ pub const permissive_flags = [_][]const u8{
 };
 
 pub fn deviceStart(argv: []const []const u8) DeviceStart {
-    if (argv.len == 0 or !isAgent(argv[0])) return .not_agent;
-    for (argv[1..]) |a| {
+    if (argv.len == 0) return .not_agent;
+    return deviceStartResolved(argv[0], argv[1..]);
+}
+
+/// deviceStart for the program as resolved for this launch (Resolved.
+/// program, found again on every tab open) and the configured arguments:
+/// a PATH change that makes `claude` another program refuses the start.
+pub fn deviceStartResolved(program: []const u8, args: []const []const u8) DeviceStart {
+    if (!isAgent(program)) return .not_agent;
+    for (args) |a| {
         if (std.mem.eql(u8, a, "--")) break;
         const flag = if (std.mem.indexOfScalar(u8, a, '=')) |eq| a[0..eq] else a;
         for (permissive_flags) |p| if (std.ascii.eqlIgnoreCase(flag, p)) return .{ .permissive = p };
@@ -305,6 +317,12 @@ test "deviceStart: the agent only, never with a permissive flag" {
     }) |f| try testing.expect(deviceStart(&.{ "claude", "--model", "x", f, "acceptEdits" }) == .permissive);
     // A prompt after "--" is not a flag.
     try testing.expect(deviceStart(&.{ "claude", "--", "--dangerously-skip-permissions" }) == .ok);
+    // As found on PATH for this launch: the npm shim or the native
+    // program is the agent; anything else PATH now finds is not.
+    try testing.expect(deviceStartResolved("C:\\npm\\claude.cmd", &.{"--verbose"}) == .ok);
+    try testing.expect(deviceStartResolved("C:\\Users\\x\\.local\\bin\\claude.exe", &.{}) == .ok);
+    try testing.expect(deviceStartResolved("C:\\evil\\claude.bat", &.{}) == .not_agent);
+    try testing.expect(deviceStartResolved("C:\\x\\claude.exe", &.{"--permission-mode=acceptEdits"}) == .permissive);
     var buf: [160]u8 = undefined;
     try testing.expect(std.mem.indexOf(u8, deviceStartText(deviceStart(&.{ "claude", "--permission-mode", "acceptEdits" }), &buf), "--permission-mode") != null);
 }
