@@ -108,9 +108,10 @@ overlapping/overwriting".
 * **Device subscription:** the owner chooses per device which packages it
   receives (e.g. `stt-npu-test` only to the laptop).
 * **Event-driven delivery:** an `{"t":"updates", ...}` message on the
-  existing WebSocket announces new versions to subscribed devices. Devices
-  fetch `GET /sync/pkg/<package>/<version>/manifest` and files over HTTPS
-  with the session, with explicit size limits. Nothing polls.
+  interactive WebSocket announces new versions to subscribed devices.
+  Devices fetch manifests and files on the bulk WebSocket (`/ws/bulk`, its
+  own connection with the bulk priority, 16 KiB chunks), with explicit size
+  limits. Nothing polls.
 
 ## Running delivered programs: `stt-local`
 
@@ -202,9 +203,9 @@ end
   CA key's blob) and the public key in `release.pub`, which must match on
   every load. `portal run` creates it on first start, like the CA. It is
   decrypted only to sign a publish.
-* **Pinned at pairing**: when a device collects its credential, it calls
-  `GET /sync/key` with its brand-new session over the CA-pinned TLS
-  connection and pins the key in `<per-user config>\servers\<host>.sync-key`
+* **Pinned at pairing**: on its first connection after pairing (the CA
+  pinned by the SHA-256 in its pairing code), a device asks `get key` on
+  the bulk WebSocket and pins the key in `<per-user config>\servers\<host>.sync-key`
   (next to the CA pin; public data). A key change on the server is refused
   (the CLI warns); only pairing again replaces the pin. Devices paired
   before sync existed must be paired again.
@@ -233,11 +234,12 @@ end
 ### Endpoints
 
 See [protocol.md section 7](protocol.md#7-portal-sync-signed-packages-for-paired-devices):
-`GET /sync/key`, `GET /sync/index`, `GET /sync/pkg/<pkg>/<ver>/manifest`
-(signature in `x-portal-signature`), `GET /sync/pkg/<pkg>/<ver>/file/<n>`
-(by index, streamed in 32 KiB chunks, each under the send deadline; a
-stored file whose size differs from the manifest is not served). All need
-a live session and serve only that device's subscriptions (404 otherwise).
+`get key`, `get index`, `get manifest <pkg> <ver>` (signature in the reply
+header), `get file <pkg> <ver> <n>` (by index, streamed in 16 KiB chunks,
+each under the send deadline; a stored file whose size differs from the
+manifest is not served), on the bulk WebSocket. Each serves only the
+connection's own device (by its tunnel address) and its subscriptions
+(404 otherwise).
 
 **Announcements.** `SyncWatch` waits on two directory change notifications
 (the data folder, for the subscriptions and device files, and `publish\`
@@ -251,7 +253,7 @@ when its device's hash changed.
 thread woken by every stream connect and `updates`) and `portalctl
 sync-device` (headless, for tests):
 
-1. `GET /sync/index`; then per line, `GET .../manifest`;
+1. `get index`; then per line, `get manifest`;
 2. SHA-256 of the manifest = the index line; signature verifies with the
    pinned key (first: nothing unsigned is interpreted); strict parse;
    package, version, sequence, kind and size = the index line;
