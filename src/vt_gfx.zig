@@ -346,8 +346,11 @@ pub const Graphics = struct {
         return null;
     }
 
-    /// Validates and keeps the received PNG; returns its image id.
+    /// Validates and keeps the received PNG (without its ancillary
+    /// chunks: `stripAncillary`); returns its image id.
     fn store(g: *Graphics, gpa: Allocator) ?u32 {
+        _ = imgcheck.validate(g.pend.items) catch return null;
+        g.pend.items.len = stripAncillary(g.pend.items) orelse return null;
         const info = imgcheck.validate(g.pend.items) catch return null;
         const len = g.pend.items.len;
         if (len > max_total_bytes) return null;
@@ -566,6 +569,87 @@ pub fn appendBlobFrame(out: *std.ArrayList(u8), gpa: Allocator, image: u32, png:
 }
 
 pub const placement_entry_len = 14;
+
+/// Removes, in place, every ancillary chunk of PNG `png` but a well-formed
+/// `tRNS` (transparency, which changes the picture): text (`tEXt`,
+/// `zTXt`, `iTXt`), `eXIf`, `tIME`, colour profiles, APNG frames and any
+/// other metadata the program put in never reach a viewer. Critical
+/// chunks (IHDR, PLTE, IDAT, IEND) are kept as they are, with their CRCs.
+/// Returns the new length, or null if the chunk structure is broken.
+pub fn stripAncillary(png: []u8) ?usize {
+    const sig_len = 8;
+    if (png.len < sig_len) return null;
+    var r: usize = sig_len;
+    var w: usize = sig_len;
+    var color_type: ?u8 = null;
+    var palette_entries: usize = 0;
+    while (r < png.len) {
+        if (png.len - r < 12) return null;
+        const len = std.mem.readInt(u32, png[r..][0..4], .big);
+        if (len > png.len - r - 12) return null;
+        const total = 12 + @as(usize, len);
+        const kind = png[r + 4 ..][0..4];
+        const data = png[r + 8 ..][0..len];
+        const critical = kind[0] & 0x20 == 0;
+        if (std.mem.eql(u8, kind, "IHDR") and len >= 10) color_type = data[9];
+        if (std.mem.eql(u8, kind, "PLTE")) palette_entries = len / 3;
+        const keep = critical or (std.mem.eql(u8, kind, "tRNS") and validTrns(color_type, palette_entries, len));
+        if (keep) {
+            std.mem.copyForwards(u8, png[w..][0..total], png[r..][0..total]);
+            w += total;
+        }
+        r += total;
+        if (std.mem.eql(u8, kind, "IEND")) break;
+    }
+    return w;
+}
+
+/// tRNS's fixed sizes: 2 bytes (grey), 6 (RGB), at most one per palette
+/// entry (indexed); none for colour types with alpha.
+fn validTrns(color_type: ?u8, palette_entries: usize, len: u32) bool {
+    return switch (color_type orelse return false) {
+        0 => len == 2,
+        2 => len == 6,
+        3 => len >= 1 and len <= palette_entries,
+        else => false,
+    };
+}
+
+test "stripAncillary keeps the picture and drops metadata" {
+    const gpa = std.testing.allocator;
+    const base = try imgcheck.testImage(gpa, 4, 3);
+    defer gpa.free(base);
+    // Insert tEXt, tIME and an over-long tRNS after IHDR (8 + 25 bytes).
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, base[0..33]);
+    try appendChunk(gpa, &buf, "tEXt", "Comment\x00C:\\Users\\someone\\secret.txt");
+    try appendChunk(gpa, &buf, "tIME", "\x07\xea\x0b\x0d\x0c\x00\x00");
+    try appendChunk(gpa, &buf, "tRNS", "\x00\x01\x02\x03\x04\x05\x06\x07");
+    try buf.appendSlice(gpa, base[33..]);
+    _ = try imgcheck.validate(buf.items);
+    const n = stripAncillary(buf.items).?;
+    try std.testing.expectEqualSlices(u8, base, buf.items[0..n]);
+    // Already clean: unchanged.
+    const again = try gpa.dupe(u8, base);
+    defer gpa.free(again);
+    try std.testing.expectEqual(base.len, stripAncillary(again).?);
+    // Broken structure.
+    try std.testing.expect(stripAncillary(again[0 .. base.len - 3]) == null);
+}
+
+fn appendChunk(gpa: Allocator, buf: *std.ArrayList(u8), kind: *const [4]u8, data: []const u8) !void {
+    var lb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lb, @intCast(data.len), .big);
+    try buf.appendSlice(gpa, &lb);
+    try buf.appendSlice(gpa, kind);
+    try buf.appendSlice(gpa, data);
+    var c = std.hash.Crc32.init();
+    c.update(kind);
+    c.update(data);
+    std.mem.writeInt(u32, &lb, c.final(), .big);
+    try buf.appendSlice(gpa, &lb);
+}
 
 /// 'P' frame: u8 'P', u16 n, then n x { u32 image, u16 col, i16 row,
 /// u16 cols, u16 rows }. Only placements whose image `have(ctx, id)`
