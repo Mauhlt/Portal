@@ -158,7 +158,7 @@ fn waitItem(v: *client.Viewer, want: Want, ms: u32) bool {
 
 /// Whether the fake program in `folder` has read exactly `want` (its
 /// e2e-input log), after `settle_ms` for anything late to arrive.
-fn inputIs(h: *proc.Harness, folder: []const u8, want: []const u8, settle_ms: u32) bool {
+pub fn inputIs(h: *proc.Harness, folder: []const u8, want: []const u8, settle_ms: u32) bool {
     h.io.sleep(.fromMilliseconds(settle_ms), .awake) catch {};
     var buf: [256]u8 = undefined;
     const path = std.fs.path.join(h.gpa, &.{ folder, "e2e-input" }) catch return false;

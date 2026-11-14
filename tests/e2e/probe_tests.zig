@@ -15,10 +15,10 @@
 //! rejected (ControlCharacter), and the program's input stays as it was.
 
 const std = @import("std");
-const w = @import("win.zig");
 const proc = @import("proc.zig");
 const client = @import("client.zig");
 const Runner = @import("runner.zig").Runner;
+const selfExe = @import("convo_tests.zig").selfExe;
 
 const reply = "\x1b]7501;?\x07";
 
@@ -26,13 +26,6 @@ fn readInput(h: *proc.Harness, folder: []const u8, buf: []u8) []const u8 {
     const path = std.fs.path.join(h.gpa, &.{ folder, "e2e-input" }) catch return "";
     defer h.gpa.free(path);
     return std.Io.Dir.cwd().readFile(h.io, path, buf) catch "";
-}
-
-fn selfExe(gpa: std.mem.Allocator) ![]u8 {
-    var buf: [1024]u16 = undefined;
-    const n = w.GetModuleFileNameW(null, &buf, buf.len);
-    if (n == 0 or n >= buf.len) return error.NoSelf;
-    return std.unicode.utf16LeToUtf8Alloc(gpa, buf[0..n]);
 }
 
 pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {

@@ -17,7 +17,6 @@
 //!     the program, the session id, tool arguments or results.
 
 const std = @import("std");
-const w = @import("win.zig");
 const proc = @import("proc.zig");
 const client = @import("client.zig");
 const Runner = @import("runner.zig").Runner;
@@ -26,13 +25,8 @@ const shared = @import("shared");
 const tabs_wire = shared.tabs;
 const subtabs_wire = shared.subtabs;
 const wire = shared.convo;
-
-fn selfExe(gpa: std.mem.Allocator) ![]u8 {
-    var buf: [1024]u16 = undefined;
-    const n = w.GetModuleFileNameW(null, &buf, buf.len);
-    if (n == 0 or n >= buf.len) return error.NoSelf;
-    return std.unicode.utf16LeToUtf8Alloc(gpa, buf[0..n]);
-}
+const selfExe = @import("convo_tests.zig").selfExe;
+const inputIs = @import("convo_tests.zig").inputIs;
 
 /// The latest `subtabs` message for tab `tab`, parsed.
 fn lastSubs(v: *const client.Viewer, tab: tabs_wire.Id) ?subtabs_wire.List {
@@ -127,16 +121,6 @@ fn hook(h: *proc.Harness, dir: []const u8, tab: []const u8, payload: []const u8)
     const code = c.wait(10_000);
     if (code == null) c.kill();
     return code;
-}
-
-fn inputIs(h: *proc.Harness, folder: []const u8, want: []const u8, settle_ms: u32) bool {
-    h.io.sleep(.fromMilliseconds(settle_ms), .awake) catch {};
-    var buf: [256]u8 = undefined;
-    const path = std.fs.path.join(h.gpa, &.{ folder, "e2e-input" }) catch return false;
-    defer h.gpa.free(path);
-    const got = std.Io.Dir.cwd().readFile(h.io, path, &buf) catch |err| return err == error.FileNotFound and want.len == 0;
-    if (!std.mem.eql(u8, got, want)) std.debug.print("    program input: {x} (want {x})\n", .{ got, want });
-    return std.mem.eql(u8, got, want);
 }
 
 pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
