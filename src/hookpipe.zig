@@ -35,6 +35,9 @@ const builtin = @import("builtin");
 const w = @import("win32.zig");
 const hookmsg = @import("hookmsg.zig");
 const statusline = @import("statusline.zig");
+const elevation = @import("elevation.zig");
+const settings = @import("settings.zig");
+const json_text = @import("shared").convo;
 
 pub const connect_timeout_ms = 200;
 /// How long the server waits for a connected client's message.
@@ -430,9 +433,16 @@ fn trustedLevel(server: u32, client: u32) bool {
 /// drained and the input counts as unparsable.
 pub const max_input = 1 << 20;
 
-/// `portalctl hook`: never prints, always exits 0 (the caller exits), and
-/// does nothing at all outside a Portal tab (no PORTAL_TAB).
-pub fn hookCommand(tab: ?[]const u8, data_dir: ?[]const u8) void {
+/// `portalctl hook`: always exits 0 (the caller exits), and does nothing
+/// at all outside a Portal tab (no PORTAL_TAB). It prints nothing, except
+/// the one decision of the admin-prompt guard: a PreToolUse shell command
+/// that asks for elevation (elevation.zig) in a session a device started
+/// (`guard` = PORTAL_GUARD, `device`), or in any session while the desk's
+/// `block_elevation_desk` is on, is denied with the hook's documented
+/// output (`hookSpecificOutput.permissionDecision = "deny"` and a reason
+/// for the agent). Otherwise the command runs and Portal is told
+/// (`guard=marked`: a "needs desk" card). The command never travels.
+pub fn hookCommand(io: std.Io, tab: ?[]const u8, data_dir: ?[]const u8, guard: ?[]const u8) void {
     const in = stdinHandle();
     const key = hookmsg.parseKey(tab orelse return drain(in)) orelse return drain(in);
     const buf = std.heap.page_allocator.alloc(u8, max_input) catch return drain(in);
@@ -445,12 +455,86 @@ pub fn hookCommand(tab: ?[]const u8, data_dir: ?[]const u8) void {
     // Large inputs (a long prompt) need more than the scratch: fall back.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    const m = hookmsg.fromHookJson(fba.allocator(), key, json) orelse
-        (hookmsg.fromHookJson(arena.allocator(), key, json) orelse return);
+    const parsed = hookmsg.parseHook(fba.allocator(), key, json) orelse
+        (hookmsg.parseHook(arena.allocator(), key, json) orelse return);
+    var m = parsed.msg;
+    if (m.event == .PreToolUse) {
+        const device = if (guard) |g| std.mem.eql(u8, g, "device") else false;
+        switch (guardDecision(parsed, device, if (device) false else deskBlocks(io, data_dir))) {
+            .none => {},
+            .marked => m.guard = .marked,
+            .denied => |r| {
+                m.guard = .denied;
+                printDecision(r.reason());
+            },
+        }
+    }
     var nb: [80:0]u16 = undefined;
     const name = pipeNameW(&nb, data_dir orelse return) orelse return;
     var mb: [hookmsg.max_message]u8 = undefined;
     send(name, m.format(&mb)) catch {};
+}
+
+pub const Decision = union(hookmsg.Guard) {
+    none,
+    marked,
+    denied: Reason,
+
+    pub const Reason = struct {
+        buf: [600]u8 = undefined,
+        len: usize = 0,
+        pub fn reason(r: *const Reason) []const u8 {
+            return r.buf[0..r.len];
+        }
+    };
+};
+
+/// The admin-prompt guard's decision for a PreToolUse (pure, tested):
+/// only the shell tools' commands count; an elevating one is denied in a
+/// device-started session (`device`) or when the desk blocks it
+/// (`desk_blocks`), else marked.
+pub fn guardDecision(p: hookmsg.Parsed, device: bool, desk_blocks: bool) Decision {
+    if (p.msg.event != .PreToolUse) return .none;
+    const t = p.msg.tool();
+    if (!std.mem.eql(u8, t, "Bash") and !std.mem.eql(u8, t, "PowerShell")) return .none;
+    const match = elevation.check(p.command orelse return .none) orelse return .none;
+    if (!device and !desk_blocks) return .marked;
+    var r: Decision.Reason = .{};
+    const text = if (device) elevation.denyReason(match, &r.buf) else elevation.deskDenyReason(match, &r.buf);
+    if (@intFromPtr(text.ptr) != @intFromPtr(&r.buf)) {
+        @memcpy(r.buf[0..text.len], text);
+    }
+    r.len = text.len;
+    return .{ .denied = r };
+}
+
+/// The desk's `block_elevation_desk` (settings.txt in the data folder);
+/// read only when an elevating command was found.
+fn deskBlocks(io: std.Io, data_dir: ?[]const u8) bool {
+    const dir = data_dir orelse return false;
+    return settings.load(std.heap.page_allocator, io, dir).block_elevation_desk orelse false;
+}
+
+/// The PreToolUse deny decision on stdout (the agent's documented hook
+/// output; exit code 0).
+pub fn decisionJson(reason: []const u8, out: *std.Io.Writer) !void {
+    try out.writeAll("{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":");
+    try json_text.writeString(out, reason);
+    try out.writeAll("}}\n");
+}
+
+fn printDecision(reason: []const u8) void {
+    var buf: [1024]u8 = undefined;
+    var wr: std.Io.Writer = .fixed(&buf);
+    decisionJson(reason, &wr) catch return;
+    const h = w.validHandle(w.GetStdHandle(w.STD_OUTPUT_HANDLE)) orelse return;
+    var done: usize = 0;
+    const bytes = wr.buffered();
+    while (done < bytes.len) {
+        var n: w.DWORD = 0;
+        if (w.WriteFile(h, bytes[done..].ptr, @intCast(bytes.len - done), &n, null) == 0 or n == 0) return;
+        done += n;
+    }
 }
 
 pub fn stdinHandle() ?w.HANDLE {
@@ -597,6 +681,35 @@ test "integrity: this process has a level, and a lower server is not trusted" {
     try testing.expect(trustedLevel(mine, mine));
     try testing.expect(trustedLevel(0x3000, 0x2000));
     try testing.expect(!trustedLevel(0x1000, 0x2000));
+}
+
+test "the admin-prompt guard: shell tools only; device sessions denied, desk ones marked unless blocked" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key: hookmsg.Key = @splat(4);
+    const elev = hookmsg.parseHook(a, key, "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"gsudo winget install X\"}}").?;
+    const plain = hookmsg.parseHook(a, key, "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"PowerShell\",\"tool_input\":{\"command\":\"zig build test\"}}").?;
+    const other = hookmsg.parseHook(a, key, "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Write\",\"tool_input\":{\"command\":\"sudo x\"}}").?;
+    try testing.expect(guardDecision(plain, true, true) == .none);
+    try testing.expect(guardDecision(other, true, true) == .none);
+    try testing.expect(guardDecision(elev, false, false) == .marked);
+    const d = guardDecision(elev, true, false);
+    try testing.expect(d == .denied);
+    try testing.expect(std.mem.indexOf(u8, d.denied.reason(), "only run at the desk") != null);
+    try testing.expect(std.mem.indexOf(u8, d.denied.reason(), "winget") == null);
+    const b = guardDecision(elev, false, true);
+    try testing.expect(std.mem.indexOf(u8, b.denied.reason(), "block_elevation_desk") != null);
+    // The documented output, as JSON the agent parses.
+    var buf: [1024]u8 = undefined;
+    var wr: std.Io.Writer = .fixed(&buf);
+    try decisionJson(d.denied.reason(), &wr);
+    const v = try std.json.parseFromSlice(std.json.Value, testing.allocator, wr.buffered(), .{});
+    defer v.deinit();
+    const o = v.value.object.get("hookSpecificOutput").?.object;
+    try testing.expectEqualStrings("PreToolUse", o.get("hookEventName").?.string);
+    try testing.expectEqualStrings("deny", o.get("permissionDecision").?.string);
+    try testing.expect(o.get("permissionDecisionReason").?.string.len > 20);
 }
 
 test "pipeNameW: this user's name for a data directory" {

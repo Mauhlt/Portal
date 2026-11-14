@@ -57,6 +57,10 @@ pub const Session = struct {
     /// `state` was set by a hook (hookmsg.zig), not by OSC 7501.
     hook_state: bool = false,
     list_gen: ?*u64 = null,
+    /// Called (with `mutex` held) whenever `state` or `wait` changes: the
+    /// tab's For-you cards (tabs.zig). Must not take `mutex`.
+    state_ctx: ?*anyopaque = null,
+    state_fn: ?*const fn (ctx: *anyopaque) void = null,
     /// The tab's Conversation view (tabs.Tab.convo; null outside a hub):
     /// told when the program starts or stops waiting for an answer.
     convo: ?*convo_model.Convo = null,
@@ -127,6 +131,7 @@ pub const Session = struct {
             if (s.convo) |c| c.programState(wait);
             changed = true;
         }
+        if (changed) if (s.state_fn) |f| f(s.state_ctx.?);
         return changed;
     }
 
@@ -233,6 +238,13 @@ pub const Session = struct {
     /// not taken as keyboard shortcuts. Returns why it was rejected, if it was.
     pub fn writeWebLine(s: *Session, line: []const u8) keymap.LineError!void {
         if (s.policy != .instruct and s.policy != .text) return error.Empty;
+        return s.writeDeskLine(line);
+    }
+
+    /// A line the desk itself made (a For-you question's "Yes." / "No.",
+    /// foryou_ws.zig, whose input mode the caller checked): the line rules
+    /// of writeWebLine, in any input mode.
+    pub fn writeDeskLine(s: *Session, line: []const u8) keymap.LineError!void {
         const text = try keymap.validateLine(line);
         s.mutex.lockUncancelable(s.io);
         const paste = s.term.bracketedPaste();

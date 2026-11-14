@@ -28,6 +28,8 @@
 //!              scrollable list, question cards, Yes/No swipe cards
 //!   hidden_tabs a device's hidden tabs: the list, the sheet and the menu
 //!   usage_strip the plan-usage strip under the top bar, its toasts
+//!   foryou     the For-you panel under the latest reply (its rows swipe
+//!              with convoview's gesture) and the device's store of cards
 //!   grid       the terminal snapshot model the frame draws
 //!   form       text fields and focus rings for panels
 //!   qr         QR code encoder (the desk's pairing code, Panel.qr)
@@ -51,6 +53,7 @@ pub const inputline = @import("inputline.zig");
 pub const dataview = @import("dataview.zig");
 pub const convo = @import("convo.zig");
 pub const convoview = @import("convoview.zig");
+pub const foryou = @import("foryou.zig");
 pub const projects_sheet = @import("projects_sheet.zig");
 pub const dictation = @import("dictation.zig");
 pub const hidden_tabs = @import("hidden_tabs.zig");
@@ -83,6 +86,7 @@ test {
     _ = convoview;
     _ = hidden_tabs;
     _ = usage_strip;
+    _ = foryou;
     _ = projects_sheet;
     _ = panels.setup;
     _ = panels.desk;

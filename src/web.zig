@@ -68,6 +68,7 @@ const sysinfo = @import("shared").sysinfo;
 const subtabs_wire = @import("shared").subtabs;
 const sysmon = @import("sysmon.zig");
 const frames = @import("shared").frames;
+const foryou_ws = @import("foryou_ws.zig");
 const projects_ws = @import("projects_ws.zig");
 
 /// Hard cap on simultaneous connections (each costs a supervisor thread and
@@ -372,6 +373,9 @@ pub const Server = struct {
     /// The optional system monitor (sysmon.zig; null: none). `y:on` from a
     /// viewer subscribes only while the desk's setting is on.
     sysmon: ?*sysmon.Monitor = null,
+
+    /// For-you answers and recaps per device (foryou_ws.zig).
+    fy_limits: foryou_ws.Limits = .{},
 
     /// Times the store watcher woke up (for the wakeup measurement).
     pairwatch_wakes: std.atomic.Value(u32) = .init(0),
@@ -1181,6 +1185,10 @@ pub const Server = struct {
         defer srv.gpa.destroy(subs_list);
         var subs_out: std.Io.Writer.Allocating = .init(srv.gpa);
         defer subs_out.deinit();
+        // Every tab's For-you cards (section 3g): after hello, then each
+        // tab whose cards changed.
+        var fy = foryou_ws.Outbox.init(srv.gpa);
+        defer fy.deinit();
         // Every tab's background tasks and usage (section 3c): after hello,
         // then whenever any of it (or the tab list) changes.
         var activity_seen: u64 = 0;
@@ -1215,6 +1223,7 @@ pub const Server = struct {
             const sys_due = if (srv.sysmon) |m| ws.sys_on.load(.acquire) and m.gen.load(.acquire) != sys_seen else false;
             const usage_next = usage_t.decide(hub.usage.latest, srv.nowMs());
             if (usage_next != .now and !hub.finished and !full and cur_gen == sent_gen and !(cur_closed and !ended_sent) and !convo_changed and
+                hub.activity_gen == activity_seen and !sys_due and !fy.due(hub) and
                 hub.activity_gen == activity_seen and !sys_due and !proj.dueLocked(hub) and
                 ws.want == .none and ws.sub_want == .none and hub.gen == seen_gen and !ws.dead.load(.acquire) and !gone and
                 srv.sync_gen.load(.acquire) == sync_seen)
@@ -1369,6 +1378,9 @@ pub const Server = struct {
                     usage_t.markSent(hub.usage.latest, now_ms);
                 } else |_| {}
             }
+            if (encode_ok) fy.fill(hub) catch {
+                encode_ok = false;
+            };
             const proj_msg = proj.collectLocked(hub);
             const cur_id: ?tabs.Id = if (cur) |c| c.id else null;
             hub.mutex.unlock(srv.io);
@@ -1412,6 +1424,8 @@ pub const Server = struct {
             if (usage_msg.len > 0) {
                 if (!ws.send(srv, usage_msg, .text)) return;
             }
+            var fy_msgs = fy.messages();
+            while (fy_msgs.next()) |m| if (!ws.send(srv, m, .text)) return;
             if (srv.sysmon) |m| if (ws.sys_on.load(.acquire) and m.gen.load(.acquire) != sys_seen) {
                 var snap: sysinfo.Snapshot = undefined;
                 sys_seen = m.latest(&snap);
@@ -1543,6 +1557,14 @@ pub const Server = struct {
                     srv.viewSub(ws, payload[2..]);
                     return true;
                 }
+                // For-you answers and recaps name their card or tab, so a
+                // shown sub-tab doesn't block them; foryou_ws checks the
+                // input mode per request (dismissing is allowed in every
+                // mode).
+                if (known) |fr| if (fr.prefix == .item or fr.prefix == .recap) {
+                    var ab: [frames.max_answer]u8 = undefined;
+                    return ws.send(srv, foryou_ws.handle(srv.fyCtx(ws), fr, &ab), .text);
+                };
                 // A sub-tab is read-only: nothing typed while it is shown.
                 if (ws.sub_view) return true;
                 // The System panel (read-only, every mode): "y:on" / "y:off".
@@ -1564,7 +1586,11 @@ pub const Server = struct {
                         return ws.send(srv, m, .text);
                     },
                     't' => s.writeWebText(payload[2..]),
-                    'l' => s.writeWebLine(payload[2..]) catch |err| {
+                    // The line `recap`: a recap of the tab watched.
+                    'l' => if (foryou_ws.isRecapLine(payload[2..])) {
+                        var ab: [frames.max_answer]u8 = undefined;
+                        return ws.send(srv, foryou_ws.recapTab(srv.fyCtx(ws), ws.sel, &ab), .text);
+                    } else s.writeWebLine(payload[2..]) catch |err| {
                         // Error names are Portal's own (keymap.LineError), so
                         // {t} is safe here; nothing from the peer is echoed.
                         srv.log.print("instruction from {s} rejected: {t}", .{ ws.conn.peer(), err });
@@ -1579,6 +1605,10 @@ pub const Server = struct {
             else => return false,
         }
     }
+    fn fyCtx(srv: *Server, ws: *const WsConn) foryou_ws.Ctx {
+        return .{ .hub = srv.hub, .limits = &srv.fy_limits, .log = srv.log, .device = ws.device.id, .device_name = ws.device.name.get(), .now_ms = srv.nowMs() };
+    }
+
     /// `p:start <name>` / `p:stop <name>` (projects_ws.handle): the answer,
     /// and on a start (or an already running one) this viewer then shows
     /// that tab, exactly as after `s:<id>`.

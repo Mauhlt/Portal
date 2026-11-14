@@ -10,7 +10,9 @@
 //!   {"hooks": [{"type": "command", "command": "<...>\\portalctl.exe",
 //!               "args": ["hook"], "timeout": 10}]}
 //!
-//! (Notification's group also has `"matcher": "permission_prompt|idle_prompt"`.)
+//! (Notification's group also has `"matcher": "permission_prompt|idle_prompt"`,
+//! PreToolUse's `"matcher": "Bash|PowerShell"`: the shell tools only, for
+//! the admin-prompt guard.)
 //! A group is Portal's when it holds exactly one hook whose command is a
 //! `portalctl.exe` and whose args are exactly ["hook"]; nothing else is
 //! ever touched.
@@ -40,7 +42,11 @@ pub const max_file = 16 << 20;
 pub const events = std.enums.values(hookmsg.Event);
 
 fn matcherOf(e: hookmsg.Event) ?[]const u8 {
-    return if (e == .Notification) hookmsg.notification_matcher else null;
+    return switch (e) {
+        .Notification => hookmsg.notification_matcher,
+        .PreToolUse => hookmsg.pretool_matcher,
+        else => null,
+    };
 }
 
 pub const Error = error{ NotJson, NotAnObject, HooksNotAnObject, EventNotAnArray, TooDeep, OutOfMemory };
@@ -726,7 +732,7 @@ test "install writes exec-form entries for every event; the user's hooks stay" {
         try testing.expectEqualStrings(exe_a, h.get("command").?.string);
         try testing.expectEqualStrings("hook", h.get("args").?.array.items[0].string);
         try testing.expectEqual(@as(i64, timeout_s), h.get("timeout").?.integer);
-        if (e == .Notification) try testing.expectEqualStrings(hookmsg.notification_matcher, g.get("matcher").?.string) else try testing.expect(g.get("matcher") == null);
+        if (matcherOf(e)) |m| try testing.expectEqualStrings(m, g.get("matcher").?.string) else try testing.expect(g.get("matcher") == null);
     }
     // The user's portalctl hook with other args is not Portal's.
     try testing.expectEqual(@as(usize, 2), hooks.get("Stop").?.array.items.len);

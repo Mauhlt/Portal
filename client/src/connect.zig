@@ -152,6 +152,17 @@ const Host = struct {
     /// The Conversation view (the devices' default main view): its own
     /// copy of Shared.convo, synced under the lock each frame.
     convo_view: ui.convoview.View = undefined,
+    /// Its For-you panel (Shared.foryou, the tab shown), likewise.
+    fy_panel: ui.foryou.Panel = undefined,
+    /// This frame's tabs with For-you cards that need the desk.
+    needs_desk: [@import("shared").tabs.max_tabs]@import("shared").tabs.Id = undefined,
+    n_needs_desk: usize = 0,
+
+    /// The panel's frames (`i:`, `r:`) go out like any input.
+    fn fySend(ctx: *anyopaque, f: []const u8) bool {
+        const c: *client_mod.Client = @ptrCast(@alignCast(ctx));
+        return c.sendInput(f);
+    }
 
     /// The view's clock (swipe guard, animations): the awake clock.
     fn clockNow(ctx: ?*anyopaque) i64 {
@@ -189,6 +200,14 @@ const Host = struct {
         h.convo_view.sync(&s.convo);
         // A sub-tab is read-only: its conversation offers no answers.
         h.convo_view.answers = s.sub_shown == null and (if (s.mode) |m| m.acceptsAnswers() else false);
+        h.fy_panel.sync(&s.foryou, s.current, if (s.mode) |m| @tagName(m) else null, s.sub_shown == null);
+        // The tabs whose For-you cards need the desk (a hidden one makes
+        // the "⋯ N hidden" button amber).
+        h.n_needs_desk = 0;
+        for (s.foryou.lists.items) |*l| if (l.needsDesk() and h.n_needs_desk < h.needs_desk.len) {
+            h.needs_desk[h.n_needs_desk] = l.tab;
+            h.n_needs_desk += 1;
+        };
         h.subs = s.subs;
         // The tabs: what the top bar draws and what its clicks mean.
         h.tabs = s.tabs;
@@ -223,6 +242,7 @@ const Host = struct {
             .now_ms = watchdog.nowMs(h.client.io),
             .utc_offset_s = localtime.offsetAt(now_unix),
             .usage = if (s.has_usage) s.usage else null,
+            .needs_desk = h.needs_desk[0..h.n_needs_desk],
             .viewer = .{
                 .status = uiStatus(st),
                 .mode = s.mode,
@@ -485,6 +505,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     host_ui.shell.modal = sync_state.modal();
     host_ui.convo_view = ui.convoview.View.init(gpa);
     host_ui.convo_view.clock = .{ .ctx = host_ui, .now = Host.clockNow };
+    host_ui.fy_panel = ui.foryou.Panel.init(gpa);
+    host_ui.fy_panel.sender = .{ .ctx = client, .send = Host.fySend };
+    host_ui.convo_view.foryou = &host_ui.fy_panel;
     {
         var sbuf: [4096]u8 = undefined;
         const text = pin_mod.loadDeviceSettings(io, &sbuf);

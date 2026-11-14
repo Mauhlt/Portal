@@ -85,6 +85,38 @@ top bar.
   panel (an Esc with the terminal focused is the terminal's). The Data
   strip, the status line and the top bar are unchanged.
 
+## For you (devices; the owner's mockup, screen 1)
+
+Under the latest reply the Conversation view draws the tab's **For you**
+panel (ui/foryou.zig; the cards: docs/tabs-design.md, "For you"):
+
+```
+┌ FOR YOU ───────────────────── [↺ Recap] ┐  Recap: instruct / text only
+│ Sent.                                    │  the last answer's result
+│ ┌ waiting  the agent wants to run a …   › ┐ │  amber: the agent is blocked
+│ ┌ run      zig build e2e             › ┐ │
+│ ┌ answer   Shall I commit this?      › ┐ │
+│ Swipe a row to answer, or tap it to …    │
+└──────────────────────────────────────────┘
+```
+
+* **Swipe a row** to answer it directly: the Yes side per the device's
+  `swipe = left-yes | right-yes` (left by default). **Tap** a row to toggle
+  its full card (what it waits for, the question, the command in a code
+  box, why, which way is which); the card swipes the same way, and a tap
+  or Esc folds it back.
+* **One gesture.** Rows and cards use the Conversation view's swipe (its
+  target is a question card or a For-you row): the same guard (not within
+  600 ms of the row first appearing, past 40 % of its width), lean
+  colours, spring-back and fly-off. The answer leaves as `i:yes <id>` /
+  `i:no <id>`, never as a key.
+* **Keys:** ←/→ answer the focused row (or its open card), ↑/↓ move the
+  focus, Enter toggles, Esc folds.
+* **Input mode `none`:** the rows are shown, not swipeable ("View only").
+  A suggestion's yes in `keys` mode is refused on the device already.
+* **One approval UI:** while the panel holds the tab's permission prompt,
+  the conversation's own permission card is not drawn.
+
 ## Devices: the Conversation view, minimal by default
 
 **Owner decisions (2026-11-12):** paired devices (`portal connect`, the

@@ -21,6 +21,13 @@
 //! default off) shows the System button and lets the system monitor
 //! sample while a System panel is open (sysmon.zig).
 //!
+//! `block_elevation_desk` (`on` / `off`, default off): the admin-prompt
+//! guard (elevation.zig, `portalctl hook` at PreToolUse) also denies
+//! commands that would open an administrator prompt in sessions started
+//! at the desk; off, they run and the tab gets a "needs desk" card.
+//! Sessions a paired device started are always denied. Read by the hook
+//! each time it finds such a command, so a change applies at once.
+//!
 //! `startable = NAME | MODE | FOLDER` (one line each, at most
 //! projects.max_projects): the projects a paired device may start
 //! (docs/tabs-design.md, "Starting projects from a device"), keyed by
@@ -108,6 +115,10 @@ pub const Settings = struct {
     cwd: Str(max_cwd) = .{},
     /// "Show system monitor" (null: not set, i.e. off).
     system_monitor: ?bool = null,
+    /// The admin-prompt guard also denies elevating commands in sessions
+    /// started at the desk (null: not set, i.e. off: they run, with a
+    /// "needs desk" card). Sessions a device started are always denied.
+    block_elevation_desk: ?bool = null,
     /// "Background art": the hero art, faint, behind the window's content
     /// (null: not set, i.e. on).
     background_art: ?bool = null,
@@ -204,6 +215,8 @@ pub const Settings = struct {
                 if (std.ascii.eqlIgnoreCase(val, "on")) s.system_monitor = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.system_monitor = false;
             } else if (std.mem.eql(u8, key, "background_art")) {
                 if (std.ascii.eqlIgnoreCase(val, "on")) s.background_art = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.background_art = false;
+            } else if (std.mem.eql(u8, key, "block_elevation_desk")) {
+                if (std.ascii.eqlIgnoreCase(val, "on")) s.block_elevation_desk = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.block_elevation_desk = false;
             } else if (std.mem.eql(u8, key, "speech_model")) {
                 _ = s.speech_model.set(val);
             } else if (std.mem.eql(u8, key, "mic")) {
@@ -250,6 +263,7 @@ pub const Settings = struct {
         if (s.cwd.get()) |v| try out.print("cwd = {s}\r\n", .{v});
         if (s.system_monitor) |v| try out.print("system_monitor = {s}\r\n", .{if (v) "on" else "off"});
         if (s.background_art) |v| try out.print("background_art = {s}\r\n", .{if (v) "on" else "off"});
+        if (s.block_elevation_desk) |v| try out.print("block_elevation_desk = {s}\r\n", .{if (v) "on" else "off"});
         if (s.speech_model.get()) |v| try out.print("speech_model = {s}\r\n", .{v});
         if (s.mic.get()) |v| try out.print("mic = {s}\r\n", .{v});
         if (s.instruct_mode) |m| try out.print("instruct_mode = {s}\r\n", .{m.text()});

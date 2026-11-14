@@ -92,8 +92,10 @@ the desk marked startable, "Starting projects from a device" below.)
      Other notification types and every other event change nothing;
      settings.json's Notification entry has the matcher
      `permission_prompt|idle_prompt`, so the others don't even start it.
-   * `PreToolUse` (and PostToolUse) are not used: they fire on every tool
-     call. So after a permission answer no hook says "working again";
+   * `PreToolUse` is used only with the matcher `Bash|PowerShell` (the
+     shell tools, not every tool call), for the admin-prompt guard and the
+     long-running card ("For you" below); it changes no state. PostToolUse
+     is not used. So after a permission answer no hook says "working again";
      instead the tab's transcript does: a tool result after a hook's
      permission wait means the prompt was answered (`working`), and
      the agent's interrupt record (`[Request interrupted by user`) means
@@ -354,6 +356,73 @@ Residual risks (accepted by design, or outside Portal's reach):
   stopping asks the agent to exit, and Portal ends it 10 s later.
 * **Rate limits are per device.** A re-paired device starts with a fresh
   window; 3 a minute bounds bursts, not slow abuse.
+
+## For you, recap and the admin-prompt guard (owner's decisions, 2026-11-14)
+
+Everything a tab needs from the owner, or suggests, is one list of cards
+per tab ("For you", docs/protocol.md section 3g), built on the desk
+(src/foryou_desk.zig, src/foryou_extract.zig), answered from any device
+with yes / no (src/foryou_ws.zig), shown under the latest reply
+(ui/foryou.zig, docs/layout-design.md).
+
+* **Where the cards come from.** After each turn (the program neither
+  works nor waits: the Stop hook, or OSC 7501 idle), the agent's last
+  reply (the trailing assistant items of the Conversation view, already
+  scrubbed) is read with fixed rules, no model call:
+  * a fenced block in a shell language (or unlabeled with a known command
+    first) holding exactly one command line -> `suggest_run`; scripts of
+    several lines are skipped;
+  * an inline code span right after a run verb ("run `zig build e2e`",
+    "try", "execute"), or in a request to the owner ("please ...",
+    "you'll need to ...", "can you ...") whose first word is a known
+    command -> `suggest_run`;
+  * a sentence naming an open tab or a startable project (not this tab)
+    with a switch cue ("switch to", "belongs in", "... project") ->
+    `suggest_goto`;
+  * the closing sentence, if it is a yes/no question -> `answer`.
+  A sentence that negates ("don't", "never", "avoid", "instead of", ...)
+  suggests nothing; a command that held a path or a name (now `[path]`,
+  `[home]`, `[user]`) or a backtick is never suggested.
+* **Waiting cards come first:** a pending permission prompt
+  (`waiting_permission`, yes = `1`, no = `esc`, as the permission card),
+  then `needs_desk` and `long_running`. At most 16 per tab.
+* **Ids are versions.** A card keeps its random id while it stays the
+  same and gets a new one when anything changes, so an answer to a card
+  that changed, was answered elsewhere or went is `stale`.
+* **Answers act through the tab's own input paths and rules:** a
+  suggestion's yes types the fixed "Please run `<cmd>`." / "Please switch
+  to the <project> project." as an instruction line (the line rules; the
+  agent still asks its own permission before running anything); a
+  question's yes / no types "Yes." / "No."; a permission card presses `1`
+  / `esc`. The input mode decides what is allowed (Effect.allowedIn:
+  dismissing always, answering from `keys`, messages from `instruct`).
+  Requests are rate limited per device (30 a minute).
+* **Dismissing is for every device**, not per device: one list per tab,
+  so the owner never answers the same thing twice on two devices. A card
+  answered or dismissed stays gone while its reply is the last one.
+* **Recap.** ↺ Recap (or the instruction line `recap`, exactly) types
+  the fixed recap.prompt into the tab as an instruction line; `instruct`
+  or `text` mode, the agent's tabs only, at most once a minute per tab.
+* **The admin-prompt guard.** A PreToolUse hook (matcher
+  `Bash|PowerShell`) checks the shell command in the hook process
+  (src/elevation.zig, one tested table): RunAs / `-Verb RunAs` / runas,
+  sudo, gsudo, msiexec, `.msi` / `.msp`, installer executables
+  (`setup*.exe`, `*install*.exe`), Set-ExecutionPolicy, and writes under
+  Program Files or into HKLM. In a session a device started (Portal sets
+  `PORTAL_GUARD=device` in its environment, after the child-environment
+  filter, so it is never inherited) such a command is **denied** with the
+  hook's decision output (`permissionDecision: deny`) and a reason telling
+  the agent it can only run at the desk: nobody is at the desktop to
+  answer the UAC prompt. In a session started at the desk it runs and the
+  tab gets a `needs_desk` card until the command's result or the turn's
+  end; the desk's `block_elevation_desk = on` (settings.txt, default off,
+  read by the hook each time) denies it there too. The command never
+  leaves the hook process; the desk logs only the verdict. It is a guard
+  against a stuck session, not a sandbox.
+* **Long runs.** One shell command (PreToolUse) running 3 minutes with no
+  new transcript record gets a `long_running` card; a deadline thread
+  sleeps until the earliest deadline (no polling), a wait for an answer
+  moves the deadline, the result or the turn's end clears it.
 
 ## Privacy rules (owner's requirement: nothing reveals closed projects or other folders)
 
