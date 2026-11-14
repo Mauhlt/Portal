@@ -52,6 +52,7 @@ const childenv = @import("childenv.zig");
 const hookmsg = @import("hookmsg.zig");
 const statusline = @import("statusline.zig");
 const usage_desk = @import("usage_desk.zig");
+const agentsettings = @import("agentsettings.zig");
 const projects_wire = @import("shared").projects;
 const settings = @import("settings.zig");
 const foryou_desk = @import("foryou_desk.zig");
@@ -555,10 +556,18 @@ pub const Program = struct {
     /// Whether devices may start sessions of it (cmdline.deviceStart:
     /// the agent, without a permissive flag); checked on every start.
     device_start: cmdline.DeviceStart = .not_agent,
-    /// Portal's status line settings file, passed as `--settings` (the
-    /// agent without a `--settings` of its own: usage_desk.zig); null:
-    /// none (no plan-usage bar).
-    settings_file: ?[]const u8 = null,
+    /// Portal's `--settings` layer (agentsettings.zig): its file for each
+    /// launch is checked and rewritten right before the launch. Device
+    /// starts always get it (the guard hook; without it they are refused);
+    /// desk starts only when `desk_settings`.
+    settings: agentsettings.Layer = .{},
+    /// The agent without a `--settings` of its own (cmdline.wantsSettings):
+    /// desk starts get the layer's status line.
+    desk_settings: bool = false,
+    /// The agent as PATH found it when Portal started: a device start runs
+    /// only this program (a later PATH change or a planted program of the
+    /// same name refuses it). Null: device starts are refused.
+    device_program: ?[]const u8 = null,
 };
 
 /// How a tab is opened (Hub.open).
@@ -572,6 +581,13 @@ pub const OpenOptions = struct {
 };
 
 pub const DeviceLaunch = struct { by: []const u8, mode: projects_wire.Mode };
+
+/// A device start runs only the program pinned when Portal started
+/// (Program.device_program), compared as a Windows path (any case).
+fn samePinned(pinned: ?[]const u8, found: []const u8) bool {
+    const p = pinned orelse return false;
+    return std.ascii.eqlIgnoreCase(p, found);
+}
 
 /// What deviceStart did, and the tab it started or found (with a
 /// reference for the caller), so the viewer can be switched to it.
@@ -631,6 +647,12 @@ pub const Hub = struct {
     /// broadcast.
     usage: usage_desk.State = .{},
 
+    /// Startable projects a device start is opening right now (their
+    /// names; len 0: free slot), so a second request can't start the same
+    /// one twice. Guarded by `mutex`.
+    starting: [settings.max_startable][projects_wire.max_name]u8 = undefined,
+    starting_len: [settings.max_startable]u8 = @splat(0),
+
     /// When a hook message for no open tab was last logged (awake ms).
     /// Guarded by `mutex`.
     hook_unknown_logged_ms: i64 = std.math.minInt(i64),
@@ -660,7 +682,7 @@ pub const Hub = struct {
 
     pub const ColorChoice = struct { name: []const u8, color: u32 };
 
-    pub const OpenError = error{ TooManyTabs, Finished, OutOfMemory, SpawnFailed, UnsafeProgram };
+    pub const OpenError = error{ TooManyTabs, Finished, OutOfMemory, SpawnFailed, UnsafeProgram, NoGuard };
 
     fn notify(h: *Hub) void {
         if (h.notify_fn) |f| if (h.notify_ctx) |c| f(c);
@@ -699,6 +721,23 @@ pub const Hub = struct {
             h.log.print("tab '{s}': the program found for '{s}' is not safe to start from a device; not started", .{ name, h.program.command_name });
             return error.UnsafeProgram;
         }
+        // ...and it is the very program found when Portal started.
+        if (opts.device != null and !samePinned(h.program.device_program, resolved.program)) {
+            h.log.print("tab '{s}': '{s}' is not the program found when Portal started; not started from a device (restart Portal to accept it)", .{ name, h.program.command_name });
+            return error.UnsafeProgram;
+        }
+        // Portal's settings layer for this launch, checked and rewritten
+        // now (agentsettings.zig): a device start's guard hook, the status
+        // line. A device start without it does not start.
+        const settings_path: ?[]u8 = if (opts.device == null and !h.program.desk_settings) null else h.program.settings.prepare(h.gpa, h.io, agentsettings.Kind.of(if (opts.device) |d| d.mode else null)) catch |err| blk: {
+            if (opts.device != null) {
+                h.log.print("tab '{s}': the guard for device starts could not be set up ({t}); not started", .{ name, err });
+                return error.NoGuard;
+            }
+            h.log.print("tab '{s}': no plan-usage bar: its settings file could not be written ({t})", .{ name, err });
+            break :blk null;
+        };
+        defer if (settings_path) |p| h.gpa.free(p);
         h.mutex.lockUncancelable(h.io);
         const full = h.n >= max_tabs;
         const done = h.finished;
@@ -785,7 +824,7 @@ pub const Hub = struct {
         // (cmdline.launchArgs): a device start's permission mode, the
         // session id.
         var arg_buf: [6][]const u8 = undefined;
-        const extra = cmdline.launchArgs(&arg_buf, if (opts.device) |d| d.mode.agentArg() else null, if (t.session_uuid) |*u| u else null, h.program.settings_file);
+        const extra = cmdline.launchArgs(&arg_buf, if (opts.device) |d| d.mode.agentArg() else null, if (t.session_uuid) |*u| u else null, settings_path);
         const line = cmdline.withArgs(h.gpa, resolved.cmdline, extra) catch {
             t.session.term.deinit();
             h.gpa.destroy(t);
@@ -802,7 +841,8 @@ pub const Hub = struct {
             for (hex, 0..) |c, i| tab_var[hookmsg.env_name.len + 1 + i] = c;
         }
         // A device start's hook denies elevating commands (the
-        // admin-prompt guard, elevation.zig): PORTAL_GUARD=device.
+        // admin-prompt guard, elevation.zig): PORTAL_GUARD=device. (The
+        // mode guard trusts its own arguments, not this: hookpipe.zig.)
         const guard_var = comptime std.unicode.utf8ToUtf16LeStringLiteral(hookmsg.guard_env_name ++ "=device");
         const extra_env: []const []const u16 = if (opts.device != null) &.{ &tab_var, guard_var } else &.{&tab_var};
         const env_block = childenv.forSessionWith(h.gpa, extra_env) catch |err| {
@@ -942,8 +982,20 @@ pub const Hub = struct {
             h.mutex.unlock(h.io);
             return .{ .result = .switched, .tab = t };
         }
-        h.mutex.unlock(h.io);
         const n = e.name.get().?;
+        // Marked under the same lock as the check: a second request while
+        // this one opens the tab is told it is starting (open adds the tab
+        // to the list before the mark goes, so after that it is running).
+        const slot = h.markStartingLocked(n) orelse {
+            h.mutex.unlock(h.io);
+            return .{ .result = .starting };
+        };
+        h.mutex.unlock(h.io);
+        defer {
+            h.mutex.lockUncancelable(h.io);
+            h.starting_len[slot] = 0;
+            h.mutex.unlock(h.io);
+        }
         if (h.program.device_start != .ok) {
             var rb: [200]u8 = undefined;
             h.log.print("device '{s}' asked to start '{s}': refused, {s}", .{ by, n, cmdline.deviceStartText(h.program.device_start, &rb) });
@@ -966,6 +1018,7 @@ pub const Hub = struct {
             return .{ .result = switch (err) {
                 error.TooManyTabs => .too_many_tabs,
                 error.UnsafeProgram => .unsafe_program,
+                error.NoGuard => .no_guard,
                 else => .failed,
             } };
         };
@@ -973,6 +1026,22 @@ pub const Hub = struct {
         // keeps the tab it shows (open made the new tab the desk's).
         t.acquire();
         return .{ .result = .started, .tab = t };
+    }
+
+    /// Caller holds `mutex`. Marks startable `name` as being started: its
+    /// slot, or null when it already is.
+    fn markStartingLocked(h: *Hub, name: []const u8) ?usize {
+        var free: ?usize = null;
+        for (&h.starting, h.starting_len, 0..) |*b, len, i| {
+            if (len == 0) {
+                if (free == null) free = i;
+            } else if (std.mem.eql(u8, b[0..len], name)) return null;
+        }
+        const i = free orelse return null; // as many as the list holds
+        const l = @min(name.len, projects_wire.max_name);
+        @memcpy(h.starting[i][0..l], name[0..l]);
+        h.starting_len[i] = @intCast(l);
+        return i;
     }
 
     /// `p:stop <name>` from paired device `by` (input mode and rate limit
@@ -1068,6 +1137,9 @@ pub const Hub = struct {
             h.finished = true;
             h.last_code = code;
         }
+        // Its status line reports go with it (usage_desk.State.forget;
+        // the broadcast below wakes the viewers that send it).
+        if (idx != null) _ = h.usage.forget(t.hook_key, Io.Timestamp.now(h.io, .real).toSeconds());
         h.mutex.unlock(h.io);
         if (t.convo_stop) |e| _ = w32.SetEvent(e);
         h.cond.broadcast(h.io);
@@ -1247,7 +1319,9 @@ pub const Hub = struct {
         for (h.tabs[0..h.n]) |t| {
             if (std.crypto.timing_safe.eql(hookmsg.Key, t.hook_key, r.key)) ours = true;
         }
-        const changed = ours and h.usage.report(r.usage, now);
+        // Kept per tab: the newest report shows, and a tab's go when it
+        // closes (usage_desk.State.reportFrom).
+        const changed = ours and h.usage.reportFrom(r.key, r.usage, now);
         h.mutex.unlock(h.io);
         if (changed) h.broadcast();
     }

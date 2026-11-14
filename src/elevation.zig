@@ -34,6 +34,12 @@ pub const Pattern = union(enum) {
     installer_exe,
     /// A write into the place.
     write_under: Place,
+    /// The tool's word, then (anywhere after it) one of its subcommands
+    /// as a word: `winget install`, `choco upgrade`.
+    subcommand: struct { tool: []const u8, subs: []const []const u8 },
+    /// `-Verb` whose value, without quotes, `+`, parentheses, backticks
+    /// and spaces, spells RunAs: `-Verb ('Run'+'As')`.
+    verb_runas,
 };
 
 pub const Rule = struct {
@@ -51,6 +57,15 @@ pub const rules = [_]Rule{
     .{ .what = "runs an installer package (.msi)", .pattern = .{ .extension = ".msi" } },
     .{ .what = "runs an installer patch (.msp)", .pattern = .{ .extension = ".msp" } },
     .{ .what = "runs an installer program", .pattern = .installer_exe },
+    .{ .what = "runs a command as administrator (runas, -Verb RunAs)", .pattern = .verb_runas },
+    .{ .what = "installs, upgrades or removes software with winget", .pattern = .{ .subcommand = .{ .tool = "winget", .subs = &.{ "install", "upgrade", "uninstall", "add", "update", "remove", "rm" } } } },
+    .{ .what = "installs, upgrades or removes software with Chocolatey", .pattern = .{ .subcommand = .{ .tool = "choco", .subs = &.{ "install", "upgrade", "uninstall", "update" } } } },
+    .{ .what = "adds or removes a Windows capability", .pattern = .{ .word = "add-windowscapability" } },
+    .{ .what = "adds or removes a Windows capability", .pattern = .{ .word = "remove-windowscapability" } },
+    .{ .what = "turns a Windows optional feature on or off", .pattern = .{ .word = "enable-windowsoptionalfeature" } },
+    .{ .what = "turns a Windows optional feature on or off", .pattern = .{ .word = "disable-windowsoptionalfeature" } },
+    .{ .what = "services the Windows image (dism)", .pattern = .{ .word = "dism" } },
+    .{ .what = "changes the boot configuration (bcdedit)", .pattern = .{ .word = "bcdedit" } },
     .{ .what = "changes the PowerShell execution policy", .pattern = .{ .word = "set-executionpolicy" } },
     .{ .what = "writes under Program Files", .pattern = .{ .write_under = .program_files } },
     .{ .what = "writes to HKEY_LOCAL_MACHINE", .pattern = .{ .write_under = .hklm } },
@@ -97,7 +112,39 @@ fn matches(p: Pattern, cmd: []const u8) bool {
             for (spellings(place)) |s| named = named or std.ascii.findIgnoreCase(cmd, s) != null;
             break :blk named and writes(cmd);
         },
+        .subcommand => |sc| blk: {
+            var from: usize = 0;
+            while (wordAt(cmd, sc.tool, from)) |i| {
+                from = i + sc.tool.len;
+                for (sc.subs) |sub| if (wordAt(cmd, sub, from) != null) break :blk true;
+            }
+            break :blk false;
+        },
+        .verb_runas => hasVerbRunAs(cmd),
     };
+}
+
+/// `-Verb` followed by a value that spells RunAs once quotes, `+`,
+/// parentheses, backticks, colons and spaces are left out.
+fn hasVerbRunAs(s: []const u8) bool {
+    var from: usize = 0;
+    while (from < s.len) {
+        const i = from + (std.ascii.findIgnoreCase(s[from..], "-verb") orelse return false);
+        from = i + 1;
+        var j = i + "-verb".len;
+        if (j < s.len and wordChar(s[j])) continue;
+        var got: [5]u8 = undefined;
+        var n: usize = 0;
+        while (j < s.len and n < got.len) : (j += 1) {
+            const c = s[j];
+            if (std.ascii.isAlphabetic(c)) {
+                got[n] = std.ascii.toLower(c);
+                n += 1;
+            } else if (std.mem.indexOfScalar(u8, " \t'\"+()`:", c) == null) break;
+        }
+        if (n == got.len and std.mem.eql(u8, &got, "runas")) return true;
+    }
+    return false;
 }
 
 fn wordChar(c: u8) bool {
@@ -108,16 +155,21 @@ fn wordChar(c: u8) bool {
 /// `-Verb RunAs` matches; but a hyphenated word like `new-item` is matched
 /// whole).
 pub fn hasWord(s: []const u8, w: []const u8) bool {
-    var from: usize = 0;
+    return wordAt(s, w, 0) != null;
+}
+
+/// Where `w` first occurs as a word (hasWord) at or after `start`.
+fn wordAt(s: []const u8, w: []const u8, start: usize) ?usize {
+    var from = start;
     while (from + w.len <= s.len) {
-        const i = from + (std.ascii.findIgnoreCase(s[from..], w) orelse return false);
+        const i = from + (std.ascii.findIgnoreCase(s[from..], w) orelse return null);
         const before_ok = i == 0 or !(wordChar(s[i - 1]) or (s[i - 1] == '-' and i >= 2 and wordChar(s[i - 2])));
         const end = i + w.len;
         const after_ok = end == s.len or !(wordChar(s[end]) or (s[end] == '-' and end + 1 < s.len and wordChar(s[end + 1])));
-        if (before_ok and after_ok) return true;
+        if (before_ok and after_ok) return i;
         from = i + 1;
     }
-    return false;
+    return null;
 }
 
 /// A file name (letters before it) ending in `ext`, then a boundary.
@@ -218,6 +270,20 @@ test "elevation: each rule, and what is not elevation" {
         .{ .cmd = "Set-ItemProperty -Path HKLM:\\SOFTWARE\\X -Name A -Value 1", .rule = "HKEY_LOCAL_MACHINE" },
         .{ .cmd = "reg add HKLM\\Software\\X /v A /d 1 /f", .rule = "HKEY_LOCAL_MACHINE" },
         .{ .cmd = "reg import x.reg HKEY_LOCAL_MACHINE", .rule = "HKEY_LOCAL_MACHINE" },
+        .{ .cmd = "winget install --id Git.Git -e", .rule = "winget" },
+        .{ .cmd = "WinGet.exe upgrade --all", .rule = "winget" },
+        .{ .cmd = "winget uninstall Foo", .rule = "winget" },
+        .{ .cmd = "choco install nodejs -y", .rule = "Chocolatey" },
+        .{ .cmd = "choco upgrade all", .rule = "Chocolatey" },
+        .{ .cmd = "choco.exe uninstall x", .rule = "Chocolatey" },
+        .{ .cmd = "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0", .rule = "capability" },
+        .{ .cmd = "Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform", .rule = "optional feature" },
+        .{ .cmd = "dism /online /enable-feature /featurename:x", .rule = "dism" },
+        .{ .cmd = "DISM.exe /Online /Cleanup-Image", .rule = "dism" },
+        .{ .cmd = "bcdedit /set testsigning on", .rule = "bcdedit" },
+        .{ .cmd = "Start-Process pwsh -Verb ('Run'+'As')", .rule = "runas" },
+        .{ .cmd = "start-process cmd -verb \"Ru\"+\"nAs\"", .rule = "runas" },
+        .{ .cmd = "Start-Process x -Verb:`RunAs", .rule = "runas" },
     };
     for (hits) |h| {
         const got = what(h.cmd) orelse {
@@ -247,6 +313,12 @@ test "elevation: each rule, and what is not elevation" {
         "./configure && make",
         "Copy-Item a b",
         "echo hi > out.txt",
+        "winget search git",
+        "winget list",
+        "choco list --local-only",
+        "echo dismiss",
+        "Start-Process notepad -Verb Open",
+        "Start-Process x -Verbose",
     };
     for (misses) |cmd| if (what(cmd)) |got| {
         std.debug.print("false alarm: {s}: {s}\n", .{ cmd, got });

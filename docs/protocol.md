@@ -453,7 +453,9 @@ ENTRY = {"name":"<name>","color":"#rrggbb","mode":"ask"|"plan",
   `unknown` (no such project, or malformed), `refused` (input mode
   `none`), `rate_limited`, `unsafe_program` (the desk's program setting is
   not safe to start from a device), `not_device_started`, `not_running`,
-  `too_many_tabs`, `failed`.
+  `too_many_tabs`, `failed`, `starting` (another request is starting it
+  right now), `no_guard` (the desk could not set up the guard that holds
+  a device start to its mode, docs/tabs-design.md).
 * Strict parser and writer: `shared/projects.zig`.
 
 ### 3g. For you (`foryou`, `i:`, `item`)

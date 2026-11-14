@@ -2,18 +2,20 @@
 //! docs/tabs-design.md "The plan-usage bar"):
 //!
 //!   * Where the numbers come from: the agent's status line. Portal gives
-//!     the sessions it launches a settings file of its own with
-//!     `--settings <data>\agent-statusline.json`, holding only
-//!     `statusLine` = `portalctl statusline` (statusline.zig). The agent
-//!     layers it over the user's settings for that session only; the
-//!     user's own files are never touched, and since the file has no
-//!     `hooks` key their hooks stay as they are (keys a settings layer
-//!     leaves out keep their values; hook entries merge across layers).
-//!     When the program setting already passes `--settings`, Portal adds
-//!     nothing.
+//!     the sessions it launches a settings layer of its own with
+//!     `--settings` (agentsettings.zig), holding `statusLine` = `portalctl
+//!     statusline` (statusline.zig). The user's own files are never
+//!     touched. When the program setting already passes `--settings`,
+//!     Portal adds nothing to desk starts.
 //!   * `State`: the latest windows (`report`), the limit (`limitReached`
 //!     from a StopFailure hook with `error` = `rate_limit`, cleared by a
-//!     later finished turn or the window's reset).
+//!     later finished turn or the window's reset). Reports are kept per
+//!     tab (`reportFrom`, keyed by the tab's hook key) and the newest one
+//!     per window is shown; a tab's reports go when it closes (`forget`).
+//!     Any process in a tab can read PORTAL_TAB and send a report, so a
+//!     report must look like the status line's (`plausible`), is replaced
+//!     by the next one from any tab, and ends with its tab: a tool cannot
+//!     pin a made-up number on every device.
 //!   * `Throttle`: per viewer, when `{"t":"usage"}` goes out: after hello,
 //!     then at most once per `interval_ms`, at once when a window crosses
 //!     75 %, 90 % or 100 %, or the limit changes. The viewer's loop waits
@@ -29,11 +31,72 @@ const Window = planusage.Window;
 
 pub const interval_ms: i64 = 5 * 60 * 1000;
 
+pub const Key = [16]u8;
+/// Tabs whose reports are kept (more: the oldest report goes).
+pub const max_sources = 16;
+
 pub const State = struct {
     latest: Usage = .{},
     /// The limited window's `resets_at` when its limit was reached (0:
     /// unknown): a later report with another reset time is a new window.
     limit_resets_at: u64 = 0,
+    sources: [max_sources]Source = undefined,
+    n_sources: usize = 0,
+    seq: u64 = 0,
+
+    const Source = struct { key: Key, usage: Usage, seq: u64 };
+
+    /// A status line report from the tab with hook key `key`: kept as that
+    /// tab's, and the newest report of each window is shown. Implausible
+    /// ones are dropped. True if what is shown changed.
+    pub fn reportFrom(s: *State, key: Key, u: Usage, now_unix: i64) bool {
+        if (!plausible(u, now_unix)) return false;
+        s.seq += 1;
+        const src: Source = .{ .key = key, .usage = .{ .week = u.week, .five_hour = u.five_hour }, .seq = s.seq };
+        for (s.sources[0..s.n_sources]) |*x| if (std.mem.eql(u8, &x.key, &key)) {
+            // A window this report leaves out keeps the tab's last one.
+            x.usage = .{ .week = u.week orelse x.usage.week, .five_hour = u.five_hour orelse x.usage.five_hour };
+            x.seq = s.seq;
+            return s.show(now_unix);
+        };
+        if (s.n_sources == max_sources) {
+            var oldest: usize = 0;
+            for (s.sources[0..s.n_sources], 0..) |x, i| if (x.seq < s.sources[oldest].seq) {
+                oldest = i;
+            };
+            s.sources[oldest] = src;
+        } else {
+            s.sources[s.n_sources] = src;
+            s.n_sources += 1;
+        }
+        return s.show(now_unix);
+    }
+
+    /// The tab with hook key `key` closed: its reports no longer count.
+    /// True if what is shown changed.
+    pub fn forget(s: *State, key: Key, now_unix: i64) bool {
+        for (s.sources[0..s.n_sources], 0..) |x, i| if (std.mem.eql(u8, &x.key, &key)) {
+            s.sources[i] = s.sources[s.n_sources - 1];
+            s.n_sources -= 1;
+            return s.show(now_unix);
+        };
+        return false;
+    }
+
+    /// Shows each window from the newest report that has it.
+    fn show(s: *State, now_unix: i64) bool {
+        var week: ?Source = null;
+        var five: ?Source = null;
+        for (s.sources[0..s.n_sources]) |x| {
+            if (x.usage.week != null and (week == null or x.seq > week.?.seq)) week = x;
+            if (x.usage.five_hour != null and (five == null or x.seq > five.?.seq)) five = x;
+        }
+        const before = s.latest;
+        s.latest.week = if (week) |x| x.usage.week else null;
+        s.latest.five_hour = if (five) |x| x.usage.five_hour else null;
+        s.checkLimit(now_unix);
+        return !before.eql(s.latest);
+    }
 
     pub fn known(s: *const State) bool {
         return s.latest.week != null or s.latest.five_hour != null;
@@ -47,13 +110,17 @@ pub const State = struct {
         const before = s.latest;
         if (u.week) |w| s.latest.week = w;
         if (u.five_hour) |w| s.latest.five_hour = w;
+        s.checkLimit(now_unix);
+        return !before.eql(s.latest);
+    }
+
+    fn checkLimit(s: *State, now_unix: i64) void {
         if (s.latest.limit_reached) |k| {
             const w = s.windowOf(k);
             const reset_passed = s.limit_resets_at != 0 and now_unix >= @as(i64, @intCast(@min(s.limit_resets_at, std.math.maxInt(i63))));
             const new_window = w != null and w.?.resets_at != 0 and s.limit_resets_at != 0 and w.?.resets_at != s.limit_resets_at;
             if (reset_passed or new_window) s.clearLimit();
         }
-        return !before.eql(s.latest);
     }
 
     /// StopFailure with `rate_limit`: the window at 100 %, else the fuller
@@ -87,6 +154,20 @@ pub const State = struct {
         };
     }
 };
+
+/// What the status line can report: at most 100 %, and a reset time
+/// (when known) no further ahead than the window is long (plus an hour)
+/// nor more than a day past.
+pub fn plausible(u: Usage, now_unix: i64) bool {
+    const spans = [_]struct { ?Window, i64 }{ .{ u.week, 7 * 86400 }, .{ u.five_hour, 5 * 3600 } };
+    for (spans) |sp| if (sp[0]) |w| {
+        if (w.pct > 100) return false;
+        if (w.resets_at == 0) continue;
+        const at: i64 = @intCast(@min(w.resets_at, std.math.maxInt(i63)));
+        if (at > now_unix +| (sp[1] + 3600) or at < now_unix -| 86400) return false;
+    };
+    return true;
+}
 
 const band = planusage.band;
 
@@ -153,64 +234,11 @@ pub fn commandFor(exe: []const u8, buf: []u8) ?[]const u8 {
     return buf[0 .. exe.len + tail.len];
 }
 
-/// The settings file's content: `statusLine` and nothing else.
-pub fn settingsJson(command: []const u8, buf: []u8) ![]const u8 {
-    // commandFor's characters need no JSON escaping.
-    return std.fmt.bufPrint(buf, "{{\"statusLine\":{{\"type\":\"command\",\"command\":\"{s}\",\"padding\":0}}}}\n", .{command});
-}
-
-/// Writes `<data_dir>\agent-statusline.json` for `portalctl.exe` next to
-/// this executable and returns the file's path (caller frees), or null
-/// with the reason in `why` (the bar then stays off; logged by the caller).
-pub fn prepare(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, why: *[]const u8) ?[]u8 {
-    if (builtin.os.tag != .windows) return null;
-    const w = @import("win32.zig");
-    const fsutil = @import("fsutil.zig");
-    var exe_w: [1024]u16 = undefined;
-    const n = w.GetModuleFileNameW(null, &exe_w, exe_w.len);
-    if (n == 0 or n >= exe_w.len) {
-        why.* = "this program's path is unknown";
-        return null;
-    }
-    const self = std.unicode.wtf16LeToWtf8Alloc(gpa, exe_w[0..n]) catch return null;
-    defer gpa.free(self);
-    const dir = std.fs.path.dirname(self) orelse return null;
-    const exe = std.fs.path.join(gpa, &.{ dir, "portalctl.exe" }) catch return null;
-    defer gpa.free(exe);
-    std.Io.Dir.cwd().access(io, exe, .{}) catch {
-        why.* = "portalctl.exe is not next to this program";
-        return null;
-    };
-    var cb: [1100]u8 = undefined;
-    const cmd = commandFor(exe, &cb) orelse blk: {
-        // A path with spaces: its 8.3 short form, if the volume has one.
-        const short = shortPath(gpa, exe) orelse break :blk null;
-        defer gpa.free(short);
-        break :blk commandFor(short, &cb);
-    } orelse {
-        why.* = "portalctl.exe's path has characters a shell would misread (and no short name)";
-        return null;
-    };
-    var jb: [1300]u8 = undefined;
-    const json = settingsJson(cmd, &jb) catch return null;
-    const path = std.fs.path.join(gpa, &.{ data_dir, settings_name }) catch return null;
-    fsutil.writeAtomic(gpa, io, path, json) catch {
-        why.* = "the settings file could not be written";
-        gpa.free(path);
-        return null;
-    };
-    return path;
-}
-
-extern "kernel32" fn GetShortPathNameW(long: [*:0]const u16, short: [*]u16, len: u32) callconv(.winapi) u32;
-
-fn shortPath(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
-    const wide = std.unicode.wtf8ToWtf16LeAllocZ(gpa, path) catch return null;
-    defer gpa.free(wide);
-    var out: [1024]u16 = undefined;
-    const n = GetShortPathNameW(wide.ptr, &out, out.len);
-    if (n == 0 or n >= out.len) return null;
-    return std.unicode.wtf16LeToWtf8Alloc(gpa, out[0..n]) catch null;
+/// The `statusLine` member (no braces) for `command` (commandFor's
+/// characters need no JSON escaping): agentsettings.zig puts it in
+/// Portal's settings layer.
+pub fn writeStatusLine(w: *std.Io.Writer, command: []const u8) std.Io.Writer.Error!void {
+    try w.print("\"statusLine\":{{\"type\":\"command\",\"command\":\"{s}\",\"padding\":0}}", .{command});
 }
 
 // ------------------------------------------------------------------ tests
@@ -246,6 +274,38 @@ test "State: reports, the limit and its clearing" {
     try testing.expect(!s.turnDone());
 }
 
+test "per tab: the newest report shows, a closed tab's go, implausible ones are dropped" {
+    var s: State = .{};
+    const now: i64 = 1_800_000_000;
+    const a: Key = @splat(1);
+    const b: Key = @splat(2);
+    try testing.expect(s.reportFrom(a, .{ .week = .{ .pct = 40, .resets_at = now + 86400 }, .five_hour = .{ .pct = 10, .resets_at = now + 3600 } }, now));
+    // A made-up report from another tab shows until a newer one comes...
+    try testing.expect(s.reportFrom(b, .{ .week = .{ .pct = 99, .resets_at = now + 86400 } }, now));
+    try testing.expectEqual(@as(u8, 99), s.latest.week.?.pct);
+    try testing.expectEqual(@as(u8, 10), s.latest.five_hour.?.pct);
+    try testing.expect(s.reportFrom(a, .{ .week = .{ .pct = 41, .resets_at = now + 86400 } }, now));
+    try testing.expectEqual(@as(u8, 41), s.latest.week.?.pct);
+    // ...or until its tab closes.
+    _ = s.reportFrom(b, .{ .week = .{ .pct = 99, .resets_at = now + 86400 } }, now);
+    try testing.expect(s.forget(b, now));
+    try testing.expectEqual(@as(u8, 41), s.latest.week.?.pct);
+    try testing.expect(!s.forget(b, now));
+    // Not what a status line reports: dropped.
+    try testing.expect(!s.reportFrom(b, .{ .week = .{ .pct = 101 } }, now));
+    try testing.expect(!s.reportFrom(b, .{ .five_hour = .{ .pct = 5, .resets_at = now + 6 * 3600 + 1 } }, now));
+    try testing.expect(!s.reportFrom(b, .{ .week = .{ .pct = 5, .resets_at = now + 9 * 86400 } }, now));
+    try testing.expect(!s.reportFrom(b, .{ .week = .{ .pct = 5, .resets_at = 1000 } }, now));
+    try testing.expect(plausible(.{ .week = .{ .pct = 5 } }, now));
+    // The last tab gone: nothing known.
+    try testing.expect(s.forget(a, now));
+    try testing.expect(!s.known());
+    // More tabs than kept: the oldest report goes.
+    for (0..max_sources + 1) |i| _ = s.reportFrom(@splat(@intCast(i + 10)), .{ .week = .{ .pct = @intCast(i) } }, now);
+    try testing.expectEqual(@as(usize, max_sources), s.n_sources);
+    try testing.expectEqual(@as(u8, max_sources), s.latest.week.?.pct);
+}
+
 test "Throttle: connect, 5 minutes, threshold crossings (fake clock)" {
     var t: Throttle = .{};
     const a: Usage = .{ .week = .{ .pct = 60, .resets_at = 9 } };
@@ -278,18 +338,19 @@ test "Throttle: connect, 5 minutes, threshold crossings (fake clock)" {
     try testing.expectEqual(Throttle.Decision.now, t.decide(d, std.math.maxInt(i64)));
 }
 
-test "commandFor and the settings file" {
+test "commandFor and the status line member" {
     var b: [256]u8 = undefined;
     const c = commandFor("C:\\Users\\bob\\AppData\\Local\\Portal\\bin\\portalctl.exe", &b).?;
     try testing.expectEqualStrings("C:/Users/bob/AppData/Local/Portal/bin/portalctl.exe statusline", c);
     var jb: [512]u8 = undefined;
-    const j = try settingsJson(c, &jb);
-    try testing.expectEqualStrings("{\"statusLine\":{\"type\":\"command\",\"command\":\"C:/Users/bob/AppData/Local/Portal/bin/portalctl.exe statusline\",\"padding\":0}}\n", j);
-    // Valid JSON with exactly one key: no hooks, nothing else layered.
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, j, .{});
+    var w: std.Io.Writer = .fixed(&jb);
+    try w.writeAll("{");
+    try writeStatusLine(&w, c);
+    try w.writeAll("}");
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, w.buffered(), .{});
     defer parsed.deinit();
-    try testing.expectEqual(@as(usize, 1), parsed.value.object.count());
-    try testing.expect(parsed.value.object.get("hooks") == null);
-    for ([_][]const u8{ "C:\\Program Files\\p.exe", "C:\\a&b\\p.exe", "C:\\$x\\p.exe", "C:\\a(1)\\p.exe", "C:\\a'b\\p.exe", "C:\\a\"b\\p.exe", "" }) |bad|
+    try testing.expectEqualStrings(c, parsed.value.object.get("statusLine").?.object.get("command").?.string);
+    // 8.3 short names (`PROGRA~1`) are refused like any other `~`.
+    for ([_][]const u8{ "C:\\Program Files\\p.exe", "C:\\PROGRA~1\\p.exe", "C:\\a&b\\p.exe", "C:\\$x\\p.exe", "C:\\a(1)\\p.exe", "C:\\a'b\\p.exe", "C:\\a\"b\\p.exe", "" }) |bad|
         try testing.expect(commandFor(bad, &b) == null);
 }

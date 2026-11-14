@@ -84,7 +84,16 @@ fn runCommand(gpa: std.mem.Allocator, cmd: []const u8, input: []const u8, out: [
     for (exe) |*c| if (c.* == '/') {
         c.* = '\\';
     };
-    const line = std.fmt.allocPrint(gpa, "\"{s}\" {s}", .{ exe, cmd[sp + 1 ..] }) catch return null;
+    return runExec(gpa, exe, &.{cmd[sp + 1 ..]}, input, out);
+}
+
+/// Runs `exe` with `args` (plain words, as a hook's exec form gives
+/// them), writes `input` to its stdin, returns its stdout.
+pub fn runExec(gpa: std.mem.Allocator, exe: []const u8, args: []const []const u8, input: []const u8, out: []u8) ?[]const u8 {
+    var lb: std.ArrayList(u8) = .empty;
+    lb.print(gpa, "\"{s}\"", .{exe}) catch return null;
+    for (args) |a| lb.print(gpa, " {s}", .{a}) catch return null;
+    const line = lb.items;
     const app_w = std.unicode.utf8ToUtf16LeAllocZ(gpa, exe) catch return null;
     const line_w = std.unicode.utf8ToUtf16LeAllocZ(gpa, line) catch return null;
     var sa: w.SECURITY_ATTRIBUTES = .{ .bInheritHandle = 1 };

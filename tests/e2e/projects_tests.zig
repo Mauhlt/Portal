@@ -72,6 +72,59 @@ fn startable(h: *proc.Harness, dir: []const u8, folder: []const u8, name: []cons
     return res.code == 0;
 }
 
+// ------------------------------------------------------------ the fake agent
+
+/// The fake agent at its start (any group): if Portal passed a settings
+/// layer with the device guard (src/agentsettings.zig), runs that hook as
+/// the agent would, for a Write, a Read and an ExitPlanMode, and prints
+/// `FAKE-GUARD=<mode>` and `FAKE-GUARD-<TOOL>=<decision|none>`; else
+/// `FAKE-NO-GUARD`.
+pub fn fakeGuard(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, say: *const fn ([]const u8) void) void {
+    var path: ?[]const u8 = null;
+    for (args, 0..) |a, i| if (std.mem.eql(u8, a, "--settings") and i + 1 < args.len) {
+        path = args[i + 1];
+    };
+    const p = path orelse return say("FAKE-NO-GUARD\r\n");
+    const text = std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(64 * 1024)) catch return say("FAKE-NO-GUARD\r\n");
+    const v = std.json.parseFromSliceLeaky(std.json.Value, gpa, text, .{}) catch return say("FAKE-NO-GUARD\r\n");
+    if (v != .object) return say("FAKE-NO-GUARD\r\n");
+    const hooks = v.object.get("hooks") orelse return say("FAKE-NO-GUARD\r\n");
+    if (hooks != .object) return say("FAKE-NO-GUARD\r\n");
+    const groups = hooks.object.get("PreToolUse") orelse return say("FAKE-NO-GUARD\r\n");
+    if (groups != .array or groups.array.items.len != 1) return say("FAKE-NO-GUARD\r\n");
+    const g = groups.array.items[0];
+    if (g != .object) return say("FAKE-NO-GUARD\r\n");
+    const m = g.object.get("matcher") orelse return say("FAKE-NO-GUARD\r\n");
+    const hs = g.object.get("hooks") orelse return say("FAKE-NO-GUARD\r\n");
+    if (m != .string or !std.mem.eql(u8, m.string, "*") or hs != .array or hs.array.items.len != 1 or hs.array.items[0] != .object) return say("FAKE-NO-GUARD\r\n");
+    const hk = hs.array.items[0].object;
+    const cmd = hk.get("command") orelse return say("FAKE-NO-GUARD\r\n");
+    const av = hk.get("args") orelse return say("FAKE-NO-GUARD\r\n");
+    if (cmd != .string or av != .array) return say("FAKE-NO-GUARD\r\n");
+    var hargs: std.ArrayList([]const u8) = .empty;
+    for (av.array.items) |a| if (a == .string) hargs.append(gpa, a.string) catch return;
+    // disableAllHooks must be false in this layer.
+    const dah = v.object.get("disableAllHooks") orelse return say("FAKE-NO-GUARD\r\n");
+    if (dah != .bool or dah.bool) return say("FAKE-NO-GUARD\r\n");
+    say("FAKE-GUARD=");
+    say(if (hargs.items.len == 3) hargs.items[2] else "?");
+    say("\r\n");
+    for ([_][]const u8{ "Write", "Read", "ExitPlanMode" }) |tool| {
+        const input = std.fmt.allocPrint(gpa, "{{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"{s}\",\"tool_input\":{{\"file_path\":\"x.txt\"}}}}", .{tool}) catch return;
+        var out: [2048]u8 = undefined;
+        const got = @import("usage_tests.zig").runExec(gpa, cmd.string, hargs.items, input, &out) orelse "";
+        var decision: []const u8 = "none";
+        if (std.json.parseFromSliceLeaky(std.json.Value, gpa, got, .{})) |o| {
+            if (o == .object) if (o.object.get("hookSpecificOutput")) |hso| if (hso == .object) if (hso.object.get("permissionDecision")) |d| if (d == .string) {
+                decision = d.string;
+            };
+        } else |_| {}
+        var ub: [32]u8 = undefined;
+        const line = std.fmt.allocPrint(gpa, "FAKE-GUARD-{s}={s}\r\n", .{ std.ascii.upperString(&ub, tool), decision }) catch return;
+        say(line);
+    }
+}
+
 pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const gpa = h.gpa;
     const dir = try h.dataDir("projects");
@@ -105,6 +158,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     defer v.deinit();
     var dump: [8192]u8 = undefined;
     _ = r.check("a desk-started tab runs without --permission-mode", v.waitFor("FAKE-NO-PERMISSION-MODE", 10_000), "{s}", .{v.dump(&dump)});
+    _ = r.check("a desk-started tab gets no device guard", v.waitFor("FAKE-NO-GUARD", 10_000), "{s}", .{v.dump(&dump)});
 
     // The list after hello: names, modes, running state.
     _ = r.check("projects follows hello: alpha running (desk-started), beta and gamma not", waitList(v, .{ .name = "alpha", .running = true, .n = 3 }, 10_000) and
@@ -120,6 +174,9 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     _ = r.check("p:start beta: started", answered(a1, .started, "beta"), "{?s}", .{v.lastText(answer_needle)});
     _ = r.check("the device's view switches to the new tab", v.waitText("\"t\":\"session\"", sessions + 1, 10_000), "", .{});
     _ = r.check("the agent was launched with --permission-mode plan", v.waitFor("FAKE-PERMISSION-MODE=plan", 15_000), "{s}", .{v.dump(&dump)});
+    _ = r.check("a plan start gets Portal's guard layer (every tool, hooks on)", v.waitFor("FAKE-GUARD=plan", 15_000), "{s}", .{v.dump(&dump)});
+    _ = r.check("plan: the guard denies a Write and ExitPlanMode, lets a Read through", v.waitFor("FAKE-GUARD-WRITE=deny", 15_000) and
+        v.waitFor("FAKE-GUARD-EXITPLANMODE=deny", 5000) and v.waitFor("FAKE-GUARD-READ=none", 5000), "{s}", .{v.dump(&dump)});
     _ = r.check("the desk's log says which device started it", inst.logHas("started by device 'proj-phone' (permission mode plan)"), "", .{});
     _ = r.check("the list: beta running, stoppable (device-started)", waitList(v, .{ .name = "beta", .running = true, .stoppable = true }, 10_000), "{?s}", .{v.lastText(list_needle)});
     _ = r.check("p:start beta again: switched", answered(ask(v, "p:start beta"), .switched, "beta"), "{?s}", .{v.lastText(answer_needle)});
@@ -143,6 +200,8 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     defer v2.deinit();
     _ = r.check("another device has its own limit: p:start gamma started", answered(ask(v2, "p:start gamma"), .started, "gamma"), "{?s}", .{v2.lastText(answer_needle)});
     _ = r.check("an ask project runs with --permission-mode default", v2.waitFor("FAKE-PERMISSION-MODE=default", 15_000), "{s}", .{v2.dump(&dump)});
+    _ = r.check("ask: the guard asks for a Write and ExitPlanMode, lets a Read through", v2.waitFor("FAKE-GUARD=ask", 15_000) and
+        v2.waitFor("FAKE-GUARD-WRITE=ask", 15_000) and v2.waitFor("FAKE-GUARD-EXITPLANMODE=ask", 5000) and v2.waitFor("FAKE-GUARD-READ=none", 5000), "{s}", .{v2.dump(&dump)});
     _ = r.check("the first device sees gamma running, stoppable", waitList(v, .{ .name = "gamma", .running = true, .stoppable = true }, 10_000), "{?s}", .{v.lastText(list_needle)});
     // "f:" followed by anything is not Forget (frames.classify).
     v2.send("f:yes 00");

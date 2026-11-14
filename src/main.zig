@@ -50,6 +50,7 @@ const hookmsg = @import("hookmsg.zig");
 const hookpipe = @import("hookpipe.zig");
 const statusline = @import("statusline.zig");
 const usage_desk = @import("usage_desk.zig");
+const agentsettings = @import("agentsettings.zig");
 const agenthooks = @import("agenthooks.zig");
 const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
@@ -269,11 +270,11 @@ pub fn main(init: std.process.Init) !void {
     if (gui_app) return guiMain(gpa, io, init.environ_map, args);
     if (args.len == 0) return printUsage();
     const cmd = args[0];
-    // Run by the agent for each hook event: never prints, always exits
-    // 0, and does nothing outside a Portal tab (hookpipe.hookCommand).
+    // Run by the agent for each hook event: prints only the guard's
+    // decision, always exits 0 (hookpipe.hookCommand).
     if (std.mem.eql(u8, cmd, "hook")) {
         const dir = dataDir(gpa, init.environ_map) catch null;
-        hookpipe.hookCommand(io, init.environ_map.get(hookmsg.env_name), dir, init.environ_map.get(hookmsg.guard_env_name));
+        hookpipe.hookCommand(io, init.environ_map.get(hookmsg.env_name), dir, init.environ_map.get(hookmsg.guard_env_name), args[1..]);
         std.process.exit(0);
     }
     // The agent's status line in the sessions Portal starts (only those:
@@ -391,27 +392,33 @@ fn dataDir(gpa: Allocator, env: *const std.process.Environ.Map) ![]u8 {
     return std.fs.path.join(gpa, &.{ base, "Portal" });
 }
 
-/// Portal's status line settings file for the agent (the plan-usage bar,
-/// usage_desk.zig), when the program is the agent and passes no
-/// `--settings` itself; null (and a log line saying why) otherwise.
-fn statusSettings(gpa: Allocator, io: Io, log: *Log, env: *const std.process.Environ.Map, command: []const []const u8) ?[]const u8 {
-    if (!cmdline.wantsSettings(command)) {
-        if (cmdline.isAgent(command[0])) log.print("usage: the program setting passes --settings itself; no plan-usage bar", .{});
-        return null;
+/// Portal's `--settings` layer for the agent (agentsettings.zig: the
+/// plan-usage bar's status line, and a device start's guard hook), when
+/// the program is the agent; empty (and a log line saying why) otherwise.
+/// Its files are written before each launch (tabs.Hub.open).
+fn agentLayer(gpa: Allocator, io: Io, log: *Log, env: *const std.process.Environ.Map, command: []const []const u8) agentsettings.Layer {
+    if (!cmdline.isAgent(command[0])) return .{};
+    if (!cmdline.wantsSettings(command)) log.print("usage: the program setting passes --settings itself; no plan-usage bar", .{});
+    const dir = dataDir(gpa, env) catch return .{};
+    if (!cmdline.pathArg(dir)) {
+        log.print("usage: no plan-usage bar, and no device starts: the data folder's path has characters a command line would misread", .{});
+        return .{};
     }
-    const dir = dataDir(gpa, env) catch return null;
-    defer gpa.free(dir);
-    var why: []const u8 = "unknown";
-    const path = usage_desk.prepare(gpa, io, dir, &why) orelse {
-        log.print("usage: no plan-usage bar: {s}", .{why});
-        return null;
-    };
-    if (!cmdline.pathArg(path)) {
-        log.print("usage: no plan-usage bar: the data folder's path has characters a command line would misread", .{});
-        gpa.free(path);
-        return null;
-    }
-    return path;
+    var why: []const u8 = "";
+    const layer = agentsettings.init(gpa, io, dir, &why);
+    if (layer.statusline == null) log.print("usage: no plan-usage bar: {s}", .{why});
+    if (layer.hook_exe == null) log.print("start: devices cannot start projects: {s} (the guard hook needs it)", .{why});
+    return layer;
+}
+
+/// The agent as PATH finds it now (cmdline.resolve): device starts run
+/// exactly this program (tabs.Program.device_program). Null: not found.
+fn pinnedProgram(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, command: []const []const u8) ?[]const u8 {
+    if (!cmdline.isAgent(command[0])) return null;
+    var r = cmdline.resolve(gpa, io, command, env.get("PATH"), env.get("SystemRoot")) catch return null;
+    const p = gpa.dupe(u8, r.program) catch null;
+    r.deinit(gpa);
+    return p;
 }
 
 fn devicePaths(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) !devices.Paths {
@@ -1452,7 +1459,7 @@ pub fn openFolder(gpa: Allocator, hub: *tabs.Hub, env: *const std.process.Enviro
         error.Finished => "Portal is shutting down",
         error.OutOfMemory => "out of memory",
         error.SpawnFailed => "the program could not be started there",
-        error.UnsafeProgram => unreachable, // only device starts check it
+        error.UnsafeProgram, error.NoGuard => unreachable, // only device starts check them
     };
     return null;
 }
@@ -1688,7 +1695,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .command_name = std.fs.path.basename(command[0]),
             .session_id = cmdline.wantsSessionId(command),
             .device_start = cmdline.deviceStart(command),
-            .settings_file = statusSettings(gpa, io, &log, env, command),
+            .settings = agentLayer(gpa, io, &log, env, command),
+            .desk_settings = cmdline.wantsSettings(command),
+            .device_program = pinnedProgram(gpa, io, env, command),
         },
         .colors = saved.colorChoices(&colors_buf),
         .convo_projects = convoProjects(gpa, env),
@@ -1932,6 +1941,7 @@ test {
     _ = @import("hookpipe.zig");
     _ = @import("statusline.zig");
     _ = @import("usage_desk.zig");
+    _ = @import("agentsettings.zig");
     _ = @import("elevation.zig");
     _ = @import("foryou_extract.zig");
     _ = @import("foryou_desk.zig");

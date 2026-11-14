@@ -37,7 +37,9 @@ const hookmsg = @import("hookmsg.zig");
 const statusline = @import("statusline.zig");
 const elevation = @import("elevation.zig");
 const settings = @import("settings.zig");
+const transcript = @import("convo/transcript.zig");
 const json_text = @import("shared").convo;
+const Mode = @import("shared").projects.Mode;
 
 pub const connect_timeout_ms = 200;
 /// How long the server waits for a connected client's message.
@@ -433,46 +435,160 @@ fn trustedLevel(server: u32, client: u32) bool {
 /// drained and the input counts as unparsable.
 pub const max_input = 1 << 20;
 
-/// `portalctl hook`: always exits 0 (the caller exits), and does nothing
-/// at all outside a Portal tab (no PORTAL_TAB). It prints nothing, except
-/// the one decision of the admin-prompt guard: a PreToolUse shell command
-/// that asks for elevation (elevation.zig) in a session a device started
-/// (`guard` = PORTAL_GUARD, `device`), or in any session while the desk's
-/// `block_elevation_desk` is on, is denied with the hook's documented
-/// output (`hookSpecificOutput.permissionDecision = "deny"` and a reason
-/// for the agent). Otherwise the command runs and Portal is told
-/// (`guard=marked`: a "needs desk" card). The command never travels.
-pub fn hookCommand(io: std.Io, tab: ?[]const u8, data_dir: ?[]const u8, guard: ?[]const u8) void {
+/// `portalctl hook [--device ask|plan]`: always exits 0 (the caller
+/// exits). Two ways it is run:
+///
+///   * Plain (`hook`, the user's hooks install, agenthooks.zig): nothing
+///     at all outside a Portal tab (no PORTAL_TAB); otherwise it tells
+///     Portal the event. Its one decision is the admin-prompt guard's: a
+///     PreToolUse shell command that asks for elevation (elevation.zig) in
+///     a session a device started (`guard` = PORTAL_GUARD, `device`), or
+///     in any session while the desk's `block_elevation_desk` is on, is
+///     denied with the hook's documented output
+///     (`hookSpecificOutput.permissionDecision = "deny"` and a reason for
+///     the agent). Otherwise the command runs and Portal is told
+///     (`guard=marked`: a "needs desk" card). The command never travels.
+///   * The device guard (`hook --device <mode>`, Portal's own settings
+///     layer for a device start, agentsettings.zig; every tool's
+///     PreToolUse): the mode is the desk's, from the hook's own arguments,
+///     not from anything the session can set. The admin-prompt guard as
+///     above, then modeDecision: in Plan only read-only tools run, in Ask
+///     every other tool asks (over any allow rule or mode). It tells
+///     Portal about shell commands that may run; in such a session the
+///     plain hook leaves that to it, so nothing reaches Portal twice.
+///
+/// Input it can't read or parse (over max_input, not JSON) is denied in
+/// the device guard, and in the plain hook for a PreToolUse in a device
+/// start or while the desk blocks elevation: the guard fails closed.
+pub fn hookCommand(io: std.Io, tab: ?[]const u8, data_dir: ?[]const u8, guard: ?[]const u8, args: []const []const u8) void {
     const in = stdinHandle();
-    const key = hookmsg.parseKey(tab orelse return drain(in)) orelse return drain(in);
-    const buf = std.heap.page_allocator.alloc(u8, max_input) catch return drain(in);
+    const device_mode = deviceArg(args);
+    const env_device = if (guard) |g| std.mem.eql(u8, g, "device") else false;
+    const key: ?hookmsg.Key = if (tab) |t| hookmsg.parseKey(t) else null;
+    if (key == null and device_mode == null) return drain(in);
+    const buf = std.heap.page_allocator.alloc(u8, max_input) catch {
+        drain(in);
+        if (device_mode != null) printDecision(.deny, unreadable_reason);
+        return;
+    };
     defer std.heap.page_allocator.free(buf);
     const n = readInput(in, buf);
     drain(in);
-    const json = buf[0 .. n orelse return];
+    // Cut off (null): the first max_input bytes; no stdin at all: none.
+    const seen = if (in == null) buf[0..0] else buf[0 .. n orelse buf.len];
     var scratch: [16 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
     // Large inputs (a long prompt) need more than the scratch: fall back.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    const parsed = hookmsg.parseHook(fba.allocator(), key, json) orelse
-        (hookmsg.parseHook(arena.allocator(), key, json) orelse return);
+    const k = key orelse @as(hookmsg.Key, @splat(0));
+    const got: ?hookmsg.Parsed = if (n == null) null else hookmsg.parseHook(fba.allocator(), k, seen) orelse
+        hookmsg.parseHook(arena.allocator(), k, seen);
+    const parsed = got orelse {
+        if (failClosed(device_mode != null, env_device, seen, io, data_dir)) printDecision(.deny, unreadable_reason);
+        return;
+    };
     var m = parsed.msg;
+    // The plain hook tells Portal, except a device start's PreToolUse,
+    // which the device guard tells.
+    var tell = if (device_mode != null) m.event == .PreToolUse else !(env_device and m.event == .PreToolUse);
     if (m.event == .PreToolUse) {
-        const device = if (guard) |g| std.mem.eql(u8, g, "device") else false;
+        const device = device_mode != null or env_device;
         switch (guardDecision(parsed, device, if (device) false else deskBlocks(io, data_dir))) {
             .none => {},
             .marked => m.guard = .marked,
             .denied => |r| {
                 m.guard = .denied;
-                printDecision(r.reason());
+                printDecision(.deny, r.reason());
             },
         }
+        if (m.guard != .denied) if (device_mode) |mode| switch (modeDecision(m.tool(), mode)) {
+            .none => {},
+            .ask => printDecision(.ask, ask_reason),
+            .deny => {
+                printDecision(.deny, plan_reason);
+                tell = false; // it never runs
+            },
+        };
+        // Portal only follows shell commands (the long-running deadline).
+        if (!shellTool(m.tool())) tell = false;
     }
+    if (!tell or key == null) return;
     var nb: [80:0]u16 = undefined;
     const name = pipeNameW(&nb, data_dir orelse return) orelse return;
     var mb: [hookmsg.max_message]u8 = undefined;
     send(name, m.format(&mb)) catch {};
+}
+
+/// `--device <mode>` in the hook's arguments (agentsettings.zig): the
+/// desk's mode. Any other value is Plan, the stricter one; null: the
+/// plain hook.
+pub fn deviceArg(args: []const []const u8) ?Mode {
+    for (args, 0..) |a, i| if (std.mem.eql(u8, a, hookmsg.device_flag)) {
+        if (i + 1 < args.len and std.mem.eql(u8, args[i + 1], "ask")) return .ask;
+        return .plan;
+    };
+    return null;
+}
+
+fn shellTool(t: []const u8) bool {
+    return std.mem.eql(u8, t, "Bash") or std.mem.eql(u8, t, "PowerShell");
+}
+
+/// Tools that only read, look up, plan or ask (transcript.category: read,
+/// search, the todo list, a question, a subagent, whose own tool calls
+/// pass this hook too). Everything else, including web access, MCP tools,
+/// ExitPlanMode and any tool Portal does not know, is not.
+pub fn readOnlyTool(t: []const u8) bool {
+    if (t.len == 0) return false;
+    return switch (transcript.category(t)) {
+        .read, .search, .todo, .question, .agent => true,
+        else => false,
+    };
+}
+
+pub const ModeVerdict = enum { none, ask, deny };
+
+/// What the desk's mode for a device start says about tool `t` (pure,
+/// tested): read-only tools take the normal way; otherwise Plan denies
+/// and Ask asks.
+pub fn modeDecision(t: []const u8, mode: Mode) ModeVerdict {
+    if (readOnlyTool(t)) return .none;
+    return switch (mode) {
+        .plan => .deny,
+        .ask => .ask,
+    };
+}
+
+pub const plan_reason = "Portal blocked this tool: this session was started from a paired device in Plan mode, which only reads and plans. Nothing may be changed or run in it, and its plan can't be approved here. Present the plan as text and stop; the user can carry it out in a session at the desk.";
+pub const ask_reason = "This session was started from a paired device in Ask mode: Portal asks before every edit, command and tool, whatever rules or mode would allow it.";
+pub const unreadable_reason = "Portal blocked this tool call because its hook could not read the call (too large or malformed), and calls in this session must be checked. Try again with a smaller call.";
+
+/// Unreadable or unparsable input is denied by the device guard (it only
+/// runs for PreToolUse), and by the plain hook for what looks like a
+/// PreToolUse (`hook_event_name` among the bytes read) in a device start
+/// or while the desk blocks elevation. Other events stay untouched.
+fn failClosed(device_guard: bool, env_device: bool, seen: []const u8, io: std.Io, data_dir: ?[]const u8) bool {
+    if (device_guard) return true;
+    if (!looksLikePreToolUse(seen)) return false;
+    return env_device or deskBlocks(io, data_dir);
+}
+
+/// `"hook_event_name"`, `:` and `"PreToolUse"` (whitespace allowed)
+/// somewhere in `s`: no parser needed, so a cut-off input counts too.
+pub fn looksLikePreToolUse(s: []const u8) bool {
+    const k = "\"hook_event_name\"";
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, s, from, k)) |i| {
+        from = i + k.len;
+        var j = from;
+        while (j < s.len and std.ascii.isWhitespace(s[j])) j += 1;
+        if (j >= s.len or s[j] != ':') continue;
+        j += 1;
+        while (j < s.len and std.ascii.isWhitespace(s[j])) j += 1;
+        if (std.mem.startsWith(u8, s[j..], "\"PreToolUse\"")) return true;
+    }
+    return false;
 }
 
 pub const Decision = union(hookmsg.Guard) {
@@ -539,18 +655,20 @@ test "block_elevation_desk: the Settings panel's merged save is what the hook re
     try testing.expect(!deskBlocks(io, null));
 }
 
-/// The PreToolUse deny decision on stdout (the agent's documented hook
-/// output; exit code 0).
-pub fn decisionJson(reason: []const u8, out: *std.Io.Writer) !void {
-    try out.writeAll("{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":");
+pub const Verdict = enum { deny, ask };
+
+/// A PreToolUse decision on stdout (the agent's documented hook output;
+/// exit code 0). At most one per hook run.
+pub fn decisionJson(verdict: Verdict, reason: []const u8, out: *std.Io.Writer) !void {
+    try out.print("{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"{t}\",\"permissionDecisionReason\":", .{verdict});
     try json_text.writeString(out, reason);
     try out.writeAll("}}\n");
 }
 
-fn printDecision(reason: []const u8) void {
+fn printDecision(verdict: Verdict, reason: []const u8) void {
     var buf: [1024]u8 = undefined;
     var wr: std.Io.Writer = .fixed(&buf);
-    decisionJson(reason, &wr) catch return;
+    decisionJson(verdict, reason, &wr) catch return;
     const h = w.validHandle(w.GetStdHandle(w.STD_OUTPUT_HANDLE)) orelse return;
     var done: usize = 0;
     const bytes = wr.buffered();
@@ -727,13 +845,50 @@ test "the admin-prompt guard: shell tools only; device sessions denied, desk one
     // The documented output, as JSON the agent parses.
     var buf: [1024]u8 = undefined;
     var wr: std.Io.Writer = .fixed(&buf);
-    try decisionJson(d.denied.reason(), &wr);
+    try decisionJson(.deny, d.denied.reason(), &wr);
     const v = try std.json.parseFromSlice(std.json.Value, testing.allocator, wr.buffered(), .{});
     defer v.deinit();
     const o = v.value.object.get("hookSpecificOutput").?.object;
     try testing.expectEqualStrings("PreToolUse", o.get("hookEventName").?.string);
     try testing.expectEqualStrings("deny", o.get("permissionDecision").?.string);
     try testing.expect(o.get("permissionDecisionReason").?.string.len > 20);
+}
+
+test "the device guard: the desk's mode from the hook's arguments; Plan denies, Ask asks, reading runs" {
+    try testing.expect(deviceArg(&.{}) == null);
+    try testing.expectEqual(Mode.ask, deviceArg(&.{ hookmsg.device_flag, "ask" }).?);
+    try testing.expectEqual(Mode.plan, deviceArg(&.{ hookmsg.device_flag, "plan" }).?);
+    // Anything else is the stricter mode.
+    try testing.expectEqual(Mode.plan, deviceArg(&.{ hookmsg.device_flag, "acceptEdits" }).?);
+    try testing.expectEqual(Mode.plan, deviceArg(&.{hookmsg.device_flag}).?);
+    for ([_][]const u8{ "Read", "Glob", "Grep", "LS", "TodoWrite", "AskUserQuestion", "Agent", "Task" }) |t| {
+        try testing.expectEqual(ModeVerdict.none, modeDecision(t, .plan));
+        try testing.expectEqual(ModeVerdict.none, modeDecision(t, .ask));
+    }
+    for ([_][]const u8{ "ExitPlanMode", "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "PowerShell", "WebFetch", "WebSearch", "mcp__x__y", "SomethingNew", "" }) |t| {
+        try testing.expectEqual(ModeVerdict.deny, modeDecision(t, .plan));
+        try testing.expectEqual(ModeVerdict.ask, modeDecision(t, .ask));
+    }
+    // The ask decision, as JSON the agent parses.
+    var buf: [1024]u8 = undefined;
+    var wr: std.Io.Writer = .fixed(&buf);
+    try decisionJson(.ask, ask_reason, &wr);
+    const v = try std.json.parseFromSlice(std.json.Value, testing.allocator, wr.buffered(), .{});
+    defer v.deinit();
+    try testing.expectEqualStrings("ask", v.value.object.get("hookSpecificOutput").?.object.get("permissionDecision").?.string);
+}
+
+test "failing closed: a PreToolUse the hook can't read is recognised from its bytes" {
+    try testing.expect(looksLikePreToolUse("{\"session_id\":\"x\",\"hook_event_name\" : \"PreToolUse\",\"tool_input\":{\"command\":\"aaaa"));
+    try testing.expect(!looksLikePreToolUse("{\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"\\\"hook_event_name\\\": PreToolUse\"}"));
+    try testing.expect(!looksLikePreToolUse(""));
+    try testing.expect(!looksLikePreToolUse("\"hook_event_name\""));
+    // The device guard always fails closed; the plain hook only in a
+    // device start (or with the desk's block on) and only for PreToolUse.
+    try testing.expect(failClosed(true, false, "", testing.io, null));
+    try testing.expect(failClosed(false, true, "{\"hook_event_name\":\"PreToolUse\"", testing.io, null));
+    try testing.expect(!failClosed(false, true, "{\"hook_event_name\":\"Stop\"", testing.io, null));
+    try testing.expect(!failClosed(false, false, "{\"hook_event_name\":\"PreToolUse\"", testing.io, null));
 }
 
 test "pipeNameW: this user's name for a data directory" {

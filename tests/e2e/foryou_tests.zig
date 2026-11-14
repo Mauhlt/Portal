@@ -34,10 +34,16 @@ const tabs_wire = shared.tabs;
 const Hook = struct { code: ?u32, out: []const u8 };
 
 /// One `portalctl hook` run with `payload` on stdin, PORTAL_TAB `tab` and
-/// PORTAL_GUARD `guard` (null: not set).
+/// PORTAL_GUARD `guard` (null: not set). hookAs: with other arguments,
+/// e.g. as the device guard of Portal's settings layer runs it (`hook
+/// --device <mode>`).
 fn hook(h: *proc.Harness, dir: []const u8, tab: []const u8, guard: ?[]const u8, payload: []const u8) Hook {
+    return hookAs(h, dir, &.{"hook"}, tab, guard, payload);
+}
+
+fn hookAs(h: *proc.Harness, dir: []const u8, args: []const []const u8, tab: []const u8, guard: ?[]const u8, payload: []const u8) Hook {
     const env = [_]proc.EnvSet{ .{ .name = "PORTAL_TAB", .value = tab }, .{ .name = "PORTAL_GUARD", .value = guard } };
-    const c = proc.LiveCli.startEnv(h, dir, &.{"hook"}, &env) catch return .{ .code = null, .out = "" };
+    const c = proc.LiveCli.startEnv(h, dir, args, &env) catch return .{ .code = null, .out = "" };
     defer c.deinit();
     c.answer(payload);
     c.closeInput();
@@ -198,7 +204,12 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         var dg: [32]u8 = undefined;
         const guard = try gpa.dupe(u8, readKey(h, dev, "e2e-guard", &dg));
         _ = r.check("a device-started tab's agent has PORTAL_GUARD=device", std.mem.eql(u8, guard, "device"), "{s}", .{guard});
-        const denied = hook(h, dir, dkey, guard, elevate);
+        // The user's own hook (if installed) denies it too, and leaves
+        // telling Portal to the device guard.
+        const plain_dev = hook(h, dir, dkey, guard, elevate);
+        _ = r.check("device-started, the user's hook: denied too", plain_dev.code == 0 and
+            std.mem.indexOf(u8, plain_dev.out, "\"permissionDecision\":\"deny\"") != null, "code {?d}: {s}", .{ plain_dev.code, plain_dev.out });
+        const denied = hookAs(h, dir, &.{ "hook", "--device", "ask" }, dkey, guard, elevate);
         _ = r.check("device-started: denied with the hook's decision output", denied.code == 0 and
             std.mem.indexOf(u8, denied.out, "\"permissionDecision\":\"deny\"") != null and
             std.mem.indexOf(u8, denied.out, "\"hookEventName\":\"PreToolUse\"") != null and
