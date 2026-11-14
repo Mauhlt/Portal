@@ -367,7 +367,7 @@ takes about 20 ms. Sessions started before the install normally pick it up
 without a restart (the agent watches its settings).
 
 **Plan usage.** A thin strip under the top bar, on the desk and every
-device, shows how much of your agent plan's limits is used: "Week 62% ·
+device, shows how much of your plan's limits is used: "Week 62% ·
 resets Mon" over a slim meter, whichever window (week or five hours) is
 closer to its limit; amber from 75 %, red from 90 %, a one-time notice at
 each step, a tap shows both windows. Portal gets the numbers from the agent's

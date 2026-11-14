@@ -93,7 +93,7 @@ panel (ui/foryou.zig; the cards: docs/tabs-design.md, "For you"):
 ```
 ┌ FOR YOU ───────────────────── [↺ Recap] ┐  Recap: instruct / text only
 │ Sent.                                    │  the last answer's result
-│ ┌ waiting  the agent wants to run a …   › ┐ │  amber: the agent is blocked
+│ ┌ waiting  Wants to run a command…   › ┐ │  amber: the agent is blocked
 │ ┌ run      zig build e2e             › ┐ │
 │ ┌ answer   Shall I commit this?      › ┐ │
 │ Swipe a row to answer, or tap it to …    │
