@@ -32,6 +32,8 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const hookmsg = @import("hookmsg.zig");
 const fsutil = @import("fsutil.zig");
+/// The one JSON string writer (quotes and escapes included).
+const writeJsonString = @import("shared").convo.writeString;
 
 pub const exe_name = "portalctl.exe";
 /// Seconds the agent waits for the hook at most (the hook itself takes
@@ -277,20 +279,6 @@ const Style = struct {
         for (0..level) |_| try w.writeAll(st.unit);
     }
 };
-
-fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |c| switch (c) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        0...8, 11, 12, 14...0x1f => try w.print("\\u{x:0>4}", .{c}),
-        else => try w.writeByte(c),
-    };
-    try w.writeByte('"');
-}
 
 /// Portal's matcher group for `e`, at nesting `level`.
 fn writeGroup(w: *std.Io.Writer, st: Style, level: usize, e: hookmsg.Event, exe: []const u8) !void {
