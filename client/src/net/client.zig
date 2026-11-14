@@ -139,6 +139,9 @@ pub const Shared = struct {
     /// Every tab's background tasks and usage (`activity`), once known.
     activity: activity_wire.Activity = .{},
     has_activity: bool = false,
+    /// Every open tab's For-you cards (`foryou`) and the last answer to an
+    /// `i:` / `r:` request (`item`, `recap`): docs/protocol.md 3g, 4b.
+    foryou: ui.foryou.Store = .{},
     /// The latest system monitor sample (`sys`), while the System panel
     /// is open.
     sys: sysinfo.Snapshot = .{},
@@ -435,6 +438,23 @@ pub const Client = struct {
         var b: [34]u8 = undefined;
         _ = c.sendInput(subtabs_wire.viewFrame(id, &b));
         c.notify();
+    }
+
+    /// A `foryou` message (section 3g): that tab's cards, parsed strictly
+    /// (malformed: ignored).
+    fn applyForYou(c: *Client, payload: []const u8) void {
+        c.shared.mutex.lockUncancelable(c.io);
+        const changed = c.shared.foryou.apply(c.gpa, payload);
+        c.shared.mutex.unlock(c.io);
+        if (changed) c.notify();
+    }
+
+    /// An `item` or `recap` answer: what the panel says next.
+    fn applyForYouResult(c: *Client, payload: []const u8) void {
+        c.shared.mutex.lockUncancelable(c.io);
+        const changed = c.shared.foryou.applyResult(payload);
+        c.shared.mutex.unlock(c.io);
+        if (changed) c.notify();
     }
 
     /// An `activity` message (section 3c): parsed strictly, kept whole.
@@ -851,6 +871,15 @@ pub const Client = struct {
                     c.applySys(frame.payload);
                     return null;
                 }
+                // For you (larger than the generic parser takes).
+                if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"foryou\"")) {
+                    c.applyForYou(frame.payload);
+                    return null;
+                }
+                if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"item\"") or std.mem.startsWith(u8, frame.payload, "{\"t\":\"recap\"")) {
+                    c.applyForYouResult(frame.payload);
+                    return null;
+                }
                 if (frame.payload.len > 8192) return null;
                 const parsed = std.json.parseFromSlice(Msg, c.gpa, frame.payload, .{ .ignore_unknown_fields = true }) catch return null;
                 defer parsed.deinit();
@@ -859,6 +888,7 @@ pub const Client = struct {
                     c.shared.mutex.lockUncancelable(c.io);
                     c.shared.mode = keys.parsePolicy(m.input orelse "none");
                     c.shared.tabs = tabs_wire.parseList(frame.payload) orelse .{};
+                    c.shared.foryou.retain(c.shared.tabs.slice());
                     c.shared.current = tabs_wire.idField(frame.payload, "session");
                     c.shared.subs = .{};
                     c.shared.sub_shown = null;
@@ -875,6 +905,8 @@ pub const Client = struct {
                 } else if (std.mem.eql(u8, m.t, "tabs")) {
                     c.shared.mutex.lockUncancelable(c.io);
                     if (tabs_wire.parseList(frame.payload)) |l| c.shared.tabs = l;
+                    // A tab gone takes its For-you cards with it.
+                    c.shared.foryou.retain(c.shared.tabs.slice());
                     c.shared.mutex.unlock(c.io);
                     c.notify();
                 } else if (std.mem.eql(u8, m.t, "session")) {
@@ -1309,4 +1341,24 @@ test "subtabs: kept for the tab shown only; the sub-tab shown going (or the tab'
     c.applySubtabs("{\"t\":\"subtabs\",\"id\":\"" ++ tab ++ "\",\"subs\":[]}");
     try std.testing.expect(shared.sub_shown == null);
     try std.testing.expectEqual(@as(usize, 0), shared.subs.len);
+}
+
+test "foryou: every tab's cards kept (malformed ignored), answers' texts, closed tabs drop theirs" {
+    const io = std.testing.io;
+    var shared: Shared = .{};
+    defer shared.foryou.deinit(std.testing.allocator);
+    const c = try std.testing.allocator.create(Client);
+    defer std.testing.allocator.destroy(c);
+    c.* = try Client.init(std.testing.allocator, io, &shared, "127.0.0.1:1", .os, .plain_for_tests);
+    c.quiet = true;
+    const tab = "0102030405060708090a0b0c0d0e0f10";
+    c.applyForYou("{\"t\":\"foryou\",\"id\":\"" ++ tab ++ "\",\"items\":[{\"id\":\"11111111111111111111111111111111\",\"k\":\"suggest_run\",\"text\":\"zig build\",\"cmd\":\"zig build\"}]}");
+    const id = tabs_wire.parseId(tab).?;
+    try std.testing.expectEqual(@as(usize, 1), shared.foryou.get(id).?.len);
+    c.applyForYou("{\"t\":\"foryou\",\"id\":\"" ++ tab ++ "\",\"items\":[{\"id\":\"11111111111111111111111111111111\",\"k\":\"suggest_run\",\"text\":\"x\",\"cmd\":\"a`b\"}]}");
+    try std.testing.expectEqualStrings("zig build", shared.foryou.get(id).?.items[0].cmd());
+    c.applyForYouResult("{\"t\":\"item\",\"op\":\"yes\",\"result\":\"sent\",\"id\":\"11111111111111111111111111111111\"}");
+    try std.testing.expectEqualStrings("Sent.", shared.foryou.result());
+    shared.foryou.retain(&.{});
+    try std.testing.expect(shared.foryou.get(id) == null);
 }

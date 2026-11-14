@@ -23,6 +23,8 @@
 //!   convo      the conversation items a device keeps (shared/convo.zig)
 //!   convoview  the Conversation view (a frame.ContentView): the items as a
 //!              scrollable list, question cards, Yes/No swipe cards
+//!   foryou     the For-you panel under the latest reply (its rows swipe
+//!              with convoview's gesture) and the device's store of cards
 //!   grid       the terminal snapshot model the frame draws
 //!   form       text fields and focus rings for panels
 //!   qr         QR code encoder (the desk's pairing code, Panel.qr)
@@ -46,6 +48,7 @@ pub const inputline = @import("inputline.zig");
 pub const dataview = @import("dataview.zig");
 pub const convo = @import("convo.zig");
 pub const convoview = @import("convoview.zig");
+pub const foryou = @import("foryou.zig");
 pub const dictation = @import("dictation.zig");
 pub const theme = @import("shared").theme;
 pub const panels = struct {
@@ -72,6 +75,7 @@ test {
     _ = dataview;
     _ = convo;
     _ = convoview;
+    _ = foryou;
     _ = panels.setup;
     _ = panels.desk;
     _ = panels.status;

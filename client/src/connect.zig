@@ -149,6 +149,14 @@ const Host = struct {
     /// The Conversation view (the devices' default main view): its own
     /// copy of Shared.convo, synced under the lock each frame.
     convo_view: ui.convoview.View = undefined,
+    /// Its For-you panel (Shared.foryou, the tab shown), likewise.
+    fy_panel: ui.foryou.Panel = undefined,
+
+    /// The panel's frames (`i:`, `r:`) go out like any input.
+    fn fySend(ctx: *anyopaque, f: []const u8) bool {
+        const c: *client_mod.Client = @ptrCast(@alignCast(ctx));
+        return c.sendInput(f);
+    }
 
     /// The view's clock (swipe guard, animations): the awake clock.
     fn clockNow(ctx: ?*anyopaque) i64 {
@@ -186,6 +194,7 @@ const Host = struct {
         h.convo_view.sync(&s.convo);
         // A sub-tab is read-only: its conversation offers no answers.
         h.convo_view.answers = s.sub_shown == null and (if (s.mode) |m| m.acceptsAnswers() else false);
+        h.fy_panel.sync(&s.foryou, s.current, if (s.mode) |m| @tagName(m) else null, s.sub_shown == null);
         h.subs = s.subs;
         // The tabs: what the top bar draws and what its clicks mean.
         h.tabs = s.tabs;
@@ -465,6 +474,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     host_ui.shell.modal = sync_state.modal();
     host_ui.convo_view = ui.convoview.View.init(gpa);
     host_ui.convo_view.clock = .{ .ctx = host_ui, .now = Host.clockNow };
+    host_ui.fy_panel = ui.foryou.Panel.init(gpa);
+    host_ui.fy_panel.sender = .{ .ctx = client, .send = Host.fySend };
+    host_ui.convo_view.foryou = &host_ui.fy_panel;
     {
         var sbuf: [4096]u8 = undefined;
         const text = pin_mod.loadDeviceSettings(io, &sbuf);
