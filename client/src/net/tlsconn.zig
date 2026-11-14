@@ -37,6 +37,8 @@ const tls = std.crypto.tls;
 const TlsClient = tls.Client;
 const Certificate = std.crypto.Certificate;
 const x509check = @import("x509check.zig");
+/// The stream seam: an OS socket or the in-process tunnel (shared/transport.zig).
+pub const transport = @import("shared").transport;
 /// Record protection and the byte cursor: the server's own code
 /// (shared/tls13.zig).
 const tls13 = @import("shared").tls13;
@@ -82,7 +84,7 @@ pub const GateError = error{
 const Gate = struct {
     interface: Io.Reader,
     io: Io,
-    stream: net.Stream,
+    stream: transport.Stream,
     read_err: ?anyerror = null,
     gate_err: ?GateError = null,
     /// The watchdog's stop flag (Conn.openWatched) and this connection's
@@ -105,7 +107,7 @@ const Gate = struct {
 
     const vtable: Io.Reader.VTable = .{ .stream = streamFn, .readVec = readVecFn };
 
-    fn init(g: *Gate, io: Io, stream: net.Stream, gating: bool) void {
+    fn init(g: *Gate, io: Io, stream: transport.Stream, gating: bool) void {
         g.* = .{
             .interface = .{ .vtable = &vtable, .buffer = undefined, .seek = 0, .end = 0 },
             .io = io,
@@ -186,13 +188,12 @@ const Gate = struct {
             g.read_err = error.Canceled;
             return error.ReadFailed;
         }
-        var vec = [_][]u8{dest};
-        const res = g.stream.readWithControl(g.io, &vec, &.{}) catch |err| {
+        const n = g.stream.read(g.io, dest) catch |err| {
             g.read_err = err;
             return error.ReadFailed;
         };
-        if (res.data_len == 0) return error.EndOfStream;
-        return res.data_len;
+        if (n == 0) return error.EndOfStream;
+        return n;
     }
 };
 
@@ -386,9 +387,9 @@ const Inspector = struct {
 
 pub const Conn = struct {
     io: Io,
-    stream: net.Stream,
+    stream: transport.Stream,
     gate: Gate,
-    sock_writer: net.Stream.Writer,
+    sock_writer: transport.Writer,
     out_buf: [tls.max_ciphertext_record_len]u8,
     tls_read_buf: [tls.max_ciphertext_record_len]u8,
     tls_write_buf: [tls.max_ciphertext_record_len]u8,
@@ -398,19 +399,19 @@ pub const Conn = struct {
     bundle_lock: Io.RwLock,
 
     pub const OpenError = error{ TlsHandshakeFailed, OutOfMemory, NoEntropy } ||
-        GateError || TlsClient.InitError || net.IpAddress.ConnectError;
+        GateError || TlsClient.InitError || transport.DialError;
 
-    /// Connects and, unless `security` is `.plain`, completes the TLS
-    /// handshake. On error, `why` (if given) gets a short reason.
-    pub fn open(gpa: std.mem.Allocator, io: Io, addr: net.IpAddress, security: Security) OpenError!*Conn {
-        return openWatched(gpa, io, addr, security, null);
+    /// Connects (through `dialer`: an OS socket or the in-process tunnel)
+    /// and, unless `security` is `.plain`, completes the TLS handshake.
+    pub fn open(gpa: std.mem.Allocator, io: Io, dialer: transport.Dialer, addr: net.IpAddress, security: Security) OpenError!*Conn {
+        return openWatched(gpa, io, dialer, addr, security, null);
     }
 
     /// `open` for a task under a watchdog: `stop` is its `stopped` flag
     /// (watchdog.zig); once set, every read and write of the connection
     /// fails with error.Canceled instead of blocking.
-    pub fn openWatched(gpa: std.mem.Allocator, io: Io, addr: net.IpAddress, security: Security, stop: ?*const std.atomic.Value(bool)) OpenError!*Conn {
-        const stream = try addr.connect(io, .{ .mode = .stream });
+    pub fn openWatched(gpa: std.mem.Allocator, io: Io, dialer: transport.Dialer, addr: net.IpAddress, security: Security, stop: ?*const std.atomic.Value(bool)) OpenError!*Conn {
+        const stream = try dialer.dial(io, addr);
         errdefer stream.close(io);
         const c = try gpa.create(Conn);
         errdefer gpa.destroy(c);
@@ -448,7 +449,7 @@ pub const Conn = struct {
         io.randomSecure(&entropy) catch return error.NoEntropy;
 
         var alert: tls.Alert = undefined;
-        c.client = TlsClient.init(&c.gate.interface, &c.sock_writer.interface, .{
+        c.client = TlsClient.init(&c.gate.interface, c.sock_writer.interface(), .{
             .host = .{ .explicit = pin.ip },
             .ca = .{ .bundle = .{ .gpa = gpa, .io = io, .lock = &c.bundle_lock, .bundle = &c.bundle } },
             .write_buffer = &c.tls_write_buf,
@@ -460,7 +461,7 @@ pub const Conn = struct {
         }) catch |err| {
             if (c.gate.gate_err) |g| return g;
             if (c.gate.read_err) |r| if (r == error.Canceled) return error.Canceled;
-            if (c.sock_writer.err) |e| if (e == error.Canceled) return error.Canceled;
+            if (c.sock_writer.err()) |e| if (e == error.Canceled) return error.Canceled;
             return err;
         };
         // The certificate must have gone through the gate.
@@ -481,7 +482,7 @@ pub const Conn = struct {
     pub fn writeAll(c: *Conn, bytes: []const u8) error{ WriteFailed, Canceled }!void {
         if (c.gate.stopped()) return error.Canceled;
         c.writeAllInner(bytes) catch {
-            if (c.sock_writer.err) |e| if (e == error.Canceled) return error.Canceled;
+            if (c.sock_writer.err()) |e| if (e == error.Canceled) return error.Canceled;
             return error.WriteFailed;
         };
     }
@@ -491,9 +492,9 @@ pub const Conn = struct {
             try cl.writer.writeAll(bytes);
             try cl.writer.flush();
         } else {
-            try c.sock_writer.interface.writeAll(bytes);
+            try c.sock_writer.interface().writeAll(bytes);
         }
-        try c.sock_writer.interface.flush();
+        try c.sock_writer.interface().flush();
     }
 
     /// Reads what is available (at least one byte); 0 at end of stream.
@@ -738,7 +739,7 @@ const FakeServer = struct {
 
     fn openThroughWatchdog(gpa: std.mem.Allocator, io: Io, addr: net.IpAddress, wd: *watchdog.Watchdog) Conn.OpenError!*Conn {
         _ = wd;
-        return Conn.open(gpa, io, addr, .{ .tls = pin_ok });
+        return Conn.open(gpa, io, .os, addr, .{ .tls = pin_ok });
     }
 };
 

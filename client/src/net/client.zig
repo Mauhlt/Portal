@@ -320,6 +320,9 @@ pub const Client = struct {
     target_buf: [credstore.max_target]u8 = undefined,
     target_len: usize = 0,
     plain: bool,
+    /// How connections are made: an OS socket, or a dial through the
+    /// in-process tunnel (set by connect.zig before `run`).
+    dialer: tlsconn.transport.Dialer = .os,
     ca_buf: [x509check.max_cert_len]u8 = undefined,
     ca_len: usize = 0,
 
@@ -610,7 +613,7 @@ pub const Client = struct {
 
     /// How the sync engine reaches the server with `session`.
     pub fn syncRemote(c: *const Client, session: []const u8) sync_engine.Remote {
-        return .{ .gpa = c.gpa, .io = c.io, .addr = c.addr, .security = c.security(), .host = c.host(), .session = session };
+        return .{ .gpa = c.gpa, .io = c.io, .dialer = c.dialer, .addr = c.addr, .security = c.security(), .host = c.host(), .session = session };
     }
 
     /// Right after pairing: asks the server, over this freshly paired and
@@ -944,7 +947,7 @@ pub const Client = struct {
     }
 
     fn roundTripTask(c: *Client, request: []const u8, buf: *[http.max_head_bytes]u8, answer_ms: i64) anyerror!http.Response {
-        const conn = try tlsconn.Conn.openWatched(c.gpa, c.io, c.addr, c.security(), &c.wd.stopped);
+        const conn = try tlsconn.Conn.openWatched(c.gpa, c.io, c.dialer, c.addr, c.security(), &c.wd.stopped);
         defer conn.close(c.gpa);
         c.wd.extend(answer_ms);
         try conn.writeAll(request);
@@ -1000,7 +1003,7 @@ pub const Client = struct {
     }
 
     fn streamTask(c: *Client, session: *const http.Cookie, backoff: *i64) StreamResult {
-        const conn = tlsconn.Conn.openWatched(c.gpa, c.io, c.addr, c.security(), &c.wd.stopped) catch |err| {
+        const conn = tlsconn.Conn.openWatched(c.gpa, c.io, c.dialer, c.addr, c.security(), &c.wd.stopped) catch |err| {
             c.logError(err);
             return .{ .unreachable_err = err };
         };
@@ -1401,7 +1404,7 @@ pub fn bareIp(canonical_host: []const u8) []const u8 {
 /// (plain HTTP on the server port + 1, `/ca.cer`) into `out`. This channel
 /// is not authenticated: the caller must compare the certificate's
 /// fingerprint with one the user read on the desktop before trusting it.
-pub fn fetchCaCertificate(gpa: std.mem.Allocator, io: Io, server: []const u8, out: *[x509check.max_cert_len]u8) anyerror![]const u8 {
+pub fn fetchCaCertificate(gpa: std.mem.Allocator, io: Io, dialer: tlsconn.transport.Dialer, server: []const u8, out: *[x509check.max_cert_len]u8) anyerror![]const u8 {
     var host_buf: [64]u8 = undefined;
     const h = try http.canonicalHost(server, &host_buf);
     var addr = net.IpAddress.parseLiteral(h) catch return error.BadServerAddress;
@@ -1411,13 +1414,13 @@ pub fn fetchCaCertificate(gpa: std.mem.Allocator, io: Io, server: []const u8, ou
     const dl_host = std.fmt.bufPrint(&dl_host_buf, "{f}", .{addr}) catch return error.BadServerAddress;
     var wd: watchdog.Watchdog = .{ .io = io };
     wd.extend(connect_timeout_ms);
-    const r = wd.run(fetchTask, .{ gpa, io, addr, dl_host, &wd, out }, null);
+    const r = wd.run(fetchTask, .{ gpa, io, dialer, addr, dl_host, &wd, out }, null);
     if (wd.expired.load(.acquire)) return error.TimedOut;
     return r;
 }
 
-fn fetchTask(gpa: std.mem.Allocator, io: Io, addr: net.IpAddress, host_: []const u8, wd: *watchdog.Watchdog, out: *[x509check.max_cert_len]u8) anyerror![]const u8 {
-    const conn = try tlsconn.Conn.openWatched(gpa, io, addr, .plain, &wd.stopped);
+fn fetchTask(gpa: std.mem.Allocator, io: Io, dialer: tlsconn.transport.Dialer, addr: net.IpAddress, host_: []const u8, wd: *watchdog.Watchdog, out: *[x509check.max_cert_len]u8) anyerror![]const u8 {
+    const conn = try tlsconn.Conn.openWatched(gpa, io, dialer, addr, .plain, &wd.stopped);
     defer conn.close(gpa);
     wd.extend(request_timeout_ms);
     var req_buf: [256]u8 = undefined;

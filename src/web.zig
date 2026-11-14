@@ -53,6 +53,9 @@ const auth = @import("auth.zig");
 const guard = @import("guard.zig");
 const http1 = @import("http1.zig");
 const websocket = @import("shared").ws;
+/// The stream seam: OS sockets or the in-process tunnel; everything in
+/// this file is the same for both (shared/transport.zig).
+const transport = @import("shared").transport;
 const http_names = @import("shared").http;
 const tabs = @import("tabs.zig");
 const tabs_wire = @import("shared").tabs;
@@ -325,7 +328,7 @@ pub const Backoff = struct {
 
 /// Per-connection state shared by the supervisor thread and the worker task.
 const Conn = struct {
-    stream: net.Stream,
+    stream: transport.Stream,
     slot: usize,
     peer_buf: [64]u8 = undefined,
     peer_len: usize = 0,
@@ -371,7 +374,9 @@ pub const Server = struct {
     /// The open project tabs (tabs.zig); viewers watch one at a time.
     hub: *tabs.Hub,
     log: *Log,
-    listener: net.Server,
+    /// An OS socket (netlisten.zig) or a listener inside the in-process
+    /// tunnel (client/src/tunnel): the rest of the server cannot tell.
+    listener: transport.Listener,
 
     auth_mutex: Io.Mutex = .init,
     sessions: auth.Sessions = .{},
@@ -847,11 +852,11 @@ pub const Server = struct {
         }
     }
 
-    fn admit(srv: *Server, stream: net.Stream, full_log: *LogLimiter) void {
+    fn admit(srv: *Server, stream: transport.Stream, full_log: *LogLimiter) void {
         const io = srv.io;
         const now = srv.nowMs();
         srv.conn_mutex.lockUncancelable(io);
-        const adm = srv.conns.admit(ipKey(stream.socket.address), now);
+        const adm = srv.conns.admit(ipKey(stream.remote()), now);
         if (adm.victim) |v| {
             srv.conn_evict[v].store(true, .release);
             srv.conn_wake[v].set(io);
@@ -892,7 +897,7 @@ pub const Server = struct {
     }
 
     /// Supervisor thread: owns the socket, runs the worker, enforces deadlines.
-    fn supervise(srv: *Server, stream: net.Stream, slot: usize) void {
+    fn supervise(srv: *Server, stream: transport.Stream, slot: usize) void {
         const io = srv.io;
         defer srv.releaseSlot(slot);
 
@@ -910,7 +915,9 @@ pub const Server = struct {
             stream.close(io);
             if (conn.viewer_socket) srv.hub.viewerSocketDelta(-1);
         }
-        const peer = std.fmt.bufPrint(&conn.peer_buf, "{f}", .{stream.socket.address}) catch blk: {
+        // The address the transport authenticated: inside the tunnel, the
+        // device's tunnel address (sessions and credentials bind to it).
+        const peer = std.fmt.bufPrint(&conn.peer_buf, "{f}", .{stream.remote()}) catch blk: {
             conn.peer_buf[0] = '?';
             break :blk conn.peer_buf[0..1];
         };
@@ -987,7 +994,7 @@ pub const Server = struct {
         if (srv.cfg.tls) |creds| return srv.serveTls(conn, creds);
         var send_buf: [16 * 1024]u8 = undefined;
         var sw = conn.stream.writer(srv.io, &send_buf);
-        srv.serveHttp(conn, &sw.interface) catch {};
+        srv.serveHttp(conn, sw.interface()) catch {};
     }
 
     /// Socket buffers and state for one HTTPS connection (heap, ~100 KiB).
@@ -1009,17 +1016,18 @@ pub const Server = struct {
         }
         var sr = conn.stream.reader(io, &st.in);
         var sw = conn.stream.writer(io, &st.out);
+        const raw_out = sw.interface();
         var entropy: [tls.entropy_len]u8 = undefined;
         io.randomSecure(&entropy) catch return;
         defer std.crypto.secureZero(u8, &entropy);
         defer st.tls.wipe();
-        st.tls.handshake(&sr.interface, &sw.interface, .{
+        st.tls.handshake(sr.interface(), raw_out, .{
             .credentials = creds,
             .entropy = &entropy,
             .read_buffer = &.{},
             .write_buffer = &st.plain_out,
         }) catch |err| {
-            srv.noteTlsFailure(conn, err, st.tls.diag, &sw.interface);
+            srv.noteTlsFailure(conn, err, st.tls.diag, raw_out);
             return;
         };
         conn.tls = &st.tls;
@@ -1067,9 +1075,7 @@ pub const Server = struct {
         if (dest.len == 0) return error.NoBufferSpace;
         if (conn.stop.load(.seq_cst)) return error.Canceled;
         if (conn.tls) |t| return t.readSome(dest);
-        var iov = [_][]u8{dest};
-        const r = try conn.stream.readWithControl(io, &iov, &.{});
-        return r.data_len;
+        return conn.stream.read(io, dest);
     }
 
     fn serveHttp(srv: *Server, conn: *Conn, w: *Io.Writer) !void {

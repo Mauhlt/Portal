@@ -375,7 +375,7 @@ fn waitUpdates(gpa: Allocator, io: Io, c: *Client, session: *const http.Cookie, 
 
 fn waitTask(gpa: Allocator, io: Io, c: *Client, session: *const http.Cookie, wd: *client.watchdog.Watchdog) anyerror!void {
     const ws = client.net_ws;
-    const conn = try client.tlsconn.Conn.openWatched(gpa, io, c.addr, .{ .tls = .{ .ca_der = c.ca_buf[0..c.ca_len], .ip = c.ip_buf[0..c.ip_len] } }, &wd.stopped);
+    const conn = try client.tlsconn.Conn.openWatched(gpa, io, c.dialer, c.addr, .{ .tls = .{ .ca_der = c.ca_buf[0..c.ca_len], .ip = c.ip_buf[0..c.ip_len] } }, &wd.stopped);
     defer conn.close(gpa);
     var rnd: [16]u8 = undefined;
     try io.randomSecure(&rnd);

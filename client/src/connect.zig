@@ -426,6 +426,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
 
     const ca_buf = gpa.create([x509check.max_cert_len]u8) catch fatal(prog, "out of memory", .{});
     const host_store = gpa.create([64]u8) catch fatal(prog, "out of memory", .{});
+    // OS sockets, or the in-process tunnel once it is configured.
+    const dialer: tlsconn.transport.Dialer = .os;
     var server_text: []const u8 = server orelse "";
     var transport: client_mod.Transport = .insecure_plain_http;
     var pair_now = false;
@@ -436,7 +438,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
         if (server) |s| {
             const want_pin = ca_file != null or ca_sha256 != null or hasPin(io, s);
             if (want_pin) {
-                switch (pinnedCa(gpa, io, s, ca_file, ca_sha256, ca_buf, &why_buf)) {
+                switch (pinnedCa(gpa, io, dialer, s, ca_file, ca_sha256, ca_buf, &why_buf)) {
                     .ok => |der| transport = .{ .tls = der },
                     .problem => |m| why = m,
                 }
@@ -467,7 +469,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
                     st.setNote("Give the Portal certificate (portal-ca.pem from Export certificate at the desk) or the SHA-256 the desk shows.", .{});
                     continue;
                 }
-                switch (pinnedCa(gpa, io, s_in, file, sha, ca_buf, &why_buf)) {
+                switch (pinnedCa(gpa, io, dialer, s_in, file, sha, ca_buf, &why_buf)) {
                     .ok => |der| {
                         transport = .{ .tls = der };
                         @memcpy(host_store[0..s_in.len], s_in);
@@ -1087,6 +1089,7 @@ const PinResult = union(enum) { ok: []const u8, problem: []const u8 };
 fn pinnedCa(
     gpa: std.mem.Allocator,
     io: std.Io,
+    dialer: tlsconn.transport.Dialer,
     server: []const u8,
     ca_file: ?[]const u8,
     ca_sha256: ?[]const u8,
@@ -1124,7 +1127,7 @@ fn pinnedCa(
             @memcpy(out[0..o.len], o);
             return .{ .ok = out[0..o.len] };
         };
-        der = client_mod.fetchCaCertificate(gpa, io, host, out) catch |err| {
+        der = client_mod.fetchCaCertificate(gpa, io, dialer, host, out) catch |err| {
             // iOS: unreachable on the local network is usually the Local
             // Network permission, not the desktop.
             if (client_mod.localNetworkHint(err, host)) |hint|

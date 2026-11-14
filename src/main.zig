@@ -1143,7 +1143,7 @@ const PairWatch = struct {
                 if (open) |p| {
                     if (active == null and failed_nonce != p.nonce) {
                         if (netlisten.listenExclusive(pw.ca_addr)) |l| {
-                            cs.listener = l;
+                            cs.listener = .{ .os = l };
                             cs.stop.store(false, .release);
                             if (io.concurrent(web.Server.run, .{cs})) |f| {
                                 active = f;
@@ -1164,7 +1164,7 @@ const PairWatch = struct {
                     cs.stop.store(true, .release);
                     f.cancel(io); // interrupts the blocked accept, waits for run() to return
                     active = null;
-                    netlisten.close(&cs.listener);
+                    netlisten.close(&cs.listener.os);
                     pw.srv.log.print("pairing window closed: certificate download on http://{s}/ stopped", .{where});
                 }
             } else if (open) |p| pw.report(p.nonce, .off, "");
@@ -1953,7 +1953,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .io = io,
         .hub = hub,
         .log = &log,
-        .listener = listener,
+        .listener = .{ .os = listener },
         .cfg = .{
             .allowed_hosts = opts.hosts.items,
             .scheme = if (opts.no_tls) "http" else "https",

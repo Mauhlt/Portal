@@ -39,6 +39,8 @@ pub const Remote = struct {
     io: Io,
     addr: net.IpAddress,
     security: tlsconn.Security,
+    /// An OS socket or the in-process tunnel (the Client's).
+    dialer: tlsconn.transport.Dialer = .os,
     /// Canonical "IP:PORT" (Host header).
     host: []const u8,
     /// The session cookie value (memory only).
@@ -85,7 +87,7 @@ fn writeRequest(r: *const Remote, path: []const u8, out: []u8) ![]const u8 {
 }
 
 fn getTask(r: *const Remote, wd: *watchdog.Watchdog, path: []const u8, target: BodyTarget) anyerror!Response {
-    const conn = try tlsconn.Conn.openWatched(r.gpa, r.io, r.addr, r.security, &wd.stopped);
+    const conn = try tlsconn.Conn.openWatched(r.gpa, r.io, r.dialer, r.addr, r.security, &wd.stopped);
     defer conn.close(r.gpa);
     wd.extend(progress_timeout_ms);
     var req_buf: [1024]u8 = undefined;
