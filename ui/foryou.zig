@@ -202,7 +202,10 @@ fn defaultWhy(k: Kind) []const u8 {
     return switch (k) {
         .waiting_permission => "Yes lets Claude go ahead; No denies it.",
         .answer => "Your answer goes straight to Claude.",
-        .suggest_run, .suggest_goto => "Claude will still ask permission before it acts.",
+        // What Yes does, nothing more: whether the agent then asks
+        // before acting depends on the tab's permission mode.
+        .suggest_run => "Yes asks Claude to run exactly this command; No dismisses it.",
+        .suggest_goto => "Yes asks Claude to switch projects; No dismisses it.",
         .needs_desk, .long_running => "Either way dismisses this card.",
     };
 }
@@ -252,6 +255,8 @@ pub const Panel = struct {
     /// on (shown once a key moved it).
     open: ?Id = null,
     focus: usize = 0,
+    /// The card the focus is on (it follows the card when the list changes).
+    focus_id: ?Id = null,
     focus_shown: bool = false,
     /// A card answered here: its controls go until the desk updates it.
     sent: ?Id = null,
@@ -304,6 +309,7 @@ pub const Panel = struct {
         if (!same_tab) {
             p.open = null;
             p.focus = 0;
+            p.focus_id = null;
             p.focus_shown = false;
             p.sent = null;
             p.n_seen = 0;
@@ -317,6 +323,18 @@ pub const Panel = struct {
         if (p.sent) |s| if (p.list.find(s) == null) {
             p.sent = null;
         };
+        // The focus follows its card, not its place: a card gone (or
+        // another in its place) leaves no row focused, so ←/→ can't
+        // answer a card the owner never put the focus on.
+        if (p.focus_id) |fid| {
+            if (p.list.find(fid)) |i| {
+                p.focus = i;
+            } else {
+                p.focus_id = null;
+                p.focus = 0;
+                p.focus_shown = false;
+            }
+        }
         if (p.focus >= p.list.len) p.focus = if (p.list.len == 0) 0 else p.list.len - 1;
         if (same_tab and store.result_len > 0) {
             @memcpy(p.note_buf[0..store.result_len], store.result());
@@ -416,7 +434,7 @@ pub const Panel = struct {
         if (i >= p.list.len) return;
         const id = p.list.items[i].id;
         p.open = if (p.open) |o| (if (std.mem.eql(u8, &o, &id)) null else id) else id;
-        p.focus = i;
+        p.setFocus(i);
         p.laid = false;
     }
 
@@ -434,16 +452,22 @@ pub const Panel = struct {
         const at: i64 = @intCast(p.focus);
         const next = std.math.clamp(at + delta, 0, @as(i64, @intCast(p.list.len - 1)));
         const moved = next != at or !p.focus_shown;
-        p.focus = @intCast(next);
+        p.setFocus(@intCast(next));
         p.focus_shown = true;
         p.laid = false;
         return moved;
     }
 
-    /// The focused card's id, if any.
+    /// The focused card's id: the card ↑/↓, Enter or a tap put the focus
+    /// on, while it is still listed (null: none).
     pub fn focused(p: *const Panel) ?Id {
-        if (p.list.len == 0) return null;
-        return p.list.items[@min(p.focus, p.list.len - 1)].id;
+        const fid = p.focus_id orelse return null;
+        return if (p.list.find(fid) != null) fid else null;
+    }
+
+    fn setFocus(p: *Panel, i: usize) void {
+        p.focus = i;
+        p.focus_id = if (i < p.list.len) p.list.items[i].id else null;
     }
 
     /// One of the panel's buttons (a tap on a row toggles it; Recap asks
@@ -531,24 +555,34 @@ pub const Panel = struct {
         r.boxes.clearRetainingCapacity();
         const s = f.s;
         const rpad = @round(9 * s);
-        const h = @max(frame.answerButtonHeight(f.act), @round(@as(f32, @floatFromInt(f.body.cell_h)) * 1.3) + 2 * @round(7 * s));
+        const h1 = @max(frame.answerButtonHeight(f.act), @round(@as(f32, @floatFromInt(f.body.cell_h)) * 1.3) + 2 * @round(7 * s));
         const warm = amber(it.kind);
         const focus = p.focus_shown and p.focus == i;
-        r.boxes.append(p.gpa, .{ .x = 0, .y = 0, .w = w, .h = h, .color = theme.ui.panel, .kind = .card }) catch {};
-        r.boxes.append(p.gpa, .{ .x = 0, .y = 0, .w = w, .h = h, .color = if (focus) theme.ui.focus else if (warm) theme.ui.attention else theme.ui.pill_bg, .kind = .outline }) catch {};
         const sc: f32 = @floatFromInt(f.small.cell_w);
         const lbl_w = @max(frame.textWidth(f.small, label(it.kind)), 8 * sc);
-        const sy = @round((h - @as(f32, @floatFromInt(f.small.cell_h))) / 2);
-        const by = @round((h - @as(f32, @floatFromInt(f.body.cell_h))) / 2);
-        r.lines.append(p.gpa, .{ .str = label(it.kind), .x = rpad, .y = sy, .font = .small, .color = if (warm) theme.ui.attention else theme.ui.dim, .bold = warm }) catch {};
         const chev = "\u{203A}";
         const chev_w = frame.textWidth(f.body, chev);
         const tx = rpad + lbl_w + sc;
+        const text_x1 = w - rpad - chev_w - sc;
         const sent = if (p.sent) |sn| std.mem.eql(u8, &sn, &it.id) else false;
         const text: []const u8 = if (sent) "Sending\u{2026}" else it.summary();
         const code = it.kind == .suggest_run and !sent;
-        r.lines.append(p.gpa, .{ .str = text, .x = tx, .y = by, .color = if (code) cv.colors.code_fg else theme.ui.text, .x1 = w - rpad - chev_w - sc }) catch {};
+        // A suggested command is shown whole, wrapped (a swipe sends all
+        // of it); any other summary is one line, cut at the chevron.
+        var h = h1;
+        var by = @round((h1 - @as(f32, @floatFromInt(f.body.cell_h))) / 2);
+        if (code) {
+            const end = codeInto(p.gpa, &r.lines, f, text, tx, by, @max(1, text_x1 - tx));
+            h = @max(h1, end + by - @round(2 * s));
+        } else {
+            r.lines.append(p.gpa, .{ .str = text, .x = tx, .y = by, .color = theme.ui.text, .x1 = text_x1 }) catch {};
+        }
+        if (h != h1) by = @round((h - @as(f32, @floatFromInt(f.body.cell_h))) / 2);
+        const sy = @round((h - @as(f32, @floatFromInt(f.small.cell_h))) / 2);
+        r.lines.append(p.gpa, .{ .str = label(it.kind), .x = rpad, .y = sy, .font = .small, .color = if (warm) theme.ui.attention else theme.ui.dim, .bold = warm }) catch {};
         r.lines.append(p.gpa, .{ .str = chev, .x = w - rpad - chev_w, .y = by, .color = theme.ui.dim }) catch {};
+        r.boxes.append(p.gpa, .{ .x = 0, .y = 0, .w = w, .h = h, .color = theme.ui.panel, .kind = .card }) catch {};
+        r.boxes.append(p.gpa, .{ .x = 0, .y = 0, .w = w, .h = h, .color = if (focus) theme.ui.focus else if (warm) theme.ui.attention else theme.ui.pill_bg, .kind = .outline }) catch {};
         r.h = h;
     }
 
@@ -973,4 +1007,63 @@ test "one approval UI: the conversation's permission card gives way to the waiti
     plain.clock = .{ .ctx = &r.clk, .now = Clock.now };
     plain.presented(0);
     try testing.expectEqual(cv.View.KeyResult.answer_yes, plain.onKey(.left, .{}));
+}
+
+test "focus follows its card; a card gone takes the focus with it" {
+    const gpa = testing.allocator;
+    var s: Store = .{};
+    defer s.deinit(gpa);
+    const tab: Id = @splat(0xa);
+    var l = testList(tab);
+    try storeWith(gpa, &s, &l);
+    var p = Panel.init(gpa);
+    defer p.deinit();
+    p.sync(&s, tab, "instruct", true);
+    // No key pressed yet: nothing is focused, ←/→ answer nothing.
+    try testing.expect(p.focused() == null);
+    _ = p.moveFocus(1); // row 1: the suggestion
+    try testing.expectEqual(@as(Id, @splat(2)), p.focused().?);
+    // The waiting card above it goes: the focus stays on the suggestion.
+    l.items[0] = l.items[1];
+    l.items[1] = l.items[2];
+    l.len = 2;
+    try storeWith(gpa, &s, &l);
+    p.sync(&s, tab, "instruct", true);
+    try testing.expectEqual(@as(usize, 0), p.focus);
+    try testing.expectEqual(@as(Id, @splat(2)), p.focused().?);
+    // The focused card goes: no focus, not the card now in its place.
+    l.items[0] = l.items[1];
+    l.len = 1;
+    try storeWith(gpa, &s, &l);
+    p.sync(&s, tab, "instruct", true);
+    try testing.expect(p.focused() == null and !p.focus_shown);
+}
+
+test "a suggested command's row shows all of it" {
+    const gpa = testing.allocator;
+    var s: Store = .{};
+    defer s.deinit(gpa);
+    const tab: Id = @splat(0xa);
+    var l: foryou.List = .{ .tab = tab };
+    const cmd = "zig build test -Dtest-filter=a-rather-long-filter-name -Doptimize=ReleaseSafe --summary all";
+    l.items[0] = .{ .id = @splat(1), .kind = .suggest_run };
+    l.items[0].setSummary(cmd);
+    l.items[0].setCmd(cmd);
+    l.len = 1;
+    try storeWith(gpa, &s, &l);
+    var p = Panel.init(gpa);
+    defer p.deinit();
+    p.sync(&s, tab, "instruct", true);
+    _ = p.layout(test_fonts.fonts, 300);
+    var shown: std.ArrayList(u8) = .empty;
+    defer shown.deinit(gpa);
+    var lines: usize = 0;
+    for (p.rows[0].lines.items) |ln| if (ln.font == .body and !std.mem.eql(u8, ln.str, "\u{203A}")) {
+        try testing.expect(ln.x1 == null);
+        try shown.appendSlice(gpa, ln.str);
+        lines += 1;
+    };
+    try testing.expectEqualStrings(cmd, shown.items);
+    try testing.expect(lines > 1);
+    try testing.expect(p.rows[0].h > p.rows[0].lines.items[0].y);
 }
