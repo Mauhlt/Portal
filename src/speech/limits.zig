@@ -1,59 +1,40 @@
-//! Speech input's limits (owner requirement, 2026-11-14: nothing can be
-//! abused by too-long clips, rapid-fire clips or a flood of submissions),
-//! in one place:
+//! Speech input's limits, in one place (trimmed 2026-11-14 for one person
+//! with two desk-approved devices inside WireGuard):
 //!
-//!   max_seconds            120 s per utterance (stt-local's too_long):
-//!                          capture stops there; the capture buffer is
-//!                          allocated once at that size and never grows
-//!   min_ms                 250 ms: shorter clips are dropped, no stt call
-//!   in flight              one transcription at a time; another request
-//!                          while one runs or waits is refused (Busy)
-//!   rate                   at most 10 transcriptions a minute (a token
-//!                          bucket: burst 10, one back every 6 s); refusals
-//!                          say when the next is allowed (a deadline, not
-//!                          a poll)
-//!   long windows           on top of the per-minute buckets, rolling caps
-//!                          per source: transcriptions 300 an hour and
-//!                          2000 a day; feedback 120 an hour and 1000 a
-//!                          day. Counted in fixed slots (60 one-minute
-//!                          slots for the hour, 24 one-hour slots for the
-//!                          day; no timestamp per event), so the day's
-//!                          window is exact to the hour. A refusal names
-//!                          the limit hit and when it frees up.
-//!   job_timeout_ms         60 s: a transcription not back by then is
-//!                          given up (its result is dropped and
-//!                          discarded); stt has no cancel yet, so the GPU
-//!                          finishes it, but nothing else is queued
-//!   max_text               8 KiB of transcript, feedback or correction
-//!                          text (cut at a UTF-8 boundary / refused)
-//!   max_feedback_jobs      16 queued feedback calls (the oldest dropped)
-//!   feedback rate          corrections / discards: burst 5, one back every
-//!                          6 s (about 10 a minute), per source: the desk's
-//!                          own UI has one bucket (home.Engine), each paired
-//!                          device another (DeviceBuckets, keyed on the
-//!                          session's device name, kept for the life of
-//!                          the process so re-pairing or reconnecting
-//!                          doesn't reset it). Over the limit: refused,
-//!                          never queued. Feedback for an id that isn't
-//!                          waiting is refused cheaply and still counts.
-//!   max_wav_bytes          the WAV handed to stt: header + 120 s of 16 kHz
-//!                          mono s16; its header is checked (rate,
-//!                          channels, bits, length) before stt decodes it
+//!   clip length            at most 120 s per utterance (stt-local's
+//!                          too_long; the capture buffer is allocated once
+//!                          at that size), at least 250 ms (shorter: no
+//!                          stt call)
+//!   in flight              one transcription at a time (another: Busy)
+//!   job timeout            60 s: a transcription not back by then is given
+//!                          up (its result dropped and discarded in stt)
+//!   rates, per source      transcriptions: a token bucket (burst 10, one
+//!                          back every 6 s) and 2000 a rolling day;
+//!                          corrections: burst 5, one every 6 s, and 1000
+//!                          a rolling day. The desk has its own (home.Engine),
+//!                          each paired device another (DeviceBuckets, keyed
+//!                          on the session's device name). A refusal names
+//!                          the limit and when it frees up.
+//!   text                   8 KiB of transcript or correction
+//!   feedback queue         16 calls (the oldest dropped; a device's never
+//!                          push out the desk's)
+//!   kept clips             500 a rolling day per source become training
+//!                          samples; past that a clip is transcribed but
+//!                          discarded in stt
+//!   bundles (future)       each at most 5 MiB, 100 MiB a rolling day per
+//!                          device
+//!   devices (gate.zig)     at most 2 devices with speech requests in
+//!                          flight at once (the desk's mic never counts),
+//!                          2 requests per device, 16 MiB of payloads in
+//!                          flight in all, 30 s to read a request body
+//!   WAV to stt             size and header checked before stt decodes it
 //!
-//!   kept clips             at most 500 clips a rolling day become stt
-//!                          training samples (per source); past that a
-//!                          clip is still transcribed but Portal discards
-//!                          it in stt at once (feedback(id, _, false)), and
-//!                          the UI says so once
-//!   bundles (future)       per device a rolling day: 50 training bundles,
-//!                          100 MiB in all, each at most 5 MiB
-//!
-//! Every value above is a field of `Config` (defaults = these numbers),
+//! Every tunable value is a field of `Config` (defaults: the constants),
 //! loaded from the desk's settings.txt (`speech.<name> = <n>`, edited only
-//! at the desk) and clamped to `Config.ranges`: never zero, and never
-//! above what keeps memory bounded (the capture buffer is allocated once
-//! for the 120 s ceiling, text buffers for 8 KiB, the feedback queue for
-//! 64). Changes apply live (home.Engine.setLimits, capture.Mic.setLimits).
+//! at the desk), clamped to `Config.ranges` (never zero, never above what
+//! keeps memory bounded) and applied live. Unknown `speech.*` keys
+//! (including removed ones) are ignored on load. Rolling days are 24
+//! hourly slots (`Day`): no timestamp per event, exact to the hour.
 //!
 //! Desk-local only: no device sends audio (there is no /stt/transcribe,
 //! docs/stt-sync-contract.md).
@@ -69,20 +50,16 @@ pub const min_samples = sample_rate * min_ms / 1000;
 pub const rate_burst = 10;
 /// One transcription comes back every this many ms (10 a minute).
 pub const rate_refill_ms: i64 = 6_000;
-pub const job_timeout_ms: i64 = 60_000;
 pub const max_text = 8 * 1024;
-/// Rolling caps per source, on top of the per-minute bucket.
-pub const transcribe_per_hour = 300;
 pub const transcribe_per_day = 2000;
-pub const feedback_per_hour = 120;
-pub const feedback_per_day = 1000;
 /// Feedback (corrections, discards): burst and refill, per source.
 pub const feedback_burst = 5;
 pub const feedback_refill_ms: i64 = 6_000;
+pub const feedback_per_day = 1000;
 /// Transcript ids that can still get feedback (stt's own window is 64).
 pub const max_pending_ids = 64;
 /// Paired devices (src/devices.zig max_devices): the size of the
-/// per-device feedback table.
+/// per-device table.
 pub const max_devices = 16;
 pub const max_device_name = 64;
 pub const max_feedback_jobs = 16;
@@ -90,32 +67,15 @@ pub const max_feedback_jobs = 16;
 pub const feedback_queue_ceiling = 64;
 pub const job_timeout_s = 60;
 pub const kept_clips_per_day = 500;
-pub const bundles_per_day = 50;
 pub const bundle_mib_per_day = 100;
 pub const bundle_max_kib = 5 * 1024;
-/// Desktop-wide, over all devices (gate.zig): devices doing speech
-/// traffic at once (the desk's own mic never counts), and totals.
+/// Devices with speech requests in flight at once (the desk's own mic
+/// never counts), requests per device, all device payloads in flight
+/// together (MiB), and each request body's read deadline.
 pub const concurrent_devices = 2;
-pub const global_feedback_per_hour = 300;
-pub const global_kept_clips_per_day = 1000;
-pub const global_bundles_per_day = 100;
-pub const global_bundle_mib_per_day = 250;
-/// All device speech payloads in flight together (MiB), each request's
-/// body read deadline, and malformed-data strikes before a device's
-/// speech traffic is closed until it reconnects.
+pub const device_inflight = 2;
 pub const payload_budget_mib = 16;
 pub const read_timeout_s = 30;
-pub const malformed_strikes = 3;
-pub const malformed_window_min = 10;
-/// A device's hold on one of the concurrent speech slots: at most this
-/// long, released early after this long without speech traffic, and after
-/// an expiry not taken again by the same device for this long while
-/// another device is waiting (seconds).
-pub const slot_max_hold_s = 300;
-pub const slot_idle_s = 60;
-pub const slot_cooldown_s = 30;
-/// Requests one device may have in flight at once.
-pub const device_inflight = 2;
 /// RIFF/fmt/data headers are 44 bytes for what Portal writes; a little room.
 pub const max_wav_bytes = max_samples * 2 + 128;
 
@@ -153,96 +113,70 @@ pub const Bucket = struct {
     }
 };
 
-/// A rolling count over the last `n` slots of `slot_ms` each, in fixed
-/// memory (one counter per slot, no timestamp per event). Pure: callers
-/// pass monotonic ms; old slots are cleared as time is seen to pass.
-pub fn Rolling(comptime n: usize, comptime slot_ms: i64) type {
-    return RollingOf(u32, n, slot_ms);
-}
+/// A rolling 24-hour total in 24 hourly slots (a count or bytes): fixed
+/// memory, no timestamp per event. Pure: callers pass monotonic ms; slots
+/// are cleared as time is seen to pass.
+pub const Day = struct {
+    const n = 24;
+    const slot_ms: i64 = 3_600_000;
+    slots: [n]u64 = @splat(0),
+    /// The absolute hour (ms / slot_ms) of the newest slot.
+    newest: ?i64 = null,
 
-/// `Rolling` with a counter type (u64 for byte totals).
-pub fn RollingOf(comptime T: type, comptime n: usize, comptime slot_ms: i64) type {
-    return struct {
-        const Self = @This();
-        slots: [n]T = @splat(0),
-        /// The absolute slot number (ms / slot_ms) of the newest slot.
-        newest: ?i64 = null,
-
-        fn advance(r: *Self, now: i64) i64 {
-            const cur = @divFloor(now, slot_ms);
-            if (r.newest) |old| {
-                if (cur > old) {
-                    const gap: usize = @intCast(@min(cur - old, n));
-                    var k: usize = 0;
-                    while (k < gap) : (k += 1) r.slots[@intCast(@mod(cur - @as(i64, @intCast(k)), n))] = 0;
-                    r.newest = cur;
-                }
-                // A clock that went back counts into the newest slot.
-            } else r.newest = cur;
-            return r.newest.?;
-        }
-
-        pub fn sum(r: *Self, now: i64) T {
-            _ = r.advance(now);
-            var t: T = 0;
-            for (r.slots) |c| t += c;
-            return t;
-        }
-
-        /// The count of the newest `k` slots (k <= n).
-        pub fn sumLast(r: *Self, now: i64, k: usize) T {
-            const cur = r.advance(now);
-            var t: T = 0;
-            var i: usize = 0;
-            while (i < @min(k, n)) : (i += 1) t += r.slots[@intCast(@mod(cur - @as(i64, @intCast(i)), n))];
-            return t;
-        }
-
-        pub fn add(r: *Self, now: i64) void {
-            r.addN(now, 1);
-        }
-
-        pub fn addN(r: *Self, now: i64, k: T) void {
-            const cur = r.advance(now);
-            r.slots[@intCast(@mod(cur, n))] += k;
-        }
-
-        /// When the count falls below `cap` again (now if it is below).
-        pub fn freeAt(r: *Self, now: i64, cap: T) i64 {
-            var t = r.sum(now);
-            if (t < cap) return now;
-            const cur = r.newest.?;
-            var a = cur - @as(i64, n) + 1;
-            while (a <= cur) : (a += 1) {
-                t -= r.slots[@intCast(@mod(a, n))];
-                if (t < cap) return (a + @as(i64, n)) * slot_ms;
+    fn advance(d: *Day, now: i64) i64 {
+        const cur = @divFloor(now, slot_ms);
+        if (d.newest) |old| {
+            if (cur > old) {
+                var k: i64 = 0;
+                while (k < @min(cur - old, n)) : (k += 1) d.slots[@intCast(@mod(cur - k, n))] = 0;
+                d.newest = cur;
             }
-            return (cur + @as(i64, n)) * slot_ms;
+            // A clock that went back counts into the newest slot.
+        } else d.newest = cur;
+        return d.newest.?;
+    }
+
+    pub fn sum(d: *Day, now: i64) u64 {
+        _ = d.advance(now);
+        var t: u64 = 0;
+        for (d.slots) |c| t += c;
+        return t;
+    }
+
+    pub fn add(d: *Day, now: i64, k: u64) void {
+        const cur = d.advance(now);
+        d.slots[@intCast(@mod(cur, n))] += k;
+    }
+
+    /// When adding `k` fits under `cap` again (now if it does); null if
+    /// it never will (k alone is over the cap).
+    pub fn fitsAt(d: *Day, now: i64, k: u64, cap: u64) ?i64 {
+        if (k > cap) return null;
+        var t = d.sum(now);
+        if (t + k <= cap) return now;
+        const cur = d.newest.?;
+        var a = cur - n + 1;
+        while (a <= cur) : (a += 1) {
+            t -= d.slots[@intCast(@mod(a, n))];
+            if (t + k <= cap) return (a + n) * slot_ms;
         }
-    };
-}
+        return (cur + n) * slot_ms;
+    }
+};
 
 pub const Limit = enum {
     per_minute,
-    per_hour,
     per_day,
     bundle_size,
     bundle_bytes_per_day,
-    global_per_hour,
-    global_per_day,
-    global_bytes_per_day,
     kept_per_day,
 
     pub fn label(l: Limit) []const u8 {
         return switch (l) {
             .per_minute => "the per-minute limit",
-            .per_hour => "the hourly limit",
             .per_day => "the daily limit",
             .bundle_size => "the bundle size limit",
             .bundle_bytes_per_day => "the daily bundle bytes limit",
-            .global_per_hour => "the desktop-wide hourly limit",
-            .global_per_day => "the desktop-wide daily limit",
-            .global_bytes_per_day => "the desktop-wide daily bundle bytes limit",
             .kept_per_day => "the daily limit of clips kept for training",
         };
     }
@@ -254,32 +188,20 @@ pub const Config = struct {
     clip_min_ms: u32 = min_ms,
     transcribe_burst: u32 = rate_burst,
     transcribe_refill_ms: u32 = rate_refill_ms,
-    transcribe_per_hour: u32 = transcribe_per_hour,
     transcribe_per_day: u32 = transcribe_per_day,
     job_timeout_s: u32 = job_timeout_s,
     feedback_burst: u32 = feedback_burst,
     feedback_refill_ms: u32 = feedback_refill_ms,
-    feedback_per_hour: u32 = feedback_per_hour,
     feedback_per_day: u32 = feedback_per_day,
     text_max: u32 = max_text,
     feedback_queue: u32 = max_feedback_jobs,
     kept_clips_per_day: u32 = kept_clips_per_day,
-    bundles_per_day: u32 = bundles_per_day,
     bundle_mib_per_day: u32 = bundle_mib_per_day,
     bundle_max_kib: u32 = bundle_max_kib,
     concurrent_devices: u32 = concurrent_devices,
-    global_feedback_per_hour: u32 = global_feedback_per_hour,
-    global_kept_clips_per_day: u32 = global_kept_clips_per_day,
-    global_bundles_per_day: u32 = global_bundles_per_day,
-    global_bundle_mib_per_day: u32 = global_bundle_mib_per_day,
+    device_inflight: u32 = device_inflight,
     payload_budget_mib: u32 = payload_budget_mib,
     read_timeout_s: u32 = read_timeout_s,
-    malformed_strikes: u32 = malformed_strikes,
-    malformed_window_min: u32 = malformed_window_min,
-    slot_max_hold_s: u32 = slot_max_hold_s,
-    slot_idle_s: u32 = slot_idle_s,
-    slot_cooldown_s: u32 = slot_cooldown_s,
-    device_inflight: u32 = device_inflight,
 
     pub const Range = struct { name: []const u8, min: u32, max: u32, doc: []const u8 };
 
@@ -289,32 +211,20 @@ pub const Config = struct {
         .{ .name = "clip_min_ms", .min = 50, .max = 5_000, .doc = "shorter clips are dropped without an stt call (ms)" },
         .{ .name = "transcribe_burst", .min = 1, .max = 100, .doc = "transcriptions at once (token bucket size)" },
         .{ .name = "transcribe_refill_ms", .min = 100, .max = 3_600_000, .doc = "one more transcription allowed every (ms)" },
-        .{ .name = "transcribe_per_hour", .min = 1, .max = 100_000, .doc = "transcriptions per rolling hour" },
         .{ .name = "transcribe_per_day", .min = 1, .max = 1_000_000, .doc = "transcriptions per rolling day" },
         .{ .name = "job_timeout_s", .min = 5, .max = 600, .doc = "a transcription not back by then is given up (s)" },
         .{ .name = "feedback_burst", .min = 1, .max = 100, .doc = "corrections at once (token bucket size)" },
         .{ .name = "feedback_refill_ms", .min = 100, .max = 3_600_000, .doc = "one more correction allowed every (ms)" },
-        .{ .name = "feedback_per_hour", .min = 1, .max = 100_000, .doc = "corrections per rolling hour" },
         .{ .name = "feedback_per_day", .min = 1, .max = 1_000_000, .doc = "corrections per rolling day" },
         .{ .name = "text_max", .min = 256, .max = max_text, .doc = "transcript / correction text (bytes)" },
         .{ .name = "feedback_queue", .min = 1, .max = feedback_queue_ceiling, .doc = "feedback calls queued (oldest dropped)" },
-        .{ .name = "kept_clips_per_day", .min = 1, .max = 100_000, .doc = "clips kept as training samples per rolling day" },
-        .{ .name = "bundles_per_day", .min = 1, .max = 10_000, .doc = "training bundles per device per rolling day" },
+        .{ .name = "kept_clips_per_day", .min = 1, .max = 100_000, .doc = "clips kept as training samples per rolling day, per source" },
         .{ .name = "bundle_mib_per_day", .min = 1, .max = 10_240, .doc = "training bundle MiB per device per rolling day" },
         .{ .name = "bundle_max_kib", .min = 64, .max = 5 * 1024, .doc = "one training bundle (KiB; stt-local caps bundles at 5 MiB)" },
-        .{ .name = "concurrent_devices", .min = 1, .max = max_devices, .doc = "devices doing speech traffic at once (the desk's mic not counted)" },
-        .{ .name = "global_feedback_per_hour", .min = 1, .max = 100_000, .doc = "corrections per rolling hour, all devices together" },
-        .{ .name = "global_kept_clips_per_day", .min = 1, .max = 1_000_000, .doc = "clips kept for training per rolling day, all devices" },
-        .{ .name = "global_bundles_per_day", .min = 1, .max = 100_000, .doc = "training bundles per rolling day, all devices" },
-        .{ .name = "global_bundle_mib_per_day", .min = 1, .max = 102_400, .doc = "training bundle MiB per rolling day, all devices" },
+        .{ .name = "concurrent_devices", .min = 1, .max = max_devices, .doc = "devices with speech requests in flight at once (the desk's mic not counted)" },
+        .{ .name = "device_inflight", .min = 1, .max = 16, .doc = "requests one device may have in flight at once" },
         .{ .name = "payload_budget_mib", .min = 1, .max = 64, .doc = "device speech payloads in flight together (MiB)" },
         .{ .name = "read_timeout_s", .min = 1, .max = 300, .doc = "a request body not read by then is dropped (s)" },
-        .{ .name = "malformed_strikes", .min = 1, .max = 100, .doc = "malformed messages that close a device's speech traffic" },
-        .{ .name = "malformed_window_min", .min = 1, .max = 60, .doc = "...within this many minutes" },
-        .{ .name = "slot_max_hold_s", .min = 10, .max = 3600, .doc = "longest hold on a speech slot (s)" },
-        .{ .name = "slot_idle_s", .min = 5, .max = 600, .doc = "a slot without speech traffic this long is released (s)" },
-        .{ .name = "slot_cooldown_s", .min = 1, .max = 600, .doc = "after an expiry, the same device waits this long if others want a slot (s)" },
-        .{ .name = "device_inflight", .min = 1, .max = 16, .doc = "requests one device may have in flight at once" },
     };
 
     comptime {
@@ -335,7 +245,8 @@ pub const Config = struct {
     }
 
     /// `key = text` from the settings (key without "speech."): parsed and
-    /// clamped. False if the key is unknown or the text isn't a number.
+    /// clamped. False if the key is unknown (or removed) or the text isn't
+    /// a number.
     pub fn set(c: *Config, key: []const u8, text: []const u8) bool {
         inline for (comptime std.meta.fieldNames(Config), ranges) |f, r| {
             if (std.mem.eql(u8, key, f)) {
@@ -372,67 +283,56 @@ pub const Verdict = union(enum) {
     exceeds: Limit,
 };
 
-/// One source's limits: a token bucket (the per-minute rate) and rolling
-/// hour and day caps. A request is counted only if every one allows it.
+/// One source's rate: a token bucket (per minute) and a daily cap. A
+/// request is counted only if both allow it.
 pub const Limiter = struct {
     bucket: Bucket,
-    hour: Rolling(60, 60_000) = .{},
-    day: Rolling(24, 3_600_000) = .{},
-    per_hour: u32,
+    day: Day = .{},
     per_day: u32,
 
     pub fn transcriptions() Limiter {
-        return .{ .bucket = .{}, .per_hour = transcribe_per_hour, .per_day = transcribe_per_day };
+        return .{ .bucket = .{}, .per_day = transcribe_per_day };
     }
     pub fn feedback() Limiter {
-        return .{
-            .bucket = .{ .burst = feedback_burst, .refill_ms = feedback_refill_ms, .tokens = feedback_burst },
-            .per_hour = feedback_per_hour,
-            .per_day = feedback_per_day,
-        };
+        return .{ .bucket = .{ .burst = feedback_burst, .refill_ms = feedback_refill_ms, .tokens = feedback_burst }, .per_day = feedback_per_day };
     }
 
-    /// New values (live): caps, the bucket's size and refill; tokens over
-    /// the new size are dropped.
-    pub fn apply(l: *Limiter, burst: u32, refill_ms: u32, per_hour: u32, per_day: u32) void {
+    /// New values (live): the cap, the bucket's size and refill; tokens
+    /// over the new size are dropped.
+    pub fn apply(l: *Limiter, burst: u32, refill_ms: u32, per_day: u32) void {
         l.bucket.burst = burst;
         l.bucket.refill_ms = refill_ms;
         l.bucket.tokens = @min(l.bucket.tokens, burst);
         if (l.bucket.tokens >= burst) l.bucket.next_ms = null;
-        l.per_hour = per_hour;
         l.per_day = per_day;
     }
 
     pub fn applyTranscriptions(l: *Limiter, c: Config) void {
-        l.apply(c.transcribe_burst, c.transcribe_refill_ms, c.transcribe_per_hour, c.transcribe_per_day);
+        l.apply(c.transcribe_burst, c.transcribe_refill_ms, c.transcribe_per_day);
     }
     pub fn applyFeedback(l: *Limiter, c: Config) void {
-        l.apply(c.feedback_burst, c.feedback_refill_ms, c.feedback_per_hour, c.feedback_per_day);
+        l.apply(c.feedback_burst, c.feedback_refill_ms, c.feedback_per_day);
     }
 
-    /// Checks every limit; counts the request only if all allow it.
     pub fn take(l: *Limiter, now: i64) Verdict {
-        if (l.day.sum(now) >= l.per_day) return .{ .limited = .{ .limit = .per_day, .at = l.day.freeAt(now, l.per_day) } };
-        if (l.hour.sum(now) >= l.per_hour) return .{ .limited = .{ .limit = .per_hour, .at = l.hour.freeAt(now, l.per_hour) } };
+        if (l.day.fitsAt(now, 1, l.per_day)) |at| if (at > now) return .{ .limited = .{ .limit = .per_day, .at = at } };
         if (!l.bucket.take(now)) return .{ .limited = .{ .limit = .per_minute, .at = l.bucket.nextAllowed(now) } };
-        l.hour.add(now);
-        l.day.add(now);
+        l.day.add(now, 1);
         return .ok;
     }
 };
 
-/// A token bucket per paired device, keyed on the device name from the
-/// session (never from the request). Entries live for the process, so a
-/// reconnect or re-pairing finds its old bucket; the table holds at most
-/// max_devices names, and a name beyond that is refused (paired devices
-/// are at most that many, so this only happens if something is wrong).
+/// Per paired device, keyed on the device name from the session (never
+/// from the request): its feedback rate, its bundle bytes and its kept
+/// clips (rolling day). Entries live for the process, so a reconnect or
+/// re-pairing finds its old counts; at most max_devices names (a name
+/// beyond that is refused); `free` reuses an unpaired device's entry.
 pub const DeviceBuckets = struct {
     names: [max_devices][max_device_name]u8 = undefined,
     lens: [max_devices]u8 = @splat(0),
     limiters: [max_devices]Limiter = undefined,
-    /// Training bundles per device (count and bytes, rolling day).
-    bundles: [max_devices]Rolling(24, 3_600_000) = undefined,
-    bundle_bytes: [max_devices]RollingOf(u64, 24, 3_600_000) = undefined,
+    bundle_bytes: [max_devices]Day = undefined,
+    kept: [max_devices]Day = undefined,
     cfg: Config = .{},
     n: usize = 0,
 
@@ -463,18 +363,19 @@ pub const DeviceBuckets = struct {
         };
     }
 
-    /// A training bundle of `bytes` from `device` (future POST
-    /// /sync/bundle): its size, the day's count and the day's bytes.
-    pub fn takeBundle(t: *DeviceBuckets, device: []const u8, bytes: u64, now: i64) DeviceVerdict {
+    /// A training bundle of `bytes` holding `clips` samples from `device`
+    /// (future POST /sync/bundle): its size, the day's bytes, the day's
+    /// kept clips.
+    pub fn takeBundle(t: *DeviceBuckets, device: []const u8, bytes: u64, clips: u32, now: i64) DeviceVerdict {
         const i = t.slot(device) orelse return .refused;
-        const max_one = @as(u64, t.cfg.bundle_max_kib) * 1024;
-        if (bytes > max_one) return .{ .exceeds = .bundle_size };
-        if (t.bundles[i].sum(now) >= t.cfg.bundles_per_day) return .{ .limited = .{ .limit = .per_day, .at = t.bundles[i].freeAt(now, t.cfg.bundles_per_day) } };
+        if (bytes > @as(u64, t.cfg.bundle_max_kib) * 1024) return .{ .exceeds = .bundle_size };
         const cap = @as(u64, t.cfg.bundle_mib_per_day) * 1024 * 1024;
-        if (bytes > cap) return .{ .exceeds = .bundle_bytes_per_day };
-        if (t.bundle_bytes[i].sum(now) + bytes > cap) return .{ .limited = .{ .limit = .bundle_bytes_per_day, .at = t.bundle_bytes[i].freeAt(now, cap - bytes + 1) } };
-        t.bundles[i].add(now);
-        t.bundle_bytes[i].addN(now, bytes);
+        const b_at = t.bundle_bytes[i].fitsAt(now, bytes, cap) orelse return .{ .exceeds = .bundle_bytes_per_day };
+        if (b_at > now) return .{ .limited = .{ .limit = .bundle_bytes_per_day, .at = b_at } };
+        const k_at = t.kept[i].fitsAt(now, clips, t.cfg.kept_clips_per_day) orelse return .{ .exceeds = .kept_per_day };
+        if (k_at > now) return .{ .limited = .{ .limit = .kept_per_day, .at = k_at } };
+        t.bundle_bytes[i].add(now, bytes);
+        t.kept[i].add(now, clips);
         return .ok;
     }
 
@@ -488,9 +389,7 @@ pub const DeviceBuckets = struct {
     }
 
     /// Frees entry `k` for reuse (its device was unpaired: no longer in
-    /// the device store). A device that pairs again under that name later
-    /// starts fresh; a re-paired device that kept its name never comes
-    /// here (`Gate.retain` keeps every name the store still has).
+    /// the device store; `Gate.retain`).
     pub fn free(t: *DeviceBuckets, k: usize) void {
         if (k < t.n) t.lens[k] = 0;
     }
@@ -500,23 +399,20 @@ pub const DeviceBuckets = struct {
     pub fn slot(t: *DeviceBuckets, device: []const u8) ?usize {
         if (device.len == 0 or device.len > max_device_name) return null;
         if (t.find(device)) |k| return k;
-        const i = blk: {
-            const k = for (0..t.n) |j| {
-                if (t.lens[j] == 0) break j;
-            } else k: {
-                if (t.n == max_devices) return null;
-                t.n += 1;
-                break :k t.n - 1;
-            };
-            @memcpy(t.names[k][0..device.len], device);
-            t.lens[k] = @intCast(device.len);
-            t.limiters[k] = Limiter.feedback();
-            t.limiters[k].applyFeedback(t.cfg);
-            t.bundles[k] = .{};
-            t.bundle_bytes[k] = .{};
-            break :blk k;
+        const k = for (0..t.n) |j| {
+            if (t.lens[j] == 0) break j;
+        } else k: {
+            if (t.n == max_devices) return null;
+            t.n += 1;
+            break :k t.n - 1;
         };
-        return i;
+        @memcpy(t.names[k][0..device.len], device);
+        t.lens[k] = @intCast(device.len);
+        t.limiters[k] = Limiter.feedback();
+        t.limiters[k].applyFeedback(t.cfg);
+        t.bundle_bytes[k] = .{};
+        t.kept[k] = .{};
+        return k;
     }
 };
 
@@ -583,59 +479,47 @@ test "device buckets: burst 5, refill every 6 s, per device, a reconnect doesn't
     try testing.expect(t.take("", 0) == .refused);
 }
 
-test "rolling windows: hour and day caps with a fake clock; under the minute limit but over the hour is refused" {
-    // Transcriptions: one every 10 s never trips the per-minute bucket
-    // (one back every 6 s), but 300 of them fill the hour.
+test "daily caps with a fake clock: under the minute rate but over the day is refused" {
+    // One every 10 s never trips the bucket (one back every 6 s), but
+    // the 2001st within 24 h is refused, and frees as the oldest hour leaves.
     var l = Limiter.transcriptions();
     var now: i64 = 0;
-    for (0..transcribe_per_hour) |_| {
+    for (0..transcribe_per_day) |_| {
         try testing.expect(l.take(now) == .ok);
         now += 10_000;
     }
-    try testing.expect(l.bucket.nextAllowed(now) == now); // the bucket has tokens
+    try testing.expect(l.bucket.nextAllowed(now) == now); // tokens left
     const v = l.take(now);
-    try testing.expectEqual(Limit.per_hour, v.limited.limit);
-    // The oldest minute's slot leaves the hour first: it frees then.
-    try testing.expectEqual(@as(i64, 3_600_000), v.limited.at);
+    try testing.expectEqual(Limit.per_day, v.limited.limit);
+    try testing.expectEqual(@as(i64, 24 * 3_600_000), v.limited.at);
     try testing.expect(l.take(v.limited.at - 1) != .ok);
     try testing.expect(l.take(v.limited.at) == .ok);
-
-    // Feedback: 120 an hour; and 1000 a day spread over hours.
+    // Feedback: 1000 a day.
     var f = Limiter.feedback();
     now = 0;
-    for (0..feedback_per_hour) |_| {
+    for (0..feedback_per_day) |_| {
         try testing.expect(f.take(now) == .ok);
-        now += 20_000;
+        now += 31_000;
     }
-    try testing.expectEqual(Limit.per_hour, f.take(now).limited.limit);
-    var d = Limiter.feedback();
-    now = 0;
-    var taken: u32 = 0;
-    while (taken < feedback_per_day) {
-        if (d.take(now) == .ok) taken += 1;
-        now += 31_000; // under 2 a minute: the hour cap (120) allows all
-    }
-    const dv = d.take(now);
-    try testing.expectEqual(Limit.per_day, dv.limited.limit);
-    try testing.expect(dv.limited.at > now and dv.limited.at <= now + 24 * 3_600_000);
-    try testing.expect(d.take(dv.limited.at) == .ok);
+    try testing.expectEqual(Limit.per_day, f.take(now).limited.limit);
 }
 
-test "rolling: slots clear as time passes, and a refused request counts nothing" {
-    var r: Rolling(60, 60_000) = .{};
-    r.add(0);
-    r.add(59_999);
-    r.add(60_000);
-    try testing.expectEqual(@as(u32, 3), r.sum(60_000));
-    try testing.expectEqual(@as(u32, 1), r.sum(3_600_000)); // the first minute left
-    try testing.expectEqual(@as(u32, 0), r.sum(100 * 3_600_000));
+test "day: slots clear as time passes; a refused request counts nothing; fitsAt" {
+    var d: Day = .{};
+    d.add(0, 1);
+    d.add(3_599_999, 2);
+    d.add(3_600_000, 4);
+    try testing.expectEqual(@as(u64, 7), d.sum(3_600_000));
+    try testing.expectEqual(@as(u64, 4), d.sum(24 * 3_600_000)); // the first hour left
+    try testing.expectEqual(@as(u64, 0), d.sum(100 * 3_600_000));
+    try testing.expect(d.fitsAt(0, 11, 10) == null); // never
     var l = Limiter.feedback();
     for (0..feedback_burst) |_| _ = l.take(0);
     try testing.expect(l.take(0) != .ok);
-    try testing.expectEqual(@as(u32, feedback_burst), l.hour.sum(0));
+    try testing.expectEqual(@as(u64, feedback_burst), l.day.sum(0));
 }
 
-test "config: clamping on load, unknown keys, defaults not written" {
+test "config: clamping on load, unknown and removed keys ignored, defaults not written" {
     var c: Config = .{};
     try testing.expect(c.set("clip_max_s", "0"));
     try testing.expectEqual(@as(u32, 1), c.clip_max_s); // never zero
@@ -645,11 +529,13 @@ test "config: clamping on load, unknown keys, defaults not written" {
     try testing.expectEqual(@as(u32, 256), c.text_max);
     try testing.expect(c.set("feedback_queue", "1000000"));
     try testing.expectEqual(@as(u32, feedback_queue_ceiling), c.feedback_queue);
-    try testing.expect(c.set("transcribe_per_hour", " 50 "));
-    try testing.expectEqual(@as(u32, 50), c.transcribe_per_hour);
+    try testing.expect(c.set("transcribe_per_day", " 50 "));
+    try testing.expectEqual(@as(u32, 50), c.transcribe_per_day);
     try testing.expect(!c.set("nonsense", "1"));
     try testing.expect(!c.set("clip_min_ms", "lots"));
-    // Out-of-range values set in code are clamped too.
+    // Keys of limits that were removed: not known any more.
+    for ([_][]const u8{ "transcribe_per_hour", "feedback_per_hour", "global_feedback_per_hour", "slot_max_hold_s", "malformed_strikes", "bundles_per_day" }) |k|
+        try testing.expect(!c.set(k, "5"));
     var raw: Config = .{ .feedback_burst = 0, .bundle_max_kib = 1 << 30 };
     raw = raw.clamped();
     try testing.expectEqual(@as(u32, 1), raw.feedback_burst);
@@ -657,29 +543,34 @@ test "config: clamping on load, unknown keys, defaults not written" {
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try c.format(&w);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "speech.transcribe_per_hour = 50") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "speech.transcribe_per_day = 50") != null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "kept_clips") == null);
     try testing.expectEqual(@as(usize, 4000), (Config{}).minSamples());
     try testing.expectEqual(@as(usize, max_samples), (Config{}).maxSamples());
 }
 
-test "bundles: size, 50 a day, 100 MiB a day, per device; limits apply live" {
+test "bundles: size, 100 MiB a day, kept clips a day, per device; limits apply live" {
     var t: DeviceBuckets = .{};
-    try testing.expectEqual(Limit.bundle_size, t.takeBundle("laptop", 5 * 1024 * 1024 + 1, 0).exceeds);
-    for (0..bundles_per_day) |_| try testing.expect(t.takeBundle("laptop", 1024, 0) == .ok);
-    try testing.expectEqual(Limit.per_day, t.takeBundle("laptop", 1024, 0).limited.limit);
-    try testing.expect(t.takeBundle("iphone", 1024, 0) == .ok);
+    try testing.expectEqual(Limit.bundle_size, t.takeBundle("laptop", 5 * 1024 * 1024 + 1, 1, 0).exceeds);
     // Bytes: 20 bundles of 5 MiB fill the 100 MiB day.
-    var u: DeviceBuckets = .{};
-    for (0..20) |_| try testing.expect(u.takeBundle("laptop", 5 * 1024 * 1024, 0) == .ok);
-    const v = u.takeBundle("laptop", 1, 0);
+    for (0..20) |_| try testing.expect(t.takeBundle("laptop", 5 * 1024 * 1024, 1, 0) == .ok);
+    const v = t.takeBundle("laptop", 1, 1, 0);
     try testing.expectEqual(Limit.bundle_bytes_per_day, v.limited.limit);
     try testing.expectEqual(@as(i64, 24 * 3_600_000), v.limited.at);
+    try testing.expect(t.takeBundle("iphone", 1024, 1, 0) == .ok); // its own
+    // Kept clips: 500 a day per device; more than that in one is never.
+    var k: DeviceBuckets = .{};
+    try testing.expect(k.takeBundle("laptop", 1024, 500, 0) == .ok);
+    try testing.expectEqual(Limit.kept_per_day, k.takeBundle("laptop", 1024, 1, 0).limited.limit);
+    try testing.expectEqual(Limit.kept_per_day, k.takeBundle("iphone", 1024, 501, 0).exceeds);
+    var z: DeviceBuckets = .{};
+    z.setLimits(.{ .bundle_mib_per_day = 1 });
+    try testing.expectEqual(Limit.bundle_bytes_per_day, z.takeBundle("a", 2 * 1024 * 1024, 0, 0).exceeds);
     // Live: a lower feedback burst applies to a device already known.
-    _ = u.take("laptop", 0);
-    u.setLimits(.{ .feedback_burst = 1 });
-    try testing.expect(u.take("laptop", 0) == .ok); // at most 1 token left
-    try testing.expect(u.take("laptop", 0) != .ok);
+    _ = t.take("laptop", 0);
+    t.setLimits(.{ .feedback_burst = 1 });
+    try testing.expect(t.take("laptop", 0) == .ok); // at most 1 token left
+    try testing.expect(t.take("laptop", 0) != .ok);
 }
 
 test "config: the shortest clip stays below the longest" {

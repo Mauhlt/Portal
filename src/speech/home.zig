@@ -150,7 +150,7 @@ pub const Engine = struct {
     learning: bool = true,
     learning_job: ?bool = null,
     /// Dictations kept as training samples (rolling day, boot clock).
-    kept: limits.Rolling(24, 3_600_000) = .{},
+    kept: limits.Day = .{},
     pending_ids: [limits.max_pending_ids]u64 = @splat(0),
     pending_at: usize = 0,
     feedbacks: std.ArrayList(Feedback) = .empty,
@@ -664,7 +664,7 @@ pub const Engine = struct {
                 const under_cap = e.kept.sum(now) < e.cfg.kept_clips_per_day;
                 const keep = res.purpose == .dictation and e.learning and under_cap;
                 if (keep) {
-                    e.kept.add(now);
+                    e.kept.add(now, 1);
                     e.addPendingId(res.id);
                 } else {
                     if (e.gpa.dupe(u8, "")) |t| e.pushFeedback(.{ .id = res.id, .text = t, .ok = false, .source = .portal }) else |_| {}
