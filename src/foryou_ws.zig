@@ -21,9 +21,14 @@
 //!     device, writeDeskLine from the desk: the line rules either way), a
 //!     permission card's yes / no presses `1` / `esc` (Session.writeWebKey,
 //!     as the permission card does; from the desk, the keys its Instruct
-//!     panel types), a question's yes / no types "Yes." / "No."; anything
-//!     else dismisses. Answered or dismissed, the card is gone for every
-//!     device and the desk.
+//!     panel types; only a prompt whose `1` is a plain one-time yes is
+//!     such a card), a question's yes / no types the desk's fixed line
+//!     "Yes." / "No." (Session.writeDeskLine from either source, since
+//!     `keys` mode may answer a question but writeWebLine refuses it);
+//!     anything else dismisses. The card is claimed (gone for every
+//!     device and the desk) under the hub's lock before anything is
+//!     typed, so a second answer to it is `stale`; one that could not be
+//!     delivered (`failed`) comes back.
 //! A recap types recap.prompt into the tab as an instruction line (input
 //! mode `instruct` or `text`, the agent's tabs only, at most one per tab
 //! a minute: foryou_desk.recap_interval_ms). An instruction line that is
@@ -142,22 +147,32 @@ fn item(c: Ctx, rest: []const u8, buf: *[frames.max_answer]u8) []const u8 {
         return answerItem(buf, if (std.mem.startsWith(u8, rest, "no ")) .no else .yes, .stale, null);
     if (!c.allow()) return answerItem(buf, req.op, .rate_limited, null);
 
-    // The card, of whichever open tab holds it.
+    // The card, of whichever open tab holds it, claimed under the hub's
+    // lock (gone for everyone at once), so two answers to one card can't
+    // both reach the agent: the second finds nothing (`stale`).
     h.mutex.lockUncancelable(h.io);
     var tab: ?*tabs.Tab = null;
     var taken: foryou_desk.Taken = undefined;
+    var refused = false;
     for (h.tabs[0..h.n]) |t| if (t.foryou.take(req.id)) |tk| {
+        taken = tk;
+        if (!tk.item.kind.effect(req.op).allowedIn(@tagName(c.policy()))) {
+            refused = true;
+            break;
+        }
+        _ = t.foryou.claim(h.io, req.id);
+        t.forYouChangedLocked();
         t.acquire();
         tab = t;
-        taken = tk;
         break;
     };
     h.mutex.unlock(h.io);
+    if (refused) return answerItem(buf, req.op, .refused, taken.item.id);
     const t = tab orelse return answerItem(buf, req.op, .stale, null);
     defer t.release();
+    h.broadcast();
     const it = &taken.item;
     const effect = it.kind.effect(req.op);
-    if (!effect.allowedIn(@tagName(c.policy()))) return answerItem(buf, req.op, .refused, it.id);
 
     const result: foryou.Result = switch (effect) {
         .dismiss => .dismissed,
@@ -170,14 +185,21 @@ fn item(c: Ctx, rest: []const u8, buf: *[frames.max_answer]u8) []const u8 {
         },
         .answer => blk: {
             if (it.kind == .waiting_permission) {
+                // Only ever a prompt whose `1` is a plain one-time yes
+                // (foryou_desk.zig: others are `needs_desk`).
                 c.key(t, if (req.op == .yes) "1" else "esc") catch break :blk .failed;
             } else {
+                // A question's answer is the desk's own fixed line, typed
+                // in `keys` mode too (Effect.answer): writeDeskLine, the
+                // line rules in any input mode (writeWebLine would refuse
+                // a `keys`-mode device).
                 t.session.writeDeskLine(if (req.op == .yes) "Yes." else "No.") catch break :blk .failed;
             }
             break :blk .sent;
         },
     };
-    if (result.ok()) t.forYouDismiss(taken.sig);
+    // Not delivered: the card comes back (for any device to try again).
+    if (!result.ok()) t.forYouRestore(taken.sig);
     var wb: [96]u8 = undefined;
     c.log.print("for you: {s} answered {t} {t} in tab '{s}': {t}", .{ c.who(&wb), it.kind, req.op, t.name(), result });
     return answerItem(buf, req.op, result, it.id);

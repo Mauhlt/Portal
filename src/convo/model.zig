@@ -1,7 +1,7 @@
 //! One tab's Conversation view (docs/protocol.md section 3b): the items a
 //! viewer draws instead of the terminal, built from the session program's
-//! transcript (transcript.zig, read by follow.zig) and its OSC 7501 state
-//! (a permission prompt or question it waits on).
+//! transcript (transcript.zig, read by follow.zig) and its state (OSC 7501
+//! or an agent hook: a permission prompt or question it waits on).
 //!
 //! Rules (owner's decision, 2026-11-12):
 //!   * the owner's prompts and the program's replies as readable text
@@ -10,8 +10,12 @@
 //!     "Ran 3 commands"; consecutive uses of the same kind merge into one
 //!     line), never arguments, paths or results;
 //!   * questions (AskUserQuestion) with their options as answer keys
-//!     ("1".."9"); a permission prompt (OSC 7501 `kind=permission`) as
-//!     Yes (`1`) / No (`esc`); other waits as a question without options;
+//!     ("1".."9"); a permission prompt (an agent hook's PermissionRequest
+//!     or permission notification, session.zig; never OSC 7501, which any
+//!     program in the tab can print) as Yes (`1`) / No (`esc`) when its
+//!     tool makes `1` a plain one-time yes (transcript.plainYes), else
+//!     as a question without options (answered in the terminal); other
+//!     waits as a question without options;
 //!   * API errors as one-line `error` items; compaction and interrupts as
 //!     `status` items;
 //!   * every text is cleaned (valid UTF-8, no controls or bidi overrides)
@@ -35,9 +39,16 @@ const scrub = @import("scrub.zig");
 
 pub const Kind = wire.Kind;
 
-/// What the program waits for (OSC 7501, session.zig): nothing, a
-/// permission prompt, or anything else (a question, sign-in...).
+/// What the program waits for (session.zig): nothing, a permission
+/// prompt (only ever from an agent hook), or anything else (a question,
+/// sign-in, or any OSC 7501 `blocked`).
 pub const Wait = enum { none, permission, other };
+
+/// The open permission question Portal asked (Convo.permissionPrompt):
+/// its text, whether it offers Yes (`1`) / No (`esc`) (the prompt's tool
+/// makes `1` a plain one-time yes), and the tool call it is about (hash of
+/// its id; 0: unknown).
+pub const Permission = struct { text: []const u8, plain: bool, tool: u64 };
 
 const Slot = struct {
     n: u32,
@@ -101,6 +112,8 @@ pub const Convo = struct {
     /// and the tool it asks permission for (0: unknown).
     synthetic_n: u32 = 0,
     synthetic_tool: u64 = 0,
+    /// The wait that question was asked for.
+    synthetic_kind: Wait = .none,
     /// Set while Portal adds its own question (askFromState).
     asking: bool = false,
     wait: Wait = .none,
@@ -531,7 +544,7 @@ pub const Convo = struct {
     }
 
     /// A question is open: one from the transcript (AskUserQuestion) or the
-    /// one Portal made from the program's OSC 7501 wait. The server takes
+    /// one Portal made from the program's wait (OSC 7501 or a hook). The server takes
     /// Up/Down in instruct mode only then (session.zig).
     pub fn hasOpenQuestion(c: *Convo) bool {
         return c.openQuestion();
@@ -559,12 +572,13 @@ pub const Convo = struct {
         return buf[0..k];
     }
 
-    /// The text of the permission question Portal asked from the
-    /// program's state, while it is open (For you's waiting card).
-    pub fn permissionQuestion(c: *Convo) ?[]const u8 {
-        if (c.wait != .permission or c.synthetic_n == 0) return null;
+    /// The permission question Portal asked from the program's state,
+    /// while it is open (For you's waiting card).
+    pub fn permissionPrompt(c: *Convo) ?Permission {
+        if (c.wait != .permission or c.synthetic_n == 0 or c.synthetic_kind != .permission) return null;
         const s = c.find(c.synthetic_n) orelse return null;
-        return if (s.open) s.text else null;
+        if (!s.open) return null;
+        return .{ .text = s.text, .plain = s.options.len > 0, .tool = c.synthetic_tool };
     }
 
     fn openQuestion(c: *Convo) bool {
@@ -577,8 +591,10 @@ pub const Convo = struct {
 
     // ---------------------------------------------------- program state
 
-    /// The program's OSC 7501 state changed (session.zig). Waiting with
-    /// nothing open asks the owner; anything else closes what Portal asked.
+    /// The program's state changed (session.zig: OSC 7501 or a hook).
+    /// Waiting with nothing open asks the owner (a question Portal asked
+    /// for another kind of wait gives way); anything else closes what
+    /// Portal asked.
     pub fn programState(c: *Convo, wait: Wait) void {
         c.wait = wait;
         if (wait == .none) {
@@ -586,39 +602,68 @@ pub const Convo = struct {
             if (c.synthetic_n != 0) c.closeSynthetic();
             return;
         }
+        if (c.synthetic_n != 0 and c.synthetic_kind != wait) c.closeSynthetic();
         if (c.synthetic_n != 0 or c.openQuestion()) return;
         c.askFromState(wait) catch {};
     }
 
     /// A hook named the tool of the permission prompt (only a category
     /// travels: the phrase comes from transcript.permissionPhrase's fixed
-    /// table, never the name). If Portal already asked without knowing
-    /// the tool, it asks again with the phrase.
+    /// table, never the name). If Portal already asked something else
+    /// (another phrase, or Yes / No where the hook's tool makes `1` more
+    /// than a plain yes), it asks again.
     pub fn permissionHint(c: *Convo, cat: transcript.Category) void {
         c.hint_cat = cat;
-        if (c.wait != .permission or c.synthetic_n == 0 or c.synthetic_tool != 0 or c.n_pending != 0) return;
-        if (c.find(c.synthetic_n)) |s| c.remove(s);
+        if (c.wait != .permission or c.synthetic_n == 0 or c.synthetic_kind != .permission) return;
+        const s = c.find(c.synthetic_n) orelse return;
+        if (!s.open) return;
+        var buf: [160]u8 = undefined;
+        var pb: [96]u8 = undefined;
+        const a = c.permissionAsk(&buf, &pb);
+        if (std.mem.eql(u8, a.text, s.text) and a.plain == (s.options.len > 0)) return;
+        c.remove(s);
         c.synthetic_n = 0;
         c.askFromState(.permission) catch {};
+    }
+
+    /// What Portal asks for the open permission prompt. The tool is the
+    /// transcript's newest call without a result, else the hook's
+    /// category; Yes (`1`) / No (`esc`) only when every tool known makes
+    /// `1` a plain one-time yes (transcript.plainYes). Otherwise no
+    /// options: the prompt is answered in the terminal.
+    fn permissionAsk(c: *const Convo, buf: *[160]u8, pb: *[96]u8) Permission {
+        const p: ?Pending = if (c.n_pending > 0) c.pending[c.n_pending - 1] else null;
+        const plain = (p != null or c.hint_cat != null) and
+            (if (p) |pp| transcript.plainYes(pp.cat) else true) and
+            (if (c.hint_cat) |h| transcript.plainYes(h) else true);
+        // From a hook: the category's phrase; `other` is "use a tool".
+        const phrase: ?[]const u8 = if (p) |pp|
+            transcript.permissionPhrase(pb, pp.cat, c.shownTool(pp.tool[0..pp.tool_len]))
+        else if (c.hint_cat) |cat|
+            transcript.permissionPhrase(pb, cat, "")
+        else
+            null;
+        const tail = if (plain) "Allow it?" else "The terminal shows the choices.";
+        const fallback = "Claude needs your permission to continue. The terminal shows the choices.";
+        const ph = phrase orelse return .{ .text = fallback, .plain = false, .tool = 0 };
+        const text = std.fmt.bufPrint(buf, "Claude wants to {s}. {s}", .{ ph, tail }) catch return .{ .text = fallback, .plain = false, .tool = 0 };
+        return .{ .text = text, .plain = plain, .tool = if (p) |pp| pp.id else 0 };
     }
 
     fn askFromState(c: *Convo, kind: Wait) Allocator.Error!void {
         c.asking = true;
         defer c.asking = false;
+        c.synthetic_kind = kind;
         var buf: [160]u8 = undefined;
         if (kind == .permission) {
-            const p: ?Pending = if (c.n_pending > 0) c.pending[c.n_pending - 1] else null;
             var pb: [96]u8 = undefined;
-            const text = if (p) |pp|
-                std.fmt.bufPrint(&buf, "Claude wants to {s}. Allow it?", .{transcript.permissionPhrase(&pb, pp.cat, pp.tool[0..pp.tool_len])}) catch "Claude needs your permission to continue."
-            else if (c.hint_cat) |cat|
-                // From a hook: the category's phrase; `other` is "use a tool".
-                std.fmt.bufPrint(&buf, "Claude wants to {s}. Allow it?", .{transcript.permissionPhrase(&pb, cat, "")}) catch "Claude needs your permission to continue."
-            else
-                "Claude needs your permission to continue.";
-            c.makeRoom(text.len, 2);
-            const s = try c.pushStatic(.question, text);
+            const a = c.permissionAsk(&buf, &pb);
+            c.makeRoom(a.text.len, if (a.plain) 2 else 0);
+            const s = try c.pushStatic(.question, a.text);
             s.open = true;
+            c.synthetic_n = s.n;
+            c.synthetic_tool = a.tool;
+            if (!a.plain) return;
             const opts = try c.gpa.alloc(wire.Option, 2);
             opts[0] = .{ .label = c.gpa.dupe(u8, "Yes") catch {
                 c.gpa.free(opts);
@@ -631,8 +676,6 @@ pub const Convo = struct {
             }, .key = "esc" };
             s.options = opts;
             c.option_count += 2;
-            c.synthetic_n = s.n;
-            c.synthetic_tool = if (p) |pp| pp.id else 0;
             return;
         }
         const s = try c.pushStatic(.question, "Claude is waiting for your answer. The terminal shows the question.");
@@ -926,7 +969,7 @@ test "the program's wait seen before the transcript catches up: Portal's questio
     f.c.programState(.none);
     f.c.programState(.permission); // the record of the tool is not read yet
     var buf: [1024]u8 = undefined;
-    try testing.expectEqualStrings("user:go|question:Claude needs your permission to continue.(open)|", try f.texts(&buf));
+    try testing.expectEqualStrings("user:go|question:Claude needs your permission to continue. The terminal shows the choices.(open)|", try f.texts(&buf));
     try f.feed(toolLine("b2", "Bash", "{\"command\":\"x\"}"));
     try testing.expectEqualStrings("user:go|tool:Ran a command|question:Claude wants to run a command. Allow it?(open)|", try f.texts(&buf));
     // A question still open from the transcript when the program says it
@@ -979,16 +1022,75 @@ test "a hook's tool category names the permission prompt; never the tool's name"
     var buf: [1024]u8 = undefined;
     // Notification (permission_prompt) first: Portal asks without a tool.
     f.c.programState(.permission);
-    try testing.expectEqualStrings("question:Claude needs your permission to continue.(open)|", try f.texts(&buf));
+    try testing.expectEqualStrings("question:Claude needs your permission to continue. The terminal shows the choices.(open)|", try f.texts(&buf));
     // PermissionRequest names a Bash call: asked again with its phrase.
     f.c.permissionHint(.command);
     try testing.expectEqualStrings("question:Claude wants to run a command. Allow it?(open)|", try f.texts(&buf));
     f.c.programState(.none);
     try testing.expect(f.c.hint_cat == null);
-    // An unknown tool (MCP...) is "use a tool".
+    // An unknown tool (MCP, leaving plan mode...) is "use a tool", and
+    // `1` may be more than a plain yes there: no Yes / No, the terminal.
     f.c.permissionHint(.other);
     f.c.programState(.permission);
-    try testing.expect(std.mem.endsWith(u8, try f.texts(&buf), "question:Claude wants to use a tool. Allow it?(open)|"));
+    try testing.expect(std.mem.endsWith(u8, try f.texts(&buf), "question:Claude wants to use a tool. The terminal shows the choices.(open)|"));
+    try testing.expectEqual(@as(usize, 0), f.c.last().?.options.len);
+    const p = f.c.permissionPrompt().?;
+    try testing.expect(!p.plain);
+}
+
+test "Yes = 1 only where 1 is a plain one-time yes" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    f.c.reset(true);
+    var buf: [1024]u8 = undefined;
+    // Leaving plan mode: its first choice also auto-accepts edits.
+    try f.feed(toolLine("x1", "ExitPlanMode", "{\"plan\":\"p\"}"));
+    f.c.programState(.permission);
+    try testing.expectEqual(@as(usize, 0), f.c.last().?.options.len);
+    try testing.expect(!f.c.permissionPrompt().?.plain);
+    f.c.programState(.none);
+    // A Bash call in the transcript, but the hook names another tool:
+    // asked again, without Yes / No.
+    try f.feed(toolLine("b9", "Bash", "{\"command\":\"x\"}"));
+    f.c.programState(.permission);
+    try testing.expect(f.c.permissionPrompt().?.plain);
     try testing.expectEqualStrings("1", f.c.last().?.options[0].key);
-    try testing.expectEqualStrings("esc", f.c.last().?.options[1].key);
+    f.c.permissionHint(.other);
+    try testing.expect(!f.c.permissionPrompt().?.plain);
+    try testing.expectEqual(@as(usize, 0), f.c.last().?.options.len);
+    try testing.expect(std.mem.endsWith(u8, try f.texts(&buf), "question:Claude wants to run a command. The terminal shows the choices.(open)|"));
+    // The same hook again changes nothing.
+    const n = f.c.last().?.n;
+    f.c.permissionHint(.other);
+    try testing.expectEqual(n, f.c.last().?.n);
+}
+
+test "a wait first reported by OSC 7501 gives way to the hook's permission prompt" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    f.c.reset(true);
+    try f.feed(toolLine("b1", "Bash", "{\"command\":\"x\"}"));
+    f.c.programState(.other);
+    try testing.expect(f.c.permissionPrompt() == null);
+    f.c.permissionHint(.command);
+    f.c.programState(.permission);
+    const p = f.c.permissionPrompt().?;
+    try testing.expect(p.plain);
+    try testing.expectEqualStrings("Claude wants to run a command. Allow it?", p.text);
+    var buf: [1024]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, try f.texts(&buf), "waiting for your answer") == null);
+}
+
+test "a tool named after the user is shown as \"a tool\"" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    f.c.reset(true);
+    try f.feed(toolLine("m1", "mcp__srv__bob_tool", "{}"));
+    try f.feed(toolLine("m2", "mcp__srv__bob", "{}"));
+    var buf: [1024]u8 = undefined;
+    const t = try f.texts(&buf);
+    try testing.expect(std.mem.indexOf(u8, t, "bob") == null);
+    try testing.expect(std.mem.indexOf(u8, t, "Used a tool") != null);
+    f.c.programState(.permission);
+    try testing.expectEqualStrings("Claude wants to use a tool. The terminal shows the choices.", f.c.permissionPrompt().?.text);
 }

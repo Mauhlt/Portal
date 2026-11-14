@@ -125,7 +125,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
 
     // An unknown tool: a fixed phrase, never its name.
     _ = hook(h, dir, key, "{\"hook_event_name\":\"PermissionRequest\",\"tool_name\":\"mcp__secretsrv__exfil_tool\"}");
-    _ = r.check("an unknown tool's card says \"use a tool\", never the name", v.waitText("Claude wants to use a tool. Allow it?", 1, 5000) and v.countText("exfil") == 0 and v.countText("secretsrv") == 0, "", .{});
+    _ = r.check("an unknown tool's card says \"use a tool\", never the name, and offers no Yes = 1 (its first choice may be more than a plain yes)", v.waitText("Claude wants to use a tool. The terminal shows the choices.", 1, 5000) and v.countText("exfil") == 0 and v.countText("secretsrv") == 0, "", .{});
     _ = hook(h, dir, key, "{\"hook_event_name\":\"Stop\"}");
     _ = r.check("Stop again: done", tabsWith(v, "done", 2, 5000), "{s}", .{lastTabs(v)});
 

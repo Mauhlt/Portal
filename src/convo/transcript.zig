@@ -182,6 +182,19 @@ pub fn oneLiner(buf: []u8, cat: Category, tool: []const u8, calls: u32, files: u
     return s catch "Used a tool";
 }
 
+/// Whether the agent's permission prompt for a tool of this category
+/// has a plain one-time Yes as its first choice, so `1` allows only this
+/// one use: editing, reading, searching, running a command, a web fetch.
+/// Anything else (an unknown or MCP tool, leaving plan mode, whose first
+/// choice also turns on auto-accepting edits) is answered in the
+/// terminal, never with a one-swipe `1`.
+pub fn plainYes(cat: Category) bool {
+    return switch (cat) {
+        .edit, .read, .command, .search, .web => true,
+        .todo, .agent, .question, .other => false,
+    };
+}
+
 /// What the owner is asked to allow, for a permission prompt about a tool
 /// of this category ("Claude wants to <phrase>.").
 pub fn permissionPhrase(buf: []u8, cat: Category, tool: []const u8) []const u8 {

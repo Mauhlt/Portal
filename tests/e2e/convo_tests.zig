@@ -7,7 +7,8 @@
 //!   * tool use as one-liners, never arguments, results or thinking;
 //!   * a question with its options as answer keys, answered with `k:<key>`
 //!     (no new input power), then closed;
-//!   * a permission prompt (OSC 7501) as Yes/No, answered with `k:1`;
+//!   * a permission prompt reported only by OSC 7501 as a plain wait (no
+//!     Yes = 1: any program can print it), answered with `k:1`;
 //!   * the program reads exactly the answers sent: nothing before them,
 //!     nothing from viewers reconnecting or restarting (its e2e-input log);
 //!   * Portal starts the agent (here the fake, run as claude.exe) with
@@ -313,15 +314,18 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("the answered question closes; the reply follows (as convo+ appends)", closed and reply and c.appends > 0, "{s}", .{c.dump(&cdump)});
     }
 
-    // A permission prompt, known only from the program's OSC 7501 state.
+    // A permission prompt known only from the program's OSC 7501 state:
+    // any program in the tab can print that, so it is a plain wait (no
+    // Yes = 1 card); only an agent hook makes a permission card
+    // (hooks_tests.zig).
     _ = r.check("the fake program asks for permission", v.waitFor("FAKE-PERMISSION", 8000), "{s}", .{v.dump(&dump)});
-    const perm = "Claude wants to run a command. Allow it?";
+    const perm = "Claude is waiting for your answer. The terminal shows the question.";
     const got_perm = waitItem(v, .{ .gpa = gpa, .id = id, .kind = .question, .text = perm, .open = true }, 8000);
     {
         var c = try Conv.build(gpa, v, id);
         defer c.deinit();
         const p = c.find(.question, perm);
-        _ = r.check("a permission prompt becomes a question: Yes = 1, No = esc", got_perm and p != null and std.mem.eql(u8, p.?.options, "Yes=1;No=esc"), "{s}", .{c.dump(&cdump)});
+        _ = r.check("an OSC 7501 permission wait is a question without answer keys", got_perm and p != null and p.?.options.len == 0 and !c.has(.question, "Claude wants to run a command. Allow it?"), "{s}", .{c.dump(&cdump)});
     }
     // Viewers coming and going (a device reconnecting, a client
     // restarting: a fresh hello, the tab chosen again) send nothing.
@@ -338,7 +342,13 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     }
     v.send("k:1");
     _ = r.check("k:1 allows it (the program got 1)", v.waitFor("FAKE-ALLOWED", 8000), "{s}", .{v.dump(&dump)});
-    _ = r.check("the permission question closes", waitItem(v, .{ .gpa = gpa, .id = id, .kind = .question, .text = perm, .open = false }, 8000), "", .{});
+    _ = r.check("the waiting note goes once the program works again", v.pumpUntil(8000, Want{ .gpa = gpa, .id = id, .kind = .question, .text = perm }, struct {
+        fn f(wt: Want, vv: *client.Viewer) bool {
+            var c = Conv.build(wt.gpa, vv, wt.id) catch return false;
+            defer c.deinit();
+            return !c.has(wt.kind, wt.text);
+        }
+    }.f), "", .{});
     _ = r.check("the closing reply arrives", waitItem(v, .{ .gpa = gpa, .id = id, .kind = .assistant, .text = "All done." }, 8000), "", .{});
     // At the idle prompt (OSC 7501 idle, no open question) Up would recall
     // history: refused, and the viewer told why.

@@ -29,8 +29,10 @@ pub const max_tabs = 12;
 /// Longest name, in bytes (title.max_project_bytes on the server).
 pub const max_name = 64;
 
-/// What the session's program last reported (OSC 7501 "program status").
-/// Untrusted: it only changes a highlight, never what input is accepted.
+/// What the session's program last reported (OSC 7501 "program status", or
+/// an agent hook). Untrusted: it only changes a highlight, never what input
+/// is accepted (a `waiting` from OSC 7501 never makes a permission card:
+/// src/session.zig, oscWait).
 pub const State = enum {
     unknown,
     /// Busy (`working`).

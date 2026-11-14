@@ -7,8 +7,9 @@
 //! `hook_event_name`, and per event `tool_name` (PermissionRequest),
 //! `notification_type` (Notification), `agent_id` (SubagentStart,
 //! SubagentStop). PreToolUse's `tool_input.command` is read by the hook
-//! process only (elevation.zig) and never sent. Everything else (the prompt, tool
-//! input, messages, paths) is never read past the parser and never sent.
+//! process only (elevation.zig) and never sent; PermissionRequest's tool
+//! input travels only as a keyed hash (`input=`). Everything else (the
+//! prompt, messages, paths) is never read past the parser and never sent.
 //!
 //! The message (at most `max_message` bytes, ASCII lines):
 //!
@@ -21,6 +22,11 @@
 //!   error=rate_limit              (StopFailure only, and only this value:
 //!                                  the plan's limit, usage_desk.zig)
 //!   guard=marked|denied           (PreToolUse only: the admin-prompt guard)
+//!   input=<16 lower-case hex>     (PermissionRequest only: SipHash-2-4,
+//!                                  keyed with the tab's key, of the tool's
+//!                                  name and input, so the desk tells two
+//!                                  prompts apart without seeing either;
+//!                                  For you's card ids, foryou_desk.zig)
 //!
 //! Untrusted on both ends: the sender only sends enumerated event names
 //! and `[A-Za-z0-9_-]{1,64}` names; the receiver accepts only those, maps
@@ -114,6 +120,9 @@ pub const Message = struct {
     /// StopFailure because of the plan's rate limit (`error`: `rate_limit`).
     rate_limit: bool = false,
     guard: Guard = .none,
+    /// PermissionRequest: the keyed hash of the tool's name and input
+    /// (`inputHash`; 0: none).
+    input_hash: u64 = 0,
 
     pub fn tool(m: *const Message) []const u8 {
         return m.tool_buf[0..m.tool_len];
@@ -149,6 +158,7 @@ pub const Message = struct {
         if (m.agent_len > 0) wr.print("agent={s}\n", .{m.agent()}) catch unreachable;
         if (m.rate_limit) wr.writeAll("error=rate_limit\n") catch unreachable;
         if (m.guard != .none) wr.print("guard={t}\n", .{m.guard}) catch unreachable;
+        if (m.input_hash != 0) wr.print("input={x:0>16}\n", .{m.input_hash}) catch unreachable;
         return wr.buffered();
     }
 };
@@ -165,6 +175,7 @@ pub fn parse(text: []const u8) ?Message {
     var agent: []const u8 = "";
     var rate_limit = false;
     var guard: Guard = .none;
+    var input_hash: u64 = 0;
     while (it.next()) |line| {
         if (line.len == 0) continue;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse return null;
@@ -188,6 +199,10 @@ pub fn parse(text: []const u8) ?Message {
             rate_limit = std.mem.eql(u8, v, "rate_limit");
         } else if (std.mem.eql(u8, k, "guard")) {
             guard = std.meta.stringToEnum(Guard, v) orelse return null;
+        } else if (std.mem.eql(u8, k, "input")) {
+            if (v.len != 16) return null;
+            for (v) |c| if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return null;
+            input_hash = std.fmt.parseInt(u64, v, 16) catch return null;
         } // unknown keys: ignored (a newer sender)
     }
     var m: Message = .{ .key = key orelse return null, .event = event orelse return null, .guard = guard };
@@ -195,7 +210,20 @@ pub fn parse(text: []const u8) ?Message {
     m.setNtype(ntype);
     m.setAgent(agent);
     m.rate_limit = rate_limit and m.event == .StopFailure;
+    if (m.event == .PermissionRequest) m.input_hash = input_hash;
     return m;
+}
+
+/// The keyed hash `input=` carries: SipHash-2-4 under the tab's key of
+/// the tool's name, a zero byte and its input as JSON. Never 0 (0 is
+/// "none").
+pub fn inputHash(key: Key, tool_name: []const u8, input_json: []const u8) u64 {
+    var h = std.crypto.auth.siphash.SipHash64(2, 4).init(&key);
+    h.update(tool_name);
+    h.update(&.{0});
+    h.update(input_json);
+    const v = h.finalInt();
+    return if (v == 0) 1 else v;
 }
 
 /// The sender's side: the agent's hook JSON (stdin) to a message, or
@@ -232,7 +260,11 @@ pub fn parseHook(scratch: std.mem.Allocator, key: Key, json: []const u8) ?Parsed
                 command = c.string;
             };
         },
-        .PermissionRequest => if (in.tool_name) |t| m.setTool(t),
+        .PermissionRequest => {
+            if (in.tool_name) |t| m.setTool(t);
+            const input: []const u8 = if (in.tool_input) |ti| std.json.Stringify.valueAlloc(scratch, ti, .{}) catch "" else "";
+            m.input_hash = inputHash(key, in.tool_name orelse "", input);
+        },
         // Only the plan's limit travels (the matcher's value): other
         // errors are just `error`.
         .StopFailure => m.rate_limit = if (in.@"error") |e| std.mem.eql(u8, e, "rate_limit") else false,
@@ -458,4 +490,30 @@ test "SubagentStart / SubagentStop: the agent id travels, nothing else; no state
     try testing.expect(fromHookJson(a, key, "{\"hook_event_name\":\"SubagentStop\"}") == null);
     try testing.expect(fromHookJson(a, key, "{\"hook_event_name\":\"SubagentStart\",\"agent_id\":\"../x\"}") == null);
     try testing.expect(parse("portal-hook-v1\ntab=02020202020202020202020202020202\nevent=SubagentStop\nagent=a/b\n") == null);
+}
+
+test "PermissionRequest: the input travels only as a keyed hash; it tells prompts apart" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key: Key = @splat(0x04);
+    const one = fromHookJson(a, key, "{\"hook_event_name\":\"PermissionRequest\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"zig build\"}}").?;
+    const same = fromHookJson(a, key, "{\"hook_event_name\":\"PermissionRequest\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"zig build\"}}").?;
+    const other = fromHookJson(a, key, "{\"hook_event_name\":\"PermissionRequest\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"zig build e2e\"}}").?;
+    const plan = fromHookJson(a, key, "{\"hook_event_name\":\"PermissionRequest\",\"tool_name\":\"ExitPlanMode\",\"tool_input\":{\"command\":\"zig build\"}}").?;
+    try testing.expect(one.input_hash != 0);
+    try testing.expectEqual(one.input_hash, same.input_hash);
+    try testing.expect(one.input_hash != other.input_hash);
+    try testing.expect(one.input_hash != plan.input_hash);
+    // Another tab's key: another hash for the same input.
+    const k2 = fromHookJson(a, @splat(0x05), "{\"hook_event_name\":\"PermissionRequest\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"zig build\"}}").?;
+    try testing.expect(one.input_hash != k2.input_hash);
+    var buf: [max_message]u8 = undefined;
+    const text = one.format(&buf);
+    try testing.expect(std.mem.indexOf(u8, text, "zig build") == null);
+    try testing.expectEqual(one.input_hash, parse(text).?.input_hash);
+    // Only on PermissionRequest, and only 16 lower-case hex digits.
+    try testing.expectEqual(@as(u64, 0), parse("portal-hook-v1\ntab=04040404040404040404040404040404\nevent=Stop\ninput=00000000000000ff\n").?.input_hash);
+    try testing.expect(parse("portal-hook-v1\ntab=04040404040404040404040404040404\nevent=PermissionRequest\ninput=FF\n") == null);
+    try testing.expect(parse("portal-hook-v1\ntab=04040404040404040404040404040404\nevent=PermissionRequest\ninput=00000000000000FF\n") == null);
 }

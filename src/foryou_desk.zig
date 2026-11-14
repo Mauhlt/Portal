@@ -7,8 +7,13 @@
 //!   * the agent's last reply (its texts from the Conversation view,
 //!     already scrubbed) -> suggestions (foryou_extract.zig), shown only
 //!     while the turn is over (the program neither works nor waits);
-//!   * the program waiting on a permission prompt -> `waiting_permission`
-//!     at the top (yes = `1`, no = `esc`, as the permission card);
+//!   * the program waiting on a permission prompt (an agent hook's
+//!     PermissionRequest or permission notification; never OSC 7501,
+//!     session.oscWait) -> at the top, `waiting_permission` (yes = `1`,
+//!     no = `esc`, as the permission card) when the prompt's tool makes
+//!     `1` a plain one-time yes (transcript.plainYes), else `needs_desk`:
+//!     a device can't answer it (leaving plan mode's `1` also turns on
+//!     auto-accepting edits);
 //!   * the admin-prompt guard (PreToolUse, `guard=marked`) -> `needs_desk`
 //!     until the command's result or the turn's end;
 //!   * a shell command (PreToolUse) running `long_running_ms` with no new
@@ -21,13 +26,16 @@
 //! dismissed is gone for every device (one list per tab, not per device)
 //! and stays gone while the reply that made it is the last one; a
 //! permission prompt, admin prompt or long run that comes again is a new
-//! card (each has its own sequence number in its signature).
+//! card (each has its own sequence number in its signature; a permission
+//! prompt's also counts every permission hook and every new tool call,
+//! and holds a hash of the hook's tool name and input).
 
 const std = @import("std");
 const Io = std.Io;
 const foryou = @import("shared").foryou;
 const extract = @import("foryou_extract.zig");
 const ratelimit = @import("ratelimit.zig");
+const Permission = @import("convo/model.zig").Permission;
 
 pub const Item = foryou.Item;
 pub const Names = extract.Names;
@@ -43,6 +51,7 @@ pub const needs_desk_why = "The agent ran a command that asks for elevation; onl
 pub const long_running_text = "A command has been running for over 3 minutes.";
 pub const long_running_why = "No new output from the agent since it started.";
 pub const permission_text = "Claude is waiting for your permission.";
+pub const permission_desk_why = "Its first choice may do more than allow this once: answer it in the terminal or at the desk.";
 
 /// What a hook or the transcript says about the tab's shell commands.
 pub const Event = union(enum) {
@@ -55,10 +64,16 @@ pub const Event = union(enum) {
     /// The turn ended or a new one began (Stop, StopFailure, SessionEnd,
     /// UserPromptSubmit).
     turn_end,
+    /// A permission hook (PermissionRequest, Notification
+    /// permission_prompt): a prompt, maybe another one than before;
+    /// `key` hashes the hook's tool name and input (0: none).
+    permission: struct { key: u64 },
 };
 
 pub const State = struct {
     list: foryou.List = .{},
+    /// Each card's signature as it was made (sigOf then).
+    sigs: [foryou.max_items]u64 = undefined,
     /// The hub's For-you generation when `list` last changed (writers send
     /// the tabs changed since they last looked).
     gen: u64 = 0,
@@ -78,6 +93,11 @@ pub const State = struct {
     perm_buf: [foryou.max_summary]u8 = undefined,
     perm_len: u8 = 0,
     perm_seq: u32 = 0,
+    /// The prompt offers a plain one-time Yes (Permission.plain), the
+    /// tool call it is about, and the last permission hook's key.
+    perm_plain: bool = false,
+    perm_tool: u64 = 0,
+    perm_key: u64 = 0,
     /// The admin-prompt guard marked the running command.
     needs_desk: bool = false,
     desk_seq: u32 = 0,
@@ -105,12 +125,18 @@ pub const State = struct {
     }
 
     /// The program's state: `busy` (working, or waiting on anything), and
-    /// whether that wait is a permission prompt (its question's text).
-    pub fn setProgram(s: *State, busy: bool, permission: bool, text: ?[]const u8) void {
+    /// whether that wait is a permission prompt (a hook's: Session.wait),
+    /// with the question the Conversation view asked for it (null: none
+    /// yet, so a device can't answer it).
+    pub fn setProgram(s: *State, busy: bool, permission: bool, prompt: ?Permission) void {
         s.busy = busy;
         if (permission and !s.permission) s.perm_seq +%= 1;
+        const tool: u64 = if (prompt) |p| p.tool else 0;
+        if (permission and tool != 0 and tool != s.perm_tool) s.perm_seq +%= 1;
+        s.perm_tool = tool;
         s.permission = permission;
-        const t = text orelse permission_text;
+        s.perm_plain = if (prompt) |p| p.plain else false;
+        const t = if (prompt) |p| p.text else permission_text;
         const n = @min(t.len, s.perm_buf.len);
         @memcpy(s.perm_buf[0..n], t[0..n]);
         s.perm_len = @intCast(n);
@@ -148,6 +174,11 @@ pub const State = struct {
                 s.long_deadline = null;
                 s.long_fired = false;
                 s.needs_desk = false;
+                return false;
+            },
+            .permission => |p| {
+                s.perm_seq +%= 1;
+                s.perm_key = p.key;
                 return false;
             },
         }
@@ -190,19 +221,51 @@ pub const State = struct {
     pub fn take(s: *const State, id: foryou.Id) ?Taken {
         const i = s.list.find(id) orelse return null;
         const it = &s.list.items[i];
-        return .{ .item = it.*, .sig = s.sigOf(it) };
+        return .{ .item = it.*, .sig = s.sigs[i] };
+    }
+
+    /// Takes card `id` for one answer: it is gone (dismissed) at once,
+    /// under the same lock as the lookup, so a second answer to it finds
+    /// nothing (`stale`). `restore` puts it back if the answer could not
+    /// be delivered. Null if `id` is not current.
+    pub fn claim(s: *State, io: Io, id: foryou.Id) ?Taken {
+        const tk = s.take(id) orelse return null;
+        _ = s.dismiss(io, tk.sig);
+        return tk;
+    }
+
+    /// Card `sig` (claimed) comes back. True if the list changed.
+    pub fn restore(s: *State, io: Io, sig: u64) bool {
+        const i = for (s.dismissed[0..s.n_dismissed], 0..) |d, k| {
+            if (d == sig) break k;
+        } else return false;
+        std.mem.copyForwards(u64, s.dismissed[i .. s.n_dismissed - 1], s.dismissed[i + 1 .. s.n_dismissed]);
+        s.n_dismissed -= 1;
+        return s.rebuild(io);
+    }
+
+    /// The `needs_desk` card made for a permission prompt a device can't
+    /// answer (its why line says so), not the admin-prompt guard's.
+    fn permissionDesk(it: *const Item) bool {
+        return it.kind == .needs_desk and std.mem.eql(u8, it.why(), permission_desk_why);
     }
 
     fn sigOf(s: *const State, it: *const Item) u64 {
         var h = std.hash.Wyhash.init(0x1d);
         h.update(&.{@intFromEnum(it.kind)});
-        const seq: u32 = switch (it.kind) {
-            .waiting_permission => s.perm_seq,
+        const perm = it.kind == .waiting_permission or permissionDesk(it);
+        const seq: u32 = if (perm) s.perm_seq else switch (it.kind) {
             .needs_desk => s.desk_seq,
             .long_running => s.long_seq,
             else => 0,
         };
         h.update(std.mem.asBytes(&seq));
+        // A permission prompt: also which tool call and which hook (tool
+        // name and input), whatever the (cut) summary says.
+        if (perm) {
+            h.update(std.mem.asBytes(&s.perm_key));
+            h.update(std.mem.asBytes(&s.perm_tool));
+        }
         for ([_][]const u8{ it.summary(), it.cmd(), it.why(), it.project() }) |f| {
             h.update(f);
             h.update(&.{0});
@@ -226,8 +289,9 @@ pub const State = struct {
             }
         };
         if (s.permission) {
-            var it: Item = .{ .kind = .waiting_permission };
+            var it: Item = .{ .kind = if (s.perm_plain) .waiting_permission else .needs_desk };
             it.setSummary(s.perm_buf[0..s.perm_len]);
+            if (!s.perm_plain) it.setWhy(permission_desk_why);
             Add.add(s, &want, &n, it);
         }
         if (s.needs_desk) {
@@ -246,12 +310,15 @@ pub const State = struct {
             for (s.sugg.slice()) |it| if (it.kind == .answer) Add.add(s, &want, &n, it);
             for (s.sugg.slice()) |it| if (it.kind != .answer) Add.add(s, &want, &n, it);
         }
-        // Ids: kept for a card that is the same, new otherwise.
+        // Ids: kept for a card that is the same (its signature as it was
+        // made: a prompt counted since is another card), new otherwise.
         var changed = n != s.list.len;
+        var sigs: [foryou.max_items]u64 = undefined;
         for (want[0..n], 0..) |*it, i| {
             const sig = s.sigOf(it);
+            sigs[i] = sig;
             var id: ?foryou.Id = null;
-            for (s.list.slice()) |*old| if (s.sigOf(old) == sig) {
+            for (s.list.slice(), 0..) |*old, k| if (s.sigs[k] == sig) {
                 id = old.id;
                 break;
             };
@@ -260,6 +327,7 @@ pub const State = struct {
         }
         if (!changed) return false;
         @memcpy(s.list.items[0..n], want[0..n]);
+        @memcpy(s.sigs[0..n], sigs[0..n]);
         s.list.len = n;
         return true;
     }
@@ -331,6 +399,10 @@ pub const Watcher = struct {
 const testing = std.testing;
 const tio = testing.io;
 
+fn plainPerm(text: []const u8) Permission {
+    return .{ .text = text, .plain = true, .tool = 0 };
+}
+
 fn kinds(s: *const State, buf: []u8) []const u8 {
     var n: usize = 0;
     for (s.list.slice()) |*it| {
@@ -358,7 +430,7 @@ test "waiting cards first; suggestions only once the turn is over" {
     var b: [16]u8 = undefined;
     try testing.expectEqualStrings("AR", kinds(&s, &b));
     // A permission prompt: on top, the suggestions wait.
-    s.setProgram(true, true, "Claude wants to run a command. Allow it?");
+    s.setProgram(true, true, plainPerm("Claude wants to run a command. Allow it?"));
     _ = s.event(.{ .pre_tool = .{ .marked = true } }, 0);
     try testing.expect(s.rebuild(tio));
     try testing.expectEqualStrings("WD", kinds(&s, &b));
@@ -385,12 +457,12 @@ test "ids: kept while a card stays, new when it changes; stale ids refused" {
     try testing.expect(!std.mem.eql(u8, &id1, &s.list.items[0].id));
     try testing.expect(s.take(id1) == null);
     // A second permission prompt with the same text is a new card.
-    s.setProgram(true, true, "Allow?");
+    s.setProgram(true, true, plainPerm("Allow?"));
     _ = s.rebuild(tio);
     const p1 = s.list.items[0].id;
     s.setProgram(false, false, null);
     _ = s.rebuild(tio);
-    s.setProgram(true, true, "Allow?");
+    s.setProgram(true, true, plainPerm("Allow?"));
     _ = s.rebuild(tio);
     try testing.expect(!std.mem.eql(u8, &p1, &s.list.items[0].id));
 }
@@ -454,4 +526,60 @@ test "every card is valid and carries no scrubbed path" {
     _ = s.rebuild(tio);
     try testing.expectEqual(@as(usize, 1), s.list.len);
     for (s.list.slice()) |*it| try testing.expect(it.valid());
+}
+
+test "a permission prompt whose 1 is not a plain yes is a needs-desk card" {
+    var s: State = .{};
+    s.setProgram(true, true, .{ .text = "Claude wants to use a tool. The terminal shows the choices.", .plain = false, .tool = 7 });
+    _ = s.rebuild(tio);
+    var b: [16]u8 = undefined;
+    try testing.expectEqualStrings("D", kinds(&s, &b));
+    try testing.expectEqualStrings(permission_desk_why, s.list.items[0].why());
+    try testing.expect(s.list.needsDesk());
+    try testing.expectEqual(foryou.Effect.dismiss, s.list.items[0].kind.effect(.yes));
+    // No prompt known yet (a hook's wait, the question not asked): the
+    // same, never a `1`.
+    s.setProgram(true, true, null);
+    _ = s.rebuild(tio);
+    try testing.expectEqualStrings("D", kinds(&s, &b));
+    // With the admin-prompt guard's card too: two cards, each its own.
+    _ = s.event(.{ .pre_tool = .{ .marked = true } }, 0);
+    _ = s.rebuild(tio);
+    try testing.expectEqualStrings("DD", kinds(&s, &b));
+}
+
+test "permission ids: every hook and every new tool call is a new card" {
+    var s: State = .{};
+    s.setProgram(true, true, .{ .text = "Allow?", .plain = true, .tool = 1 });
+    _ = s.rebuild(tio);
+    const a = s.list.items[0].id;
+    // The same prompt, rebuilt: the same card.
+    s.setProgram(true, true, .{ .text = "Allow?", .plain = true, .tool = 1 });
+    try testing.expect(!s.rebuild(tio));
+    // Another tool call with the same text, no state change between.
+    s.setProgram(true, true, .{ .text = "Allow?", .plain = true, .tool = 2 });
+    _ = s.rebuild(tio);
+    const b = s.list.items[0].id;
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+    // Another permission hook (same tool name, other input): new again.
+    _ = s.event(.{ .permission = .{ .key = 0xabc } }, 0);
+    _ = s.rebuild(tio);
+    try testing.expect(!std.mem.eql(u8, &b, &s.list.items[0].id));
+    try testing.expect(s.take(b) == null);
+}
+
+test "claim: one answer per card; restored when it could not be delivered" {
+    var s: State = .{};
+    s.setReply(&.{"Run `zig build test`."}, .{});
+    _ = s.rebuild(tio);
+    const id = s.list.items[0].id;
+    const tk = s.claim(tio, id).?;
+    // Gone at once: a second answer finds nothing.
+    try testing.expect(s.claim(tio, id) == null);
+    try testing.expectEqual(@as(usize, 0), s.list.len);
+    // Not delivered: back (a new id: devices see it again).
+    try testing.expect(s.restore(tio, tk.sig));
+    try testing.expectEqual(@as(usize, 1), s.list.len);
+    try testing.expectEqualStrings("zig build test", s.list.items[0].cmd());
+    try testing.expect(!s.restore(tio, tk.sig));
 }

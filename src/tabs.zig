@@ -407,7 +407,7 @@ pub const Tab = struct {
         };
         t.foryou.setReply(t.convo.lastReply(&reply), .{ .tabs = open[0..h.n], .startable = startable[0..ns], .own = t.name() });
         const st = t.session.state;
-        t.foryou.setProgram(st == .working or st == .waiting, st == .waiting and t.session.wait == .permission, t.convo.permissionQuestion());
+        t.foryou.setProgram(st == .working or st == .waiting, st == .waiting and t.session.wait == .permission, t.convo.permissionPrompt());
         if (t.foryou.rebuild(h.io)) {
             h.foryou_gen +%= 1;
             t.foryou.gen = h.foryou_gen;
@@ -437,16 +437,21 @@ pub const Tab = struct {
         }
     }
 
-    /// Card `sig` was answered or dismissed (foryou_ws.zig): gone for
-    /// every device.
-    pub fn forYouDismiss(t: *Tab, sig: u64) void {
+    /// Caller holds hub.mutex: the tab's cards changed (a card claimed
+    /// for an answer, foryou_ws.zig); viewers send them. Wake them after
+    /// unlocking (Hub.broadcast).
+    pub fn forYouChangedLocked(t: *Tab) void {
+        t.hub.foryou_gen +%= 1;
+        t.foryou.gen = t.hub.foryou_gen;
+    }
+
+    /// Card `sig`, claimed for an answer that could not be delivered
+    /// (foryou_ws.zig), comes back for every device.
+    pub fn forYouRestore(t: *Tab, sig: u64) void {
         const h = t.hub;
         h.mutex.lockUncancelable(h.io);
-        const changed = t.foryou.dismiss(h.io, sig);
-        if (changed) {
-            h.foryou_gen +%= 1;
-            t.foryou.gen = h.foryou_gen;
-        }
+        const changed = t.foryou.restore(h.io, sig);
+        if (changed) t.forYouChangedLocked();
         h.mutex.unlock(h.io);
         if (changed) {
             h.cond.broadcast(h.io);
@@ -1210,6 +1215,8 @@ pub const Hub = struct {
         }
         // Desktop log only: the tab's name (shown on the desk anyway),
         // the event and the new state; never the key or anything else.
+        // For you: every permission hook is a prompt of its own (a new card).
+        if (e.wait == .permission) t.forYouEvent(.{ .permission = .{ .key = m.input_hash } });
         if (t.session.setHookState(e)) h.log.print("hooks: tab '{s}': {t} -> {t}", .{ t.name(), m.event, stateOf(e.state) });
         // For you: a turn's end (or a new one) ends what ran.
         switch (m.event) {

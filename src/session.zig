@@ -46,7 +46,8 @@ pub const Session = struct {
     closed: bool = false,
     exit_code: u32 = 0,
     /// The program's state: from OSC 7501 (term.program_state) or from
-    /// an agent hook (setHookState), whichever changed last; and the
+    /// an agent hook (setHookState), whichever changed last (a `wait` of
+    /// `.permission` only ever from a hook: oscWait); and the
     /// tab list's generation, bumped when it changes (tabs.Hub.gen; null
     /// outside a hub).
     state: vt.ProgramState = .unknown,
@@ -108,7 +109,7 @@ pub const Session = struct {
             s.osc_state = s.term.program_state;
             s.osc_kind = s.term.program_kind;
             s.hook_state = false;
-            const wait: convo_model.Wait = if (s.osc_state != .waiting) .none else if (s.osc_kind == .permission) .permission else .other;
+            const wait = oscWait(s.osc_state, s.osc_kind, s.wait);
             _ = s.setStateLocked(s.osc_state, wait);
         }
         s.mutex.unlock(s.io);
@@ -412,6 +413,26 @@ pub const LocalInput = struct {
         }
     }
 };
+
+/// What an OSC 7501 report means for `Session.wait`. Any program in the
+/// tab can print one (shared/tabs.zig: untrusted, a highlight only), so
+/// `blocked` is never a permission prompt of its own: that is `.other` (a
+/// question without answer keys). A permission prompt comes only from an
+/// agent hook (setHookState); one already known stays while the program
+/// also reports `kind=permission`.
+pub fn oscWait(state: vt.ProgramState, kind: vt.ProgramKind, current: convo_model.Wait) convo_model.Wait {
+    if (state != .waiting) return .none;
+    if (kind == .permission and current == .permission) return .permission;
+    return .other;
+}
+
+test "oscWait: OSC 7501 never makes a permission prompt" {
+    try std.testing.expectEqual(convo_model.Wait.other, oscWait(.waiting, .permission, .none));
+    try std.testing.expectEqual(convo_model.Wait.other, oscWait(.waiting, .permission, .other));
+    try std.testing.expectEqual(convo_model.Wait.permission, oscWait(.waiting, .permission, .permission));
+    try std.testing.expectEqual(convo_model.Wait.other, oscWait(.waiting, .none, .permission));
+    try std.testing.expectEqual(convo_model.Wait.none, oscWait(.working, .permission, .permission));
+}
 
 /// Gap enforced after a web Esc before the next web input is written.
 pub const esc_gap_ms: i64 = 50;
