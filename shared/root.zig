@@ -21,6 +21,10 @@
 //!   activity background tasks and token usage per tab (activity message)
 //!   sysinfo  the optional system monitor's numbers (sys message)
 //!   subtabs  subagent sub-tabs of the tab watched (subtabs message, a: frame)
+//!   transport the stream seam (OS sockets or the in-process tunnel) under
+//!            the HTTPS/WSS server and client, and an in-memory network
+//!            for tests
+//!   tunnelnet the in-process tunnel's addresses and ports (one definition)
 //!
 //! Zig analyses only what a build references, so the browser build only
 //! compiles what it uses (it must stay wasm32-freestanding clean).
@@ -37,6 +41,8 @@ pub const pairqr = @import("pairqr.zig");
 pub const activity = @import("activity.zig");
 pub const sysinfo = @import("sysinfo.zig");
 pub const subtabs = @import("subtabs.zig");
+pub const transport = @import("transport.zig");
+pub const tunnelnet = @import("tunnelnet.zig");
 
 test {
     _ = screen;
@@ -51,4 +57,6 @@ test {
     _ = activity;
     _ = sysinfo;
     _ = subtabs;
+    _ = transport;
+    _ = tunnelnet;
 }
