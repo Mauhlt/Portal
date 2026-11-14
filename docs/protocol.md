@@ -330,9 +330,12 @@ ITEM = {"n":<u32>,"k":"<kind>","text":"<text>"
   injected context. Subagents' conversations are never mixed in: each
   is its own read-only sub-tab (section 3e). Every text is scrubbed on the
   desktop: the tab's folder becomes the tab's name (`acme\src\a.zig`),
-  any other absolute path becomes `[path]` (drive, UNC, `\\?\`, POSIX,
-  `file://`, `~/`, `%VAR%\`, `$HOME/`, URL-encoded), the user's name
-  `[user]` (docs/tabs-design.md, privacy rule 1).
+  the home folder (%USERPROFILE%, its 8.3 form, OneDrive) `[home]`, any
+  other absolute path `[path]` (drive, also glued to a word or with
+  spaces, drive-relative, UNC, `\\?\`, `\Users\`, POSIX, `file://`,
+  `smb://`, `~/`, `%VAR%\`, `$HOME/`, URL-encoded once or twice), the
+  user's names (%USERNAME%, the home folder's name, their parts; any
+  case) `[user]` (docs/tabs-design.md, privacy rule 1).
 * **Answering adds no input power.** An option's `key` is one of the
   answer keys (`0`…`9`, `y`, `n`, `enter`, `esc`); answering is sending
   `k:<key>` exactly as the answer buttons do, under the same input mode
