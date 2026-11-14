@@ -65,7 +65,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const base = base_buf[0..base_in.len];
     @memcpy(base, base_in);
     // conhost's DA1 reply (`ESC [ ? ... c`) may come first; then exactly the reply.
-    const da_end = if (std.mem.startsWith(u8, base, "\x1b[?")) (std.mem.indexOfScalar(u8, base, 'c') orelse base.len - 1) + 1 else 0;
+    const da_end = if (std.mem.startsWith(u8, base, "\x1b[?")) (std.mem.indexOfScalar(u8, base, 'c') orelse (base.len - 1)) + 1 else 0;
     _ = r.check("the program read exactly ESC ] 7501 ; ? BEL, once (besides conhost's DA reply)", std.mem.eql(u8, base[da_end..], reply), "{x}", .{base});
 
     // A device can neither send the probe's reply nor make Portal send one.

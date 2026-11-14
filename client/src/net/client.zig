@@ -744,9 +744,9 @@ pub const Client = struct {
         while (true) {
             // Drain complete frames.
             while (true) {
-                const frame = ws.parseServerFrame(buf.items, max_frame_payload) catch |err| {
+                const frame = (ws.parseServerFrame(buf.items, max_frame_payload) catch |err| {
                     return .{ .failed = @errorName(err) };
-                } orelse break;
+                }) orelse break;
                 if (c.handleFrame(frame, backoff)) |r| return r;
                 const used = frame.len;
                 std.mem.copyForwards(u8, buf.items[0 .. buf.items.len - used], buf.items[used..]);

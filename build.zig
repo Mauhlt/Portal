@@ -531,7 +531,11 @@ fn uiModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
 /// remote viewer behind `portal connect`) to `mod`.
 fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inputrules: *std.Build.Module) GuiModules {
     const renderer = rendererDep(b, target, optimize);
-    const link_libc = target.result.os.tag != .windows; // dlopen off Windows
+    // dlopen off Windows. On Windows left unset rather than false: Zig
+    // 0.18.0-dev.1005 rejects a module with link_libc = false in a
+    // compilation where another module links libc (stt's translate-c'd
+    // QNN headers on x86_64 Windows), and false never kept libc out.
+    const link_libc: ?bool = if (target.result.os.tag != .windows) true else null;
     const img = imageModules(b, target, optimize);
     const shared = sharedModule(b, target, optimize);
     const ui = uiModule(b, target, optimize, inputrules);

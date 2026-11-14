@@ -157,7 +157,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         try std.Io.Dir.cwd().createDirPath(h.io, src);
         const big = try gpa.alloc(u8, 50 << 20);
         defer gpa.free(big);
-        for (big, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 7);
+        for (big, 0..) |*b, i| b.* = @truncate((i *% 2654435761) >> 7);
         const fpath = try std.fmt.allocPrint(gpa, "{s}\\model.bin", .{src});
         try std.Io.Dir.cwd().writeFile(h.io, .{ .sub_path = fpath, .data = big });
         const p = try inst.cli(&.{ "publish", "stt-model", src, "--kind", "data", "--version", "1.0" });

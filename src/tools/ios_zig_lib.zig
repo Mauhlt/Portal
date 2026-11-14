@@ -11,7 +11,7 @@
 //! every Darwin target, so no iOS program using std.Io compiles. The fix
 //! keeps only wasi on the fd-less struct. If a newer Zig no longer has the
 //! line, the copy is made unchanged and a note says so (drop this helper
-//! then). Report upstream.
+//! then). Zig 0.18.0-dev.1005 has the fix upstream: the copy is unchanged.
 //!
 //! Only what an iOS build needs is copied (std, compiler_rt, the Darwin
 //! libc stubs and headers): the other targets' libc sources stay behind.

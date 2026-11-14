@@ -1,7 +1,7 @@
 .{
     .name = .Portal,
     .version = "0.0.1",
-    .minimum_zig_version = "0.18.0-dev.4+5a23bf4b2",
+    .minimum_zig_version = "0.18.0-dev.1005+75d48dfff",
     .paths = .{""},
     .fingerprint = 0xc0296c6a8828e98,
     .dependencies = .{

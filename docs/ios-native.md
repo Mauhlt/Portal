@@ -242,6 +242,8 @@ of overriding the panic handler (which would still leave std.Io broken),
 with that one line fixed (src/tools/ios_zig_lib.zig, made and cached by
 the build). With it the app and the extension keep std's default panic
 handler. When Zig fixes it upstream the tool copies unchanged and says so.
+Zig 0.18.0-dev.1005 has the fix (only wasi, tvOS and watchOS keep the
+fd-less `NullFile`), so the copy is now unchanged and the helper can go.
 
 ## Build, sign, install (owner's Mac)
 

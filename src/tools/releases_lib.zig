@@ -45,7 +45,7 @@ fn isVersionChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '.' or c == '+' or c == '-';
 }
 
-/// The zig version part of a valid id ("0.18.0-dev.4+5a23bf4b2").
+/// The zig version part of a valid id ("0.18.0-dev.1005+75d48dfff").
 pub fn zigVersionOf(id: []const u8) []const u8 {
     std.debug.assert(isValidId(id));
     return id[stamp_len + zig_marker.len ..];
@@ -232,7 +232,7 @@ pub fn fromFileTime(ft: u64) DateTime {
         .month = @intCast(m),
         .day = @intCast(d),
         .hour = @intCast(sod / 3600),
-        .minute = @intCast(sod / 60 % 60),
+        .minute = @intCast((sod / 60) % 60),
         .second = @intCast(sod % 60),
         .ticks = @intCast(ft % ticks_per_second),
     };
