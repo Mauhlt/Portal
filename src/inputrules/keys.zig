@@ -59,12 +59,12 @@ pub const Key = struct { name: []const u8, bytes: []const u8 };
 /// prompts. No arrows or Backspace in `keys` (Up+Enter at an empty prompt
 /// would resubmit an earlier prompt from history).
 pub const answer_keys = [_]Key{
-    .{ .name = "0", .bytes = "0" }, .{ .name = "1", .bytes = "1" },
-    .{ .name = "2", .bytes = "2" }, .{ .name = "3", .bytes = "3" },
-    .{ .name = "4", .bytes = "4" }, .{ .name = "5", .bytes = "5" },
-    .{ .name = "6", .bytes = "6" }, .{ .name = "7", .bytes = "7" },
-    .{ .name = "8", .bytes = "8" }, .{ .name = "9", .bytes = "9" },
-    .{ .name = "y", .bytes = "y" },     .{ .name = "n", .bytes = "n" },
+    .{ .name = "0", .bytes = "0" },      .{ .name = "1", .bytes = "1" },
+    .{ .name = "2", .bytes = "2" },      .{ .name = "3", .bytes = "3" },
+    .{ .name = "4", .bytes = "4" },      .{ .name = "5", .bytes = "5" },
+    .{ .name = "6", .bytes = "6" },      .{ .name = "7", .bytes = "7" },
+    .{ .name = "8", .bytes = "8" },      .{ .name = "9", .bytes = "9" },
+    .{ .name = "y", .bytes = "y" },      .{ .name = "n", .bytes = "n" },
     .{ .name = "enter", .bytes = "\r" }, .{ .name = "esc", .bytes = "\x1b" },
 };
 

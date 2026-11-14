@@ -12,7 +12,7 @@ pub const Channels = enum(u8) { rgb = 3, rgba = 4 };
 /// the alpha channel is dropped (the caller makes the pixels opaque).
 pub fn encode(gpa: std.mem.Allocator, px: []const u8, w: u32, h: u32, ch: Channels) ![]u8 {
     std.debug.assert(px.len == @as(usize, w) * h * 4);
-    const bpp: usize = @intFromEnum(ch);
+    const bpp: usize = @backingInt(ch);
     const stride = bpp * w;
     // Filtered scanlines: one filter byte + the row.
     const raw = try gpa.alloc(u8, (1 + stride) * h);

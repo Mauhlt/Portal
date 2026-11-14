@@ -155,7 +155,7 @@ fn timestamp(io: Io, out: []u8) []const u8 {
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
     return std.fmt.bufPrint(out, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-        yd.year,                   md.month.numeric(),      @as(u32, md.day_index) + 1,
+        yd.year,              md.month.numeric(),      @as(u32, md.day_index) + 1,
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     }) catch out[0..0];
 }

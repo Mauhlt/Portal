@@ -165,13 +165,13 @@ pub const Writer = struct {
         if (year >= 10000) return error.DerBadTime;
         if (year < 2050) {
             const s = std.fmt.bufPrint(&buf, "{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}Z", .{
-                year % 100, md.month.numeric(), @as(u32, md.day_index) + 1,
+                year % 100,           md.month.numeric(),      @as(u32, md.day_index) + 1,
                 ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
             }) catch unreachable;
             return d.tlv(Tag.utc_time, s);
         }
         const s = std.fmt.bufPrint(&buf, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}Z", .{
-            year, md.month.numeric(), @as(u32, md.day_index) + 1,
+            year,                 md.month.numeric(),      @as(u32, md.day_index) + 1,
             ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
         }) catch unreachable;
         return d.tlv(Tag.generalized_time, s);

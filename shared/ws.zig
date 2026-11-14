@@ -30,7 +30,7 @@ pub const Opcode = enum(u4) {
     _,
 
     pub fn isControl(op: Opcode) bool {
-        return @intFromEnum(op) >= 8;
+        return @backingInt(op) >= 8;
     }
 };
 
@@ -65,7 +65,7 @@ pub fn parseHeader(buf: []const u8, from: Sender, max_payload: usize) FrameError
     const b0 = buf[0];
     const b1 = buf[1];
     if (b0 & 0x70 != 0) return error.ProtocolError; // RSV bits: no extensions negotiated
-    const opcode: Opcode = @enumFromInt(@as(u4, @truncate(b0)));
+    const opcode: Opcode = @fromBackingInt(@intCast(@as(u4, @truncate(b0))));
     switch (opcode) {
         .text, .binary, .close, .ping, .pong => {},
         .continuation => return error.Fragmented,
@@ -124,7 +124,7 @@ pub fn applyMask(payload: []u8, mask: [4]u8) void {
 pub fn encodeHeader(out: *[max_header_len]u8, opcode: Opcode, payload_len: usize, mask: ?[4]u8) error{TooLarge}![]u8 {
     if (opcode.isControl() and payload_len > 125) return error.TooLarge;
     const m: u8 = if (mask != null) 0x80 else 0;
-    out[0] = 0x80 | @as(u8, @intFromEnum(opcode));
+    out[0] = 0x80 | @as(u8, @backingInt(opcode));
     var n: usize = 2;
     if (payload_len < 126) {
         out[1] = m | @as(u8, @intCast(payload_len));

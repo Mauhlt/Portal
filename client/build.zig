@@ -216,11 +216,14 @@ pub fn datafeedModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize:
 
 fn addClient(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
     const mods = modules(b, target, optimize);
-    return b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = target.result.os.tag != .windows, // libsecret / Security.framework via dlopen
-        .imports = mods.clientImports(),
-    }) });
+    return b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = target.result.os.tag != .windows, // libsecret / Security.framework via dlopen
+            .imports = mods.clientImports(),
+        }),
+    });
 }

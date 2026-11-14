@@ -121,7 +121,6 @@ test "longWide: absolute paths get the long-path prefix, normalised; others as t
     }
 }
 
-
 /// Replaces `final` with `data` atomically: written to a fresh temporary
 /// file next to it, flushed to disk, then renamed over it
 /// (MoveFileEx REPLACE_EXISTING | WRITE_THROUGH), so a reader or a crash

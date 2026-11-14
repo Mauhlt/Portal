@@ -557,7 +557,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
             gone_handled = true;
             if (platform.sync) {
                 sync_state.forget_gone.store(true, .release);
-                sync_state.pending.store(@intFromEnum(SyncState.Op.forget), .release);
+                sync_state.pending.store(@backingInt(SyncState.Op.forget), .release);
                 shared.sync_wake.set(io);
             } else {
                 var r = forgetDesktop(io, client.host());
@@ -690,8 +690,11 @@ const SyncState = struct {
         const host = s.client.host();
         // Right after pairing: pin the desktop's release key, over the
         // tunnel and the CA the first connection pinned.
-        if (s.shared.just_paired.load(.acquire)) if (s.client.pinReleaseKey()) |_| {} else |err|
-            std.debug.print("portal connect: no release key pinned ({t}); sync stays off until this device is paired again\n", .{err});
+        if (s.shared.just_paired.load(.acquire)) {
+            if (s.client.pinReleaseKey()) |_| {} else |err| {
+                std.debug.print("portal connect: no release key pinned ({t}); sync stays off until this device is paired again\n", .{err});
+            }
+        }
         const pinned = s.loadPin() orelse {
             s.mutex.lockUncancelable(s.io());
             s.ui.setNote("Sync is off for {s}: pair this device again to pin the desktop's release key.", .{host});
@@ -766,14 +769,14 @@ const SyncState = struct {
     fn performPending(s: *SyncState, allow_forget: bool) void {
         s.mutex.lockUncancelable(s.io());
         const raw = s.pending.load(.acquire);
-        if (raw == @intFromEnum(Op.forget) and !allow_forget) {
+        if (raw == @backingInt(Op.forget) and !allow_forget) {
             s.mutex.unlock(s.io());
             return;
         }
         _ = s.pending.swap(0, .acq_rel);
         const pkg = s.pending_pkg;
         s.mutex.unlock(s.io());
-        const op: Op = if (raw <= 3) @enumFromInt(raw) else return;
+        const op: Op = if (raw <= 3) @fromBackingInt(@intCast(raw)) else return;
         switch (op) {
             .none => return,
             .forget => {
@@ -839,7 +842,7 @@ const SyncState = struct {
             s.ui.setNote("Still busy with the last request; try again in a moment.", .{});
         } else {
             s.pending_pkg = pkg;
-            s.pending.store(@intFromEnum(op), .release);
+            s.pending.store(@backingInt(op), .release);
             switch (op) {
                 .rollback => s.ui.setNote("Rolling back {s}...", .{pkg.slice()}),
                 .revoke => s.ui.setNote("Revoking {s}...", .{pkg.slice()}),

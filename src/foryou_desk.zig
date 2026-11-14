@@ -252,7 +252,7 @@ pub const State = struct {
 
     fn sigOf(s: *const State, it: *const Item) u64 {
         var h = std.hash.Wyhash.init(0x1d);
-        h.update(&.{@intFromEnum(it.kind)});
+        h.update(&.{@backingInt(it.kind)});
         const perm = it.kind == .waiting_permission or permissionDesk(it);
         const seq: u32 = if (perm) s.perm_seq else switch (it.kind) {
             .needs_desk => s.desk_seq,

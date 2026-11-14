@@ -208,7 +208,7 @@ pub fn writeResponse(
     body: []const u8,
     keep_alive: bool,
 ) !void {
-    try w.print("HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(status), status.phrase() });
+    try w.print("HTTP/1.1 {d} {s}\r\n", .{ @backingInt(status), status.phrase() });
     for (headers) |h| {
         if (!headerSafe(h)) return error.UnsafeHeader;
         try w.print("{s}: {s}\r\n", .{ h.name, h.value });

@@ -125,8 +125,8 @@ pub fn fromU32(v: u32) Rgb {
 pub const ansi16 = blk: {
     const p = palette;
     const list = [16]Rgb{
-        p.bg,      p.red,        p.green,        p.yellow,        p.blue,        p.magenta,        p.cyan,        p.dim,
-        p.border,  p.red_warmer, p.green_cooler, p.yellow_warmer, p.blue_warmer, p.magenta_cooler, p.cyan_cooler, p.fg,
+        p.bg,     p.red,        p.green,        p.yellow,        p.blue,        p.magenta,        p.cyan,        p.dim,
+        p.border, p.red_warmer, p.green_cooler, p.yellow_warmer, p.blue_warmer, p.magenta_cooler, p.cyan_cooler, p.fg,
     };
     var out: [16]u32 = undefined;
     for (list, 0..) |c, i| out[i] = toU32(c);
@@ -170,8 +170,8 @@ pub const terminal: Terminal = .{};
 pub const accents = blk: {
     const p = palette;
     const list = [_]Rgb{
-        p.blue,        p.green,         p.yellow,      p.magenta,        p.cyan,        p.red,
-        p.blue_warmer, p.green_cooler,  p.yellow_warmer, p.magenta_cooler, p.cyan_cooler, p.red_warmer,
+        p.blue,        p.green,        p.yellow,        p.magenta,        p.cyan,        p.red,
+        p.blue_warmer, p.green_cooler, p.yellow_warmer, p.magenta_cooler, p.cyan_cooler, p.red_warmer,
     };
     var out: [list.len]u32 = undefined;
     for (list, 0..) |c, i| out[i] = toU32(c);

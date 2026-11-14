@@ -284,10 +284,10 @@ pub const Settings = struct {
 /// Speech limits that existed and were removed (2026-11-14 trim): ignored
 /// on load and not written back, so the next save drops them.
 const removed_speech_keys = [_][]const u8{
-    "transcribe_per_hour",       "feedback_per_hour",         "global_feedback_per_hour",
-    "global_kept_clips_per_day", "global_bundles_per_day",    "global_bundle_mib_per_day",
-    "slot_max_hold_s",           "slot_idle_s",               "slot_cooldown_s",
-    "malformed_strikes",         "malformed_window_min",      "bundles_per_day",
+    "transcribe_per_hour",       "feedback_per_hour",      "global_feedback_per_hour",
+    "global_kept_clips_per_day", "global_bundles_per_day", "global_bundle_mib_per_day",
+    "slot_max_hold_s",           "slot_idle_s",            "slot_cooldown_s",
+    "malformed_strikes",         "malformed_window_min",   "bundles_per_day",
 };
 
 fn removedSpeechKey(name: []const u8) bool {

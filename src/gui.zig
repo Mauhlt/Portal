@@ -703,7 +703,6 @@ pub const LocalHost = struct {
         h.p.setTitle(t);
     }
 
-
     // ------------------------------------------------------------ desk actions
 
     fn perform(h: *LocalHost, a: deskui.Action) void {
@@ -1351,8 +1350,6 @@ pub fn validEndpoint(text: []const u8) bool {
     _ = @import("WireGuard").device.config.Endpoint.parse(text) catch return false;
     return true;
 }
-
-
 
 test "validEndpoint" {
     try std.testing.expect(validEndpoint("home.example.org:51820"));

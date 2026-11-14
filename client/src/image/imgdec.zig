@@ -396,7 +396,7 @@ test "fuzz: mutated, truncated, split and odd-format PNGs never panic" {
         try seeds.append(gpa, try aw.toOwnedSlice());
     }
     const layouts = [_][3]u8{
-        .{ 1, 0, 0 }, .{ 2, 0, 1 }, .{ 4, 3, 0 }, .{ 8, 3, 1 }, .{ 16, 0, 0 }, .{ 16, 2, 1 },
+        .{ 1, 0, 0 }, .{ 2, 0, 1 },  .{ 4, 3, 0 }, .{ 8, 3, 1 }, .{ 16, 0, 0 }, .{ 16, 2, 1 },
         .{ 8, 4, 0 }, .{ 16, 6, 1 }, .{ 8, 2, 0 }, .{ 1, 3, 1 },
     };
     for (layouts) |l| {

@@ -47,4 +47,3 @@ test "head end, tokens, values" {
     try testing.expect(validValue("a b\tc") and validValue(""));
     try testing.expect(!validValue("a\r\nb") and !validValue("a\x00") and !validValue("\x7f"));
 }
-

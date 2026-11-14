@@ -316,7 +316,7 @@ pub fn withArgs(gpa: Allocator, line: []const u16, args: []const []const u8) ![:
     const batch_prefix = std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"");
     const batch = std.mem.startsWith(u16, line, batch_prefix) and line.len > batch_prefix.len and line[line.len - 1] == '"';
     const start = if (batch) batch_prefix.len else 0;
-    const cut = start + programEnd(line[start .. if (batch) line.len - 1 else line.len]);
+    const cut = start + programEnd(line[start..if (batch) line.len - 1 else line.len]);
     const out = try gpa.allocSentinel(u16, line.len + add_len, 0);
     @memcpy(out[0..cut], line[0..cut]);
     var at = cut;

@@ -414,11 +414,11 @@ test "fuzz: random, truncated, oversized and interleaved graphics never panic" {
     };
     defer for (pngs) |p| gpa.free(p);
     const pieces = [_][]const u8{
-        "\x1b_G",      "\x1b]7070;G", "a=T,f=100", "a=t,f=100,i=3", "a=p,i=3", "a=d,d=a", "m=1",
-        "m=0",         ";",           "AAAA",      "\x1b\\",        "\x07",    "\x18",    "\x1b[2J",
+        "\x1b_G",      "\x1b]7070;G", "a=T,f=100", "a=t,f=100,i=3", "a=p,i=3", "a=d,d=a",   "m=1",
+        "m=0",         ";",           "AAAA",      "\x1b\\",        "\x07",    "\x18",      "\x1b[2J",
         "\x1b[?1049h", "\x1b[?1049l", "\n",        "\r\n",          "text",    "\x1b[5;5H", "=",
-        "c=3,r=2",     "C=1",         ",",         "j=30,l=40",     "\x1bM",   "\x1b[3L", "\x1b[2M",
-        "\x1b[S",      "\x1b[T",      "\xff\xfe",  "\x1b[K",        "\x1b_",   "\x1b]",   "i=4294967295",
+        "c=3,r=2",     "C=1",         ",",         "j=30,l=40",     "\x1bM",   "\x1b[3L",   "\x1b[2M",
+        "\x1b[S",      "\x1b[T",      "\xff\xfe",  "\x1b[K",        "\x1b_",   "\x1b]",     "i=4294967295",
     };
     var seq: std.ArrayList(u8) = .empty;
     defer seq.deinit(gpa);

@@ -318,8 +318,8 @@ pub const DeskSpeech = struct {
                 }
             }
             const st = e.getStatus();
-            if (@intFromEnum(st.state) != s.last_state or st.busy != s.last_busy) changed = true;
-            s.last_state = @intFromEnum(st.state);
+            if (@backingInt(st.state) != s.last_state or st.busy != s.last_busy) changed = true;
+            s.last_state = @backingInt(st.state);
             s.last_busy = st.busy;
         };
         s.updateShell(sh);

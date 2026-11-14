@@ -61,7 +61,6 @@ pub const Response = struct {
     }
 };
 
-
 /// Where a response body goes: collected (bounded) or streamed to a sink.
 const BodyTarget = union(enum) {
     collect: usize,
@@ -356,5 +355,3 @@ fn approvedFor(opts: Options, m: *const manifest.Manifest, digest: [32]u8) bool 
     }
     return false;
 }
-
-

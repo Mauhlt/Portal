@@ -90,13 +90,12 @@ const shell_langs = [_][]const u8{ "sh", "bash", "shell", "console", "terminal",
 /// First words that make an unlabeled code block or a request's span a
 /// command.
 const command_words = [_][]const u8{
-    "zig",    "git",     "npm",    "npx",       "pnpm",   "yarn",   "node",   "cargo",  "go",
-    "python", "python3", "py",     "pip",       "pip3",   "make",   "cmake",  "ninja",  "dotnet",
-    "msbuild", "docker", "kubectl", "gh",       "deno",   "bun",    "mvn",    "gradle", "ruby",
-    "bundle", "rake",    "rustc",
-    "rustup", "portalctl", "portal", "winget",  "choco",  "scoop",  "uv",     "poetry", "pytest",
-    "jest",   "vitest",  "tsc",    "eslint",    "prettier", "terraform", "helm", "ls", "dir",
-    "cat",    "type",    "echo",   "cd",        "zvc",
+    "zig",     "git",     "npm",     "npx",    "pnpm",      "yarn",   "node",   "cargo",    "go",
+    "python",  "python3", "py",      "pip",    "pip3",      "make",   "cmake",  "ninja",    "dotnet",
+    "msbuild", "docker",  "kubectl", "gh",     "deno",      "bun",    "mvn",    "gradle",   "ruby",
+    "bundle",  "rake",    "rustc",   "rustup", "portalctl", "portal", "winget", "choco",    "scoop",
+    "uv",      "poetry",  "pytest",  "jest",   "vitest",    "tsc",    "eslint", "prettier", "terraform",
+    "helm",    "ls",      "dir",     "cat",    "type",      "echo",   "cd",     "zvc",
 };
 
 const run_verbs = [_][]const u8{ "run", "rerun", "re-run", "execute", "try", "type", "running" };
@@ -209,7 +208,7 @@ fn inlineCommands(sentence: []const u8, out: *Out) void {
         i = b + 1;
         const before = std.mem.trimEnd(u8, sentence[0..a], " :");
         const sp = std.mem.lastIndexOfAny(u8, before, " (") orelse 0;
-        const word = std.mem.trim(u8, before[if (sp == 0) 0 else sp + 1 ..], " (\"'*_");
+        const word = std.mem.trim(u8, before[if (sp == 0) 0 else sp + 1..], " (\"'*_");
         var verb = false;
         for (run_verbs) |v| verb = verb or std.ascii.eqlIgnoreCase(word, v);
         if (verb or (request and knownCommand(span))) addRun(span, sentence, out);

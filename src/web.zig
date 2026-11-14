@@ -610,7 +610,6 @@ pub const Server = struct {
         return @splat(0);
     }
 
-
     /// Accept loop. Runs on its own thread for the life of the process.
     pub fn run(srv: *Server) void {
         var backoff: Backoff = .{};
@@ -1112,8 +1111,8 @@ pub const Server = struct {
             // Wakeup counts make idle cost visible (and testable): an idle
             // viewer should cost no periodic wakeups at all.
             srv.log.print("viewer disconnected from {s} ({d} watching; wakeups while connected: supervisor {d}, writer {d}, pairing watcher {d})", .{
-                peer,                                        left,
-                conn.sup_wakes.load(.monotonic) -% sup_before, ws.writer_wakes,
+                peer,                                                     left,
+                conn.sup_wakes.load(.monotonic) -% sup_before,            ws.writer_wakes,
                 srv.pairwatch_wakes.load(.monotonic) -% pairwatch_before,
             });
             srv.updateTitle(left);
@@ -1921,7 +1920,6 @@ pub const Server = struct {
         }
         return true;
     }
-
 };
 
 /// Writes a JSON string body: `"` and `\` escaped (names are printable,

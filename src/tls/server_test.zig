@@ -777,7 +777,6 @@ test "record layer: padding, key update, close_notify, and bad records" {
     }
 }
 
-
 test "reader interface: std.Io.Reader end to end, any buffer size, no spin" {
     const gpa = testing.allocator;
     const h = try gpa.create(Harness);

@@ -25,4 +25,3 @@ test "host allowlist" {
     try testing.expect(!hostAllowed(null, &allowed));
     try testing.expect(!hostAllowed("", &allowed));
 }
-

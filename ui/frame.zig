@@ -2048,7 +2048,7 @@ const TapRec = struct {
         of(p).scrolled += dy;
     }
     fn drag(p: *anyopaque, d: input.Drag) void {
-        of(p).drags[@intFromEnum(d.phase)] += 1;
+        of(p).drags[@backingInt(d.phase)] += 1;
         of(p).last_drag = d;
     }
     const vt: input.InputSink.VTable = .{ .key = key, .char = char, .answer = answer, .button = button, .resized = resized, .mouse = mouse, .scroll = scroll, .drag = drag };
@@ -2147,7 +2147,6 @@ test "touch: nothing acts on a press; buttons are taps; a cancel never taps; dra
     try std.testing.expectEqual([3]usize{ 1, 1, 1 }, r.drags);
     try std.testing.expectEqual(@as(usize, 1), r.n_answers);
 }
-
 
 test "hit-testing maps clicks to what the last frame drew" {
     var f = Frame.init(std.testing.allocator, .fit_grid);

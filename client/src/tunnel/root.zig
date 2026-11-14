@@ -310,7 +310,6 @@ pub const Tunnel = struct {
         return t.udp_port orelse 0;
     }
 
-
     // ---------------------------------------------------------- streams
 
     /// A listener on this side's tunnel address, `port`.

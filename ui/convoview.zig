@@ -405,7 +405,7 @@ const Entry = struct {
 
 fn itemHash(it: wire.Item) u64 {
     var h = std.hash.Wyhash.init(0x5eed);
-    h.update(&.{ @intFromEnum(it.kind), @intFromBool(it.open), @intFromBool(it.multi) });
+    h.update(&.{ @backingInt(it.kind), @intFromBool(it.open), @intFromBool(it.multi) });
     h.update(it.text);
     for (it.options) |o| {
         h.update(o.label);
@@ -865,9 +865,7 @@ pub const View = struct {
         else if (map) |sm| (if (sm.yes_no)
             std.fmt.allocPrint(v.gpa, "Question \u{00B7} swipe {s} for Yes, {s} for No", .{ yes_dir, no_dir }) catch &.{}
         else
-            std.fmt.allocPrint(v.gpa, "Question \u{00B7} swipe {s}: {s} \u{00B7} {s}: {s}", .{ yes_dir, sm.yes_label, no_dir, sm.no_label }) catch &.{})
-        else
-            v.gpa.dupe(u8, "Question \u{00B7} waiting for your answer") catch &.{};
+            std.fmt.allocPrint(v.gpa, "Question \u{00B7} swipe {s}: {s} \u{00B7} {s}: {s}", .{ yes_dir, sm.yes_label, no_dir, sm.no_label }) catch &.{}) else v.gpa.dupe(u8, "Question \u{00B7} waiting for your answer") catch &.{};
         e.lines.append(v.gpa, .{ .str = frame.clipText(f.small, e.head, inner, false), .x = g.qpad, .y = y, .font = .small, .color = if (e.open) theme.ui.question_head else theme.ui.dim, .bold = true }) catch {};
         y += g.slh + @round(4 * g.s);
         y += v.layoutText(e, f, g, e.text, g.qpad, y, inner, theme.ui.text, .body, false).h;
@@ -1959,7 +1957,6 @@ test "no answer without a committed swipe: short drags either way, re-synced (re
     try testing.expectEqual(View.KeyResult.ignored, v2.onKey(.up, .{}));
     try testing.expect(v2.sent_n == null);
 }
-
 
 test "two options never get buttons (Yes/No or a choice); more than two do; multi-choice gets Done" {
     const gpa = testing.allocator;

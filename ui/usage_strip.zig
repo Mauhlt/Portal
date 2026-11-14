@@ -53,7 +53,7 @@ pub const Strip = struct {
         var told_now: ?struct { kind: Kind, step: u8 } = null;
         inline for (.{ Kind.week, Kind.five_hour }) |k| {
             if (@field(x, @tagName(k))) |w| {
-                const t = &s.told[@intFromEnum(k)];
+                const t = &s.told[@backingInt(k)];
                 if (w.resets_at != t.resets_at) t.* = .{ .resets_at = w.resets_at };
                 const step = @min(planusage.band(w), 2);
                 if (step > t.step) {

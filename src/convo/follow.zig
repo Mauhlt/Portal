@@ -1328,7 +1328,6 @@ test "follower: a transcript path longer than MAX_PATH is found, watched and rea
     try testing.expectEqualStrings("hello|long way|", ts.texts(&buf));
 }
 
-
 test "DirChanges: a new transcript in the folder is reported by name" {
     var t = try Tmp.init();
     defer t.deinit();

@@ -81,17 +81,17 @@ fn spellings(p: Place) []const []const u8 {
 
 /// Words that write files or registry keys (cmd, PowerShell, coreutils).
 pub const write_verbs = [_][]const u8{
-    "copy",          "cp",               "xcopy",                "robocopy",           "move",
-    "mv",            "del",              "erase",                "rm",                 "rmdir",
-    "rd",            "mkdir",            "md",                   "ren",                "rename",
-    "new-item",      "ni",               "set-content",          "sc",                 "add-content",
-    "ac",            "out-file",         "copy-item",            "cpi",                "move-item",
-    "mi",            "remove-item",      "ri",                   "rename-item",        "rni",
-    "set-item",      "si",               "set-itemproperty",     "sp",                 "new-itemproperty",
-    "remove-itemproperty", "rp",         "clear-item",           "clear-itemproperty", "expand-archive",
-    "tee",           "tee-object",       "install",              "icacls",             "takeown",
-    "regedit",       "reg add",          "reg delete",           "reg import",         "reg copy",
-    "reg restore",   "reg load",         "new-service",          "set-service",
+    "copy",                "cp",          "xcopy",            "robocopy",           "move",
+    "mv",                  "del",         "erase",            "rm",                 "rmdir",
+    "rd",                  "mkdir",       "md",               "ren",                "rename",
+    "new-item",            "ni",          "set-content",      "sc",                 "add-content",
+    "ac",                  "out-file",    "copy-item",        "cpi",                "move-item",
+    "mi",                  "remove-item", "ri",               "rename-item",        "rni",
+    "set-item",            "si",          "set-itemproperty", "sp",                 "new-itemproperty",
+    "remove-itemproperty", "rp",          "clear-item",       "clear-itemproperty", "expand-archive",
+    "tee",                 "tee-object",  "install",          "icacls",             "takeown",
+    "regedit",             "reg add",     "reg delete",       "reg import",         "reg copy",
+    "reg restore",         "reg load",    "new-service",      "set-service",
 };
 
 pub const Match = struct { rule: *const Rule };

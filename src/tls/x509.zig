@@ -521,13 +521,27 @@ test "certificate profile fields" {
     //   dNSName "invalid", rfc822Name "invalid", URI ".invalid", directoryName O=Portal }
     const expected_nc = [_]u8{
         0x30, 0x53, 0xa0, 0x51,
-        0x30, 0x0a, 0x87, 0x08, 10,   8,    0,    0,    255,  255,  255,  0,
-        0x30, 0x0a, 0x87, 0x08, 127,  0,    0,    1,    255,  255,  255,  255,
-        0x30, 0x09, 0x82, 0x07, 'i',  'n',  'v',  'a',  'l',  'i',  'd',
-        0x30, 0x09, 0x81, 0x07, 'i',  'n',  'v',  'a',  'l',  'i',  'd',
-        0x30, 0x0a, 0x86, 0x08, '.',  'i',  'n',  'v',  'a',  'l',  'i',  'd',
-        0x30, 0x15, 0xa4, 0x13, 0x30, 0x11, 0x31, 0x0f, 0x30, 0x0d, 0x06, 0x03, 0x55, 0x04, 0x0a,
-        0x0c, 0x06, 'P',  'o',  'r',  't',  'a',  'l',
+        0x30, 0x0a, 0x87, 0x08,
+        10,   8,    0,    0,
+        255,  255,  255,  0,
+        0x30, 0x0a, 0x87, 0x08,
+        127,  0,    0,    1,
+        255,  255,  255,  255,
+        0x30, 0x09, 0x82, 0x07,
+        'i',  'n',  'v',  'a',
+        'l',  'i',  'd',  0x30,
+        0x09, 0x81, 0x07, 'i',
+        'n',  'v',  'a',  'l',
+        'i',  'd',  0x30, 0x0a,
+        0x86, 0x08, '.',  'i',
+        'n',  'v',  'a',  'l',
+        'i',  'd',  0x30, 0x15,
+        0xa4, 0x13, 0x30, 0x11,
+        0x31, 0x0f, 0x30, 0x0d,
+        0x06, 0x03, 0x55, 0x04,
+        0x0a, 0x0c, 0x06, 'P',
+        'o',  'r',  't',  'a',
+        'l',
     };
     try testing.expectEqualSlices(u8, &expected_nc, ca.name_constraints);
     try testing.expectEqualSlices(u8, &eku_server_auth_der, ca.eku);
@@ -728,7 +742,9 @@ test "old CA profile is detected" {
     // and dNSName subtrees only, no EKU.
     const old_nc = [_]u8{
         0x30, 0x0e, 0xa0, 0x0c,
-        0x30, 0x0a, 0x87, 0x08, 127, 0, 0, 1, 255, 255, 255, 255,
+        0x30, 0x0a, 0x87, 0x08,
+        127,  0,    0,    1,
+        255,  255,  255,  255,
         // (no dNSName: still parses)
     };
     const c = try parseConstraints(&old_nc);

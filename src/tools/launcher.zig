@@ -90,7 +90,6 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     w.ExitProcess(1);
 }
 
-
 /// This launcher's own file name, lower-cased, if it is one of `targets`.
 fn ownName(out: *[64]u8) ?[]const u8 {
     var buf: [32768]u16 = undefined;
@@ -140,7 +139,6 @@ fn readCurrent(gpa: Allocator, io: Io, releases: []const u8) ?[]u8 {
 fn ignoreCtrl(ctrl_type: w.DWORD) callconv(.winapi) w.BOOL {
     return @intFromBool(ctrl_type == w.CTRL_C_EVENT or ctrl_type == w.CTRL_BREAK_EVENT);
 }
-
 
 fn run(gpa: Allocator, exe: []const u8) !u32 {
     const exe_w = try std.unicode.wtf8ToWtf16LeAllocZ(gpa, exe);

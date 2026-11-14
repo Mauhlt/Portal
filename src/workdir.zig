@@ -179,7 +179,6 @@ test "takeLauncherFlag removes the variable from the environment" {
     try testing.expect(parentPid() != null);
 }
 
-
 test "pathInside" {
     try testing.expect(pathInside("C:\\a\\b", "C:\\a"));
     try testing.expect(pathInside("C:\\a", "c:\\A\\"));

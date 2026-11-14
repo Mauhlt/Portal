@@ -78,7 +78,6 @@ pub const panic = @import("panic.zig").handler;
 
 pub const portal_version = "0.1.0";
 
-
 const usage =
     \\Portal {s} - share a desktop terminal session with your own devices
     \\
@@ -152,7 +151,6 @@ const usage =
     \\      --allow-elevated   Run even as administrator. Refused by default:
     \\                         the session program, and everything a paired
     \\                         device types into it, would run as admin.
-
     \\
     \\  portalctl open <folder> [--name NAME]
     \\      Open <folder> as a new project tab in the running Portal (the
@@ -346,7 +344,6 @@ fn guiMain(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     w.ExitProcess(2);
 }
 
-
 /// An information box (the GUI program's stdout).
 fn messageBox(text: []const u8) void {
     showBox(text, 0x40); // MB_ICONINFORMATION
@@ -383,7 +380,6 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     }
     w.ExitProcess(1);
 }
-
 
 // ------------------------------------------------------------- data paths
 
@@ -438,7 +434,6 @@ fn openLog(gpa: Allocator, paths: devices.Paths, io: Io) ?Log {
 }
 
 // ---------------------------------------------------------------- devices
-
 
 /// SHA-256 of the Portal CA, if one exists yet (never creates one).
 fn caFingerprint(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, out: *[95]u8) ?[]const u8 {
@@ -1511,7 +1506,6 @@ fn childCwd(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, data_di
     }
     return std.unicode.wtf8ToWtf16LeAllocZ(gpa, chosen) catch fatal("bad directory name '{s}'", .{chosen});
 }
-
 
 /// Puts the folder of this exe first on PATH in Portal's own environment,
 /// which each session's block is built from (childenv.forSession), so

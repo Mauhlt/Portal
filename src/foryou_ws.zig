@@ -205,7 +205,6 @@ fn item(c: Ctx, rest: []const u8, buf: *[frames.max_answer]u8) []const u8 {
     return answerItem(buf, req.op, result, it.id);
 }
 
-
 fn recapFrame(c: Ctx, rest: []const u8, buf: *[frames.max_answer]u8) []const u8 {
     const id = recap.parseRequest(rest) orelse return answerRecap(buf, .unknown, null);
     const h = c.hub;

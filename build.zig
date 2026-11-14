@@ -296,7 +296,6 @@ fn crlf(b: *std.Build, text: []const u8) []const u8 {
     return std.mem.replaceOwned(u8, b.allocator, lf, "\n", "\r\n") catch @panic("OOM");
 }
 
-
 /// `zig build brand`: regenerates docs/brand's raster assets (the icon
 /// PNGs, portal.ico, the embedded hero PNG) with src/tools/brand.zig. Its
 /// outputs are committed; normal builds only read them.
@@ -337,20 +336,23 @@ fn laptopClientCheck(b: *std.Build, t: std.Build.ResolvedTarget) *std.Build.Step
     const inputrules = inputrulesModule(b, t, .Debug);
     const scratch = b.createModule(.{ .target = t, .optimize = .Debug });
     const gui = addGuiModules(b, scratch, t, .Debug, inputrules);
-    return b.addExecutable(.{ .name = b.fmt("portal-client-check-{t}", .{t.result.os.tag}), .root_module = b.createModule(.{
-        .root_source_file = b.path("client/src/main.zig"),
-        .target = t,
-        .optimize = .Debug,
-        .link_libc = true, // Security.framework via dlopen
-        .imports = &.{
-            .{ .name = "view", .module = gui.view },
-            .{ .name = "portal_ui", .module = gui.ui },
-            .{ .name = "shared", .module = sharedModule(b, t, .Debug) },
-            .{ .name = "inputrules", .module = inputrules },
-            .{ .name = "WireGuard", .module = wireguardModule(b, t, .Debug) },
-            .{ .name = "tunnel_options", .module = tunnelOptions(b) },
-        },
-    }) });
+    return b.addExecutable(.{
+        .name = b.fmt("portal-client-check-{t}", .{t.result.os.tag}),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("client/src/main.zig"),
+            .target = t,
+            .optimize = .Debug,
+            .link_libc = true, // Security.framework via dlopen
+            .imports = &.{
+                .{ .name = "view", .module = gui.view },
+                .{ .name = "portal_ui", .module = gui.ui },
+                .{ .name = "shared", .module = sharedModule(b, t, .Debug) },
+                .{ .name = "inputrules", .module = inputrules },
+                .{ .name = "WireGuard", .module = wireguardModule(b, t, .Debug) },
+                .{ .name = "tunnel_options", .module = tunnelOptions(b) },
+            },
+        }),
+    });
 }
 
 /// "inputrules" (src/inputrules): the input policy, the allowed key names

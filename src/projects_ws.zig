@@ -175,4 +175,3 @@ test "decide: verb, then view-only, then the device's rate, then the name" {
     try testing.expectEqualStrings("acme", decide(.keys, &lim, io, a, 60_001, "start acme").start);
     try testing.expect(decide(.keys, &lim, io, a, 60_001, "start acme").answer.result == .rate_limited);
 }
-

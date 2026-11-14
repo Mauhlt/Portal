@@ -244,4 +244,3 @@ test "fuzz: random frames never panic" {
         apply(&g, gpa, buf[0..n]) catch {};
     }
 }
-

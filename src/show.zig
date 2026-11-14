@@ -35,7 +35,6 @@ const usage =
 /// base64 characters per chunk, as kitty recommends.
 const chunk_b64 = 4096;
 
-
 pub fn main(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     var path: ?[]const u8 = null;
     var cols_arg: ?u32 = null;

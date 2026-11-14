@@ -1049,7 +1049,6 @@ pub const Client = struct {
         c.write_wake.set(c.io);
         return true;
     }
-
 };
 
 fn sameId(a: ?tabs_wire.Id, b: tabs_wire.Id) bool {
@@ -1126,7 +1125,6 @@ pub const OutQueue = struct {
     }
 };
 
-
 /// "10.8.0.1:8420" -> "10.8.0.1", "[fd00::1]:8420" -> "fd00::1".
 pub fn bareIp(canonical_host: []const u8) []const u8 {
     if (canonical_host.len > 0 and canonical_host[0] == '[') {
@@ -1143,7 +1141,6 @@ test "bare IP" {
 }
 
 // ------------------------------------------------------------------ stream tests
-
 
 /// A WebSocket server that completes the upgrade, then never reads or
 /// writes again: the client's writes back up until the socket blocks.

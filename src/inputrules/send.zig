@@ -59,23 +59,23 @@ const Word = struct { word: []const u8, key: []const u8 };
 /// Spoken or typed answers and the key each presses (docs/protocol.md §4
 /// key names). Matched after normalising (see `normalize`).
 pub const answer_words = [_]Word{
-    .{ .word = "yes", .key = "y" },     .{ .word = "y", .key = "y" },
-    .{ .word = "yeah", .key = "y" },    .{ .word = "yep", .key = "y" },
-    .{ .word = "no", .key = "n" },      .{ .word = "n", .key = "n" },
-    .{ .word = "nope", .key = "n" },    .{ .word = "zero", .key = "0" },
-    .{ .word = "one", .key = "1" },     .{ .word = "two", .key = "2" },
-    .{ .word = "three", .key = "3" },   .{ .word = "four", .key = "4" },
-    .{ .word = "five", .key = "5" },    .{ .word = "six", .key = "6" },
-    .{ .word = "seven", .key = "7" },   .{ .word = "eight", .key = "8" },
-    .{ .word = "nine", .key = "9" },    .{ .word = "0", .key = "0" },
-    .{ .word = "1", .key = "1" },       .{ .word = "2", .key = "2" },
-    .{ .word = "3", .key = "3" },       .{ .word = "4", .key = "4" },
-    .{ .word = "5", .key = "5" },       .{ .word = "6", .key = "6" },
-    .{ .word = "7", .key = "7" },       .{ .word = "8", .key = "8" },
-    .{ .word = "9", .key = "9" },       .{ .word = "escape", .key = "esc" },
-    .{ .word = "esc", .key = "esc" },   .{ .word = "cancel", .key = "esc" },
+    .{ .word = "yes", .key = "y" },       .{ .word = "y", .key = "y" },
+    .{ .word = "yeah", .key = "y" },      .{ .word = "yep", .key = "y" },
+    .{ .word = "no", .key = "n" },        .{ .word = "n", .key = "n" },
+    .{ .word = "nope", .key = "n" },      .{ .word = "zero", .key = "0" },
+    .{ .word = "one", .key = "1" },       .{ .word = "two", .key = "2" },
+    .{ .word = "three", .key = "3" },     .{ .word = "four", .key = "4" },
+    .{ .word = "five", .key = "5" },      .{ .word = "six", .key = "6" },
+    .{ .word = "seven", .key = "7" },     .{ .word = "eight", .key = "8" },
+    .{ .word = "nine", .key = "9" },      .{ .word = "0", .key = "0" },
+    .{ .word = "1", .key = "1" },         .{ .word = "2", .key = "2" },
+    .{ .word = "3", .key = "3" },         .{ .word = "4", .key = "4" },
+    .{ .word = "5", .key = "5" },         .{ .word = "6", .key = "6" },
+    .{ .word = "7", .key = "7" },         .{ .word = "8", .key = "8" },
+    .{ .word = "9", .key = "9" },         .{ .word = "escape", .key = "esc" },
+    .{ .word = "esc", .key = "esc" },     .{ .word = "cancel", .key = "esc" },
     .{ .word = "enter", .key = "enter" }, .{ .word = "ok", .key = "enter" },
-    .{ .word = "okay", .key = "enter" }, .{ .word = "o.k", .key = "enter" },
+    .{ .word = "okay", .key = "enter" },  .{ .word = "o.k", .key = "enter" },
 };
 
 /// "option two", "number 3": a digit answer said with a lead-in word.
@@ -103,11 +103,17 @@ fn isPunct(c: u8) bool {
 fn wideMark(cp: u21) bool {
     return switch (cp) {
         0x2026, // …
-        0x3002, 0x3001, // 。 、
+        0x3002,
+        0x3001, // 。 、
         0xFF61, // ｡
-        0x00A1, 0x00BF, // ¡ ¿
-        0x2018, 0x2019, 0x201C, 0x201D, // curly quotes
-        0x00AB, 0x00BB, // « »
+        0x00A1,
+        0x00BF, // ¡ ¿
+        0x2018,
+        0x2019,
+        0x201C,
+        0x201D, // curly quotes
+        0x00AB,
+        0x00BB, // « »
         => true,
         else => false,
     };
@@ -347,7 +353,6 @@ pub fn help(policy: Policy) []const u8 {
     };
 }
 
-
 // ------------------------------------------------------------------ tests
 
 const testing = std.testing;
@@ -416,10 +421,10 @@ test "answer words: unicode" {
 
 test "answer words: everything else is not an answer" {
     for ([_][]const u8{
-        "",       "   ",          ".",             "yes please",  "no way",   "yess",
-        "10",     "12",           "one two",       "option yes",  "number",   "option",
-        "y y",    "run the tests", "/permissions", "!dir",        "#note",    "yesno",
-        "escape the string",       "okay then",
+        "",                  "   ",           ".",            "yes please", "no way", "yess",
+        "10",                "12",            "one two",      "option yes", "number", "option",
+        "y y",               "run the tests", "/permissions", "!dir",       "#note",  "yesno",
+        "escape the string", "okay then",
     }) |t| try expectAnswer(null, t);
     const long: [200]u8 = @splat('a');
     try expectAnswer(null, &long);
