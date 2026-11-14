@@ -43,7 +43,11 @@ fn matcherOf(e: hookmsg.Event) ?[]const u8 {
     return if (e == .Notification) hookmsg.notification_matcher else null;
 }
 
-pub const Error = error{ NotJson, NotAnObject, HooksNotAnObject, EventNotAnArray, OutOfMemory };
+pub const Error = error{ NotJson, NotAnObject, HooksNotAnObject, EventNotAnArray, TooDeep, OutOfMemory };
+
+/// Deepest nesting of objects and arrays accepted: the span parser
+/// recurses once per level, so deeper input is refused, not followed.
+pub const max_depth = 64;
 
 pub fn describe(err: anyerror) []const u8 {
     return switch (err) {
@@ -51,6 +55,7 @@ pub fn describe(err: anyerror) []const u8 {
         error.NotAnObject => "its top level is not a JSON object",
         error.HooksNotAnObject => "its \"hooks\" is not a JSON object",
         error.EventNotAnArray => "one of its \"hooks\" events is not a JSON array",
+        error.TooDeep => std.fmt.comptimePrint("it nests objects or arrays more than {d} levels deep", .{max_depth}),
         error.ChangedMeanwhile => "it changed while Portal was editing it (try again)",
         error.FileTooBig => "it is larger than 16 MiB",
         else => @errorName(err),
@@ -84,6 +89,8 @@ const Parser = struct {
     a: Allocator,
     s: []const u8,
     i: usize,
+    /// Objects and arrays open around `i`.
+    depth: usize = 0,
 
     fn ws(p: *Parser) void {
         while (p.i < p.s.len and (p.s[p.i] == ' ' or p.s[p.i] == '\t' or p.s[p.i] == '\n' or p.s[p.i] == '\r')) p.i += 1;
@@ -94,42 +101,11 @@ const Parser = struct {
         p.ws();
         const start = p.i;
         switch (p.s[p.i]) {
-            '{' => {
-                p.i += 1;
-                var ms: std.ArrayList(Member) = .empty;
-                p.ws();
-                if (p.s[p.i] == '}') {
-                    p.i += 1;
-                } else while (true) {
-                    p.ws();
-                    const ks = p.i;
-                    try p.string();
-                    const key = std.json.parseFromSliceLeaky([]const u8, p.a, p.s[ks..p.i], .{}) catch return error.NotJson;
-                    p.ws();
-                    p.i += 1; // ':'
-                    const v = try p.value();
-                    try ms.append(p.a, .{ .key = key, .start = ks, .value = v });
-                    p.ws();
-                    const c = p.s[p.i];
-                    p.i += 1;
-                    if (c == '}') break;
-                }
-                return .{ .kind = .object, .start = start, .end = p.i, .members = ms.items };
-            },
-            '[' => {
-                p.i += 1;
-                var it: std.ArrayList(Node) = .empty;
-                p.ws();
-                if (p.s[p.i] == ']') {
-                    p.i += 1;
-                } else while (true) {
-                    try it.append(p.a, try p.value());
-                    p.ws();
-                    const c = p.s[p.i];
-                    p.i += 1;
-                    if (c == ']') break;
-                }
-                return .{ .kind = .array, .start = start, .end = p.i, .items = it.items };
+            '{', '[' => {
+                if (p.depth >= max_depth) return error.TooDeep;
+                p.depth += 1;
+                defer p.depth -= 1;
+                return if (p.s[p.i] == '{') p.object(start) else p.array(start);
             },
             '"' => {
                 try p.string();
@@ -140,6 +116,45 @@ const Parser = struct {
                 return .{ .kind = .other, .start = start, .end = p.i };
             },
         }
+    }
+
+    fn object(p: *Parser, start: usize) Error!Node {
+        p.i += 1;
+        var ms: std.ArrayList(Member) = .empty;
+        p.ws();
+        if (p.s[p.i] == '}') {
+            p.i += 1;
+        } else while (true) {
+            p.ws();
+            const ks = p.i;
+            try p.string();
+            const key = std.json.parseFromSliceLeaky([]const u8, p.a, p.s[ks..p.i], .{}) catch return error.NotJson;
+            p.ws();
+            p.i += 1; // ':'
+            const v = try p.value();
+            try ms.append(p.a, .{ .key = key, .start = ks, .value = v });
+            p.ws();
+            const c = p.s[p.i];
+            p.i += 1;
+            if (c == '}') break;
+        }
+        return .{ .kind = .object, .start = start, .end = p.i, .members = ms.items };
+    }
+
+    fn array(p: *Parser, start: usize) Error!Node {
+        p.i += 1;
+        var it: std.ArrayList(Node) = .empty;
+        p.ws();
+        if (p.s[p.i] == ']') {
+            p.i += 1;
+        } else while (true) {
+            try it.append(p.a, try p.value());
+            p.ws();
+            const c = p.s[p.i];
+            p.i += 1;
+            if (c == ']') break;
+        }
+        return .{ .kind = .array, .start = start, .end = p.i, .items = it.items };
     }
 
     fn string(p: *Parser) Error!void {
@@ -749,6 +764,27 @@ test "refused: not JSON, comments, wrong shapes; the reason is given" {
     try testing.expectError(error.EventNotAnArray, install(testing.allocator, "{\"hooks\":{\"Stop\":{}}}", exe_a));
     try testing.expectError(error.NotJson, uninstall(testing.allocator, "{"));
     try testing.expect(std.mem.indexOf(u8, describe(error.NotJson), "JSON") != null);
+}
+
+test "nesting deeper than max_depth is refused with a reason, not a stack overflow" {
+    const gpa = testing.allocator;
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(gpa);
+    try deep.appendSlice(gpa, "{\"a\":");
+    for (0..100_000) |_| try deep.append(gpa, '[');
+    for (0..100_000) |_| try deep.append(gpa, ']');
+    try deep.append(gpa, '}');
+    try testing.expectError(error.TooDeep, install(gpa, deep.items, exe_a));
+    try testing.expectError(error.TooDeep, uninstall(gpa, deep.items));
+    try testing.expect(std.mem.indexOf(u8, describe(error.TooDeep), "64 levels") != null);
+    // Exactly max_depth levels (the top object counts) is fine.
+    var ok: std.ArrayList(u8) = .empty;
+    defer ok.deinit(gpa);
+    try ok.appendSlice(gpa, "{\"a\":");
+    for (0..max_depth - 1) |_| try ok.append(gpa, '[');
+    for (0..max_depth - 1) |_| try ok.append(gpa, ']');
+    try ok.append(gpa, '}');
+    if (try install(gpa, ok.items, exe_a)) |out| gpa.free(out);
 }
 
 test "status: disableAllHooks; paths with quotes are escaped" {
