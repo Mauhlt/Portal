@@ -10,13 +10,14 @@
 //!     portalctl sync subscriptions
 //!
 //!   device (headless; the same code `portal connect` runs, for tests)
-//!     portalctl sync-device --server IP:PORT --ca FILE [--pair]
+//!     portalctl sync-device [--pairing-code CODE] | --key
 //!         [--approve] [--wait-updates SECONDS] [--only PACKAGE]
-//!     portalctl sync-device --server IP:PORT --rollback PACKAGE | --revoke PACKAGE | --status
-//!     portalctl sync-device --server IP:PORT --forget
+//!     portalctl sync-device --rollback PACKAGE | --revoke PACKAGE | --status
+//!     portalctl sync-device --forget
 //!
 //!   Each desktop has its own store on the device (client/src/sync/keypin.zig,
-//!   desktopRoot), so every device command names the desktop (--server).
+//!   desktopRoot); the device reaches its desktop through its own tunnel
+//!   (client/src/devicelink.zig), like `portal connect`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -173,7 +174,8 @@ pub fn cmdUnpublish(io: Io, paths: sync.Paths, args: []const []const u8) !void {
 // ------------------------------------------------------------------ device
 
 const Client = client.net_client.Client;
-const http = client.net_http;
+const tunnel = client.tunnel;
+const devicelink = client.devicelink;
 const engine = client.sync.engine;
 const keypin = client.sync.keypin;
 const store_mod = client.sync.store;
@@ -183,9 +185,8 @@ fn report(_: ?*anyopaque, line: []const u8) void {
 }
 
 pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_version: []const u8) !void {
-    var server: ?[]const u8 = null;
-    var ca_file: ?[]const u8 = null;
-    var pair = false;
+    var code_arg: ?[]const u8 = null;
+    var show_key = false;
     var forget = false;
     var status = false;
     var approve = false;
@@ -196,16 +197,14 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        const needs = std.mem.eql(u8, a, "--server") or std.mem.eql(u8, a, "--ca") or std.mem.eql(u8, a, "--wait-updates") or
+        const needs = std.mem.eql(u8, a, "--pairing-code") or std.mem.eql(u8, a, "--wait-updates") or
             std.mem.eql(u8, a, "--only") or std.mem.eql(u8, a, "--rollback") or std.mem.eql(u8, a, "--revoke");
         if (needs) {
             i += 1;
             if (i >= args.len) fatal("{s} needs a value", .{a});
         }
-        if (std.mem.eql(u8, a, "--server")) {
-            server = args[i];
-        } else if (std.mem.eql(u8, a, "--ca")) {
-            ca_file = args[i];
+        if (std.mem.eql(u8, a, "--pairing-code")) {
+            code_arg = args[i];
         } else if (std.mem.eql(u8, a, "--wait-updates")) {
             wait_s = std.fmt.parseInt(u32, args[i], 10) catch fatal("--wait-updates takes seconds", .{});
         } else if (std.mem.eql(u8, a, "--only")) {
@@ -214,25 +213,34 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
             rollback = args[i];
         } else if (std.mem.eql(u8, a, "--revoke")) {
             revoke = args[i];
-        } else if (std.mem.eql(u8, a, "--pair")) {
-            pair = true;
+        } else if (std.mem.eql(u8, a, "--key")) {
+            show_key = true;
         } else if (std.mem.eql(u8, a, "--forget")) {
             forget = true;
         } else if (std.mem.eql(u8, a, "--status")) {
             status = true;
         } else if (std.mem.eql(u8, a, "--approve")) {
             approve = true;
-        } else fatal("usage: portalctl sync-device --server IP:PORT [--ca FILE] [--pair] [--approve] [--wait-updates S] [--only PKG] | --rollback PKG | --revoke PKG | --status | --forget", .{});
+        } else fatal("usage: portalctl sync-device [--pairing-code CODE] [--approve] [--wait-updates S] [--only PKG] | --key | --rollback PKG | --revoke PKG | --status | --forget", .{});
     }
 
-    const srv = server orelse fatal("--server IP:PORT is required (each desktop has its own sync folder)", .{});
-    var hb: [64]u8 = undefined;
-    const host = http.canonicalHost(srv, &hb) catch fatal("bad --server '{s}'", .{srv});
+    var key = tunnel.keys.loadOrCreate(io) catch |err| fatal("cannot load or create this device's tunnel key: {t}", .{err});
+    defer key.wipe();
+    if (show_key) {
+        std.debug.print("sync-device: key {s} check {s}\n", .{ &key.publicText(), &key.checkCode() });
+        return;
+    }
+    // The pairing code: given now (and saved), or saved earlier.
+    const code: devicelink.Code = if (code_arg) |t| blk: {
+        const c = devicelink.parse(t) catch |err| fatal("{s}", .{devicelink.describe(err)});
+        devicelink.save(io, &c) catch |err| fatal("cannot save the pairing code: {t}", .{err});
+        break :blk c;
+    } else devicelink.load(io) orelse fatal("not paired: give --pairing-code (the code the desk shows after Pair a device)", .{});
+    const host = devicelink.server;
+
     if (forget) {
         // Both ways: the desktop removes this device first (if reachable).
-        var fca_buf: [client.x509check_mod.max_cert_len]u8 = undefined;
-        const fca: ?[]const u8 = if (ca_file) |p| (client.pin.readCaFile(io, p, &fca_buf) catch null) else null;
-        const r = client.forgetHost(gpa, io, host, fca);
+        const r = client.forgetLinked(gpa, io, &code, &key);
         var mb: [600]u8 = undefined;
         var w: Io.Writer = .fixed(&mb);
         r.describe(&w, host) catch {};
@@ -240,14 +248,7 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
         return;
     }
 
-    {
-        // The shared store of earlier builds is never used: delete it.
-        const r = keypin.removeLegacyStore(io) catch keypin.Dropped{};
-        if (r.removed > 0 or r.kept > 0)
-            std.debug.print("sync-device: removed the shared store of earlier versions ({d} removed, {d} still in use: retried next time)\n", .{ r.removed, r.kept });
-    }
-
-    // This desktop's own store, named after the pinned host and key.
+    // This desktop's own store, named after its address and pinned key.
     const pinned_now = keypin.load(io, host) catch |err| fatal("the pinned release key is unreadable: {t}", .{err});
     var root_buf: [client.pin.max_path]u8 = undefined;
     var st_opt: ?store_mod.Store = null;
@@ -284,70 +285,53 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
         return;
     }
 
-
-    const ca_path = ca_file orelse fatal("--ca FILE is required (the Portal CA, portal-ca.pem)", .{});
+    // The tunnel and the client, exactly as `portal connect` makes them.
+    const tun = devicelink.startTunnel(gpa, io, &code, &key) catch |err| fatal("cannot start the tunnel: {t}", .{err});
+    defer tun.destroy();
     var ca_buf: [client.x509check_mod.max_cert_len]u8 = undefined;
-    const der = client.pin.readCaFile(io, ca_path, &ca_buf) catch |err| fatal("cannot use {s} as the Portal CA: {t}", .{ ca_path, err });
-
+    const trust = devicelink.trust(io, &code, &ca_buf);
     var shared: client.net_client.Shared = .{};
-    // GET /pair/wait is a long poll (the server answers when the desk
-    // does); re-ask at once, and retry quickly after a network error.
-    var c = Client.init(gpa, io, &shared, host, .{ .tls = der }) catch fatal("bad --server", .{});
-    c.pair_retry_ms = 200;
-    c.pair_min_interval_ms = 0;
+    var c = Client.init(gpa, io, &shared, host, tun.dialer(), trust) catch fatal("bad desktop address", .{});
+    var io_copy = io;
+    c.on_pinned = devicelink.savePin;
+    c.on_pinned_ctx = &io_copy;
 
-    if (pair) {
-        std.debug.print("sync-device: asking the desk to pair\n", .{});
-        switch (c.pairFlow()) {
-            .paired => |p| {
-                var dev = p.device;
-                defer dev.wipe();
-                var sess = p.session;
-                defer sess.wipe();
-                client.credstore_mod.save(c.target(), dev.value()) catch |err| fatal("cannot store the credential: {t}", .{err});
-                const key = c.pinReleaseKey(&sess) catch |err| fatal("paired, but no release key could be pinned: {t}", .{err});
-                var fp: [95]u8 = undefined;
-                std.debug.print("sync-device: paired; release key pinned: SHA-256 {s}\n", .{fingerprintText(key, &fp)});
-            },
-            .failed => |why| fatal("pairing failed: {s}", .{why}),
-            .cancelled => fatal("pairing cancelled", .{}),
-        }
-        return;
-    }
+    // Connect once on the interactive channel: pins the CA on a first
+    // connection, and says whether this device is still paired. With
+    // --wait-updates it stays until the desktop announces updates.
+    waitUpdates(gpa, io, &c, wait_s orelse 0, host);
 
-    const pinned = pinned_now orelse fatal("no release key pinned for {s}: pair this device first (--pair)", .{host});
-    var st = st_opt.?;
-    var session = c.signIn() catch |err| {
-        if (err == error.DeviceGone) forgetGone(io, host);
-        fatal("sign-in failed: {t}", .{err});
+    const pinned = pinned_now orelse blk: {
+        // First run after pairing: pin the release key now.
+        const k = c.pinReleaseKey() catch |err| fatal("no release key could be pinned: {t}", .{err});
+        var fp: [95]u8 = undefined;
+        std.debug.print("sync-device: paired; release key pinned: SHA-256 {s}\n", .{fingerprintText(k, &fp)});
+        const root = keypin.desktopRoot(host, k, &root_buf) catch fatal("no LOCALAPPDATA", .{});
+        st_opt = store_mod.Store.open(gpa, io, root, manifest.fingerprint(k)) catch |err| fatal("cannot open the sync store {s}: {t}", .{ root, err });
+        break :blk k;
     };
-    defer session.wipe();
-    const remote = c.syncRemote(session.value());
+    var st = st_opt.?;
+    const remote = c.syncRemote();
     {
-        // A key change on the server is refused: only re-pairing re-pins.
-        const now_key = engine.fetchKey(&remote) catch |err| fatal("GET /sync/key failed: {t}", .{err});
+        // A key change on the desktop is refused: only re-pairing re-pins.
+        const now_key = engine.fetchKey(&remote) catch |err| fatal("fetching the release key failed: {t}", .{err});
         if (!std.mem.eql(u8, &now_key, &pinned)) {
             var a: [95]u8 = undefined;
             var b: [95]u8 = undefined;
-            std.debug.print("sync-device: WARNING: the server's release key changed (pinned {s}, server {s}); packages signed by it will be rejected until this device is paired again\n", .{ fingerprintText(pinned, &a), fingerprintText(now_key, &b) });
+            std.debug.print("sync-device: WARNING: the desktop's release key changed (pinned {s}, desktop {s}); packages signed by it will be rejected until this device is paired again\n", .{ fingerprintText(pinned, &a), fingerprintText(now_key, &b) });
         }
     }
-    if (wait_s) |secs| waitUpdates(gpa, io, &c, &session, secs, host);
 
     var rep: engine.Report = .{};
-    engine.run(&remote, &st, pinned, .{ .client_version = client_version, .approve_all = approve, .only = only }, &rep, .{ .f = report }) catch |err| switch (err) {
-        error.Unauthorized => fatal("the session was refused (401)", .{}),
-        else => fatal("sync failed: {s}", .{engine.describe(err)}),
-    };
+    engine.run(&remote, &st, pinned, .{ .client_version = client_version, .approve_all = approve, .only = only }, &rep, .{ .f = report }) catch |err|
+        fatal("sync failed: {s}", .{engine.describe(err)});
     std.debug.print("sync-device: done: {d} installed, {d} up to date, {d} waiting for approval, {d} refused, {d} rejected\n", .{
         rep.count(.installed), rep.count(.up_to_date), rep.count(.pending_approval), rep.count(.refused), rep.count(.rejected),
     });
 }
 
-/// Opens the WebSocket with the session and returns once the server says
-/// {"t":"updates"} (or after `secs`).
-/// The desktop said it no longer has this device (`X-Portal-Device: gone`,
-/// or logout reason "unpaired"): forget it here too, say why, exit 1.
+/// The desktop said it no longer has this device (403, or a logout):
+/// forget it here too, say why, exit 1.
 fn forgetGone(io: Io, host: []const u8) noreturn {
     var r = client.forgetDesktop(io, host);
     r.remote = .gone_by_desktop;
@@ -358,62 +342,37 @@ fn forgetGone(io: Io, host: []const u8) noreturn {
     std.process.exit(1);
 }
 
-fn waitUpdates(gpa: Allocator, io: Io, c: *Client, session: *const http.Cookie, secs: u32, host: []const u8) void {
+/// Opens the interactive WebSocket (pinning the CA on a first connection)
+/// and returns at hello (`secs` 0) or once the desktop says
+/// {"t":"updates"} (or after `secs`).
+fn waitUpdates(gpa: Allocator, io: Io, c: *Client, secs: u32, host: []const u8) void {
     var wd: client.watchdog.Watchdog = .{ .io = io };
-    wd.extend(@as(i64, secs) * 1000);
-    const r = wd.run(waitTask, .{ gpa, io, c, session, &wd }, null);
+    wd.extend(@as(i64, @max(secs, 15)) * 1000);
+    const r = wd.run(waitTask, .{ gpa, io, c, secs, &wd }, null);
     if (wd.expired.load(.acquire)) {
+        if (secs == 0) fatal("the desktop did not answer through the tunnel", .{});
         std.debug.print("sync-device: no updates announced within {d} s\n", .{secs});
         return;
     }
     r catch |err| {
-        if (err == error.DeviceGone) forgetGone(io, host);
+        if (err == error.NotPaired or err == error.DeviceGone) forgetGone(io, host);
         fatal("stream failed: {t}", .{err});
     };
-    std.debug.print("sync-device: server announced updates\n", .{});
+    if (secs > 0) std.debug.print("sync-device: desktop announced updates\n", .{});
 }
 
-fn waitTask(gpa: Allocator, io: Io, c: *Client, session: *const http.Cookie, wd: *client.watchdog.Watchdog) anyerror!void {
-    const ws = client.net_ws;
-    const conn = try client.tlsconn.Conn.openWatched(gpa, io, c.dialer, c.addr, .{ .tls = .{ .ca_der = c.ca_buf[0..c.ca_len], .ip = c.ip_buf[0..c.ip_len] } }, &wd.stopped);
-    defer conn.close(gpa);
-    var rnd: [16]u8 = undefined;
-    try io.randomSecure(&rnd);
-    const key = ws.makeKey(rnd);
-    var req_buf: [768]u8 = undefined;
-    defer std.crypto.secureZero(u8, &req_buf);
-    var w: Io.Writer = .fixed(&req_buf);
-    try http.writeUpgradeRequest(&w, c.host(), true, session, &key);
-    try conn.writeAll(w.buffered());
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(gpa);
-    var head_done = false;
-    while (true) {
-        if (!head_done) {
-            if (http.findHeadEnd(buf.items)) |e| {
-                const resp = try http.parseResponseHead(buf.items[0..e]);
-                if (resp.status != 101) return error.UpgradeRefused;
-                std.mem.copyForwards(u8, buf.items[0 .. buf.items.len - e], buf.items[e..]);
-                buf.shrinkRetainingCapacity(buf.items.len - e);
-                head_done = true;
-            } else if (buf.items.len > http.max_head_bytes) return error.ResponseTooLarge;
+fn waitTask(gpa: Allocator, io: Io, c: *Client, secs: u32, wd: *client.watchdog.Watchdog) anyerror!void {
+    var sock = try client.wsclient.Socket.open(gpa, io, c.dialer, c.addr, c.security(), c.host(), .interactive, &wd.stopped);
+    defer sock.close();
+    if (c.trust == .fingerprint) c.pinFound(sock.conn.caDer());
+    while (try sock.next(8 << 20)) |f| {
+        if (f.opcode != .text) continue;
+        if (std.mem.indexOf(u8, f.payload, "\"t\":\"hello\"") != null) {
+            std.debug.print("sync-device: connected through the tunnel\n", .{});
+            if (secs == 0) return;
         }
-        if (head_done) while (try ws.parseServerFrame(buf.items, 8 << 20)) |f| {
-            if (f.opcode == .text) {
-                if (std.mem.indexOf(u8, f.payload, "\"t\":\"hello\"") != null)
-                    std.debug.print("sync-device: listening for updates\n", .{});
-                if (std.mem.indexOf(u8, f.payload, "\"t\":\"updates\"") != null) return;
-                if (std.mem.indexOf(u8, f.payload, "\"t\":\"logout\"") != null) {
-                    if (std.mem.indexOf(u8, f.payload, "\"reason\":\"unpaired\"") != null) return error.DeviceGone;
-                    return error.LoggedOut;
-                }
-            }
-            std.mem.copyForwards(u8, buf.items[0 .. buf.items.len - f.len], buf.items[f.len..]);
-            buf.shrinkRetainingCapacity(buf.items.len - f.len);
-        };
-        try buf.ensureUnusedCapacity(gpa, 32 * 1024);
-        const n = try conn.read(buf.unusedCapacitySlice());
-        if (n == 0) return error.ConnectionClosed;
-        buf.items.len += n;
+        if (std.mem.indexOf(u8, f.payload, "\"t\":\"updates\"") != null) return;
+        if (std.mem.indexOf(u8, f.payload, "\"t\":\"logout\"") != null) return error.DeviceGone;
     }
+    return error.ConnectionClosed;
 }

@@ -158,14 +158,20 @@ pub const Tunnel = struct {
     }
 
     /// Replaces the peer list (the desk: whenever the device store
-    /// changes). A no-op if it is the same. Until zwg can change peers in a
-    /// running device, the device is restarted on the same stack: TCP
-    /// connections of peers that stay survive (their packets are
-    /// retransmitted), the WireGuard sessions are handshaken again.
-    pub fn setPeers(t: *Tunnel, peers: []const Peer) StartError!void {
+    /// changes). A no-op if it is the same. zwg's Device.setPeers applies
+    /// it on the running device: peers that stay keep their sessions,
+    /// removed ones are wiped. (A WireGuard without it gets the device
+    /// restarted on the same stack instead; TCP survives either way.)
+    pub fn setPeers(t: *Tunnel, peers: []const Peer) !void {
         t.mutex.lockUncancelable(t.io);
         defer t.mutex.unlock(t.io);
         if (samePeers(t.peers.items, peers) and t.device != null) return;
+        if (comptime @hasDecl(Device, "setPeers")) if (t.device) |d| {
+            var b: PeerConfigs = .{};
+            defer b.deinit(t.gpa);
+            try t.ownPeers(peers, &b);
+            return d.setPeers(b.configs);
+        };
         t.stopDeviceLocked();
         try t.setPeersLocked(peers);
     }
@@ -181,14 +187,26 @@ pub const Tunnel = struct {
         return true;
     }
 
-    /// Starts a device with `peers` (the mutex is held, or not yet shared).
-    fn setPeersLocked(t: *Tunnel, peers: []const Peer) StartError!void {
+    /// zwg peer configs for `peers` (their slices point into `t.peers`
+    /// and `b`).
+    const PeerConfigs = struct {
+        cidrs: []wg.device.ip.Cidr = &.{},
+        configs: []wg.device.device.PeerConfig = &.{},
+
+        fn deinit(b: *PeerConfigs, gpa: std.mem.Allocator) void {
+            gpa.free(b.cidrs);
+            gpa.free(b.configs);
+        }
+    };
+
+    /// Copies `peers` into `t.peers` and builds their zwg configs.
+    fn ownPeers(t: *Tunnel, peers: []const Peer, b: *PeerConfigs) StartError!void {
         t.peers.clearRetainingCapacity();
         try t.peers.ensureTotalCapacity(t.gpa, peers.len);
-        const cidrs = try t.gpa.alloc(wg.device.ip.Cidr, peers.len);
-        defer t.gpa.free(cidrs);
-        const configs = try t.gpa.alloc(wg.device.device.PeerConfig, peers.len);
-        defer t.gpa.free(configs);
+        b.cidrs = try t.gpa.alloc(wg.device.ip.Cidr, peers.len);
+        b.configs = try t.gpa.alloc(wg.device.device.PeerConfig, peers.len);
+        const cidrs = b.cidrs;
+        const configs = b.configs;
         for (peers, 0..) |p, i| {
             var op: OwnedPeer = .{ .peer = p };
             if (p.endpoint) |e| {
@@ -211,11 +229,18 @@ pub const Tunnel = struct {
             };
             configs[i] = wg.device.device.PeerConfig.fromConfig(t.io, &cp).peer;
         }
+    }
+
+    /// Starts a device with `peers` (the mutex is held, or not yet shared).
+    fn setPeersLocked(t: *Tunnel, peers: []const Peer) StartError!void {
+        var b: PeerConfigs = .{};
+        defer b.deinit(t.gpa);
+        try t.ownPeers(peers, &b);
         var dopts: wg.device.device.Options = .{
             .private_key = t.private_key,
             .listen_port = t.udp_port,
             .loopback_only = t.loopback_only,
-            .peers = configs,
+            .peers = b.configs,
         };
         defer std.crypto.secureZero(u8, &dopts.private_key);
         const d = try Device.create(t.gpa, &t.clock, t.stack.tun(), dopts);

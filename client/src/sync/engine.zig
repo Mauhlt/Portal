@@ -2,9 +2,12 @@
 //! Used by `portal connect` (on connect and on every {"t":"updates"}) and
 //! by `portalctl sync-device` (headless, for tests).
 //!
-//! For each package the desktop lists in GET /sync/index:
-//!   1. GET /sync/pkg/<pkg>/<ver>/manifest: the manifest bytes, with the
-//!      signature in `x-portal-signature`;
+//! Every request goes on the bulk WebSocket (`/ws/bulk`, shared/bulk.zig),
+//! its own connection with the transport's bulk priority, so a large
+//! download never delays the interactive stream. For each package the
+//! desktop lists in `get index`:
+//!   1. `get manifest <pkg> <ver>`: the manifest bytes, with the signature
+//!      in the reply header;
 //!   2. its SHA-256 must match the index line, the Ed25519 signature must
 //!      verify against the release key pinned at pairing, it must parse
 //!      strictly, and its package, version, sequence and kind must be what
@@ -13,7 +16,7 @@
 //!      installed (no downgrade, no replay), client new enough, quota;
 //!   4. `data` installs now; `executable` only when approved on the device
 //!      (`Options.approve`), every new version;
-//!   5. GET /sync/pkg/<pkg>/<ver>/file/<n> for each file, by index, each
+//!   5. `get file <pkg> <ver> <n>` for each file, by index, each
 //!      bounded by the manifest's size and verified by SHA-256 in staging.
 //! Anything that fails is rejected and reported; nothing is executed.
 
@@ -25,30 +28,24 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const manifest = @import("manifest.zig");
 const store_mod = @import("store.zig");
 const keypin = @import("keypin.zig");
-const http = @import("../net/http.zig");
 const tlsconn = @import("../net/tlsconn.zig");
+const wsclient = @import("../net/wsclient.zig");
+const bulk = @import("shared").bulk;
 const watchdog = @import("../net/watchdog.zig");
 
 pub const connect_timeout_ms = 15_000;
 /// Any request: the server must answer (or send more file bytes) within this.
 pub const progress_timeout_ms = 30_000;
 
-/// How to reach the desktop, with a live session.
+/// How to reach the desktop: through the tunnel (the Client's dialer).
 pub const Remote = struct {
     gpa: Allocator,
     io: Io,
     addr: net.IpAddress,
     security: tlsconn.Security,
-    /// An OS socket or the in-process tunnel (the Client's).
-    dialer: tlsconn.transport.Dialer = .os,
+    dialer: tlsconn.transport.Dialer,
     /// Canonical "IP:PORT" (Host header).
     host: []const u8,
-    /// The session cookie value (memory only).
-    session: []const u8,
-
-    fn secure(r: *const Remote) bool {
-        return r.security == .tls;
-    }
 };
 
 pub const Response = struct {
@@ -64,15 +61,6 @@ pub const Response = struct {
     }
 };
 
-fn headerValue(head: []const u8, name: []const u8) ?[]const u8 {
-    var it = std.mem.splitSequence(u8, head, "\r\n");
-    _ = it.next();
-    while (it.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        if (std.ascii.eqlIgnoreCase(line[0..colon], name)) return std.mem.trim(u8, line[colon + 1 ..], " \t");
-    }
-    return null;
-}
 
 /// Where a response body goes: collected (bounded) or streamed to a sink.
 const BodyTarget = union(enum) {
@@ -80,83 +68,58 @@ const BodyTarget = union(enum) {
     sink: *store_mod.FileSink,
 };
 
-fn writeRequest(r: *const Remote, path: []const u8, out: []u8) ![]const u8 {
-    return std.fmt.bufPrint(out, "GET {s} HTTP/1.1\r\nHost: {s}\r\nCookie: {s}={s}\r\nConnection: close\r\n\r\n", .{
-        path, r.host, http.cookieName(.session, r.secure()), r.session,
-    });
-}
+/// Where a reply's chunks go, with the watchdog moved on every one.
+const BodySink = struct {
+    gpa: Allocator,
+    wd: *watchdog.Watchdog,
+    target: BodyTarget,
+    collected: std.ArrayList(u8) = .empty,
 
-fn getTask(r: *const Remote, wd: *watchdog.Watchdog, path: []const u8, target: BodyTarget) anyerror!Response {
-    const conn = try tlsconn.Conn.openWatched(r.gpa, r.io, r.dialer, r.addr, r.security, &wd.stopped);
-    defer conn.close(r.gpa);
+    fn chunk(b: *BodySink, bytes: []const u8) anyerror!void {
+        switch (b.target) {
+            .collect => |cap| {
+                if (b.collected.items.len + bytes.len > cap) return error.ResponseTooLarge;
+                try b.collected.appendSlice(b.gpa, bytes);
+            },
+            // The manifest decides the size, not the server (FileSink
+            // refuses a byte more).
+            .sink => |s| try s.write(bytes),
+        }
+        b.wd.extend(progress_timeout_ms);
+    }
+};
+
+fn getTask(r: *const Remote, wd: *watchdog.Watchdog, req: bulk.Request, target: BodyTarget) anyerror!Response {
+    var sock = try wsclient.Socket.open(r.gpa, r.io, r.dialer, r.addr, r.security, r.host, .bulk, &wd.stopped);
+    defer sock.close();
     wd.extend(progress_timeout_ms);
-    var req_buf: [1024]u8 = undefined;
-    defer std.crypto.secureZero(u8, &req_buf);
-    try conn.writeAll(try writeRequest(r, path, &req_buf));
-
-    var buf: [64 * 1024]u8 = undefined;
-    var len: usize = 0;
-    const head_end = while (true) {
-        if (http.findHeadEnd(buf[0..len])) |e| break e;
-        if (len >= http.max_head_bytes) return error.ResponseTooLarge;
-        const n = try conn.read(buf[len..http.max_head_bytes]);
-        if (n == 0) return error.ConnectionClosed;
-        len += n;
-        wd.extend(progress_timeout_ms);
+    var b: BodySink = .{ .gpa = r.gpa, .wd = wd, .target = target };
+    errdefer b.collected.deinit(r.gpa);
+    const reply = try sock.request(req, &b, BodySink.chunk);
+    var resp: Response = switch (reply) {
+        .err => |code| .{ .status = code },
+        .ok => |o| .{ .status = 200, .sig = if (o.sig) |s| manifest.parseHex(manifest.signature_len, s) else null },
     };
-    const head = buf[0..head_end];
-    const parsed = try http.parseResponseHead(head);
-    var resp: Response = .{ .status = parsed.status };
-    if (headerValue(head, "x-portal-signature")) |s| resp.sig = manifest.parseHex(manifest.signature_len, s);
-    if (headerValue(head, "x-portal-sync-key")) |k| if (k.len == 64) {
-        resp.key_hex = k[0..64].*;
-    };
-    if (parsed.status != 200) return resp;
-    const want = parsed.content_length orelse return error.NoContentLength;
-    var got: usize = len - head_end;
-    if (got > want) return error.ResponseTooLarge;
+    if (resp.status != 200) return resp;
     switch (target) {
-        .collect => |cap| {
-            if (want > cap) return error.ResponseTooLarge;
-            const body = try r.gpa.alloc(u8, want);
-            errdefer r.gpa.free(body);
-            @memcpy(body[0..got], buf[head_end..len]);
-            while (got < want) {
-                const n = try conn.read(body[got..]);
-                if (n == 0) return error.ConnectionClosed;
-                got += n;
-                wd.extend(progress_timeout_ms);
-            }
-            resp.body = body;
-        },
-        .sink => |sink| {
-            // The manifest decides the size, not the server.
-            if (want != sink.remaining()) return error.SizeMismatch;
-            try sink.write(buf[head_end..len]);
-            while (got < want) {
-                const n = try conn.read(buf[0..@min(buf.len, want - got)]);
-                if (n == 0) return error.ConnectionClosed;
-                try sink.write(buf[0..n]);
-                got += n;
-                wd.extend(progress_timeout_ms);
-            }
-        },
+        .collect => resp.body = try b.collected.toOwnedSlice(r.gpa),
+        .sink => |s| if (s.remaining() != 0) return error.SizeMismatch,
     }
     return resp;
 }
 
-/// GET `path` with the session, under a watchdog (connect + steady progress).
-pub fn get(r: *const Remote, path: []const u8, target: BodyTarget) anyerror!Response {
+/// One bulk request, under a watchdog (connect + steady progress).
+pub fn get(r: *const Remote, req: bulk.Request, target: BodyTarget) anyerror!Response {
     var wd: watchdog.Watchdog = .{ .io = r.io };
     wd.extend(connect_timeout_ms);
-    const res = wd.run(getTask, .{ r, &wd, path, target }, null);
+    const res = wd.run(getTask, .{ r, &wd, req, target }, null);
     if (wd.expired.load(.acquire)) return error.TimedOut;
     return res;
 }
 
-/// The release key the server reports for this session (GET /sync/key).
+/// The release key the desktop reports (`get key`).
 pub fn fetchKey(r: *const Remote) !keypin.Key {
-    var resp = try get(r, "/sync/key", .{ .collect = 256 });
+    var resp = try get(r, .key, .{ .collect = 256 });
     defer resp.deinit(r.gpa);
     if (resp.status != 200) return error.NoSyncKey;
     return keypin.parse(resp.body) orelse error.NoSyncKey;
@@ -267,9 +230,7 @@ const FileSource = struct {
     version: []const u8,
 
     pub fn fetch(src: *FileSource, i: usize, sink: *store_mod.FileSink) !void {
-        var pb: [256]u8 = undefined;
-        const p = try std.fmt.bufPrint(&pb, "/sync/pkg/{s}/{s}/file/{d}", .{ src.package, src.version, i });
-        var resp = try get(src.r, p, .{ .sink = sink });
+        var resp = try get(src.r, .{ .file = .{ .pkg = .{ .id = src.package, .version = src.version }, .n = @intCast(i) } }, .{ .sink = sink });
         defer resp.deinit(src.r.gpa);
         if (resp.status != 200) return error.FileRefused;
     }
@@ -294,9 +255,8 @@ pub fn run(r: *const Remote, st: *store_mod.Store, pinned: keypin.Key, opts: Opt
     // for this very key.
     if (!std.mem.eql(u8, &st.signer, &manifest.fingerprint(pinned))) return error.SignerMismatch;
     _ = st.cleanup() catch 0; // never resume from a half-done staging folder
-    var idx = try get(r, "/sync/index", .{ .collect = manifest.max_index_bytes });
+    var idx = try get(r, .index, .{ .collect = manifest.max_index_bytes });
     defer idx.deinit(r.gpa);
-    if (idx.status == 401) return error.Unauthorized;
     if (idx.status != 200) return error.IndexRefused;
     var entries_buf: [manifest.max_index_entries]manifest.IndexEntry = undefined;
     const entries = try manifest.parseIndex(idx.body, &entries_buf);
@@ -340,9 +300,7 @@ pub fn describe(err: anyerror) []const u8 {
 }
 
 fn passOne(r: *const Remote, st: *store_mod.Store, pinned: keypin.Key, opts: Options, e: manifest.IndexEntry, it: *Item) !void {
-    var pb: [256]u8 = undefined;
-    const p = try std.fmt.bufPrint(&pb, "/sync/pkg/{s}/{s}/manifest", .{ e.package, e.version });
-    var resp = try get(r, p, .{ .collect = manifest.max_manifest_bytes });
+    var resp = try get(r, .{ .manifest = .{ .id = e.package, .version = e.version } }, .{ .collect = manifest.max_manifest_bytes });
     defer resp.deinit(r.gpa);
     if (resp.status != 200) return error.ManifestRefused;
     const sig = resp.sig orelse return error.NoSignature;
@@ -399,8 +357,4 @@ fn approvedFor(opts: Options, m: *const manifest.Manifest, digest: [32]u8) bool 
     return false;
 }
 
-test "header lookup" {
-    const head = "HTTP/1.1 200 OK\r\nX-Portal-Signature: abcd\r\nContent-Length: 4\r\n\r\n";
-    try std.testing.expectEqualStrings("abcd", headerValue(head, "x-portal-signature").?);
-    try std.testing.expect(headerValue(head, "x-other") == null);
-}
+

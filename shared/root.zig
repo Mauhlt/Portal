@@ -25,6 +25,7 @@
 //!            the HTTPS/WSS server and client, and an in-memory network
 //!            for tests
 //!   tunnelnet the in-process tunnel's addresses and ports (one definition)
+//!   bulk     the bulk WebSocket's request/reply messages (sync transfers)
 
 pub const screen = @import("screen.zig");
 pub const ws = @import("ws.zig");
@@ -40,6 +41,7 @@ pub const sysinfo = @import("sysinfo.zig");
 pub const subtabs = @import("subtabs.zig");
 pub const transport = @import("transport.zig");
 pub const tunnelnet = @import("tunnelnet.zig");
+pub const bulk = @import("bulk.zig");
 
 test {
     _ = screen;
@@ -56,4 +58,5 @@ test {
     _ = subtabs;
     _ = transport;
     _ = tunnelnet;
+    _ = bulk;
 }

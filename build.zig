@@ -22,7 +22,6 @@ fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // ReleaseSafe builds releases are made of.
     opts.addOption(bool, "test_env", optimize == @TypeOf(optimize).Debug);
     root.addOptions("build_options", opts);
-    root.addAnonymousImport("app_wasm", .{ .root_source_file = browserStub(b) });
     root.addImport("shared", sharedModule(b, target, optimize));
     // src/vt.zig (a file of the root module) takes its cell widths from it.
     root.addImport("Font", fontModule(b, target, optimize));
@@ -231,21 +230,6 @@ pub fn build(b: *std.Build) void {
     addIos(b, optimize, test_step);
     addBrand(b, test_step);
     addPackage(b, test_step);
-}
-
-/// TEMPORARY: src/web.zig still embeds "app_wasm" (and tests its imports
-/// and exports) until feat/inproc-tunnel drops the browser routes. The
-/// browser client is gone; this is a do-nothing module with the same
-/// interface (src/web/app_stub.zig). Delete both with those routes.
-fn browserStub(b: *std.Build) std.Build.LazyPath {
-    const stub = b.addExecutable(.{ .name = "portal-app-stub", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/web/app_stub.zig"),
-        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
-        .optimize = .ReleaseSmall,
-    }) });
-    stub.entry = .disabled;
-    stub.rdynamic = true;
-    return stub.getEmittedBin();
 }
 
 /// Windows: links docs/brand/portal.ico as icon resource 1 (Explorer,

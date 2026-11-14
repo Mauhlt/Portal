@@ -31,10 +31,11 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-const auth = @import("auth.zig");
-const guard = @import("guard.zig");
 const cmdline = @import("cmdline.zig");
-const netlisten = @import("netlisten.zig");
+const tunneldesk = @import("tunneldesk.zig");
+const shared = @import("shared");
+const tunnelnet = shared.tunnelnet;
+const transport = shared.transport;
 const keymap = @import("keymap.zig");
 const vt = @import("vt.zig");
 const conpty = @import("conpty.zig");
@@ -71,7 +72,7 @@ pub const gui_app = @import("build_options").gui;
 pub const panic = @import("panic.zig").handler;
 
 pub const portal_version = "0.1.0";
-const default_listen = "127.0.0.1:8420";
+
 
 const usage =
     \\Portal {s} - share a desktop terminal session with your own devices
@@ -82,27 +83,22 @@ const usage =
     \\This is portalctl, its console tool:
     \\
     \\Usage:
-    \\  portalctl pair <name> [--minutes N]
-    \\      Pair a device called <name> (a-z, 0-9, -). Stays running for the
-    \\      window (default 2 minutes, max 10) and asks you, here, about each
-    \\      device that asks to pair:
-    \\        Pair 'iphone' from 10.8.0.3 (request 7f3a)? [y/N]
-    \\      On the device, with WireGuard on, open the address Portal
-    \\      listens on (e.g. https://10.8.0.1:8420/ after
-    \\      `portal run --listen 10.8.0.1:8420`) and tap "Pair this device";
-    \\      it shows the same request code. Nothing is typed on the device:
-    \\      it gets its own credential, which rotates on every use and is
-    \\      bound to its WireGuard address. While the window is open, the
-    \\      running Portal also serves the Portal CA certificate on
-    \\      http://<address>:<port+1>/; `portalctl pair` prints the CA's
-    \\      SHA-256 and whether that download is actually up. The Portal
-    \\      window does the same in its "Pair a device" panel (Ctrl+Shift+P).
+    \\  portalctl pair <name> <device key>
+    \\      Pair a device called <name> (a-z, 0-9, -) whose WireGuard public
+    \\      key is <device key> (`portal connect` shows it on the device, with
+    \\      its check code). Prints the check code of the key you typed and
+    \\      asks [y/N]: approve only if the device shows the same code. Then
+    \\      prints the pairing code to enter on the device (this desktop's
+    \\      key, tunnel endpoint, CA fingerprint and the device's address).
+    \\      The device is its key: nothing secret is ever typed. The Portal
+    \\      window does the same in Pair a device (Ctrl+Shift+P).
     \\
     \\  portalctl devices
-    \\      List paired devices (and any open pairing window).
+    \\      List paired devices: name, tunnel address, key and check code.
     \\
     \\  portalctl unpair <name>
-    \\      Revoke a device immediately, even while Portal is running.
+    \\      Revoke a device immediately, even while Portal is running: its
+    \\      key is no longer let into the tunnel.
     \\
     \\  portalctl run --console [options] [-- command args...]
     \\      Run `command` in this console and share it (the window is
@@ -113,12 +109,13 @@ const usage =
     \\                         terminal's current directory, or your home
     \\                         folder (%USERPROFILE%) when started from
     \\                         inside Portal's own folders.
-    \\      --listen IP:PORT   Address to listen on (default {s}, which
-    \\                         only this desktop can reach). For your other
-    \\                         devices give your WireGuard address, e.g.
-    \\                         --listen 10.8.0.1:8420. Wildcard and public
-    \\                         addresses are refused.
-    \\      --host NAME[:PORT] Extra Host header value to accept (repeatable).
+    \\      --tunnel-port N    Portal's own WireGuard UDP port (default {d}).
+    \\                         Devices reach the session only through it,
+    \\                         at 10.8.0.1:8420 inside the tunnel.
+    \\      --tunnel-endpoint HOST:PORT
+    \\                         Where devices reach that port (public IP or
+    \\                         DNS name), put into their pairing codes.
+    \\      --tunnel-loopback  Tests: the UDP port on 127.0.0.1 only.
     \\      --input MODE       none | keys | instruct | text   (default:
     \\                         instruct; keys when the program is a shell)
     \\                           none: view only
@@ -150,9 +147,7 @@ const usage =
     \\      --allow-elevated   Run even as administrator. Refused by default:
     \\                         the session program, and everything a paired
     \\                         device types into it, would run as admin.
-    \\      --no-tls           Serve plain HTTP instead of HTTPS (tests and
-    \\                         debugging only; WireGuard is then the only
-    \\                         protection for cookies and keystrokes).
+
     \\
     \\  portalctl open <folder> [--name NAME]
     \\      Open <folder> as a new project tab in the running Portal (the
@@ -206,12 +201,12 @@ const usage =
     \\  portalctl sync subscribe|unsubscribe <device> <package>
     \\  portalctl sync subscriptions
     \\      Which device receives which package.
-    \\  portalctl sync-device --server IP:PORT --ca FILE [--pair] [--approve]
+    \\  portalctl sync-device --pairing-code CODE [--approve]
     \\                    [--wait-updates S] [--only PKG]
-    \\      Headless device side (tests): pair, then fetch, verify and
-    \\      install what the desktop offers. --approve stands for the
-    \\      approval click in the app. Also --status, --rollback PKG and
-    \\      --server IP:PORT --forget.
+    \\      Headless device side (tests): its own tunnel, then fetch, verify
+    \\      and install what the desktop offers. --approve stands for the
+    \\      approval click in the app. Also --key (print this device's
+    \\      key), --status, --rollback PKG and --forget.
     \\
     \\  portalctl version
     \\
@@ -224,12 +219,12 @@ const gui_usage =
     \\portal                     open the Portal window (first run: it asks what to run)
     \\portal run [options] [-- program args...]
     \\                           the window, with options overriding the saved settings
-    \\                           (--listen, --input, --project, --cwd, --no-tls,
+    \\                           (--tunnel-port, --input, --project, --cwd,
     \\                            --allow-remote-shell, --allow-elevated)
     \\portal open <folder> [--name NAME]
     \\                           open a folder as a new tab in the running Portal
-    \\portal connect [--server IP:PORT]
-    \\                           watch a Portal on another machine
+    \\portal connect             watch a Portal on another machine (through
+    \\                           its own WireGuard tunnel; first run: pair)
     \\
     \\Console commands (pair, devices, unpair, ca, show, version, run --console)
     \\are in portalctl.exe, installed next to portal.exe.
@@ -295,7 +290,7 @@ fn guiMain(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     const cmd = args[0];
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(gpa, io, env, args[1..]);
     if (std.mem.eql(u8, cmd, "open")) return cmdOpen(gpa, io, env, args[1..]);
-    if (std.mem.startsWith(u8, cmd, "--")) return cmdRun(gpa, io, env, args); // `portal --listen ...`
+    if (std.mem.startsWith(u8, cmd, "--")) return cmdRun(gpa, io, env, args); // `portal --input ...`
     if (std.mem.eql(u8, cmd, "connect")) {
         const client = @import("client");
         client.report_fn = messageBox;
@@ -337,7 +332,7 @@ fn showBox(text: []const u8, flags: u32) void {
 }
 
 fn printUsage() void {
-    std.debug.print(usage, .{ portal_version, default_listen });
+    std.debug.print(usage, .{ portal_version, tunnelnet.default_udp_port });
 }
 
 /// Set (by the main thread only) once the console is in raw mode, so fatal()
@@ -397,96 +392,16 @@ fn caFingerprint(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, ou
     return x509.formatFingerprint(x509.fingerprint(ca.der), out);
 }
 
-/// Lines typed at the `portal pair` console, handed from a reader thread
-/// to the main loop through an event it can wait on with the store watch.
-const ConsoleLines = struct {
-    ready_ev: w.HANDLE,
-    taken_ev: w.HANDLE,
-    buf: [256]u8 = undefined,
-    len: usize = 0,
-    eof: std.atomic.Value(bool) = .init(false),
-    ready: std.atomic.Value(bool) = .init(false),
-
-    fn reader(c: *ConsoleLines) void {
-        const in = w.GetStdHandle(w.STD_INPUT_HANDLE) orelse {
-            c.finish();
-            return;
-        };
-        var line: [256]u8 = undefined;
-        var n: usize = 0;
-        while (true) {
-            var b: [1]u8 = undefined;
-            var got: w.DWORD = 0;
-            if (w.ReadFile(in, &b, 1, &got, null) == 0 or got == 0) {
-                c.finish();
-                return;
-            }
-            if (b[0] == '\r') continue;
-            if (b[0] != '\n') {
-                if (n < line.len) line[n] = b[0];
-                n +|= 1;
-                continue;
-            }
-            const len = @min(n, line.len);
-            @memcpy(c.buf[0..len], line[0..len]);
-            c.len = len;
-            n = 0;
-            c.ready.store(true, .release);
-            _ = w.SetEvent(c.ready_ev);
-            _ = w.WaitForSingleObject(c.taken_ev, w.INFINITE);
-        }
-    }
-
-    fn finish(c: *ConsoleLines) void {
-        c.eof.store(true, .release);
-        _ = w.SetEvent(c.ready_ev);
-    }
-
-    /// The next typed line, if one is waiting (copied into `out`).
-    fn take(c: *ConsoleLines, out: []u8) ?[]const u8 {
-        if (!c.ready.load(.acquire)) return null;
-        const n = @min(c.len, out.len);
-        @memcpy(out[0..n], c.buf[0..n]);
-        c.ready.store(false, .release);
-        _ = w.ResetEvent(c.ready_ev);
-        _ = w.SetEvent(c.taken_ev);
-        return out[0..n];
-    }
-};
-
 /// "y" / "yes" (any case, surrounding blanks ignored) approves; anything
 /// else, including an empty line, denies. A leading UTF-8 byte order mark
 /// is ignored: .NET and PowerShell write one at the start of a redirected
-/// stdin (`'y' | portalctl pair laptop`), which would otherwise turn the
-/// first answer into a denial.
+/// stdin (`'y' | portalctl pair laptop KEY`), which would otherwise turn the
+/// answer into a denial.
 pub fn isYes(line: []const u8) bool {
     const bom = "\xEF\xBB\xBF";
     const l = if (std.mem.startsWith(u8, line, bom)) line[bom.len..] else line;
-    const t = std.mem.trim(u8, l, " \t");
+    const t = std.mem.trim(u8, l, " \t\r");
     return std.ascii.eqlIgnoreCase(t, "y") or std.ascii.eqlIgnoreCase(t, "yes");
-}
-
-/// What Ctrl+C / closing the console must undo: the window this
-/// `portal pair` opened.
-var pair_cleanup: ?struct { gpa: Allocator, io: Io, paths: devices.Paths, nonce: u64 } = null;
-
-fn pairCtrlHandler(_: w.DWORD) callconv(.winapi) w.BOOL {
-    if (pair_cleanup) |c| endWindow(c.gpa, c.io, c.paths, c.nonce);
-    std.debug.print("\nPairing cancelled; the window is closed.\n", .{});
-    w.ExitProcess(130);
-}
-
-fn endWindow(gpa: Allocator, io: Io, paths: devices.Paths, nonce: u64) void {
-    devices.withStore(gpa, io, paths, nowUnix(io), nonce, struct {
-        fn op(n: u64, st: *devices.Store) !bool {
-            return st.endPair(n);
-        }
-    }.op) catch {};
-}
-
-fn pairStoreFail(desk: devices.Desk, nonce: u64, err: anyerror) noreturn {
-    desk.cancel(nonce) catch {};
-    fatal("device store error: {s} ({t})", .{ devices.describeError(err), err });
 }
 
 fn pairLog(gpa: Allocator, paths: devices.Paths, io: Io, comptime fmt: []const u8, args: anytype) void {
@@ -497,278 +412,111 @@ fn pairLog(gpa: Allocator, paths: devices.Paths, io: Io, comptime fmt: []const u
     }
 }
 
-/// `portal pair <name>`: opens a window, then stays here asking the owner
-/// to approve or deny each device that asks (nothing is typed on the
-/// device). Event-driven: it sleeps until the device list changes (a
-/// device asked, collected its credential, the server reported on the
-/// certificate listener), a line is typed, or the window expires.
+/// What the desk shows a newly paired device: the pairing code (its own
+/// key, endpoint, the CA fingerprint and the device's address) and the
+/// check code of the desk's key. Shared by `portalctl pair` and the
+/// window (gui.zig) so both say the same.
+pub const PairingInfo = struct {
+    code_buf: [shared.pairqr.max_len_tunnel]u8 = undefined,
+    code_len: usize = 0,
+    desk_check: [shared.tunnelnet.check_code_len]u8 = undefined,
+
+    pub fn code(p: *const PairingInfo) []const u8 {
+        return p.code_buf[0..p.code_len];
+    }
+
+    pub fn make(desk_public: *const tunneldesk.Key, endpoint: []const u8, ca_sha256: [32]u8, d: *const devices.Device) !PairingInfo {
+        var p: PairingInfo = .{ .desk_check = shared.tunnelnet.checkCode(desk_public) };
+        p.code_len = (try tunneldesk.pairingCode(&p.code_buf, desk_public, endpoint, ca_sha256, d)).len;
+        return p;
+    }
+};
+
+/// The CA's SHA-256 (32 bytes), if there is a CA.
+fn caSha256(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) ?[32]u8 {
+    const store = tlsStore(gpa, io, env) catch return null;
+    defer gpa.free(store.dir);
+    var ca = (pki.loadCa(store) catch return null) orelse return null;
+    defer ca.deinit(gpa);
+    return x509.fingerprint(ca.der);
+}
+
+/// `portalctl pair <name> <device key>`: the console form of Pair a
+/// device. Shows the check code of the key that was typed; only if the
+/// owner confirms it matches the device's screen is the device recorded
+/// (its key goes into the running Portal's tunnel at once), and the
+/// pairing code for the device is printed. Nothing crosses the network.
 fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
-    if (args.len == 0) fatal("usage: portalctl pair <name> [--minutes N]", .{});
+    const usage_pair = "usage: portalctl pair <name> <the device's WireGuard public key, as `portal connect` shows it>";
+    if (args.len != 2) fatal(usage_pair, .{});
     const name = args[0];
     if (!devices.validName(name)) fatal("device name must be 1-32 characters of a-z, 0-9 and -", .{});
-    var minutes: i64 = 2;
-    if (args.len == 3 and std.mem.eql(u8, args[1], "--minutes")) {
-        minutes = std.fmt.parseInt(i64, args[2], 10) catch fatal("--minutes needs a number", .{});
-        if (minutes < 1 or minutes > 10) fatal("--minutes must be 1-10", .{});
-    } else if (args.len != 1) fatal("usage: portalctl pair <name> [--minutes N]", .{});
+    const key = tunneldesk.tunnel.keys.parsePublic(args[1]) orelse fatal("'{s}' is not a WireGuard public key (44 characters ending in =, as the device shows it)", .{args[1]});
 
     const paths = try devicePaths(gpa, io, env);
     defer gpa.free(paths.dir);
-    var fp_buf: [95]u8 = undefined;
-    const fingerprint = caFingerprint(gpa, io, env, &fp_buf);
-
-    var nonce_bytes: [8]u8 = undefined;
-    io.randomSecure(&nonce_bytes) catch fatal("no entropy", .{});
-    const nonce = std.mem.readInt(u64, &nonce_bytes, .little) | 1;
-    const pid = w.GetCurrentProcessId();
-
-    // Watch before opening the window, so no change is missed.
-    var dw = devices.watchStore(gpa, paths) catch |err|
-        fatal("cannot watch {s} for changes ({t}), so this command could not see the device ask; nothing was opened", .{ paths.dir, err });
-    defer dw.close();
-
-    // `portalctl pair` is a thin console wrapper over devices.Desk, the same
-    // API the Portal window uses (through web.Server.desk*).
-    const desk: devices.Desk = .{ .gpa = gpa, .io = io, .paths = paths };
-    const now0 = nowUnix(io);
-    const replaced = desk.begin(name, minutes * 60, nonce, pid) catch |err|
-        fatal("could not open the pairing window: {s} ({t})", .{ devices.describeError(err), err });
-    var replaced_buf: [devices.max_name]u8 = undefined;
-    var replaced_len: usize = 0;
-    if (replaced) |t| {
-        replaced_len = t.len;
-        @memcpy(replaced_buf[0..t.len], t.get());
-    }
-    pair_cleanup = .{ .gpa = gpa, .io = io, .paths = paths, .nonce = nonce };
-    _ = w.SetConsoleCtrlHandler(&pairCtrlHandler, 1);
-    pairLog(gpa, paths, io, "pairing window opened for '{s}' ({d} min); requests need approval at the desk", .{ name, minutes });
-
-    if (replaced_len > 0) std.debug.print("(Replaced the open pairing window for '{s}'.)\n", .{replaced_buf[0..replaced_len]});
-    std.debug.print(
-        \\Pairing open for '{s}' for {d} minute(s). Nothing is typed on the device:
-        \\you approve it here.
-        \\
-        \\
-    , .{ name, minutes });
-    if (fingerprint) |fp| {
-        std.debug.print("Portal CA SHA-256: {s}\n", .{fp});
-    } else {
-        std.debug.print("Portal CA: none yet (Portal creates it when it first starts).\n", .{});
-    }
-    std.debug.print(
-        \\
-        \\On the device, with WireGuard on:
-        \\  1. First time only: open http://<desktop WireGuard address>:<port+1>/
-        \\     (e.g. http://10.8.0.1:8421/) and install the Portal certificate. Its
-        \\     SHA-256 (shown on that page and in the profile details) must match
-        \\     the one above. iPhone/iPad: also enable full trust for it in
-        \\     Settings > General > About > Certificate Trust Settings.
-        \\  2. Open https://<desktop WireGuard address>:<port>/ (e.g.
-        \\     https://10.8.0.1:8420/) and tap "Pair this device".
-        \\Each request then appears here with a code, which the device also shows.
-        \\Approve only the request whose code and address match your device.
-        \\
-        \\Waiting for the device... (Ctrl+C cancels)
-        \\
-    , .{});
-
-    var lines: ConsoleLines = .{
-        .ready_ev = w.CreateEventW(null, 1, 0, null) orelse fatal("cannot create an event", .{}),
-        .taken_ev = w.CreateEventW(null, 0, 0, null) orelse fatal("cannot create an event", .{}),
+    const desk_public = blk: {
+        var kp = tunneldesk.loadOrCreate(gpa, io, paths) catch |err| fatal("cannot load or create this desktop's WireGuard key: {t}", .{err});
+        defer kp.wipe();
+        break :blk kp.public;
     };
-    const reader = std.Thread.spawn(.{}, ConsoleLines.reader, .{&lines}) catch fatal("cannot start the input thread", .{});
-    reader.detach();
+    const ca = caSha256(gpa, io, env) orelse fatal("no Portal CA yet: start Portal once (it creates one), then pair", .{});
 
-    const start_s = nowUnix(io);
-    var expires: i64 = now0 + minutes * 60;
-    var asked: ?[devices.code_len]u8 = null;
-    var announced: [devices.max_requests * 4][devices.code_len]u8 = undefined;
-    var n_announced: usize = 0;
-    var ca_seen: devices.CaState = .unknown;
-    var ca_hint_done = false;
-    var first = true;
-    while (true) {
-        if (!first) dw.rearm() catch {
-            endWindow(gpa, io, paths, nonce);
-            fatal("lost the change watch on {s}; the pairing window is closed. Run `portalctl pair` again.", .{paths.dir});
-        };
-        first = false;
-        const now = nowUnix(io);
-
-        // A typed answer applies to the request currently asked.
-        var answer: ?struct { code: [devices.code_len]u8, yes: bool } = null;
-        var line_buf: [256]u8 = undefined;
-        if (lines.take(&line_buf)) |line| {
-            if (asked) |code| {
-                answer = .{ .code = code, .yes = isYes(line) };
-            } else std.debug.print("(no request is waiting for an answer)\n", .{});
-        }
-        if (lines.eof.load(.acquire) and !lines.ready.load(.acquire)) {
-            endWindow(gpa, io, paths, nonce);
-            fatal("input closed: `portalctl pair` must ask you to approve the device, so run it in a terminal. The window is closed.", .{});
-        }
-
-        const Snap = struct {
-            lost: bool = false,
-            pairing: ?devices.Pairing = null,
-            answer_result: ?devices.AnswerResult = null,
-            done: ?devices.Request = null,
-        };
-        var snap: Snap = .{};
-        if (answer) |a| snap.answer_result = desk.answer(nonce, &a.code, a.yes) catch |err| pairStoreFail(desk, nonce, err);
-        snap.pairing = desk.get(nonce) catch |err| pairStoreFail(desk, nonce, err);
-        if (snap.pairing) |p| {
-            snap.done = devices.pairedRequest(&p);
-            if (snap.done != null) desk.cancel(nonce) catch |err| pairStoreFail(desk, nonce, err);
-        } else snap.lost = true;
-
-        if (answer) |a| if (snap.answer_result) |r| {
-            const ip: []const u8 = blk: {
-                const p = snap.pairing orelse break :blk "?";
-                const i = p.findCode(&a.code) orelse break :blk "?";
-                break :blk p.requests[i].?.ip.get();
-            };
-            switch (r) {
-                .approved => {
-                    std.debug.print("Approved request {s} from {s}. Waiting for the device to collect its credential...\n", .{ &a.code, ip });
-                    pairLog(gpa, paths, io, "pairing request {s} for '{s}' from {s} approved at the desk", .{ &a.code, name, ip });
-                },
-                .denied => {
-                    std.debug.print("Denied request {s} from {s}. Further requests from that address are refused in this window.\n", .{ &a.code, ip });
-                    pairLog(gpa, paths, io, "pairing request {s} for '{s}' from {s} denied at the desk", .{ &a.code, name, ip });
-                },
-                .not_pending, .no_such_request => std.debug.print("Request {s} is no longer waiting.\n", .{&a.code}),
-                .window_gone => {},
-            }
-            asked = null;
-        };
-
-        if (snap.done) |r| {
-            std.debug.print("Paired '{s}' at {s}.\n", .{ name, r.ip.get() });
-            return;
-        }
-        if (snap.lost) {
-            if (now > expires) {
-                std.debug.print("The pairing window expired; nothing was paired. Run `portalctl pair {s}` again when the device is ready.\n", .{name});
-                pairLog(gpa, paths, io, "pairing window for '{s}' expired; nothing was paired", .{name});
-            } else {
-                std.debug.print("The pairing window was closed or replaced by another `portalctl pair`.\n", .{});
-            }
-            w.ExitProcess(1);
-        }
-        const p = snap.pairing.?;
-        expires = p.expires;
-
-        // What the running server reports about the certificate listener.
-        if (p.ca != ca_seen) {
-            ca_seen = p.ca;
-            switch (p.ca) {
-                .up => std.debug.print("Certificate download is up: http://{s}/ (served by the running Portal).\n", .{p.ca_where.get()}),
-                .failed => std.debug.print(
-                    \\WARNING: the running Portal could NOT open the certificate download listener on
-                    \\  {s}. Another program may be using that port: do not install a
-                    \\  certificate from that address. Use `portalctl ca export` instead, and
-                    \\  check the SHA-256 above.
-                    \\
-                , .{p.ca_where.get()}),
-                .off => std.debug.print("The running Portal uses --no-tls: no certificate download.\n", .{}),
-                .unknown => {},
-            }
-        }
-        if (p.ca == .unknown and !ca_hint_done and now - start_s >= 3) {
-            ca_hint_done = true;
-            std.debug.print("No running Portal has picked up this window yet (start it, as this Windows user).\n", .{});
-        }
-
-        // Announce new requests; ask about one at a time, oldest first.
-        if (asked) |code| {
-            const still = if (p.findCode(&code)) |i| p.requests[i].?.state == .pending else false;
-            if (!still) {
-                std.debug.print("\nRequest {s} is no longer waiting.\n", .{&code});
-                asked = null;
-            }
-        }
-        var order: [devices.max_requests]usize = undefined;
-        var n_order: usize = 0;
-        for (p.requests, 0..) |slot, i| if (slot != null) {
-            order[n_order] = i;
-            n_order += 1;
-        };
-        std.mem.sort(usize, order[0..n_order], &p, struct {
-            fn lt(pp: *const devices.Pairing, a: usize, b: usize) bool {
-                return pp.requests[a].?.created < pp.requests[b].?.created;
-            }
-        }.lt);
-        for (order[0..n_order]) |i| {
-            const r = p.requests[i].?;
-            var seen = false;
-            for (announced[0..n_announced]) |c| seen = seen or std.mem.eql(u8, &c, &r.code);
-            if (seen or r.state != .pending) continue;
-            if (n_announced < announced.len) {
-                announced[n_announced] = r.code;
-                n_announced += 1;
-            }
-            if (asked != null) std.debug.print("\n  (another request is waiting: '{s}' from {s}, request {s}; asked next)\n", .{ name, r.ip.get(), &r.code });
-        }
-        if (asked == null and !p.decided()) {
-            for (order[0..n_order]) |i| {
-                const r = p.requests[i].?;
-                if (r.state != .pending) continue;
-                std.debug.print("\nPair '{s}' from {s} (request {s})? [y/N] ", .{ name, r.ip.get(), &r.code });
-                asked = r.code;
-                break;
-            }
-        }
-
-        const handles = [2]w.HANDLE{ lines.ready_ev, dw.h };
-        var ms = devices.waitMs(now, expires);
-        // One real deadline: the "no running Portal picked this up" hint.
-        if (p.ca == .unknown and !ca_hint_done) ms = @min(ms, @as(w.DWORD, @intCast(@max(0, start_s + 3 - now) * 1000 + 250)));
-        _ = w.WaitForMultipleObjects(handles.len, &handles, 0, ms);
+    const check = shared.tunnelnet.checkCode(&key);
+    std.debug.print("Device '{s}'\n  key        {s}\n  check code {s}\n\nApprove only if the device shows the same check code.\nPair it? [y/N] ", .{ name, args[1], &check });
+    var ibuf: [256]u8 = undefined;
+    var r = Io.File.stdin().reader(io, &ibuf);
+    const line = (r.interface.takeDelimiter('\n') catch null) orelse "";
+    if (!isYes(line)) {
+        std.debug.print("Not paired.\n", .{});
+        std.process.exit(1);
     }
+    const desk: devices.Desk = .{ .gpa = gpa, .io = io, .paths = paths };
+    const paired = desk.pair(name, key, desk_public) catch |err|
+        fatal("could not pair '{s}': {s} ({t})", .{ name, devices.describeError(err), err });
+    for (paired.replaced.items()) |old| pairLog(gpa, paths, io, "pairing '{s}' replaced the earlier record of '{s}'", .{ name, old.name.get() });
+    var ib: [shared.tunnelnet.max_ip_text]u8 = undefined;
+    pairLog(gpa, paths, io, "device '{s}' paired at the desk as {s} (key check code {s})", .{ name, paired.device.ipText(&ib), &check });
+
+    const saved = settings.load(gpa, io, paths.dir);
+    const endpoint = saved.tunnel_endpoint.get() orelse "<this desktop's public address or DNS name>:51820";
+    const info = PairingInfo.make(&desk_public, endpoint, ca, &paired.device) catch fatal("the tunnel endpoint in Settings is too long", .{});
+    std.debug.print(
+        \\Paired '{s}' as {s}.
+        \\
+        \\On the device, enter this pairing code (or scan it from Pair a device in the window):
+        \\  {s}
+        \\The device then shows this desktop's key check code: it must be {s}.
+        \\
+    , .{ name, paired.device.ipText(&ib), info.code(), &info.desk_check });
+    if (saved.tunnel_endpoint.get() == null)
+        std.debug.print("Note: set the tunnel endpoint in the Portal window's Settings first (where devices reach this desktop's UDP {d}); the code above has a placeholder.\n", .{saved.tunnelPort()});
 }
 
 fn cmdDevices(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) !void {
     const paths = try devicePaths(gpa, io, env);
     defer gpa.free(paths.dir);
+    const st = devices.read(gpa, io, paths) catch |err| fatal("could not read the device list: {s} ({t})", .{ devices.describeError(err), err });
+    if (st.count() == 0) std.debug.print("No paired devices. Pair one with `portalctl pair <name> <key>`.\n", .{});
     const now = nowUnix(io);
-    const Ctx = struct { now: i64 };
-    devices.withStore(gpa, io, paths, now, Ctx{ .now = now }, struct {
-        fn op(c: Ctx, st: *devices.Store) !bool {
-            if (st.count() == 0) std.debug.print("No paired devices. Pair one with `portalctl pair <name>`.\n", .{});
-            for (st.devices) |slot| {
-                const d = slot orelse continue;
-                std.debug.print("  {s: <20} {s: <18} last used {d} min ago\n", .{
-                    d.name.get(), d.ip.get(), @divTrunc(c.now -| d.last_seen, 60),
-                });
-            }
-            if (st.pairing) |p| if (st.pairingName(c.now) != null) {
-                std.debug.print("Pairing window open for '{s}' ({d} s left; answer requests in its `portalctl pair` console).\n", .{ p.name.get(), p.expires - c.now });
-                for (p.requests) |slot| {
-                    const r = slot orelse continue;
-                    std.debug.print("  request {s} from {s}: {t}\n", .{ &r.code, r.ip.get(), r.state });
-                }
-            };
-            return false;
-        }
-    }.op) catch |err| fatal("could not read the device list: {s} ({t})", .{ devices.describeError(err), err });
+    for (st.devices) |slot| {
+        const d = slot orelse continue;
+        var ib: [shared.tunnelnet.max_ip_text]u8 = undefined;
+        std.debug.print("  {s: <20} {s: <10} {s}  {s}  last used {d} min ago\n", .{
+            d.name.get(), d.ipText(&ib), &d.keyText(), &shared.tunnelnet.checkCode(&d.key), @divTrunc(now -| d.last_seen, 60),
+        });
+    }
 }
 
 fn cmdUnpair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
     if (args.len != 1) fatal("usage: portalctl unpair <name>", .{});
     const paths = try devicePaths(gpa, io, env);
     defer gpa.free(paths.dir);
-    var removed = false;
-    const Ctx = struct { name: []const u8, removed: *bool };
-    devices.withStore(gpa, io, paths, nowUnix(io), Ctx{ .name = args[0], .removed = &removed }, struct {
-        fn op(c: Ctx, st: *devices.Store) !bool {
-            c.removed.* = st.remove(c.name);
-            return c.removed.*;
-        }
-    }.op) catch |err| fatal("could not update the device list: {s} ({t})", .{ devices.describeError(err), err });
-    if (!removed) fatal("no paired device named '{s}' (see `portalctl devices`)", .{args[0]});
+    const desk: devices.Desk = .{ .gpa = gpa, .io = io, .paths = paths };
+    const removed = desk.unpair(args[0]) catch |err| fatal("could not update the device list: {s} ({t})", .{ devices.describeError(err), err });
+    if (removed == null) fatal("no paired device named '{s}' (see `portalctl devices`)", .{args[0]});
     pairLog(gpa, paths, io, "device '{s}' unpaired from the desktop", .{args[0]});
-    std.debug.print("Unpaired '{s}'. Its open viewers are disconnected within a few seconds.\n", .{args[0]});
+    std.debug.print("Unpaired '{s}'. Its key is no longer let in, and its open connections end within a few seconds.\n", .{args[0]});
 }
 
 // --------------------------------------------------------------------- ca
@@ -907,30 +655,11 @@ fn cmdCa(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []co
     std.debug.print("    SPKI SHA-256 (base64) {s}\n", .{std.base64.standard.Encoder.encode(&b64, &spki_hash)});
 }
 
-/// Host part of a Host-style value: "10.8.0.1:8420" -> "10.8.0.1",
-/// "[fd00::1]:8420" -> "fd00::1", "desk" -> "desk".
-fn hostOnly(h: []const u8) []const u8 {
-    if (h.len > 0 and h[0] == '[') {
-        const end = std.mem.indexOfScalar(u8, h, ']') orelse return h;
-        return h[1..end];
-    }
-    if (std.mem.count(u8, h, ":") == 1) return h[0..std.mem.indexOfScalar(u8, h, ':').?];
-    return h;
-}
-
-/// The same host with `port` (for the certificate download listener's
-/// Host allowlist).
-fn withPort(gpa: Allocator, h: []const u8, port: u16) ![]u8 {
-    const host = hostOnly(h);
-    if (std.mem.indexOfScalar(u8, host, ':') != null) return std.fmt.allocPrint(gpa, "[{s}]:{d}", .{ host, port });
-    return std.fmt.allocPrint(gpa, "{s}:{d}", .{ host, port });
-}
-
 const TlsSetup = struct { ca: pki.Ca, leaf: pki.Leaf };
 
 /// Loads (or on first use creates) the CA and makes sure the server
-/// certificate covers the listen address and any permitted --host names.
-fn setupTls(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, addr: std.Io.net.IpAddress, hosts: []const []const u8, log: *Log) TlsSetup {
+/// certificate covers the desk's tunnel address.
+fn setupTls(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, log: *Log) TlsSetup {
     const store = tlsStore(gpa, io, env) catch |err| fatal("cannot create the TLS directory: {t}", .{err});
     const now = nowUnix(io);
     const ca = (pki.loadCa(store) catch |err|
@@ -938,7 +667,7 @@ fn setupTls(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, addr: s
         const c = pki.defaultConstraints();
         const created = pki.initCa(store, &c, now, false) catch |err| fatal("cannot create the Portal CA: {t}", .{err});
         std.debug.print("portal: created {s}, limited to 10.8.0.0/24 and 127.0.0.1.\n" ++
-            "       Install it on each device first: `portalctl ca export` (see README).\n", .{created.commonName()});
+            "       Devices pin it from the fingerprint in their pairing code.\n", .{created.commonName()});
         log.print("created {s}", .{created.commonName()});
         break :blk created;
     };
@@ -953,59 +682,16 @@ fn setupTls(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, addr: s
     if (!ca.currentProfile())
         std.debug.print("portal: note: old CA profile - run `portalctl ca init --force` to upgrade (devices must re-trust).\n", .{});
 
-    var sans: [1 + 16]x509.SanEntry = undefined;
-    var n: usize = 0;
-    var listen_ip: [16]u8 = @splat(0);
-    const ip_len: u8 = switch (addr) {
-        .ip4 => |a| blk: {
-            @memcpy(listen_ip[0..4], &a.bytes);
-            break :blk 4;
-        },
-        .ip6 => |a| blk: {
-            listen_ip = a.bytes;
-            break :blk 16;
-        },
-    };
-    if (!ca.constraints.ipPermitted(listen_ip[0..ip_len])) {
+    // The one name devices use: the desk's tunnel address.
+    const desk_ip: [16]u8 = tunnelnet.desk_ip ++ @as([12]u8, @splat(0));
+    if (!ca.constraints.ipPermitted(desk_ip[0..4])) {
         std.debug.print("permitted by the Portal CA:\n", .{});
         printConstraints(&ca.constraints);
-        fatal("the listen address is outside the Portal CA's name constraints. Re-create the CA with " ++
-            "`portalctl ca init --force --permit <subnet>` (every device must then trust it again).", .{});
+        fatal("the desk's tunnel address (10.8.0.1) is outside the Portal CA's name constraints. Re-create the CA with " ++
+            "`portalctl ca init --force` (every device must then be paired again).", .{});
     }
-    sans[n] = .{ .ip = .{ .bytes = listen_ip, .len = ip_len } };
-    n += 1;
-    for (hosts) |h| {
-        if (n == sans.len) break;
-        const host = hostOnly(h);
-        var entry: ?x509.SanEntry = null;
-        if (std.Io.net.IpAddress.parse(host, 0)) |ip| {
-            var b: [16]u8 = @splat(0);
-            const l: u8 = switch (ip) {
-                .ip4 => |a| blk: {
-                    @memcpy(b[0..4], &a.bytes);
-                    break :blk 4;
-                },
-                .ip6 => |a| blk: {
-                    b = a.bytes;
-                    break :blk 16;
-                },
-            };
-            if (ca.constraints.ipPermitted(b[0..l])) entry = .{ .ip = .{ .bytes = b, .len = l } };
-        } else |_| {
-            if (x509.validDnsName(host) and ca.constraints.dnsPermitted(host)) entry = .{ .dns = host };
-        }
-        const e = entry orelse {
-            std.debug.print("portal: note: --host {s} is outside the CA's name constraints; not in the certificate (HTTPS to that name will fail)\n", .{h});
-            continue;
-        };
-        var dup = false;
-        for (sans[0..n]) |s| dup = dup or sanEql(s, e);
-        if (!dup) {
-            sans[n] = e;
-            n += 1;
-        }
-    }
-    const leaf = pki.ensureLeaf(store, &ca, sans[0..n], now) catch |err| fatal("cannot issue the server certificate: {t}", .{err});
+    const sans = [_]x509.SanEntry{.{ .ip = .{ .bytes = desk_ip, .len = 4 } }};
+    const leaf = pki.ensureLeaf(store, &ca, &sans, now) catch |err| fatal("cannot issue the server certificate: {t}", .{err});
     if (leaf.renewed) |why| {
         log.print("issued a new server certificate ({s})", .{why});
         std.debug.print("portal: issued a new server certificate ({s}).\n", .{why});
@@ -1013,196 +699,62 @@ fn setupTls(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, addr: s
     return .{ .ca = ca, .leaf = leaf };
 }
 
-fn sanEql(a: x509.SanEntry, b: x509.SanEntry) bool {
-    return switch (a) {
-        .ip => |x| switch (b) {
-            .ip => |y| x.len == y.len and std.mem.eql(u8, x.bytes[0..x.len], y.bytes[0..y.len]),
-            .dns => false,
-        },
-        .dns => |x| switch (b) {
-            .dns => |y| std.ascii.eqlIgnoreCase(x, y),
-            .ip => false,
-        },
-    };
-}
-
-/// The server side of pairing, event-driven: sleeps until a file in the
-/// data directory is renamed (every device-store change ends in one), the
-/// `portalctl pair` process that owns the open window exits, or the window
-/// expires. On each wake it re-reads the store once and
-///   * refreshes the HTTPS server's in-memory pairing view (so requests
-///     before sign-in never read the file),
-///   * ends the sessions of devices that are no longer paired (`portal
-///     unpair` from another process); a failed read revokes nothing,
-///   * opens the certificate download listener (plain HTTP, listen port
-///     + 1) while a window is open, closes it afterwards, and reports
-///     whether it is actually up back into the store, where `portalctl pair`
-///     shows it. A listener that can't be opened (e.g. another program is
-///     squatting the port) is logged loudly and reported as failed.
-const PairWatch = struct {
+/// The device store watcher, one thread for the life of the process.
+/// Sleeps until a file in the data directory is created, renamed or
+/// deleted (every device-store change ends in one: a pairing or Unpair at
+/// the desk, `portalctl pair/unpair`, a device forgetting this desktop).
+/// On each wake it re-reads the store once and
+///   * hands it to the server, which ends the connections of devices that
+///     are no longer paired (with a `logout` saying why);
+///   * gives the tunnel the new peer table (only paired keys get in, each
+///     only from its own address). A failed read changes nothing.
+const StoreWatch = struct {
     srv: *web.Server,
+    tun: *tunneldesk.tunnel.Tunnel,
     /// The data directory's change watch, opened before the thread starts
     /// (Portal refuses to run without it).
     dw: ?fsutil.DirWatch,
-    /// The certificate download server; null with --no-tls.
-    ca_srv: ?*web.Server,
-    ca_addr: std.Io.net.IpAddress,
     paths: devices.Paths,
     io: Io,
     gpa: Allocator,
 
-    fn readStore(pw: *PairWatch, out: *devices.Store) !void {
-        devices.withStore(pw.gpa, pw.io, pw.paths, nowUnix(pw.io), out, struct {
-            fn op(o: *devices.Store, st: *devices.Store) !bool {
-                o.* = st.*;
-                return false;
-            }
-        }.op) catch |err| return err;
-    }
-
-    /// Records the certificate listener's state for window `nonce`.
-    fn report(pw: *PairWatch, nonce: u64, state: devices.CaState, where: []const u8) void {
-        const Ctx = struct { nonce: u64, state: devices.CaState, where: []const u8 };
-        devices.withStore(pw.gpa, pw.io, pw.paths, nowUnix(pw.io), Ctx{ .nonce = nonce, .state = state, .where = where }, struct {
-            fn op(c: Ctx, st: *devices.Store) !bool {
-                const p = &(st.pairing orelse return false);
-                if (p.nonce != c.nonce or (p.ca == c.state and std.mem.eql(u8, p.ca_where.get(), c.where))) return false;
-                p.ca = c.state;
-                p.ca_where.set(if (devices.validWhere(c.where)) c.where else "");
-                return true;
-            }
-        }.op) catch |err| pw.srv.noteStoreError(err);
+    /// The server's and the tunnel's view of `st`.
+    fn apply(sw: *StoreWatch, st: *const devices.Store) void {
+        sw.srv.applyStore(st);
+        var peers: [devices.max_devices]tunneldesk.tunnel.Peer = undefined;
+        sw.tun.setPeers(tunneldesk.peersFrom(st, &peers)) catch |err|
+            sw.srv.log.print("ERROR: the tunnel's peer table could not be updated ({t}); device changes take effect after a restart", .{err});
     }
 
     /// Re-arms the change watch; if that fails, re-opens it once. Losing
     /// it is logged as an error: changes made by `portalctl` (pair,
     /// unpair) are then not seen until Portal restarts, while the
-    /// window's own desk actions still are.
-    fn rearm(pw: *PairWatch) void {
-        var d = pw.dw orelse return;
+    /// window's own desk actions still are (gui.zig applies them).
+    fn rearm(sw: *StoreWatch) void {
+        var d = sw.dw orelse return;
         d.rearm() catch {
             d.close();
-            pw.dw = devices.watchStore(pw.gpa, pw.paths) catch |err| {
-                pw.dw = null;
-                pw.srv.log.print("ERROR: lost the change watch on {s} ({t}): `portalctl pair`/`unpair` changes are not seen until Portal restarts", .{ pw.paths.dir, err });
+            sw.dw = devices.watchStore(sw.gpa, sw.paths) catch |err| {
+                sw.dw = null;
+                sw.srv.log.print("ERROR: lost the change watch on {s} ({t}): `portalctl pair`/`unpair` changes are not seen until Portal restarts", .{ sw.paths.dir, err });
                 return;
             };
-            pw.srv.log.print("change watch on {s} was lost and has been re-opened", .{pw.paths.dir});
+            sw.srv.log.print("change watch on {s} was lost and has been re-opened", .{sw.paths.dir});
         };
     }
 
-    fn watch(pw: *PairWatch) void {
-        const io = pw.io;
-        var where_buf: [80]u8 = undefined;
-        const where = std.fmt.bufPrint(&where_buf, "{f}", .{pw.ca_addr}) catch "?";
-        var active: ?Io.Future(void) = null;
-        var failed_nonce: u64 = 0;
-        var proc_h: ?w.HANDLE = null;
-        var proc_nonce: u64 = 0;
-        var gone_nonce: u64 = 0;
-        var first = true;
+    fn watch(sw: *StoreWatch) void {
         while (true) {
-            _ = pw.srv.pairwatch_wakes.fetchAdd(1, .monotonic);
-            if (!first) pw.rearm(); // before reading: a change made meanwhile signals again
-            first = false;
-            const read_start = pw.srv.realNowMs();
-            const now = nowUnix(io);
-            var st: devices.Store = .{};
-            var window: ?devices.Pairing = null;
-            if (pw.readStore(&st)) |_| {
-                pw.srv.applyStore(&st, read_start);
-                window = st.pairing;
-            } else |err| {
-                pw.srv.noteStoreError(err);
-                window = pw.srv.pairingSnapshot(now); // keep the last known view
-            }
-
-            // Follow the owning `portalctl pair` process.
-            if (window) |p| {
-                if (p.nonce != proc_nonce) {
-                    if (proc_h) |h| _ = w.CloseHandle(h);
-                    proc_nonce = p.nonce;
-                    proc_h = w.OpenProcess(w.SYNCHRONIZE, 0, p.pid);
-                    if (proc_h == null) {
-                        gone_nonce = p.nonce;
-                        pw.srv.pairingProcessGone(p.nonce);
-                        pw.srv.log.print("pairing window closed: its `portalctl pair` (pid {d}) is not running (error {d})", .{ p.pid, w.GetLastError() });
-                    }
-                }
-            } else if (proc_h) |h| {
-                _ = w.CloseHandle(h);
-                proc_h = null;
-                proc_nonce = 0;
-            }
-            const open: ?devices.Pairing = if (window) |p|
-                (if (now <= p.expires and p.nonce != gone_nonce) p else null)
-            else
-                null;
-
-            if (pw.ca_srv) |cs| {
-                if (open) |p| {
-                    if (active == null and failed_nonce != p.nonce) {
-                        if (netlisten.listenExclusive(pw.ca_addr)) |l| {
-                            cs.listener = .{ .os = l };
-                            cs.stop.store(false, .release);
-                            if (io.concurrent(web.Server.run, .{cs})) |f| {
-                                active = f;
-                                pw.srv.log.print("pairing window open: certificate download on http://{s}/", .{where});
-                            } else |_| {
-                                var ll = l;
-                                netlisten.close(&ll);
-                            }
-                        } else |err| {
-                            pw.srv.log.print("PAIRING WARNING: cannot open the certificate download listener on {s}: {t}. " ++
-                                "Another program may be using that port; devices must not trust a certificate page served there " ++
-                                "(use `portalctl ca export` and compare SHA-256 fingerprints).", .{ where, err });
-                        }
-                        if (active == null) failed_nonce = p.nonce;
-                    }
-                    pw.report(p.nonce, if (active != null) .up else .failed, where);
-                } else if (active) |*f| {
-                    cs.stop.store(true, .release);
-                    f.cancel(io); // interrupts the blocked accept, waits for run() to return
-                    active = null;
-                    netlisten.close(&cs.listener.os);
-                    pw.srv.log.print("pairing window closed: certificate download on http://{s}/ stopped", .{where});
-                }
-            } else if (open) |p| pw.report(p.nonce, .off, "");
-
-            var handles: [2]w.HANDLE = undefined;
-            var n: w.DWORD = 0;
-            if (pw.dw) |d| {
-                handles[n] = d.h;
-                n += 1;
-            }
-            const proc_slot = n;
-            if (proc_h) |h| if (open != null) {
-                handles[n] = h;
-                n += 1;
-            };
-            // Events only; the one timeout is a real deadline (the open
-            // window's expiry).
-            const ms = devices.waitMs(now, if (open) |p| p.expires else null);
-            const r = if (n == 0) blk: {
-                // Only after the watch was lost (logged as an error).
-                const left: Io.Timeout = if (ms == w.INFINITE) .none else .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
-                left.sleep(io) catch {};
-                break :blk w.WAIT_TIMEOUT;
-            } else w.WaitForMultipleObjects(n, &handles, 0, ms);
-            if (n > proc_slot and r == w.WAIT_OBJECT_0 + proc_slot) {
-                // `portalctl pair` exited (Ctrl+C, closed console, killed):
-                // the window closes now, not at its expiry.
-                gone_nonce = proc_nonce;
-                pw.srv.pairingProcessGone(proc_nonce);
-                pw.srv.log.print("pairing window closed: `portalctl pair` exited", .{});
-                if (proc_h) |h| _ = w.CloseHandle(h);
-                proc_h = null;
-            }
+            const d = sw.dw orelse return;
+            if (w.WaitForMultipleObjects(1, &[1]w.HANDLE{d.h}, 0, w.INFINITE) != w.WAIT_OBJECT_0) return;
+            _ = sw.srv.pairwatch_wakes.fetchAdd(1, .monotonic);
+            sw.rearm(); // before reading: a change made meanwhile signals again
+            if (devices.read(sw.gpa, sw.io, sw.paths)) |st| sw.apply(&st) else |err| sw.srv.noteStoreError(err);
         }
     }
 };
 
-/// Portal sync, event-driven like PairWatch: sleeps until a file is
+/// Portal sync, event-driven like StoreWatch: sleeps until a file is
 /// created, renamed or deleted in the data directory (the subscriptions
 /// and device lists are replaced by rename) or anywhere under publish\
 /// (a publish ends in a folder rename). On each wake it hashes every
@@ -1260,24 +812,19 @@ const SyncWatch = struct {
     }
 };
 
-const no_tls_warning =
-    \\
-    \\  *****************************************************************
-    \\  *  --no-tls: PLAIN HTTP. Cookies, device credentials and        *
-    \\  *  keystrokes cross the network unencrypted; only WireGuard     *
-    \\  *  protects them. Use this for tests and debugging only.        *
-    \\  *****************************************************************
-    \\
-    \\
-;
-
 // -------------------------------------------------------------------- run
 
 /// What the command line said. Unset values come from settings.txt
 /// (mergeConfig); command-line values win.
 const RunOptions = struct {
-    listen: ?[]const u8 = null,
-    hosts: std.ArrayList([]const u8) = .empty,
+    /// `--tunnel-port N`: the WireGuard UDP port (default 51820).
+    tunnel_port: ?u16 = null,
+    /// `--tunnel-endpoint HOST:PORT`: where devices reach that port.
+    tunnel_endpoint: ?[]const u8 = null,
+    /// `--tunnel-loopback`: bind the UDP port to 127.0.0.1 only (tests:
+    /// devices on this machine; never reachable from the network, no
+    /// firewall prompt).
+    tunnel_loopback: bool = false,
     /// `instruct` unless chosen (here or in settings): a paired device
     /// answers prompts and sends checked instruction lines (no shell escape,
     /// slash commands or memory shortcut). For a shell the default drops to
@@ -1289,8 +836,6 @@ const RunOptions = struct {
     console: bool = false,
     /// `--cwd`: the child's working directory (see workdir.zig for the default).
     cwd: ?[]const u8 = null,
-    /// Plain HTTP (tests/debugging). HTTPS is the default.
-    no_tls: bool = false,
     /// Allow instruct/text input when the session program is a shell.
     allow_remote_shell: bool = false,
     /// `--project`: shown in the window title (title.validProject).
@@ -1301,7 +846,7 @@ const RunOptions = struct {
     command: ?[]const []const u8 = null,
 };
 
-fn parseRunArgs(gpa: Allocator, args: []const []const u8) !RunOptions {
+fn parseRunArgs(args: []const []const u8) RunOptions {
     var o: RunOptions = .{};
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -1311,15 +856,18 @@ fn parseRunArgs(gpa: Allocator, args: []const []const u8) !RunOptions {
             o.command = args[i + 1 ..];
             break;
         }
-        const needs_value = std.mem.eql(u8, a, "--listen") or std.mem.eql(u8, a, "--host") or
+        const needs_value = std.mem.eql(u8, a, "--tunnel-port") or std.mem.eql(u8, a, "--tunnel-endpoint") or
             std.mem.eql(u8, a, "--input") or std.mem.eql(u8, a, "--cwd") or std.mem.eql(u8, a, "--project");
         if (needs_value and i + 1 >= args.len) fatal("{s} needs a value", .{a});
-        if (std.mem.eql(u8, a, "--listen")) {
+        if (std.mem.eql(u8, a, "--tunnel-port")) {
             i += 1;
-            o.listen = args[i];
-        } else if (std.mem.eql(u8, a, "--host")) {
+            o.tunnel_port = settings.parsePort(args[i]) orelse fatal("--tunnel-port must be 1-65535", .{});
+        } else if (std.mem.eql(u8, a, "--tunnel-endpoint")) {
             i += 1;
-            try o.hosts.append(gpa, args[i]);
+            if (args[i].len > settings.max_endpoint) fatal("--tunnel-endpoint is too long", .{});
+            o.tunnel_endpoint = args[i];
+        } else if (std.mem.eql(u8, a, "--tunnel-loopback")) {
+            o.tunnel_loopback = true;
         } else if (std.mem.eql(u8, a, "--input")) {
             i += 1;
             o.policy = keymap.Policy.parse(args[i]) orelse fatal("--input must be none, keys, instruct or text", .{});
@@ -1331,10 +879,8 @@ fn parseRunArgs(gpa: Allocator, args: []const []const u8) !RunOptions {
             i += 1;
             if (!title.validProject(args[i])) fatal("--project must be 1-{d} bytes of printable text on one line", .{title.max_project_bytes});
             o.project = args[i];
-        } else if (std.mem.eql(u8, a, "--no-tls")) {
-            o.no_tls = true;
-        } else if (std.mem.eql(u8, a, "--https")) {
-            fatal("--https was removed: Portal now serves HTTPS itself (use --no-tls for plain HTTP)", .{});
+        } else if (std.mem.eql(u8, a, "--listen") or std.mem.eql(u8, a, "--host") or std.mem.eql(u8, a, "--no-tls")) {
+            fatal("{s} was removed: devices reach Portal only through its own WireGuard tunnel (--tunnel-port), always over TLS", .{a});
         } else if (std.mem.eql(u8, a, "--console")) {
             o.console = true;
         } else if (std.mem.eql(u8, a, "--cwd")) {
@@ -1348,10 +894,12 @@ fn parseRunArgs(gpa: Allocator, args: []const []const u8) !RunOptions {
 }
 
 /// The session's configuration: the command line over settings.txt over
-/// the built-in defaults (listen address and input mode only: there is
-/// no default program).
+/// the built-in defaults (tunnel port and input mode only: there is no
+/// default program).
 const RunConfig = struct {
-    listen: []const u8 = default_listen,
+    tunnel_port: u16 = tunnelnet.default_udp_port,
+    /// Null: not set yet (pairing codes then carry a placeholder).
+    tunnel_endpoint: ?[]const u8 = null,
     policy: keymap.Policy = .instruct,
     /// The default `instruct` was lowered to `keys` for a shell.
     fell_back: bool = false,
@@ -1367,7 +915,8 @@ const RunConfig = struct {
 /// be used (it is then treated as unset).
 fn mergeConfig(cfg: *RunConfig, cli: *const RunOptions, s: *const settings.Settings) ?[]const u8 {
     var problem: ?[]const u8 = null;
-    cfg.listen = cli.listen orelse s.listen.get() orelse default_listen;
+    cfg.tunnel_port = cli.tunnel_port orelse s.tunnelPort();
+    cfg.tunnel_endpoint = cli.tunnel_endpoint orelse s.tunnel_endpoint.get();
     cfg.project = cli.project orelse s.project.get();
     cfg.cwd = cli.cwd orelse s.cwd.get();
     cfg.command = cli.command;
@@ -1408,14 +957,18 @@ fn joinCommand(argv: []const []const u8, buf: []u8) []const u8 {
 /// Everything a session needs that can fail because of the configuration;
 /// failures are a message for the setup panel (GUI) or fatal (console).
 const Prepared = struct {
-    addr: std.Io.net.IpAddress,
-    listener: std.Io.net.Server,
+    /// The in-process tunnel, its peers the paired devices (`store`).
+    tun: *tunneldesk.tunnel.Tunnel,
+    /// 10.8.0.1:8420 inside the tunnel. Never closed.
+    listener: transport.Listener,
+    store: devices.Store,
     resolved: cmdline.Resolved,
 };
 
 const PrepareResult = union(enum) { ok: Prepared, problem: []const u8 };
 
-fn prepare(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, cfg: *const RunConfig, allow_remote_shell: bool, err_buf: []u8) PrepareResult {
+fn prepare(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, paths: devices.Paths, cfg: *const RunConfig, opts: *const RunOptions, err_buf: []u8) PrepareResult {
+    const allow_remote_shell = opts.allow_remote_shell;
     const P = PrepareResult;
     const fail_ = struct {
         fn f(buf: []u8, comptime fmt: []const u8, args: anytype) P {
@@ -1431,31 +984,25 @@ fn prepare(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, cfg: *co
     // Remote typing into a shell is a remote shell: refuse unless explicit.
     if ((cfg.policy == .instruct or cfg.policy == .text) and isShellProgram(command[0]) and !allow_remote_shell)
         return fail_(err_buf, "Refusing {t} input for a shell ({s}): remote typing would be a remote shell. Choose keys input, or pass --allow-remote-shell if you really mean it.", .{ cfg.policy, command[0] });
-    const addr = parseListen(cfg.listen) catch
-        return fail_(err_buf, "Bad listen address '{s}' (want IP:PORT, e.g. 127.0.0.1:8420).", .{cfg.listen});
-    guard.checkListenAddress(addr) catch |err| return switch (err) {
-        error.WildcardAddress => fail_(err_buf, "Refusing to listen on all interfaces ({s}). Use your WireGuard address.", .{cfg.listen}),
-        error.PublicAddress => fail_(err_buf, "Refusing to listen on a public address ({s}). Use loopback or your WireGuard address.", .{cfg.listen}),
-    };
-    // Listen before starting the child so a port conflict fails fast.
-    var listener = netlisten.listenExclusive(addr) catch |err|
-        return fail_(err_buf, "Cannot listen on {s}: {t}. Is another Portal running there?", .{ cfg.listen, err });
-    const resolved = cmdline.resolve(gpa, io, command, env.get("PATH"), env.get("SystemRoot")) catch |err| {
-        netlisten.close(&listener);
+    const resolved = cmdline.resolve(gpa, io, command, env.get("PATH"), env.get("SystemRoot")) catch |err|
         return fail_(err_buf, "Cannot find program '{s}': {t}.", .{ command[0], err });
-    };
-    return .{ .ok = .{ .addr = addr, .listener = listener, .resolved = resolved } };
+    // The tunnel before the child, so a busy UDP port fails fast. Only one
+    // per process: the setup panel may come back here after a problem.
+    if (prepared_tunnel == null) {
+        const st = devices.read(gpa, io, paths) catch |err|
+            return fail_(err_buf, "Cannot read the device list: {s}.", .{devices.describeError(err)});
+        const tun = tunneldesk.start(gpa, io, paths, .{ .udp_port = cfg.tunnel_port, .loopback_only = opts.tunnel_loopback }, &st) catch |err|
+            return fail_(err_buf, "Cannot start Portal's WireGuard tunnel on UDP port {d}: {t}. Is another Portal (or WireGuard) using that port? Choose another tunnel port.", .{ cfg.tunnel_port, err });
+        const listener = tun.listen(tunnelnet.https_port) catch |err|
+            return fail_(err_buf, "Cannot listen on {s} inside the tunnel: {t}.", .{ tunnelnet.desk_server, err });
+        prepared_tunnel = .{ .tun = tun, .listener = listener, .store = st };
+    }
+    const t = prepared_tunnel.?;
+    return .{ .ok = .{ .tun = t.tun, .listener = t.listener, .store = t.store, .resolved = resolved } };
 }
 
-fn parseListen(text: []const u8) !std.Io.net.IpAddress {
-    // Accept "a.b.c.d:port" and "[v6]:port".
-    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return error.MissingPort;
-    var host = text[0..colon];
-    const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return error.BadPort;
-    if (port == 0) return error.BadPort;
-    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
-    return std.Io.net.IpAddress.parse(host, port);
-}
+/// The tunnel `prepare` started (it lives until the process exits).
+var prepared_tunnel: ?struct { tun: *tunneldesk.tunnel.Tunnel, listener: transport.Listener, store: devices.Store } = null;
 
 /// Suffix for the log line and banner when the remote side has full control.
 fn policyNote(policy: keymap.Policy) []const u8 {
@@ -1763,8 +1310,7 @@ fn hubBroadcast(ctx: *anyopaque) void {
 }
 
 fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
-    var opts = try parseRunArgs(gpa, args);
-    defer opts.hosts.deinit(gpa);
+    var opts = parseRunArgs(args);
     if (gui_app and opts.console) fatal("--console is the console tool's: run `portalctl run --console ...`. `portal` is the window.", .{});
     if (!gui_app and !opts.console) fatal("the Portal window is portal.exe: run `portal run ...`. For a session in this console: `portalctl run --console ...`.", .{});
 
@@ -1803,9 +1349,10 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         if (host) |h| if (cfg.command == null or problem != null) {
             var prog_buf: [settings.max_program]u8 = undefined;
             const prog_text = if (cfg.command) |c| joinCommand(c, &prog_buf) else (saved.program.get() orelse "");
+            var port_buf: [settings.max_port_text]u8 = undefined;
             const v = h.runSetup(.{
                 .first_run = cfg.command == null and problem == null,
-                .listen = cfg.listen,
+                .tunnel_port = std.fmt.bufPrint(&port_buf, "{d}", .{cfg.tunnel_port}) catch "",
                 .program = prog_text,
                 .project = cfg.project orelse "",
                 .policy = cfg.policy,
@@ -1813,19 +1360,19 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             }) orelse w.ExitProcess(0); // window closed
             // What the desk typed wins over the command line for this
             // run, and is saved for the next.
-            _ = saved.listen.set(v.listen);
+            _ = saved.tunnel_port.set(v.tunnel_port);
             _ = saved.program.set(v.program);
             _ = saved.project.set(v.project);
             saved.input = v.policy;
             settings.save(gpa, io, dir, &saved) catch |err| log.print("could not save {s}\\{s}: {t}", .{ dir, settings.file_name, err });
-            opts.listen = null;
+            opts.tunnel_port = null;
             opts.command = null;
             opts.project = null;
             opts.policy = null;
             problem = mergeConfig(&cfg, &opts, &saved);
             if (problem != null) continue;
         };
-        switch (prepare(gpa, io, env, &cfg, opts.allow_remote_shell, &err_buf)) {
+        switch (prepare(gpa, io, env, paths, &cfg, &opts, &err_buf)) {
             .ok => |p| {
                 prep = p;
                 break;
@@ -1837,43 +1384,31 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         }
     }
     const command = cfg.command.?;
-    const addr = prep.addr;
     // The listener is never closed (see the end of this function).
     const listener = prep.listener;
     var resolved = prep.resolved;
     defer resolved.deinit(gpa);
-
-    // Host header allowlist: the listen address as browsers write it, plus --host values.
-    var listen_host_buf: [128]u8 = undefined;
-    const listen_host = try std.fmt.bufPrint(&listen_host_buf, "{f}", .{addr});
-    try opts.hosts.append(gpa, listen_host);
+    const listen_host = tunnelnet.desk_server;
+    const allowed_hosts = [_][]const u8{tunnelnet.desk_server};
 
     if (elevation == .warn) { // [fix2/desk]
         std.debug.print("portal: WARNING: ELEVATED: remote input runs as administrator (--allow-elevated)\n", .{});
         log.print("start: ELEVATED: remote input runs as administrator (--allow-elevated)", .{});
     }
 
-    // HTTPS: Portal's CA and a server certificate for the listen address.
-    // Everything here lives until the process exits.
+    // TLS 1.3 inside the tunnel: Portal's CA and a server certificate for
+    // 10.8.0.1. The chain carries the CA too, so a device pins it from the
+    // fingerprint in its pairing code (no separate download). Everything
+    // here lives until the process exits.
     var tls_creds: tls_server.Credentials = undefined;
-    var tls_chain: [1][]const u8 = undefined;
-    var ca_download: web.CaDownload = undefined;
+    var tls_chain: [2][]const u8 = undefined;
     var fp_buf: [95]u8 = undefined;
-    if (!opts.no_tls) {
-        const tls_setup = setupTls(gpa, io, env, addr, opts.hosts.items[0 .. opts.hosts.items.len - 1], &log);
-        tls_chain[0] = tls_setup.leaf.der;
-        tls_creds = .{ .chain = &tls_chain, .key = tls_setup.leaf.key };
-        ca_download = .{
-            .cer = tls_setup.ca.der,
-            .mobileconfig = pki.mobileconfig(gpa, &tls_setup.ca) catch fatal("out of memory", .{}),
-            .fingerprint = x509.formatFingerprint(x509.fingerprint(tls_setup.ca.der), &fp_buf),
-            .https_port = addr.getPort(),
-        };
-        std.debug.print("portal: HTTPS with certificate from {s}\n       CA SHA-256 {s}\n", .{ tls_setup.ca.commonName(), ca_download.fingerprint });
-    } else {
-        std.debug.print(no_tls_warning, .{});
-        log.print("start: --no-tls given: serving plain HTTP", .{});
-    }
+    const tls_setup = setupTls(gpa, io, env, &log);
+    tls_chain = .{ tls_setup.leaf.der, tls_setup.ca.der };
+    tls_creds = .{ .chain = &tls_chain, .key = tls_setup.leaf.key };
+    const ca_sha256 = x509.fingerprint(tls_setup.ca.der);
+    const fingerprint = x509.formatFingerprint(ca_sha256, &fp_buf);
+    std.debug.print("portal: TLS with a certificate from {s}\n       CA SHA-256 {s}\n", .{ tls_setup.ca.commonName(), fingerprint });
 
     // Working directory (before anything changes Portal's environment).
     const cwd_w = childCwd(gpa, io, env, dir, cfg.cwd);
@@ -1883,8 +1418,10 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
 
     if (cfg.policy == .text) std.debug.print(text_warning, .{});
     var url_buf: [160]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "{s}://{s}/", .{ if (opts.no_tls) "http" else "https", listen_host }) catch listen_host;
-    std.debug.print("portal: sharing '{s}' on {s}  (input: {t}{s}{s})\n", .{ command[0], url, cfg.policy, policyNote(cfg.policy), fallbackNote(&cfg) });
+    const url = std.fmt.bufPrint(&url_buf, "https://{s}/", .{listen_host}) catch listen_host;
+    std.debug.print("portal: sharing '{s}' through Portal's WireGuard tunnel on UDP {d}{s} (input: {t}{s}{s})\n", .{
+        command[0], prep.tun.udpPort(), if (opts.tunnel_loopback) " (127.0.0.1 only)" else "", cfg.policy, policyNote(cfg.policy), fallbackNote(&cfg),
+    });
 
     // ---- GUI / console split (see gui.zig) ----------------------------
     // GUI (portal.exe): no console at all; the window decides the PTY size.
@@ -1953,81 +1490,52 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .io = io,
         .hub = hub,
         .log = &log,
-        .listener = .{ .os = listener },
+        .listener = listener,
         .cfg = .{
-            .allowed_hosts = opts.hosts.items,
-            .scheme = if (opts.no_tls) "http" else "https",
-            .secure_cookie = !opts.no_tls,
+            .allowed_hosts = &allowed_hosts,
             .devices = paths,
-            .tls = if (opts.no_tls) null else &tls_creds,
-            .ca_fingerprint = if (opts.no_tls) null else ca_download.fingerprint,
+            .tls = &tls_creds,
             .sync_key = sync_key,
         },
         .sysmon = monitor,
     };
-
-    // While a pairing window is open: plain HTTP on port+1 serving only
-    // the CA certificate, so a new device can install it before its first
-    // HTTPS visit. PairWatch (always running) opens and closes it.
-    var ca_server: web.Server = undefined;
-    var ca_addr = addr;
-    const ca_listener_on = !opts.no_tls and addr.getPort() < 65535;
-    if (ca_listener_on) {
-        ca_addr.setPort(addr.getPort() + 1);
-        var ca_hosts: std.ArrayList([]const u8) = .empty;
-        for (opts.hosts.items) |h| {
-            ca_hosts.append(gpa, withPort(gpa, h, addr.getPort() + 1) catch fatal("out of memory", .{})) catch fatal("out of memory", .{});
-        }
-        ca_server = .{
-            .gpa = gpa,
-            .io = io,
-            .hub = hub,
-            .log = &log,
-            .listener = undefined,
-            .cfg = .{
-                .allowed_hosts = ca_hosts.items,
-                .scheme = "http",
-                .secure_cookie = false,
-                .devices = paths,
-                .ca_download = &ca_download,
-            },
-        };
-    }
-    var pair_watch: PairWatch = .{
+    server.applyStore(&prep.store);
+    var store_watch: StoreWatch = .{
         .srv = &server,
-        // Unpair from `portalctl` must end sessions: no watch, no run.
+        .tun = prep.tun,
+        // Unpair from `portalctl` must end connections: no watch, no run.
         .dw = devices.watchStore(gpa, paths) catch |err|
             fatal("cannot watch {s} for changes ({t}); Portal needs it to notice pairing and unpairing", .{ paths.dir, err }),
-        .ca_srv = if (ca_listener_on) &ca_server else null,
-        .ca_addr = ca_addr,
         .paths = paths,
         .io = io,
         .gpa = gpa,
     };
 
-    // The window's desk panels (pairing, devices, certificate export,
-    // settings) use the in-process desk API; pairing changes wake it.
+    // The window's desk panels (pairing, devices, settings with the
+    // tunnel) use the device store directly; store changes wake it.
     if (host) |h| {
+        const desk_public = (tunneldesk.loadPublic(io, paths) catch null) orelse fatal("this desktop's WireGuard key is missing", .{});
         const home = env.get("USERPROFILE") orelse dir;
-        const export_dir = std.fs.path.join(gpa, &.{ home, "Downloads", "Portal-CA" }) catch fatal("out of memory", .{});
-        const tls_dir = std.fs.path.join(gpa, &.{ dir, "tls" }) catch fatal("out of memory", .{});
         h.attachDesk(.{
+            .export_default = std.fs.path.join(gpa, &.{ home, "Downloads", "Portal-CA" }) catch fatal("out of memory", .{}),
+            .tls_dir = std.fs.path.join(gpa, &.{ dir, "tls" }) catch fatal("out of memory", .{}),
             .srv = &server,
             .paths = paths,
-            .fingerprint = if (opts.no_tls) null else ca_download.fingerprint,
-            .export_default = export_dir,
-            .tls_dir = tls_dir,
+            .fingerprint = fingerprint,
+            .ca_sha256 = ca_sha256,
+            .desk_public = desk_public,
+            .tunnel_port = prep.tun.udpPort(),
             .saved = saved,
             .open_ctx = env,
             .env = env,
             .open_fn = deskOpen,
         });
-        server.pairing_notify_ctx = h;
-        server.pairing_notify_fn = gui.LocalHost.pairingNotify;
+        server.store_notify_ctx = h;
+        server.store_notify_fn = gui.LocalHost.storeNotify;
     }
 
-    log.print("start: v{s} zig {s}, listening on {s}, input={t}{s}{s}, command={s}", .{
-        portal_version, builtin.zig_version_string, cfg.listen, cfg.policy, policyNote(cfg.policy), fallbackNote(&cfg), command[0],
+    log.print("start: v{s} zig {s}, tunnel on UDP {d}{s}, input={t}{s}{s}, command={s}", .{
+        portal_version, builtin.zig_version_string, prep.tun.udpPort(), if (opts.tunnel_loopback) " (loopback)" else "", cfg.policy, policyNote(cfg.policy), fallbackNote(&cfg), command[0],
     });
 
     if (opts.console) {
@@ -2058,7 +1566,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         const st = std.Thread.spawn(.{}, SyncWatch.watch, .{sw}) catch |err|
             fatal("cannot start the sync watcher thread: {t}", .{err});
         st.detach();
-        const t = std.Thread.spawn(.{}, PairWatch.watch, .{&pair_watch}) catch |err|
+        const t = std.Thread.spawn(.{}, StoreWatch.watch, .{&store_watch}) catch |err|
             fatal("cannot start the pairing watcher thread: {t}", .{err});
         t.detach();
         // `portal open <dir>`: requests through the data directory.
@@ -2157,7 +1665,6 @@ test {
     _ = @import("settings.zig");
     _ = @import("deskui.zig");
     _ = @import("keymap.zig");
-    _ = @import("auth.zig");
     _ = @import("guard.zig");
     _ = @import("netlisten.zig");
     _ = @import("cmdline.zig");
@@ -2206,59 +1713,49 @@ test "isYes" {
     try std.testing.expect(!isYes("\xEF\xBB\xBFn"));
 }
 
-test "parseListen" {
-    const a = try parseListen("10.8.0.1:8420");
-    try std.testing.expectEqual(@as(u16, 8420), a.getPort());
-    _ = try parseListen("[::1]:8420");
-    try std.testing.expectError(error.MissingPort, parseListen("10.8.0.1"));
-    try std.testing.expectError(error.BadPort, parseListen("10.8.0.1:0"));
-    try std.testing.expectError(error.BadPort, parseListen("10.8.0.1:99999"));
-}
-
 test "run: --project and --allow-elevated" {
-    var o = try parseRunArgs(std.testing.allocator, &.{});
-    defer o.hosts.deinit(std.testing.allocator);
+    const o = parseRunArgs(&.{});
     try std.testing.expect(o.project == null);
     try std.testing.expect(!o.allow_elevated);
-    var p = try parseRunArgs(std.testing.allocator, &.{ "--project", "acme-api", "--allow-elevated", "--", "cmd.exe" });
-    defer p.hosts.deinit(std.testing.allocator);
+    const p = parseRunArgs(&.{ "--project", "acme-api", "--allow-elevated", "--", "cmd.exe" });
     try std.testing.expectEqualStrings("acme-api", p.project.?);
     try std.testing.expect(p.allow_elevated);
 }
 
-test "run defaults to HTTPS; --https is gone" {
-    var o = try parseRunArgs(std.testing.allocator, &.{});
-    defer o.hosts.deinit(std.testing.allocator);
-    try std.testing.expect(!o.no_tls);
-    var p = try parseRunArgs(std.testing.allocator, &.{"--no-tls"});
-    defer p.hosts.deinit(std.testing.allocator);
-    try std.testing.expect(p.no_tls);
+test "run: tunnel options" {
+    const o = parseRunArgs(&.{});
+    try std.testing.expect(o.tunnel_port == null and !o.tunnel_loopback and o.tunnel_endpoint == null);
+    const p = parseRunArgs(&.{ "--tunnel-port", "51999", "--tunnel-loopback", "--tunnel-endpoint", "home.example.org:51999" });
+    try std.testing.expectEqual(@as(?u16, 51999), p.tunnel_port);
+    try std.testing.expect(p.tunnel_loopback);
+    try std.testing.expectEqualStrings("home.example.org:51999", p.tunnel_endpoint.?);
 }
 
 test "run config: command line over settings over defaults; no default program" {
-    var none = try parseRunArgs(std.testing.allocator, &.{});
-    defer none.hosts.deinit(std.testing.allocator);
+    const none = parseRunArgs(&.{});
     var cfg: RunConfig = .{};
     try std.testing.expect(mergeConfig(&cfg, &none, &.{}) == null);
     try std.testing.expect(cfg.command == null); // the window asks
-    try std.testing.expectEqualStrings(default_listen, cfg.listen);
+    try std.testing.expectEqual(tunnelnet.default_udp_port, cfg.tunnel_port);
+    try std.testing.expect(cfg.tunnel_endpoint == null);
 
     var s: settings.Settings = .{};
-    _ = s.listen.set("10.8.0.1:8420");
+    _ = s.tunnel_port.set("51900");
+    _ = s.tunnel_endpoint.set("home.example.org:51900");
     _ = s.program.set("\"C:\\Program Files\\tool\\tool.exe\" --flag");
     _ = s.project.set("acme");
     s.input = .instruct;
     try std.testing.expect(mergeConfig(&cfg, &none, &s) == null);
-    try std.testing.expectEqualStrings("10.8.0.1:8420", cfg.listen);
+    try std.testing.expectEqual(@as(u16, 51900), cfg.tunnel_port);
+    try std.testing.expectEqualStrings("home.example.org:51900", cfg.tunnel_endpoint.?);
     try std.testing.expectEqual(keymap.Policy.instruct, cfg.policy);
     try std.testing.expectEqualStrings("acme", cfg.project.?);
     try std.testing.expectEqual(@as(usize, 2), cfg.command.?.len);
     try std.testing.expectEqualStrings("C:\\Program Files\\tool\\tool.exe", cfg.command.?[0]);
 
-    var cli = try parseRunArgs(std.testing.allocator, &.{ "--listen", "127.0.0.1:9", "--input", "none", "--", "cmd.exe", "/k" });
-    defer cli.hosts.deinit(std.testing.allocator);
+    const cli = parseRunArgs(&.{ "--tunnel-port", "9", "--input", "none", "--", "cmd.exe", "/k" });
     try std.testing.expect(mergeConfig(&cfg, &cli, &s) == null);
-    try std.testing.expectEqualStrings("127.0.0.1:9", cfg.listen);
+    try std.testing.expectEqual(@as(u16, 9), cfg.tunnel_port);
     try std.testing.expectEqual(keymap.Policy.none, cfg.policy);
     try std.testing.expectEqualStrings("cmd.exe", cfg.command.?[0]);
 
@@ -2270,33 +1767,15 @@ test "run config: command line over settings over defaults; no default program" 
     try std.testing.expectEqualStrings("\"C:\\a b\\x.exe\" -k \"\"", joinCommand(&.{ "C:\\a b\\x.exe", "-k", "" }, &buf));
 }
 
-test "withPort and host splitting" {
-    const gpa = std.testing.allocator;
-    const a = try withPort(gpa, "10.8.0.1:8420", 8421);
-    defer gpa.free(a);
-    try std.testing.expectEqualStrings("10.8.0.1:8421", a);
-    const b = try withPort(gpa, "[fd00::1]:8420", 8421);
-    defer gpa.free(b);
-    try std.testing.expectEqualStrings("[fd00::1]:8421", b);
-    const c = try withPort(gpa, "desk.portal.home", 8421);
-    defer gpa.free(c);
-    try std.testing.expectEqualStrings("desk.portal.home:8421", c);
-    try std.testing.expectEqualStrings("fd00::1", hostOnly("[fd00::1]:8420"));
-    try std.testing.expectEqualStrings("10.8.0.1", hostOnly("10.8.0.1:8420"));
-    try std.testing.expectEqualStrings("desk", hostOnly("desk"));
-}
-
 test "run defaults to instruct input; keys for a shell" {
-    var o = try parseRunArgs(std.testing.allocator, &.{});
-    defer o.hosts.deinit(std.testing.allocator);
+    const o = parseRunArgs(&.{});
     try std.testing.expect(o.policy == null);
     var cfg: RunConfig = .{};
     try std.testing.expect(mergeConfig(&cfg, &o, &.{}) == null);
     try std.testing.expectEqual(keymap.Policy.instruct, cfg.policy);
     try std.testing.expect(!cfg.fell_back);
     {
-        var sh = try parseRunArgs(std.testing.allocator, &.{ "--", "cmd.exe", "/k" });
-        defer sh.hosts.deinit(std.testing.allocator);
+        const sh = parseRunArgs(&.{ "--", "cmd.exe", "/k" });
         try std.testing.expect(mergeConfig(&cfg, &sh, &.{}) == null);
         try std.testing.expectEqual(keymap.Policy.keys, cfg.policy);
         try std.testing.expect(cfg.fell_back);
@@ -2305,27 +1784,22 @@ test "run defaults to instruct input; keys for a shell" {
         _ = s.program.set("powershell.exe -NoLogo");
         try std.testing.expect(mergeConfig(&cfg, &o, &s) == null);
         try std.testing.expectEqual(keymap.Policy.keys, cfg.policy);
-        var ok = try parseRunArgs(std.testing.allocator, &.{ "--allow-remote-shell", "--", "pwsh" });
-        defer ok.hosts.deinit(std.testing.allocator);
+        const ok = parseRunArgs(&.{ "--allow-remote-shell", "--", "pwsh" });
         try std.testing.expect(mergeConfig(&cfg, &ok, &.{}) == null);
         try std.testing.expectEqual(keymap.Policy.instruct, cfg.policy);
         // A chosen mode is never lowered (prepare refuses it for a shell).
-        var ex = try parseRunArgs(std.testing.allocator, &.{ "--input", "instruct", "--", "cmd.exe" });
-        defer ex.hosts.deinit(std.testing.allocator);
+        const ex = parseRunArgs(&.{ "--input", "instruct", "--", "cmd.exe" });
         try std.testing.expect(mergeConfig(&cfg, &ex, &.{}) == null);
         try std.testing.expectEqual(keymap.Policy.instruct, cfg.policy);
         try std.testing.expect(!cfg.fell_back);
     }
     try std.testing.expect(!o.console);
-    var c = try parseRunArgs(std.testing.allocator, &.{ "--console", "--", "cmd.exe" });
-    defer c.hosts.deinit(std.testing.allocator);
+    const c = parseRunArgs(&.{ "--console", "--", "cmd.exe" });
     try std.testing.expect(c.console);
     try std.testing.expect(c.cwd == null);
-    var d = try parseRunArgs(std.testing.allocator, &.{ "--cwd", "C:\\work", "--", "cmd.exe" });
-    defer d.hosts.deinit(std.testing.allocator);
+    const d = parseRunArgs(&.{ "--cwd", "C:\\work", "--", "cmd.exe" });
     try std.testing.expectEqualStrings("C:\\work", d.cwd.?);
-    var t = try parseRunArgs(std.testing.allocator, &.{ "--input", "text" });
-    defer t.hosts.deinit(std.testing.allocator);
+    const t = parseRunArgs(&.{ "--input", "text" });
     try std.testing.expectEqual(keymap.Policy.text, t.policy.?);
     try std.testing.expectEqualStrings("", policyNote(.keys));
     try std.testing.expect(std.mem.indexOf(u8, policyNote(.text), "FULL REMOTE CONTROL") != null);

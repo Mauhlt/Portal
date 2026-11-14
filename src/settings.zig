@@ -3,7 +3,8 @@
 //! by the window's first-run and Settings panels.
 //!
 //!   # Portal settings
-//!   listen = 10.8.0.1:8420
+//!   tunnel_port = 51820
+//!   tunnel_endpoint = home.example.org:51820
 //!   input = keys
 //!   project = acme-api
 //!   program = agent --some-flag
@@ -37,7 +38,8 @@ const speech_limits = @import("speech").limits;
 
 pub const file_name = "settings.txt";
 
-pub const max_listen = 64;
+pub const max_port_text = 5;
+pub const max_endpoint = @import("shared").pairqr.max_endpoint;
 pub const max_project = 64;
 pub const max_program = 1024;
 pub const max_cwd = 1024;
@@ -72,7 +74,11 @@ fn Str(comptime cap: usize) type {
 }
 
 pub const Settings = struct {
-    listen: Str(max_listen) = .{},
+    /// The desk's WireGuard UDP port (default 51820, tunnelnet).
+    tunnel_port: Str(max_port_text) = .{},
+    /// Where devices reach that port ("host:port": a public IP or DNS
+    /// name), put into their pairing codes. Portal cannot know it.
+    tunnel_endpoint: Str(max_endpoint) = .{},
     input: ?keymap.Policy = null,
     project: Str(max_project) = .{},
     program: Str(max_program) = .{},
@@ -106,6 +112,11 @@ pub const Settings = struct {
         return buf[0..s.n_colors];
     }
 
+    /// The tunnel UDP port: the saved one, else the default.
+    pub fn tunnelPort(s: *const Settings) u16 {
+        return parsePort(s.tunnel_port.get() orelse "") orelse @import("shared").tunnelnet.default_udp_port;
+    }
+
     pub fn parse(text: []const u8) Settings {
         var s: Settings = .{};
         var lines = std.mem.splitScalar(u8, text, '\n');
@@ -116,8 +127,10 @@ pub const Settings = struct {
             const key = std.mem.trim(u8, line[0..eq], " \t");
             const val = std.mem.trim(u8, line[eq + 1 ..], " \t");
             if (val.len == 0) continue;
-            if (std.mem.eql(u8, key, "listen")) {
-                _ = s.listen.set(val);
+            if (std.mem.eql(u8, key, "tunnel_port")) {
+                if (parsePort(val) != null) _ = s.tunnel_port.set(val);
+            } else if (std.mem.eql(u8, key, "tunnel_endpoint")) {
+                _ = s.tunnel_endpoint.set(val);
             } else if (std.mem.eql(u8, key, "input")) {
                 s.input = keymap.Policy.parse(val);
             } else if (std.mem.eql(u8, key, "project")) {
@@ -160,7 +173,8 @@ pub const Settings = struct {
 
     pub fn format(s: *const Settings, out: *Io.Writer) !void {
         try out.writeAll("# Portal settings (written by the Portal window; command-line options win)\r\n");
-        if (s.listen.get()) |v| try out.print("listen = {s}\r\n", .{v});
+        if (s.tunnel_port.get()) |v| try out.print("tunnel_port = {s}\r\n", .{v});
+        if (s.tunnel_endpoint.get()) |v| try out.print("tunnel_endpoint = {s}\r\n", .{v});
         if (s.input) |v| try out.print("input = {t}\r\n", .{v});
         if (s.project.get()) |v| try out.print("project = {s}\r\n", .{v});
         if (s.program.get()) |v| try out.print("program = {s}\r\n", .{v});
@@ -192,6 +206,14 @@ const removed_speech_keys = [_][]const u8{
 fn removedSpeechKey(name: []const u8) bool {
     for (removed_speech_keys) |k| if (std.mem.eql(u8, k, name)) return true;
     return false;
+}
+
+/// A UDP port 1-65535 as typed (digits only).
+pub fn parsePort(text: []const u8) ?u16 {
+    if (text.len == 0 or text.len > max_port_text) return null;
+    for (text) |c| if (c < '0' or c > '9') return null;
+    const p = std.fmt.parseInt(u16, text, 10) catch return null;
+    return if (p == 0) null else p;
 }
 
 /// Reads `<dir>\settings.txt`; a missing or unreadable file is empty settings.
@@ -271,6 +293,8 @@ const testing = std.testing;
 test "settings parse and format round trip" {
     const text =
         \\# comment
+        \\tunnel_port = 51900
+        \\tunnel_endpoint = home.example.org:51900
         \\listen = 10.8.0.1:8420
         \\input=instruct
         \\
@@ -284,7 +308,9 @@ test "settings parse and format round trip" {
         \\input2 = text
     ;
     const s = Settings.parse(text);
-    try testing.expectEqualStrings("10.8.0.1:8420", s.listen.get().?);
+    try testing.expectEqual(@as(u16, 51900), s.tunnelPort());
+    try testing.expectEqualStrings("home.example.org:51900", s.tunnel_endpoint.get().?);
+    try testing.expectEqual(@as(u16, 51820), Settings.parse("tunnel_port = 0").tunnelPort());
     try testing.expectEqual(keymap.Policy.instruct, s.input.?);
     try testing.expect(Settings.parse("system_monitor = ON\r\n").system_monitor.?);
     try testing.expect(!Settings.parse("system_monitor=off").system_monitor.?);
@@ -301,7 +327,8 @@ test "settings parse and format round trip" {
     var out: Io.Writer = .fixed(&buf);
     try s.format(&out);
     const again = Settings.parse(out.buffered());
-    try testing.expectEqualStrings(s.listen.get().?, again.listen.get().?);
+    try testing.expectEqualStrings(s.tunnel_port.get().?, again.tunnel_port.get().?);
+    try testing.expectEqualStrings(s.tunnel_endpoint.get().?, again.tunnel_endpoint.get().?);
     try testing.expectEqual(s.input, again.input);
     try testing.expectEqualStrings(s.project.get().?, again.project.get().?);
     try testing.expectEqualStrings(s.program.get().?, again.program.get().?);
@@ -373,13 +400,13 @@ test "settings: speech limits load clamped and round-trip" {
 
 test "settings: bad values are ignored, nothing defaults" {
     const empty = Settings.parse("");
-    try testing.expect(empty.listen.get() == null);
+    try testing.expect(empty.tunnel_port.get() == null);
     try testing.expect(empty.input == null);
     try testing.expect(empty.program.get() == null); // no default program
     const long: [max_project + 1]u8 = @splat('p');
-    const s = Settings.parse("input = everything\r\nlisten =\r\nproject = " ++ long ++ "\r\n");
+    const s = Settings.parse("input = everything\r\ntunnel_port = 99999\r\nproject = " ++ long ++ "\r\n");
     try testing.expect(s.input == null);
-    try testing.expect(s.listen.get() == null);
+    try testing.expect(s.tunnel_port.get() == null);
     try testing.expect(s.project.get() == null);
     var t: Settings = .{};
     try testing.expect(!t.program.set("a\nb"));
@@ -394,12 +421,12 @@ test "settings save and load" {
     var path_buf: [1024]u8 = undefined;
     const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
     var s: Settings = .{};
-    _ = s.listen.set("127.0.0.1:9000");
+    _ = s.tunnel_port.set("9000");
     _ = s.program.set("cmd.exe /k");
     s.input = .none;
     try save(gpa, io, dir, &s);
     const l = load(gpa, io, dir);
-    try testing.expectEqualStrings("127.0.0.1:9000", l.listen.get().?);
+    try testing.expectEqualStrings("9000", l.tunnel_port.get().?);
     try testing.expectEqualStrings("cmd.exe /k", l.program.get().?);
     try testing.expectEqual(keymap.Policy.none, l.input.?);
     // Missing file: empty settings.
