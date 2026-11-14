@@ -37,6 +37,8 @@ const tls = std.crypto.tls;
 const TlsClient = tls.Client;
 const Certificate = std.crypto.Certificate;
 const x509check = @import("x509check.zig");
+/// The stream seam: an OS socket or the in-process tunnel (shared/transport.zig).
+pub const transport = @import("shared").transport;
 /// Record protection and the byte cursor: the server's own code
 /// (shared/tls13.zig).
 const tls13 = @import("shared").tls13;
@@ -58,10 +60,16 @@ pub const Security = union(enum) {
     tls: Pinned,
 
     pub const Pinned = struct {
-        /// DER of the pinned Portal CA.
+        /// DER of the pinned Portal CA; empty on the first connection after
+        /// pairing, when only `ca_sha256` is known.
         ca_der: []const u8,
         /// Bare IP the certificate must name ("10.8.0.1", "::1").
         ip: []const u8,
+        /// First connection: the SHA-256 of the Portal CA from the pairing
+        /// code. The server sends its CA in the chain; only a certificate
+        /// with exactly this fingerprint is taken as the CA (and pinned by
+        /// the caller afterwards, Conn.caDer). Never trust on first use.
+        ca_sha256: ?[32]u8 = null,
     };
 };
 
@@ -82,7 +90,7 @@ pub const GateError = error{
 const Gate = struct {
     interface: Io.Reader,
     io: Io,
-    stream: net.Stream,
+    stream: transport.Stream,
     read_err: ?anyerror = null,
     gate_err: ?GateError = null,
     /// The watchdog's stop flag (Conn.openWatched) and this connection's
@@ -96,6 +104,10 @@ const Gate = struct {
 
     gating: bool,
     insp: Inspector = .{},
+    /// std's bundle, filled from the chain on a first connection
+    /// (Security.Pinned.ca_sha256).
+    bundle: ?*Certificate.Bundle = null,
+    gpa: std.mem.Allocator = undefined,
     /// Bytes read from the socket and not yet handed to std.
     pend: [pend_cap]u8 = undefined,
     pend_len: usize = 0,
@@ -105,7 +117,7 @@ const Gate = struct {
 
     const vtable: Io.Reader.VTable = .{ .stream = streamFn, .readVec = readVecFn };
 
-    fn init(g: *Gate, io: Io, stream: net.Stream, gating: bool) void {
+    fn init(g: *Gate, io: Io, stream: transport.Stream, gating: bool) void {
         g.* = .{
             .interface = .{ .vtable = &vtable, .buffer = undefined, .seek = 0, .end = 0 },
             .io = io,
@@ -186,13 +198,12 @@ const Gate = struct {
             g.read_err = error.Canceled;
             return error.ReadFailed;
         }
-        var vec = [_][]u8{dest};
-        const res = g.stream.readWithControl(g.io, &vec, &.{}) catch |err| {
+        const n = g.stream.read(g.io, dest) catch |err| {
             g.read_err = err;
             return error.ReadFailed;
         };
-        if (res.data_len == 0) return error.EndOfStream;
-        return res.data_len;
+        if (n == 0) return error.EndOfStream;
+        return n;
     }
 };
 
@@ -212,6 +223,9 @@ const Inspector = struct {
     seen_ee: bool = false,
     pin: Security.Pinned = .{ .ca_der = "", .ip = "" },
     now_sec: i64 = 0,
+    /// The CA found in the chain by its fingerprint (first connection).
+    found_ca: [x509check.max_cert_len]u8 = undefined,
+    found_ca_len: usize = 0,
 
     fn haveKey(i: *Inspector) bool {
         if (i.key_ready) return true;
@@ -288,6 +302,13 @@ const Inspector = struct {
                         }
                         g.inspected = rec_end;
                         if (try i.messages()) {
+                            // A CA taken from the chain by its fingerprint
+                            // goes into std's (still empty) bundle before
+                            // std sees the Certificate message.
+                            if (i.found_ca_len > 0) if (g.bundle) |b| {
+                                b.bytes.appendSlice(g.gpa, i.found_ca[0..i.found_ca_len]) catch return error.TlsHandshakeTooLarge;
+                                b.parseCert(g.gpa, 0, i.now_sec) catch return error.NotIssuedByPinnedCa;
+                            };
                             i.stage = .done;
                             i.wipe();
                             g.allowed = g.pend_len;
@@ -374,11 +395,23 @@ const Inspector = struct {
         if (list.left() == 0) return error.NoServerCertificate;
         const leaf = try list.vec(u24);
         _ = try list.vec(u16); // extensions
-        // Further entries (intermediates) are allowed; std walks them only
-        // after the leaf, which it must also find signed by the pinned CA.
+        // Further entries (the Portal CA itself) are allowed; std walks them
+        // only after the leaf, which it must also find signed by the
+        // pinned CA.
         while (list.left() > 0) {
-            try x509check.validateCertificate(try list.vec(u24));
+            const cert = try list.vec(u24);
+            try x509check.validateCertificate(cert);
             _ = try list.vec(u16);
+            if (i.pin.ca_der.len == 0) if (i.pin.ca_sha256) |want| {
+                if (std.mem.eql(u8, &x509check.fingerprint(cert), &want) and cert.len <= i.found_ca.len) {
+                    @memcpy(i.found_ca[0..cert.len], cert);
+                    i.found_ca_len = cert.len;
+                }
+            };
+        }
+        if (i.pin.ca_der.len == 0) {
+            if (i.found_ca_len == 0) return error.NotIssuedByPinnedCa;
+            i.pin.ca_der = i.found_ca[0..i.found_ca_len];
         }
         try x509check.verifyLeaf(leaf, i.pin.ca_der, i.pin.ip, i.now_sec);
     }
@@ -386,9 +419,9 @@ const Inspector = struct {
 
 pub const Conn = struct {
     io: Io,
-    stream: net.Stream,
+    stream: transport.Stream,
     gate: Gate,
-    sock_writer: net.Stream.Writer,
+    sock_writer: transport.Writer,
     out_buf: [tls.max_ciphertext_record_len]u8,
     tls_read_buf: [tls.max_ciphertext_record_len]u8,
     tls_write_buf: [tls.max_ciphertext_record_len]u8,
@@ -398,19 +431,19 @@ pub const Conn = struct {
     bundle_lock: Io.RwLock,
 
     pub const OpenError = error{ TlsHandshakeFailed, OutOfMemory, NoEntropy } ||
-        GateError || TlsClient.InitError || net.IpAddress.ConnectError;
+        GateError || TlsClient.InitError || transport.DialError;
 
-    /// Connects and, unless `security` is `.plain`, completes the TLS
-    /// handshake. On error, `why` (if given) gets a short reason.
-    pub fn open(gpa: std.mem.Allocator, io: Io, addr: net.IpAddress, security: Security) OpenError!*Conn {
-        return openWatched(gpa, io, addr, security, null);
+    /// Connects (through `dialer`: an OS socket or the in-process tunnel)
+    /// and, unless `security` is `.plain`, completes the TLS handshake.
+    pub fn open(gpa: std.mem.Allocator, io: Io, dialer: transport.Dialer, addr: net.IpAddress, security: Security) OpenError!*Conn {
+        return openWatched(gpa, io, dialer, addr, security, null);
     }
 
     /// `open` for a task under a watchdog: `stop` is its `stopped` flag
     /// (watchdog.zig); once set, every read and write of the connection
     /// fails with error.Canceled instead of blocking.
-    pub fn openWatched(gpa: std.mem.Allocator, io: Io, addr: net.IpAddress, security: Security, stop: ?*const std.atomic.Value(bool)) OpenError!*Conn {
-        const stream = try addr.connect(io, .{ .mode = .stream });
+    pub fn openWatched(gpa: std.mem.Allocator, io: Io, dialer: transport.Dialer, addr: net.IpAddress, security: Security, stop: ?*const std.atomic.Value(bool)) OpenError!*Conn {
+        const stream = try dialer.dial(io, addr);
         errdefer stream.close(io);
         const c = try gpa.create(Conn);
         errdefer gpa.destroy(c);
@@ -437,18 +470,23 @@ pub const Conn = struct {
         c.key_log = .{ .client_key_seq = 0, .server_key_seq = 0, .client_random = undefined, .writer = &insp.keylog };
 
         // A fresh bundle holding only the pinned CA (std may replace a
-        // bundle's contents on Windows; see the file comment).
-        _ = x509check.parse(pin.ca_der) catch |err| return err;
-        try c.bundle.bytes.appendSlice(gpa, pin.ca_der);
-        c.bundle.parseCert(gpa, 0, insp.now_sec) catch return error.CaExpired;
-        if (c.bundle.map.count() != 1) return error.CaExpired; // std drops expired CAs
+        // bundle's contents on Windows; see the file comment). On a first
+        // connection the gate adds the CA it found by fingerprint.
+        if (pin.ca_der.len > 0) {
+            _ = x509check.parse(pin.ca_der) catch |err| return err;
+            try c.bundle.bytes.appendSlice(gpa, pin.ca_der);
+            c.bundle.parseCert(gpa, 0, insp.now_sec) catch return error.CaExpired;
+            if (c.bundle.map.count() != 1) return error.CaExpired; // std drops expired CAs
+        } else if (pin.ca_sha256 == null) return error.NotIssuedByPinnedCa;
+        c.gate.bundle = &c.bundle;
+        c.gate.gpa = gpa;
 
         var entropy: [TlsClient.Options.entropy_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &entropy);
         io.randomSecure(&entropy) catch return error.NoEntropy;
 
         var alert: tls.Alert = undefined;
-        c.client = TlsClient.init(&c.gate.interface, &c.sock_writer.interface, .{
+        c.client = TlsClient.init(&c.gate.interface, c.sock_writer.interface(), .{
             .host = .{ .explicit = pin.ip },
             .ca = .{ .bundle = .{ .gpa = gpa, .io = io, .lock = &c.bundle_lock, .bundle = &c.bundle } },
             .write_buffer = &c.tls_write_buf,
@@ -460,11 +498,12 @@ pub const Conn = struct {
         }) catch |err| {
             if (c.gate.gate_err) |g| return g;
             if (c.gate.read_err) |r| if (r == error.Canceled) return error.Canceled;
-            if (c.sock_writer.err) |e| if (e == error.Canceled) return error.Canceled;
+            if (c.sock_writer.err()) |e| if (e == error.Canceled) return error.Canceled;
             return err;
         };
-        // The certificate must have gone through the gate.
-        if (c.gate.insp.stage != .done) {
+        // The certificate must have gone through the gate, and std must
+        // have checked it against exactly one CA.
+        if (c.gate.insp.stage != .done or c.bundle.map.count() != 1) {
             c.client = null;
             return error.NoServerCertificate;
         }
@@ -477,11 +516,18 @@ pub const Conn = struct {
         return c.client != null;
     }
 
+    /// The CA the server's certificate was checked against (DER): on a
+    /// first connection, the one found by its fingerprint, for the caller
+    /// to pin.
+    pub fn caDer(c: *const Conn) []const u8 {
+        return c.bundle.bytes.items;
+    }
+
     /// Writes and flushes all of `bytes`.
     pub fn writeAll(c: *Conn, bytes: []const u8) error{ WriteFailed, Canceled }!void {
         if (c.gate.stopped()) return error.Canceled;
         c.writeAllInner(bytes) catch {
-            if (c.sock_writer.err) |e| if (e == error.Canceled) return error.Canceled;
+            if (c.sock_writer.err()) |e| if (e == error.Canceled) return error.Canceled;
             return error.WriteFailed;
         };
     }
@@ -491,9 +537,9 @@ pub const Conn = struct {
             try cl.writer.writeAll(bytes);
             try cl.writer.flush();
         } else {
-            try c.sock_writer.interface.writeAll(bytes);
+            try c.sock_writer.interface().writeAll(bytes);
         }
-        try c.sock_writer.interface.flush();
+        try c.sock_writer.interface().flush();
     }
 
     /// Reads what is available (at least one byte); 0 at end of stream.
@@ -738,7 +784,7 @@ const FakeServer = struct {
 
     fn openThroughWatchdog(gpa: std.mem.Allocator, io: Io, addr: net.IpAddress, wd: *watchdog.Watchdog) Conn.OpenError!*Conn {
         _ = wd;
-        return Conn.open(gpa, io, addr, .{ .tls = pin_ok });
+        return Conn.open(gpa, io, .os, addr, .{ .tls = pin_ok });
     }
 };
 

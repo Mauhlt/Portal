@@ -71,6 +71,28 @@ pub fn unprotect(gpa: Allocator, data: []const u8, purpose: []const u8) ![]u8 {
     return gpa.dupe(u8, p[0..out.cbData]);
 }
 
+/// A secret at rest in one file: `magic` (a format line) followed by the
+/// DPAPI blob, written atomically. Portal's private keys that are not part
+/// of the TLS store (the sync release key, the desk's WireGuard key) are
+/// kept this way.
+pub fn writeSealedFile(gpa: Allocator, io: std.Io, path: []const u8, magic: []const u8, secret: []const u8, purpose: []const u8) !void {
+    const sealed = try protect(gpa, secret, purpose);
+    defer gpa.free(sealed);
+    const data = try std.mem.concat(gpa, u8, &.{ magic, sealed });
+    defer gpa.free(data);
+    try @import("../fsutil.zig").writeAtomic(gpa, io, path, data);
+}
+
+/// Reads a file from `writeSealedFile` with the same `magic` and
+/// `purpose` (error.BadSealedFile for another format). Caller must
+/// secureZero and free the result.
+pub fn readSealedFile(gpa: Allocator, io: std.Io, path: []const u8, magic: []const u8, purpose: []const u8) ![]u8 {
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024));
+    defer gpa.free(data);
+    if (!std.mem.startsWith(u8, data, magic)) return error.BadSealedFile;
+    return unprotect(gpa, data[magic.len..], purpose);
+}
+
 test "dpapi round trip and purpose binding" {
     const gpa = std.testing.allocator;
     const secret = "0123456789abcdef0123456789abcdef";

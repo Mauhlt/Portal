@@ -22,7 +22,8 @@
         // The owner's pure-Zig WireGuard: the iPhone app's packet tunnel
         // extension (client/src/ios/tunnel_ext) runs it. Only iOS builds
         // and the extension's host tests compile it.
-        .WireGuard = .{ .path = "../WireGuard" },
+        // REVERT BEFORE MERGE: the netstack branch until it is on master.
+        .WireGuard = .{ .path = "../WireGuard-wt-netstack" },
         // The owner's speech-to-text (read-only): stt.Home runs in-process
         // on the desktop GPU (src/speech/home.zig); its stt-local program
         // is the laptop's engine. stt brings ../Audio (the WAV Portal hands

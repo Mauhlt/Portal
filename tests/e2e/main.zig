@@ -18,17 +18,12 @@ const net = @import("net.zig");
 const proc = @import("proc.zig");
 const Runner = @import("runner.zig").Runner;
 
-const pairing = @import("pairing.zig");
 const grid_tests = @import("grid_tests.zig");
 const input_tests = @import("input_tests.zig");
-const transport = @import("transport.zig");
-const privacy = @import("privacy.zig");
 const console_tests = @import("console_tests.zig");
 const images = @import("images.zig");
 const idle = @import("idle.zig");
-const tls_tests = @import("tls_tests.zig");
-const webinput = @import("webinput.zig");
-const sync_tests = @import("sync_tests.zig");
+const tunnel_tests = @import("tunnel_tests.zig");
 const ended = @import("ended.zig");
 const tabs_tests = @import("tabs_tests.zig");
 const convo_tests = @import("convo_tests.zig");
@@ -57,19 +52,14 @@ const Group = struct {
 };
 
 const groups = [_]Group{
-    .{ .name = "pairing", .run = pairing.run, .port_offset = 0 },
+    .{ .name = "tunnel", .run = tunnel_tests.run, .port_offset = 0 },
     .{ .name = "grid", .run = grid_tests.run, .port_offset = 10 },
     .{ .name = "keys", .run = input_tests.runKeys, .port_offset = 20 },
     .{ .name = "text", .run = input_tests.runText, .port_offset = 30 },
-    .{ .name = "transport", .run = transport.run, .port_offset = 40 },
-    .{ .name = "privacy", .run = privacy.run, .port_offset = 50 },
     .{ .name = "instruct", .run = input_tests.runInstruct, .port_offset = 70 },
     .{ .name = "console", .run = console_tests.run, .port_offset = 80 },
     .{ .name = "images", .run = images.run, .port_offset = 60 },
     .{ .name = "idle", .run = idle.run, .port_offset = 90 },
-    .{ .name = "tls", .run = tls_tests.run, .port_offset = 100 },
-    .{ .name = "sync", .run = sync_tests.run, .port_offset = 110 },
-    .{ .name = "webinput", .run = webinput.run, .port_offset = 120 },
     .{ .name = "ended", .run = ended.run, .port_offset = 130 },
     .{ .name = "tabs", .run = tabs_tests.run, .port_offset = 140 },
     .{ .name = "convo", .run = convo_tests.run, .port_offset = 150 },
@@ -132,7 +122,10 @@ pub fn main(init: std.process.Init) !void {
         h.mutex.lock();
         const live = h.live.items;
         h.mutex.unlock();
-        for (live) |inst| inst.kill();
+        for (live) |inst| {
+            inst.kill();
+            for (inst.links.items) |l| l.stop();
+        }
         r.endGroup();
     }
     h.deinit();
@@ -144,6 +137,9 @@ pub fn main(init: std.process.Init) !void {
         for (r.failures.items) |f| std.debug.print("  {s}\n", .{f});
         std.process.exit(1);
     }
+    // Every group's device tunnels are stopped; exit without waiting for
+    // anything still parked in the Io (a forwarder's accept, for one).
+    std.process.exit(0);
 }
 
 test {

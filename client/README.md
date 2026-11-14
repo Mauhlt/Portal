@@ -1,28 +1,26 @@
 # portal-client
 
 Native viewer for a Portal session (Windows, Linux, macOS), drawn with the
-owner's Vulkan Renderer. Implements `docs/protocol.md`: device pairing,
-rotating sign-in, the WebSocket grid stream and key-name input.
+owner's Vulkan Renderer. Implements `docs/protocol.md`: the device's own
+WireGuard tunnel to the desk (in-process: no WireGuard app, adapter or
+administrator right), TLS 1.3 with the Portal CA pinned, the interactive
+WebSocket (grid stream, key-name input) and the bulk one (sync).
 
 ```
-portal-client --server 10.8.0.1:8420 --ca portal-ca.pem   # first run: pin the server's CA
-portal-client --server 10.8.0.1:8420 --ca-sha256 AB:CD:.. # or: fetch it while `portal pair` is open
-portal-client --server 10.8.0.1:8420                      # later runs (CA pinned)
-portal-client --server 10.8.0.1:8420 --forget             # delete credentials + pinned CA
-portal-client --server 127.0.0.1:8420 --insecure-plain-http  # only for `portal run --no-tls`
+portal-client                        # the paired desktop, or the first-run screen
+portal-client --key                  # print this device's tunnel key and check code
+portal-client --pairing-code CODE    # pair with the code the desk showed
+portal-client --forget               # forget the desktop, both ways
 ```
 
 On Windows the same viewer is built into Portal itself as `portal connect`
 (same arguments): `src/connect.zig` is shared by both.
 
-First run: at the desktop run `portal ca export` (it writes portal-ca.pem /
-portal-ca.cer and prints the CA's SHA-256 fingerprint) and `portal pair
-<name>`. Here, either copy portal-ca.pem over and pass `--ca portal-ca.pem`,
-or pass `--ca-sha256 <fingerprint>` while the pairing window is open: the
-client then downloads `/ca.cer` from the desktop's pairing-time page
-(http://IP:PORT+1/), and pins it only if its SHA-256 matches. Then click
-**Pair** (or press P) within 2 minutes. After that the client signs in by
-itself on every launch and reconnect, with just `--server`.
+First run (docs/pairing.md): the window shows this device's tunnel key and
+its check code. At the desk, Pair a device with that key and compare the
+check code; the desk then shows a pairing code, which you enter here (and
+compare the desk key's check code it shows). After that the client
+connects by itself on every launch.
 
 The window opens on the **Conversation view** (the Terminal | Conversation
 toggle is in the top bar; docs/layout-design.md). Device settings live in
@@ -33,42 +31,16 @@ toggle is in the top bar; docs/layout-design.md). Device settings live in
 
 ## TLS
 
-Portal serves HTTPS/WSS by default with a private CA name-constrained to the
-tunnel addresses. The client pins that CA per server:
-
-* The CA (public, not secret) is stored in the per-user config directory:
-  `%APPDATA%\Portal\servers\<ip>_<port>.pem` (Windows),
-  `~/Library/Application Support/Portal/servers/` (macOS),
-  `$XDG_CONFIG_HOME/portal/servers/` or `~/.config/portal/servers/` (Linux).
-  It is only ever written from an explicit `--ca FILE` (which must be a
-  self-signed CA; `--ca-sha256` with it must match) or a download that
-  matches `--ca-sha256`. Without a pin the client refuses to start: there is
-  no trust on first use. A `--ca` with a different CA replaces the pin and
-  says so. The pinned fingerprint is printed on every start.
-* `std.crypto.tls.Client` (TLS 1.3) runs with `.host = .{ .explicit =
-  "<bare IP>" }` and a CA bundle holding only the pinned CA. In front of it
-  `src/net/tlsconn.zig` holds back the server's encrypted handshake flight
-  until it has checked the certificate itself with bounds-checked code
-  (`src/net/x509check.zig`): signed by exactly the pinned CA, valid now,
-  subjectAltName = the server IP, ECDSA P-256. This closes two std gaps: on
-  Windows std falls back to the OS root store when the pinned bundle has no
-  issuer (so any Windows-trusted certificate, e.g. another Portal's CA a
-  browser trusts, would pass), and std's certificate parser is not
-  bounds-checked (a malformed certificate from an unauthenticated server
-  could crash it). Only TLS_AES_128_GCM_SHA256 and
-  TLS_CHACHA20_POLY1305_SHA256 are accepted (what Portal's server offers).
-* Over HTTPS the client uses Origin `https://IP:PORT` and the `__Host-portal`
-  / `__Host-portal_device` cookie names. A credential stored by an older
-  client is sent only over HTTPS (under the `__Host-` name), never in
-  cleartext.
-* `--insecure-plain-http` (loud warning, never the default) talks plain HTTP
-  to a `portal run --no-tls` server. It uses a separate credential
-  (`Portal-plain/<host>`), so a credential obtained over TLS is never sent
-  in cleartext.
-* Liveness: connect + handshake 15 s, each request 15 s, and the stream is
-  dropped after 60 s without data; a WebSocket ping goes out after 20 s of
-  silence. Steps run as `std.Io` concurrent tasks that a watchdog cancels
-  (`src/net/watchdog.zig`), since std cannot time out connects or reads.
+The desk sends its Portal CA in its certificate chain. On the first
+connection after pairing the client accepts it only if its SHA-256 is the
+one in the pairing code, then pins it (`%APPDATA%\Portal\servers\`,
+`~/Library/Application Support/Portal/servers/`,
+`$XDG_CONFIG_HOME/portal/servers/`); never trust on first use.
+`src/net/tlsconn.zig` holds back the server's encrypted handshake flight
+until it has checked the certificate itself with bounds-checked code
+(`src/net/x509check.zig`): signed by exactly the pinned CA, valid now,
+subjectAltName = 10.8.0.1, ECDSA P-256 (this closes std's fallback to the
+OS root store on Windows and its unchecked certificate parser).
 
 ## Build
 
@@ -91,9 +63,10 @@ zig build -Dtarget=aarch64-macos
 | `src/gframe.zig` | Writes decoded 'G'/'I'/'P' frames into `view.grid.Grid` (remote grid source). |
 | `src/keys.zig` | Protocol key names per `hello.input` mode. |
 | `src/remote.zig` | `RemoteSink` (InputSink → protocol frames) and the overlay (pairing screen, status). |
-| `src/net/` | `http.zig` (requests, strict response/Set-Cookie parsing), `client.zig` (connection thread), `tlsconn.zig` (TCP/TLS connection, certificate gate), `x509check.zig` (bounds-checked certificate checks, PEM, fingerprints), `pin.zig` (per-server pinned CA files), `watchdog.zig` (deadlines). |
-| `../shared/` | **Module `shared`** (a path dependency, also used by Portal's server and e2e tests): `screen.zig` (the 'G'/'I'/'P' frame decoder), `ws.zig` (WebSocket framing), `http.zig` (header syntax, cookie names), `pki/` (DER, certificate reading, PEM, fingerprints), `tls13.zig` (TLS 1.3 record protection). |
-| `src/credstore.zig` | OS credential store: Windows Credential Manager; macOS Keychain and Linux Secret Service (libsecret) via dlopen. |
+| `src/net/` | `http.zig` (the upgrade request, strict response parsing), `wsclient.zig` (a WebSocket on either channel), `client.zig` (connection thread), `tlsconn.zig` (TLS over the tunnel stream, certificate gate), `x509check.zig` (bounds-checked certificate checks, PEM, fingerprints), `pin.zig` (per-server pinned CA files), `watchdog.zig` (deadlines). |
+| `../shared/` | **Module `shared`** (a path dependency, also used by Portal's server and e2e tests): `screen.zig` (the 'G'/'I'/'P' frame decoder), `ws.zig` (WebSocket framing), `http.zig` (header syntax), `pki/` (DER, certificate reading, PEM, fingerprints), `tls13.zig` (TLS 1.3 record protection). |
+| `src/credstore.zig` | OS credential store: Windows Credential Manager; the macOS Keychain (dlopen); on Linux a private file. |
+| `src/tunnel/`, `src/devicelink.zig` | The in-process WireGuard tunnel (zwg + netstack behind the stream seam), this device's key, the pairing code. |
 
 `portal run`'s local window (Portal's `src/gui.zig`) uses `view` too: it
 fills a `Grid` from `vt.Terminal` (`src/localgrid.zig`), its `InputSink`
@@ -102,16 +75,14 @@ makes `InputSink.resized` report the cols/rows for the PTY.
 
 ## Security
 
-* The device credential is stored only in the OS credential store under
-  `Portal/<server host>` (`Portal-plain/<server host>` for
-  `--insecure-plain-http`); the rotated value is saved before anything else is
-  done with the response. The session cookie stays in memory. Nothing secret
-  is accepted on the command line, written to files, or logged. A 401 from
-  `/auth/refresh` deletes the stored credential.
-* If the credential store is unavailable (e.g. Linux without a Secret
-  Service), the client refuses to pair instead of falling back to a file.
-* `--server` must be a literal IP:PORT (no DNS); Host and Origin are derived
-  from its canonical form.
+* This device's WireGuard private key is stored only in the OS credential
+  store (`src/credstore.zig`): Windows Credential Manager, the macOS
+  Keychain, on Linux a 0600 file in a 0700 directory checked on every load.
+  It is wiped from memory once the tunnel has it, and never leaves the
+  device. Nothing secret is accepted on the command line, written
+  elsewhere, or logged.
+* The device talks only to `10.8.0.1:8420` inside its own tunnel; its only
+  peer is the desk, allowed only that address.
 * WebSocket client frames are masked with keys from the OS CSPRNG; the
   Sec-WebSocket-Accept value is verified. Server frames must be unmasked,
   unfragmented, at most 8 MiB; anything else drops the connection.

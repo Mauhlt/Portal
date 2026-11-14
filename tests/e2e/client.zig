@@ -1,5 +1,7 @@
-//! Portal-specific client helpers shared by the scenario groups: pairing a
-//! device, signing in, and a WebSocket viewer that tracks the grid.
+//! Portal-specific client helpers shared by the scenario groups: pairing
+//! an in-process device (proc.Instance.pair: its own WireGuard key and
+//! tunnel, link.zig) and a WebSocket viewer that tracks the grid. A device
+//! is its tunnel key: there are no cookies or sign-in.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -11,187 +13,28 @@ const proc = @import("proc.zig");
 
 pub const Instance = proc.Instance;
 
-pub const device_cookie = "portal_device";
-pub const session_cookie = "portal_session";
-pub const pairreq_cookie = "portal_pairreq";
-/// The names over HTTPS (`__Host-` prefix, always Secure).
-pub const tls_device_cookie = "__Host-portal_device";
-pub const tls_session_cookie = "__Host-portal";
-pub const tls_pairreq_cookie = "__Host-portal_pairreq";
-
-/// GET with an optional Cookie header value.
-pub fn get(inst: *Instance, path: []const u8, cookie: ?[]const u8) !http.Response {
-    return http.request(inst.h.gpa, inst.port, .{ .path = path, .host = inst.host, .cookie = cookie, .tls = inst.tls });
-}
-
-/// Empty-bodied POST; `origin` false omits the Origin header.
-pub fn post(inst: *Instance, path: []const u8, cookie: ?[]const u8, origin: bool) !http.Response {
-    return http.request(inst.h.gpa, inst.port, .{
-        .method = "POST",
-        .path = path,
-        .host = inst.host,
-        .origin = if (origin) inst.origin else null,
-        .cookie = cookie,
-        .body = "",
-        .tls = inst.tls,
-    });
-}
-
-/// A device's credentials, as Cookie header values ("name=value").
+/// A paired device, as the groups use it: `sessionCookie()` names the
+/// device for Viewer.open (it picks that device's tunnel).
 pub const Creds = struct {
-    device: [128]u8 = undefined,
-    device_len: usize = 0,
-    session: [96]u8 = undefined,
-    session_len: usize = 0,
+    name_buf: [32]u8 = undefined,
+    name_len: usize = 0,
 
-    pub fn deviceCookie(c: *const Creds) []const u8 {
-        return c.device[0..c.device_len];
-    }
     pub fn sessionCookie(c: *const Creds) []const u8 {
-        return c.session[0..c.session_len];
+        return c.name_buf[0..c.name_len];
     }
-    /// The bare device value "<name>.<secret>".
-    pub fn deviceValue(c: *const Creds) []const u8 {
-        const d = c.deviceCookie();
-        return d[(std.mem.indexOfScalar(u8, d, '=') orelse return d) + 1 ..];
-    }
-
-    /// Fills from a response's Set-Cookie headers (plain or `__Host-`
-    /// names); null if either is missing.
-    pub fn fromResponse(r: *const http.Response) ?Creds {
-        var c: Creds = .{};
-        const tls = r.setCookieLine(tls_device_cookie) != null;
-        const dn = if (tls) tls_device_cookie else device_cookie;
-        const sn = if (tls) tls_session_cookie else session_cookie;
-        const d = r.cookie(dn) orelse return null;
-        const s = r.cookie(sn) orelse return null;
-        if (d.len == 0 or s.len == 0) return null;
-        c.device_len = (std.fmt.bufPrint(&c.device, "{s}={s}", .{ dn, d }) catch return null).len;
-        c.session_len = (std.fmt.bufPrint(&c.session, "{s}={s}", .{ sn, s }) catch return null).len;
-        return c;
+    pub fn deviceCookie(c: *const Creds) []const u8 {
+        return c.sessionCookie();
     }
 };
 
-/// A device's outstanding pairing request: its `portal_pairreq` cookie.
-pub const PairReq = struct {
-    status: u16 = 0,
-    location_buf: [64]u8 = undefined,
-    location_len: usize = 0,
-    cookie_buf: [96]u8 = undefined,
-    cookie_len: usize = 0,
-    set_cookies: usize = 0,
-
-    pub fn location(p: *const PairReq) []const u8 {
-        return p.location_buf[0..p.location_len];
-    }
-    /// "portal_pairreq=<token>", or "" if none was set.
-    pub fn cookie(p: *const PairReq) []const u8 {
-        return p.cookie_buf[0..p.cookie_len];
-    }
-    /// The server accepted the request and sent the device to wait.
-    pub fn waiting(p: *const PairReq) bool {
-        return p.status == 303 and std.mem.eql(u8, p.location(), "/pair/wait") and p.cookie_len > 0;
-    }
-};
-
-/// POST /pair (optionally from another loopback source address).
-pub fn requestPair(inst: *Instance, source: ?[4]u8) !PairReq {
-    var r = try http.request(inst.h.gpa, inst.port, .{
-        .method = "POST",
-        .path = "/pair",
-        .host = inst.host,
-        .origin = inst.origin,
-        .body = "",
-        .source = source,
-        .tls = inst.tls,
-    });
-    defer r.deinit();
-    var p: PairReq = .{ .status = r.status, .set_cookies = r.setCookieCount() };
-    const loc = r.location();
-    p.location_len = @min(loc.len, p.location_buf.len);
-    @memcpy(p.location_buf[0..p.location_len], loc[0..p.location_len]);
-    const qn = if (r.setCookieLine(tls_pairreq_cookie) != null) tls_pairreq_cookie else pairreq_cookie;
-    if (r.cookie(qn)) |v| if (v.len > 0) {
-        const s: []const u8 = std.fmt.bufPrint(&p.cookie_buf, "{s}={s}", .{ qn, v }) catch "";
-        p.cookie_len = s.len;
-    };
-    return p;
-}
-
-/// GET /pair/wait with the request cookie.
-pub fn waitPage(inst: *Instance, req: []const u8, source: ?[4]u8) !http.Response {
-    return http.request(inst.h.gpa, inst.port, .{ .path = "/pair/wait", .host = inst.host, .cookie = req, .source = source, .tls = inst.tls });
-}
-
-pub const Collected = union(enum) {
-    creds: Creds,
-    /// Sent back to /pair with this reason (e.g. "/pair?e=denied").
-    refused: [64]u8,
-    timeout,
-};
-
-/// Polls GET /pair/wait (as the page's meta refresh would) until the
-/// outcome is decided.
-pub fn collect(inst: *Instance, req: []const u8, source: ?[4]u8, ms: u32) !Collected {
-    const deadline = net.now() + ms;
-    while (net.now() < deadline) {
-        var r = try waitPage(inst, req, source);
-        defer r.deinit();
-        if (r.status == 303) {
-            if (std.mem.eql(u8, r.location(), "/")) return .{ .creds = Creds.fromResponse(&r) orelse return error.NoCookies };
-            var why: [64]u8 = @splat(0);
-            const loc = r.location();
-            @memcpy(why[0..@min(loc.len, 64)], loc[0..@min(loc.len, 64)]);
-            return .{ .refused = why };
-        }
-        net.sleep(50);
-    }
-    return .timeout;
-}
-
-/// Waits until GET /pair offers the "Pair this device" button.
-pub fn waitPairOpen(inst: *Instance, ms: u32) bool {
-    const deadline = net.now() + ms;
-    while (net.now() < deadline) {
-        var r = get(inst, "/pair", null) catch return false;
-        defer r.deinit();
-        if (r.bodyContains("type=\"submit\"")) return true;
-        net.sleep(30);
-    }
-    return false;
-}
-
-/// The full desk-approval flow: `portal pair <name>` (kept running),
-/// POST /pair, answer "y" at the desk prompt, collect the credential.
+/// Pairs a new in-process device called `name` at the desk (see
+/// proc.Instance.pair).
 pub fn pair(inst: *Instance, name: []const u8) !Creds {
-    const pc = try inst.liveCli(&.{ "pair", name });
-    defer pc.deinit();
-    if (!pc.waitFor("Waiting for the device", 15_000)) return error.PairCommandFailed;
-    if (!waitPairOpen(inst, 10_000)) {
-        const text: []const u8 = inst.log() catch "";
-        std.debug.print("---- pair window not seen; `portal pair` said:\n{s}\n---- portal.log\n{s}\n----\n", .{ pc.output(), text });
-        return error.PairWindowNotSeen;
-    }
-    const rq = try requestPair(inst, null);
-    if (!rq.waiting()) return error.PairingRefused;
-    if (!pc.waitFor("[y/N]", 10_000)) return error.NoDeskPrompt;
-    pc.answer("y\r\n");
-    const got = try collect(inst, rq.cookie(), null, 10_000);
-    const creds = switch (got) {
-        .creds => |c| c,
-        else => return error.PairingRefused,
-    };
-    if (pc.wait(10_000) != 0) return error.PairCommandFailed;
-    return creds;
-}
-
-/// Device sign-in (GET / with only the device cookie). Returns the new
-/// credentials, or null if the server sent the device elsewhere.
-pub fn signIn(inst: *Instance, device: []const u8) !?Creds {
-    var r = try get(inst, "/", device);
-    defer r.deinit();
-    if (r.status != 303 or !std.mem.eql(u8, r.location(), "/")) return null;
-    return Creds.fromResponse(&r);
+    _ = try inst.pair(name);
+    var c: Creds = .{};
+    c.name_len = @min(name.len, c.name_buf.len);
+    @memcpy(c.name_buf[0..c.name_len], name[0..c.name_len]);
+    return c;
 }
 
 pub const Viewer = struct {
@@ -228,12 +71,15 @@ pub const Viewer = struct {
     trace: bool = false,
 
     /// Upgrades, reads hello and the first grid frame.
-    pub fn open(inst: *Instance, session: []const u8) !*Viewer {
+    /// `device` names a device paired with `inst` (Creds.sessionCookie):
+    /// the viewer connects through that device's tunnel.
+    pub fn open(inst: *Instance, device: []const u8) !*Viewer {
         const gpa = inst.h.gpa;
+        const l = inst.link(device) orelse return error.NoSuchDevice;
         const v = try gpa.create(Viewer);
         errdefer gpa.destroy(v);
         v.* = .{
-            .c = try ws.Client.connect(gpa, inst.port, .{ .host = inst.host, .origin = inst.origin, .cookie = session, .tls = inst.tls }),
+            .c = try ws.Client.connect(gpa, l.port, .{ .host = inst.host, .origin = null, .cookie = null, .tls = inst.tls }),
             .g = grid.Grid.init(gpa),
         };
         errdefer v.c.close();
@@ -442,13 +288,6 @@ pub const Viewer = struct {
     }
 };
 
-/// The server answers a plain GET /pair (used as a liveness probe).
-pub fn alive(inst: *Instance) bool {
-    var r = get(inst, "/pair", null) catch return false;
-    defer r.deinit();
-    return r.status == 200;
-}
-
 /// `n` copies of `c` (comptime; `**` on strings is gone in Zig 0.18).
 pub fn rep(comptime n: usize, comptime c: u8) [n]u8 {
     return @splat(c);
@@ -461,4 +300,12 @@ pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
     }
     return false;
+}
+
+/// The desk still answers through the last paired device's tunnel (any
+/// path but the two WebSockets is a 404).
+pub fn alive(inst: *Instance) bool {
+    var r = http.request(inst.h.gpa, inst.port, .{ .path = "/", .host = inst.host, .tls = inst.tls }) catch return false;
+    defer r.deinit();
+    return r.status == 404;
 }

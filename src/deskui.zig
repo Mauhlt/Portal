@@ -26,117 +26,60 @@ pub const ago = P.ago;
 // ------------------------------------------------------------------ tests
 
 const testing = std.testing;
-const auth = @import("auth.zig");
 
 fn typeText(ui: *Ui, s: []const u8) void {
     for (s) |ch| _ = ui.char(ch, .{});
 }
 
-fn window(nonce: u64, expires: i64) devices.Pairing {
-    var p: devices.Pairing = .{ .nonce = nonce, .expires = expires };
-    p.name.set("iphone");
-    return p;
-}
-
-fn request(code: *const [4]u8, ip: []const u8, created: i64, state: devices.ReqState) devices.Request {
-    var r: devices.Request = .{ .code = code.*, .token = auth.hashSecret(code), .created = created, .state = state };
-    r.ip.set(ip);
-    return r;
-}
-
-test "pairing: name, open, ask oldest first, approve, collected" {
+test "pairing: name and key, check code, approve with y, pairing code shown" {
     var ui: Ui = .{};
     ui.openPair();
     try testing.expectEqual(Screen.pair_name, ui.screen);
     // An invalid name is refused with a note, not an action.
+    _ = ui.key(.tab, .{});
     try testing.expectEqual(Action.none, ui.key(.enter, .{}));
     try testing.expect(ui.note().len > 0);
-    typeText(&ui, "iPhone!");
-    try testing.expectEqualStrings("iphone", ui.name.text());
-    try testing.expectEqual(Action.begin_pair, ui.key(.enter, .{}));
-
-    var w = window(77, 1000);
-    try testing.expectEqual(Action.none, ui.pairBegun(77, w));
-    try testing.expectEqual(Screen.pairing, ui.screen);
-    try testing.expect(ui.asked == null);
-
-    // Two requests: the older one is asked first; focus starts on Deny.
-    w.requests[0] = request("bbbb", "10.8.0.4", 20, .pending);
-    w.requests[1] = request("aaaa", "10.8.0.3", 10, .pending);
-    _ = ui.pairingChanged(w, 100);
-    try testing.expectEqualStrings("aaaa", &ui.asked.?);
+    _ = ui.key(.tab, .{}); // back to the name (wraps through the buttons)
+    ui.focus.index = 0;
+    typeText(&ui, "Laptop!");
+    try testing.expectEqualStrings("laptop", ui.name.text());
+    try testing.expectEqual(Action.none, ui.key(.enter, .{})); // on to the key
+    try testing.expectEqual(Action.paste, ui.char('v', .{ .ctrl = true }));
+    ui.paste("hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=");
+    try testing.expectEqual(Action.check_key, ui.key(.enter, .{}));
+    ui.keyChecked("ABCDE-FGHJK".*);
+    try testing.expectEqual(Screen.pair_check, ui.screen);
     var bufs: Ui.Bufs = .{};
-    const p = ui.panel(&bufs, .{ .now = 100 }).?;
-    try testing.expectEqualStrings("Pair 'iphone' from 10.8.0.3, code aaaa?", p.title);
-    var focused: ?u32 = null;
-    for (p.buttons) |b| if (b.focused) {
-        focused = b.id;
-    };
-    try testing.expectEqual(@as(?u32, id.deny), focused);
-    // Enter answers what is focused: deny. 'y' approves.
-    const a1 = ui.key(.enter, .{});
-    try testing.expect(a1 == .answer and !a1.answer.approve and std.mem.eql(u8, &a1.answer.code, "aaaa"));
-    const a2 = ui.char('y', .{});
-    try testing.expect(a2 == .answer and a2.answer.approve);
-
-    // The desk denied aaaa: bbbb is asked next.
-    w.requests[1].?.state = .denied;
-    _ = ui.pairingChanged(w, 101);
-    try testing.expectEqualStrings("bbbb", &ui.asked.?);
-    // Approved, then collected: the result screen, and the window is closed.
-    w.requests[0].?.state = .approved;
-    _ = ui.pairingChanged(w, 102);
-    try testing.expect(ui.asked == null);
-    w.requests[0].?.state = .done;
-    try testing.expectEqual(Action.stop_pair, ui.pairingChanged(w, 103));
+    const q = ui.panel(&bufs, .{}).?;
+    try testing.expect(std.mem.indexOf(u8, q.title, "ABCDE-FGHJK") != null);
+    // Deny has the focus: Enter denies; y approves.
+    try testing.expectEqualStrings("Deny", q.buttons[0].label);
+    try testing.expect(q.buttons[0].focused);
+    try testing.expectEqual(Action.approve_pair, ui.char('y', .{}));
+    const code = "portal-pair 2 10.8.0.1:8420 " ++ "00070E151C232A31383F464D545B626970777E858C939AA1A8AFB6BDC4CBD2D9 home.example.org:51820 hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo= 10.8.0.2";
+    ui.paired("10.8.0.2", code, "KLMNP-QRSTV".*);
     try testing.expectEqual(Screen.pair_result, ui.screen);
-    try testing.expectEqual(PairResult.paired, ui.result);
-    try testing.expectEqualStrings("10.8.0.4", ui.result_ip.get());
-    try testing.expectEqual(@as(u64, 0), ui.own_nonce);
-    _ = ui.key(.enter, .{});
-    try testing.expectEqual(Screen.none, ui.screen);
+    const r = ui.panel(&bufs, .{}).?;
+    try testing.expect(std.mem.indexOf(u8, r.title, "10.8.0.2") != null);
+    try testing.expect(r.qr != null);
+    try testing.expectEqualStrings("", ui.key_text.text()); // the key field is cleared
 }
 
-test "pairing: the open window shows the pairing QR code over TLS only" {
+test "pairing: deny goes back with a note; Esc in the question goes back" {
     var ui: Ui = .{};
     ui.openPair();
     typeText(&ui, "iphone");
-    _ = ui.key(.enter, .{});
-    _ = ui.pairBegun(5, window(5, 1000));
-    var bufs: Ui.Bufs = .{};
-    const fp = "00:07:0E:15:1C:23:2A:31:38:3F:46:4D:54:5B:62:69:70:77:7E:85:8C:93:9A:A1:A8:AF:B6:BD:C4:CB:D2:D9";
-    const p = ui.panel(&bufs, .{ .now = 100, .url = "https://10.8.0.1:8420/", .fingerprint = fp }).?;
-    const q = p.qr.?;
-    try testing.expect(q.size >= 21);
-    try testing.expectEqual(@as(usize, q.size) * q.size, q.modules.len);
-    // Plain HTTP: no CA, no QR.
-    try testing.expect(ui.panel(&bufs, .{ .now = 100, .url = "http://10.8.0.1:8420/" }).?.qr == null);
-}
-
-test "pairing: expiry, foreign windows, Esc stops" {
-    var ui: Ui = .{};
-    ui.openPair();
-    typeText(&ui, "laptop");
-    _ = ui.pairBegun(5, window(5, 200));
-    // Another process replaced the window: ours is closed.
-    _ = ui.pairingChanged(window(6, 300), 150);
-    try testing.expectEqual(Screen.pair_result, ui.screen);
-    try testing.expectEqual(PairResult.closed, ui.result);
-
-    _ = ui.pairBegun(7, window(7, 200));
-    _ = ui.pairingChanged(null, 201);
-    try testing.expectEqual(PairResult.expired, ui.result);
-    // "Try again" goes back to the name.
+    ui.keyChecked("ABCDE-FGHJK".*);
+    _ = ui.key(.enter, .{}); // Deny is focused
+    try testing.expectEqual(Screen.pair_name, ui.screen);
+    try testing.expect(ui.note().len > 0);
+    ui.keyChecked("ABCDE-FGHJK".*);
+    _ = ui.key(.escape, .{});
+    try testing.expectEqual(Screen.pair_name, ui.screen);
+    ui.pairFailed("no", .{});
+    try testing.expectEqual(PairResult.failed, ui.result);
     try testing.expectEqual(Action.none, ui.button(id.again));
     try testing.expectEqual(Screen.pair_name, ui.screen);
-
-    _ = ui.pairBegun(8, window(8, 200));
-    try testing.expectEqual(Action.stop_pair, ui.key(.escape, .{}));
-    try testing.expectEqual(Screen.none, ui.screen);
-    // No window of ours: snapshots change nothing.
-    ui.own_nonce = 0;
-    try testing.expectEqual(Action.none, ui.pairingChanged(window(9, 500), 10));
-    try testing.expectEqual(Screen.none, ui.screen);
 }
 
 test "devices: confirm before unpair" {
@@ -191,7 +134,7 @@ test "devices: P opens a device's sync packages; Enter or a click toggles" {
 
 test "setup: fields, choice, submit; settings can be cancelled" {
     var ui: Ui = .{};
-    ui.openSetup(true, "127.0.0.1:8420", "", "", .keys);
+    ui.openSetup(true, "51820", "", "", .keys);
     try testing.expectEqual(@as(u8, 1), ui.focus.index); // the empty program
     typeText(&ui, "cmd.exe /k");
     try testing.expectEqualStrings("cmd.exe /k", ui.setup.program.text());
@@ -209,10 +152,11 @@ test "setup: fields, choice, submit; settings can be cancelled" {
     _ = ui.key(.left, .{});
     try testing.expectEqual(rules.Policy.none, ui.setup.input);
     try testing.expectEqual(Action.setup_submit, ui.key(.enter, .{}));
-    _ = ui.button(id.field0); // click: focus the listen field
+    _ = ui.button(id.field0); // click: focus the tunnel port field
     try testing.expectEqual(Action.paste, ui.char('v', .{ .ctrl = true }));
-    ui.paste("x\ny");
-    try testing.expectEqualStrings("127.0.0.1:8420x", ui.setup.listen.text());
+    _ = ui.key(.backspace, .{});
+    ui.paste("9\ny");
+    try testing.expectEqualStrings("51829", ui.setup.tunnel_port.text());
 
     var s: Ui = .{};
     s.openSetup(false, "a", "b", "c", .text);
@@ -230,7 +174,7 @@ test "settings: Show system monitor is a fifth choice (not on the first run), of
     try testing.expect(!s.setup.sysmon);
     var b2: Ui.Bufs = .{};
     const p = s.panel(&b2, .{}).?;
-    try testing.expectEqual(@as(usize, 7), p.fields.len);
+    try testing.expectEqual(@as(usize, 8), p.fields.len);
     try testing.expectEqualStrings("Off", p.fields[4].value);
     // A click focuses it, a second click flips it; Left/Right and space too.
     _ = s.button(id.field0 + 4);
@@ -242,7 +186,9 @@ test "settings: Show system monitor is a fifth choice (not on the first run), of
     _ = s.char(' ', .{});
     try testing.expect(s.setup.sysmon);
     try testing.expectEqual(rules.Policy.keys, s.setup.input); // the policy is untouched
-    // Enter: on to "Background art", "Claude Code integration", then submit.
+    // Enter: on to "Background art", "Claude Code integration", the
+    // tunnel endpoint, then submit.
+    try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.setup_submit, s.key(.enter, .{}));
@@ -310,11 +256,11 @@ test "settings: agent integration is a seventh choice that acts at once (not on 
 test "setup: the button says Start on first run and Save in Settings" {
     var b: Ui.Bufs = .{};
     var first: Ui = .{};
-    first.openSetup(true, "127.0.0.1:8420", "", "", .keys);
+    first.openSetup(true, "51820", "", "", .keys);
     const p1 = first.panel(&b, .{}).?;
     try testing.expectEqualStrings("Start", p1.buttons[p1.buttons.len - 1].label);
     var later: Ui = .{};
-    later.openSetup(false, "127.0.0.1:8420", "cmd.exe", "", .keys);
+    later.openSetup(false, "51820", "cmd.exe", "", .keys);
     const p2 = later.panel(&b, .{}).?;
     try testing.expectEqualStrings("Save", p2.buttons[p2.buttons.len - 1].label);
     try testing.expectEqual(Action.setup_submit, later.button(id.save));

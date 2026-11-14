@@ -1,19 +1,23 @@
 //! The desk's panels, as a state machine with no drawing and no I/O:
-//! first-run / Settings, "Pair a device…" with the approval question, the
-//! Devices list with Unpair (and a device's sync packages), and "Export
-//! certificate…". The desk's window glue (src/gui.zig) feeds it keys,
-//! characters, button clicks and pairing-window snapshots, performs the
-//! `Action`s it returns (the in-process desk API, the device store, the CA
-//! export) and draws `panel()` with the frame.
+//! first-run / Settings (with the tunnel: this desktop's key, port,
+//! endpoint and its peers), "Pair a device…" with the check-code
+//! question, the Devices list with Unpair (and a device's sync packages),
+//! and "Export certificate…". The desk's window glue (src/gui.zig) feeds it
+//! keys, characters and button clicks, performs the `Action`s it returns
+//! (the device store, the CA export) and draws `panel()` with the frame.
 //!
-//! Generic over the desk's device store module (`devices`: Pairing,
-//! Request, Text, code_len, max_name, max_devices, validName,
-//! pairedRequest), so the pairing rules stay defined once, in the store
-//! (src/devices.zig); src/deskui.zig binds it and holds the tests.
+//! Generic over the desk's device store module (`devices`: Text,
+//! max_name, max_devices, validName), so the pairing rules stay defined
+//! once, in the store (src/devices.zig); src/deskui.zig binds it and holds
+//! the tests.
 //!
-//! Approval is explicit: nothing approves by default. In the question the
-//! focus starts on Deny, Enter answers whatever is focused, `y` approves
-//! and `n` denies, like the [y/N] prompt of `portalctl pair`.
+//! Pairing: the owner types (or pastes) the name and the device's
+//! WireGuard public key; the glue checks the key and the panel shows its
+//! check code, to compare with the device's screen. Approval is explicit:
+//! nothing approves by default. In the question the focus starts on Deny,
+//! Enter answers whatever is focused, `y` approves and `n` denies, like
+//! the [y/N] prompt of `portalctl pair`. Approved, the panel shows the
+//! pairing code for the device (text and QR).
 
 const std = @import("std");
 const rules = @import("inputrules");
@@ -25,7 +29,7 @@ const pairqr = @import("shared").pairqr;
 
 pub fn Panels(comptime devices: type) type {
     return struct {
-        pub const Screen = enum { none, setup, pair_name, pairing, pair_result, devices, dev_packages, export_form, export_done };
+        pub const Screen = enum { none, setup, pair_name, pair_check, pair_result, devices, dev_packages, export_form, export_done };
 
         /// Button and field ids (the frame reports clicks by id).
         pub const id = struct {
@@ -66,11 +70,11 @@ pub fn Panels(comptime devices: type) type {
 
         pub const Action = union(enum) {
             none,
-            /// Open a pairing window for `ui.name`.
-            begin_pair,
-            answer: struct { code: [devices.code_len]u8, approve: bool },
-            /// Close our pairing window.
-            stop_pair,
+            /// Check the key in `ui.key` (keyChecked, or a note).
+            check_key,
+            /// The owner approved `ui.name` with `ui.key` (paired, or
+            /// pairFailed).
+            approve_pair,
             /// (Re)read the paired devices into `ui.devs` (setDevices).
             load_devices,
             /// Unpair `ui.devs[i]`.
@@ -98,6 +102,8 @@ pub fn Panels(comptime devices: type) type {
         pub const DevRow = struct {
             name: devices.Text = .{},
             ip: devices.Text = .{},
+            /// Its WireGuard key's check code.
+            key: devices.Text = .{},
             last_seen: i64 = 0,
             /// Sync packages the device is subscribed to.
             n_subs: u8 = 0,
@@ -112,14 +118,20 @@ pub fn Panels(comptime devices: type) type {
         };
         pub const max_pkgs = 16;
 
-        pub const PairResult = enum { paired, expired, closed, failed };
+        pub const PairResult = enum { paired, failed };
+        /// "ABCDE-FGHJK" (shared/tunnelnet.zig checkCode).
+        pub const check_len = 11;
+        pub const key_text_len = 44;
 
         pub const Setup = struct {
             /// First run: there is no session yet, the button says Start and the
             /// panel can't be dismissed. Otherwise (Settings…) it saves for the
             /// next start.
             first_run: bool = true,
-            listen: form.TextField(64) = .{},
+            /// The tunnel's UDP port.
+            tunnel_port: form.TextField(5) = .{},
+            /// Where devices reach it (Settings only).
+            tunnel_endpoint: form.TextField(259) = .{},
             program: form.TextField(1024) = .{},
             project: form.TextField(64) = .{},
             input: rules.Policy = .keys,
@@ -146,14 +158,18 @@ pub fn Panels(comptime devices: type) type {
 
             // ---- pairing
             name: form.TextField(devices.max_name) = .{},
-            /// Our window, once open (0: none).
-            own_nonce: u64 = 0,
-            window: ?devices.Pairing = null,
-            /// The pending request being asked about (oldest first).
-            asked: ?[devices.code_len]u8 = null,
+            /// The device's WireGuard public key, as typed or pasted.
+            key_text: form.TextField(64) = .{},
+            /// The check code of `key` (set by keyChecked).
+            check: [check_len]u8 = @splat(' '),
             result: PairResult = .paired,
             result_ip: devices.Text = .{},
             result_name: devices.Text = .{},
+            /// The pairing code for the device (shared/pairqr.zig v2) and the
+            /// check code of the desk's key it carries.
+            result_code: [pairqr.max_len_tunnel]u8 = undefined,
+            result_code_len: usize = 0,
+            result_desk_check: [check_len]u8 = @splat(' '),
 
             // ---- devices
             devs: [devices.max_devices]DevRow = undefined,
@@ -198,24 +214,23 @@ pub fn Panels(comptime devices: type) type {
 
             /// First-run or Settings panel, prefilled with `listen`, `program`,
             /// `project`, `policy`.
-            pub fn openSetup(ui: *Ui, first_run: bool, listen: []const u8, program: []const u8, project: []const u8, policy: rules.Policy) void {
+            pub fn openSetup(ui: *Ui, first_run: bool, tunnel_port: []const u8, program: []const u8, project: []const u8, policy: rules.Policy) void {
                 ui.setup.first_run = first_run;
-                ui.setup.listen.set(listen);
+                ui.setup.tunnel_port.set(tunnel_port);
                 ui.setup.program.set(program);
                 ui.setup.project.set(project);
                 ui.setup.input = policy;
                 ui.show(.setup);
                 // Start in the first empty field (the program, on a first run).
-                if (ui.setup.listen.len == 0) {
+                if (ui.setup.tunnel_port.len == 0) {
                     ui.focus.index = 0;
                 } else if (ui.setup.program.len == 0) {
                     ui.focus.index = 1;
                 }
             }
 
-            /// "Pair a device…". While our window is open this shows it instead.
+            /// "Pair a device…".
             pub fn openPair(ui: *Ui) void {
-                if (ui.own_nonce != 0 and ui.window != null) return ui.show(.pairing);
                 ui.show(.pair_name);
             }
 
@@ -231,73 +246,32 @@ pub fn Panels(comptime devices: type) type {
 
             // ------------------------------------------------------- host results
 
-            /// Our window `nonce` was opened.
-            pub fn pairBegun(ui: *Ui, nonce: u64, snapshot: ?devices.Pairing) Action {
-                ui.own_nonce = nonce;
-                ui.window = null;
-                ui.asked = null;
-                ui.show(.pairing);
-                return ui.pairingChanged(snapshot, std.math.minInt(i64));
+            /// The key in `ui.key` is a WireGuard public key with check code
+            /// `code`: ask the owner to compare it with the device's.
+            pub fn keyChecked(ui: *Ui, code: [check_len]u8) void {
+                ui.check = code;
+                ui.show(.pair_check);
             }
 
-            /// The pairing view may have changed (`snapshot` is the open window,
-            /// if any; `now` in unix seconds). Returns `.stop_pair` once our device
-            /// has collected its credential (the window has done its job).
-            pub fn pairingChanged(ui: *Ui, snapshot: ?devices.Pairing, now: i64) Action {
-                if (ui.own_nonce == 0) return .none;
-                const p: ?devices.Pairing = if (snapshot) |s| (if (s.nonce == ui.own_nonce) s else null) else null;
-                if (p) |win| {
-                    ui.window = win;
-                    if (devices.pairedRequest(&win)) |r| {
-                        ui.finish(.paired, r.ip.get());
-                        return .stop_pair;
-                    }
-                    // Keep asking about the same request while it is pending;
-                    // otherwise ask about the oldest pending one.
-                    if (ui.asked) |code| {
-                        const still = if (win.findCode(&code)) |i| win.requests[i].?.state == .pending else false;
-                        if (!still) ui.asked = null;
-                    }
-                    if (ui.asked == null and !win.decided()) {
-                        var best: ?devices.Request = null;
-                        for (win.requests) |slot| {
-                            const r = slot orelse continue;
-                            if (r.state != .pending) continue;
-                            if (best == null or r.created < best.?.created) best = r;
-                        }
-                        if (best) |b| {
-                            ui.asked = b.code;
-                            if (ui.screen == .pairing) ui.focus.reset(ui.focusCount(), ui.defaultFocus());
-                        }
-                    }
-                    return .none;
-                }
-                // Our window is gone.
-                if (ui.window) |old| {
-                    ui.finish(if (now >= old.expires) .expired else .closed, "");
-                } else if (now != std.math.minInt(i64)) {
-                    ui.finish(.closed, "");
-                }
-                return .none;
-            }
-
-            fn finish(ui: *Ui, r: PairResult, ip: []const u8) void {
-                const was_shown = ui.screen == .pairing or ui.screen == .pair_name or ui.screen == .pair_result;
-                ui.result = r;
+            /// The device was recorded: show its pairing code.
+            pub fn paired(ui: *Ui, ip: []const u8, code: []const u8, desk_check: [check_len]u8) void {
+                ui.result = .paired;
+                ui.result_name.set(ui.name.text());
                 ui.result_ip.set(ip);
-                ui.result_name.set(if (ui.window) |win| win.name.get() else ui.name.text());
-                ui.own_nonce = 0;
-                ui.window = null;
-                ui.asked = null;
-                // Tell the desk the outcome even if the panel was put away.
-                if (was_shown or r == .paired or r == .expired) ui.show(.pair_result);
+                const n = @min(code.len, ui.result_code.len);
+                @memcpy(ui.result_code[0..n], code[0..n]);
+                ui.result_code_len = n;
+                ui.result_desk_check = desk_check;
+                ui.key_text.set("");
+                ui.show(.pair_result);
             }
 
-            /// The pairing window could not be opened or answered.
+            pub fn resultCode(ui: *const Ui) []const u8 {
+                return ui.result_code[0..ui.result_code_len];
+            }
+
+            /// The device could not be recorded.
             pub fn pairFailed(ui: *Ui, comptime fmt: []const u8, args: anytype) void {
-                ui.own_nonce = 0;
-                ui.window = null;
-                ui.asked = null;
                 ui.result = .failed;
                 ui.show(.pair_result);
                 ui.setNote(.bad, fmt, args);
@@ -390,8 +364,9 @@ pub fn Panels(comptime devices: type) type {
             /// Fields of the current screen, in focus order (fields come first).
             fn fieldCount(ui: *const Ui) u8 {
                 return switch (ui.screen) {
-                    .setup => if (ui.setup.first_run) 4 else 7,
-                    .pair_name, .export_form => 1,
+                    .setup => if (ui.setup.first_run) 4 else 8,
+                    .pair_name => 2,
+                    .export_form => 1,
                     else => 0,
                 };
             }
@@ -399,12 +374,13 @@ pub fn Panels(comptime devices: type) type {
             fn fieldAt(ui: *Ui, i: u8) FieldRef {
                 return switch (ui.screen) {
                     .setup => switch (i) {
-                        0 => ref(64, &ui.setup.listen),
+                        0 => ref(5, &ui.setup.tunnel_port),
                         1 => ref(1024, &ui.setup.program),
                         2 => ref(64, &ui.setup.project),
+                        7 => ref(259, &ui.setup.tunnel_endpoint),
                         else => .choice,
                     },
-                    .pair_name => ui.nameRef(),
+                    .pair_name => if (i == 0) ui.nameRef() else ref(64, &ui.key_text),
                     .export_form => ref(512, &ui.export_dir),
                     else => unreachable,
                 };
@@ -434,12 +410,9 @@ pub fn Panels(comptime devices: type) type {
                         add(out, &n, id.cancel);
                         add(out, &n, id.open_pair);
                     },
-                    .pairing => {
-                        add(out, &n, id.stop);
-                        if (ui.asked != null) {
-                            add(out, &n, id.deny);
-                            add(out, &n, id.approve);
-                        }
+                    .pair_check => {
+                        add(out, &n, id.deny);
+                        add(out, &n, id.approve);
                     },
                     .pair_result => switch (ui.result) {
                         .paired => add(out, &n, id.ok),
@@ -563,10 +536,10 @@ pub fn Panels(comptime devices: type) type {
                 // P on a device row: its sync packages.
                 if (ui.screen == .devices and (cp == 'p' or cp == 'P')) if (ui.focusedRow()) |r| return ui.openPackages(r);
                 // The approval question answers to y / n like `portalctl pair`.
-                if (ui.screen == .pairing) if (ui.asked) |code| {
-                    if (cp == 'y' or cp == 'Y') return .{ .answer = .{ .code = code, .approve = true } };
-                    if (cp == 'n' or cp == 'N') return .{ .answer = .{ .code = code, .approve = false } };
-                };
+                if (ui.screen == .pair_check) {
+                    if (cp == 'y' or cp == 'Y') return ui.activate(id.approve);
+                    if (cp == 'n' or cp == 'N') return ui.activate(id.deny);
+                }
                 return .none;
             }
 
@@ -605,10 +578,7 @@ pub fn Panels(comptime devices: type) type {
                         ui.close();
                         return .setup_cancel;
                     },
-                    .pairing => {
-                        ui.close();
-                        return .stop_pair;
-                    },
+                    .pair_check => ui.show(.pair_name),
                     .devices => if (ui.confirm != null) {
                         ui.confirm = null;
                     } else ui.close(),
@@ -664,17 +634,15 @@ pub fn Panels(comptime devices: type) type {
                             ui.setNote(.bad, "Give the device a name: 1-32 characters of a-z, 0-9 and -.", .{});
                             return .none;
                         }
-                        return .begin_pair;
+                        return .check_key;
                     },
                     id.again => {
                         ui.show(.pair_name);
                     },
-                    id.stop => if (ui.screen == .pairing) {
-                        ui.close();
-                        return .stop_pair;
-                    },
-                    id.approve, id.deny => if (ui.screen == .pairing) if (ui.asked) |code| {
-                        return .{ .answer = .{ .code = code, .approve = b == id.approve } };
+                    id.approve => if (ui.screen == .pair_check) return .approve_pair,
+                    id.deny => if (ui.screen == .pair_check) {
+                        ui.show(.pair_name);
+                        ui.setNote(.bad, "Not paired: the check codes did not match. Copy the key from the device again.", .{});
                     },
                     id.export_ => if (ui.screen == .export_form) {
                         if (std.mem.trim(u8, ui.export_dir.text(), " ").len == 0) {
@@ -693,35 +661,30 @@ pub fn Panels(comptime devices: type) type {
             pub const Ctx = struct {
                 /// "AB:CD:..." SHA-256 of the Portal CA, if there is one.
                 fingerprint: ?[]const u8 = null,
-                /// e.g. "https://10.8.0.1:8420/".
-                url: []const u8 = "",
-                /// Local time the open window closes, e.g. "14:32".
-                until: []const u8 = "",
+                /// This desktop's WireGuard public key and its check code.
+                desk_key: []const u8 = "",
+                desk_check: []const u8 = "",
+                /// The UDP port the tunnel listens on now.
+                tunnel_port: u16 = 0,
                 now: i64 = 0,
             };
 
             pub const Bufs = struct {
                 lines: [14]frame.PanelText = undefined,
-                after: [6]frame.PanelText = undefined,
+                after: [8 + devices.max_devices]frame.PanelText = undefined,
                 rows: [@max(devices.max_devices, max_pkgs)]frame.PanelRow = undefined,
-                fields: [7]frame.PanelField = undefined,
+                fields: [8]frame.PanelField = undefined,
                 buttons: [4]frame.PanelButton = undefined,
-                txt: [14][200]u8 = undefined,
+                txt: [14 + devices.max_devices][200]u8 = undefined,
                 row_txt: [@max(devices.max_devices, max_pkgs)][120]u8 = undefined,
                 n_txt: usize = 0,
-                /// The pairing QR code (address + CA fingerprint) for the
-                /// iPhone app.
+                /// The pairing code's QR (shared/pairqr.zig v2) for the
+                /// device's camera.
                 qr_code: qr.Code = .{},
                 qr_modules: [qr.max_size * qr.max_size]u8 = undefined,
-                qr_text: [pairqr.max_len]u8 = undefined,
 
-                /// Encodes the pairing QR for `c` (TLS only: it carries the
-                /// CA fingerprint). Null if there is nothing to show.
-                fn pairQr(b: *Bufs, c: Ctx) ?frame.PanelQr {
-                    const fp_text = c.fingerprint orelse return null;
-                    const fp = pairqr.parseFingerprint(fp_text) orelse return null;
-                    const host = hostOfUrl(c.url) orelse return null;
-                    const text = pairqr.format(&b.qr_text, host, fp) catch return null;
+                /// Encodes `text` as the panel's QR. Null if it does not fit.
+                fn pairQr(b: *Bufs, text: []const u8) ?frame.PanelQr {
                     b.qr_code.encode(text) catch return null;
                     const n: usize = b.qr_code.size;
                     for (0..n) |y| for (0..n) |x| {
@@ -749,7 +712,7 @@ pub fn Panels(comptime devices: type) type {
                     id.export_ => "Export",
                     id.start => "Start",
                     id.save => "Save",
-                    id.open_pair => "Open pairing",
+                    id.open_pair => "Check key",
                     else => "?",
                 };
             }
@@ -797,7 +760,7 @@ pub fn Panels(comptime devices: type) type {
                             L.add(&bufs.lines, &nl, .{ .text = "Saved for the next time Portal starts (command-line options still win)." });
                         }
                         const f = ui.focus.index;
-                        bufs.fields[0] = .{ .label = "Listen address (IP:PORT)", .value = ui.setup.listen.text(), .hint = "127.0.0.1:8420 (this desktop only) or your WireGuard address, e.g. 10.8.0.1:8420", .id = id.field0, .focused = f == 0 };
+                        bufs.fields[0] = .{ .label = "Tunnel UDP port (Portal's own WireGuard; devices reach it here)", .value = ui.setup.tunnel_port.text(), .hint = "51820", .id = id.field0, .focused = f == 0 };
                         bufs.fields[1] = .{ .label = "Program to run", .value = ui.setup.program.text(), .hint = "the program and its arguments, e.g. the agent CLI's name", .id = id.field0 + 1, .focused = f == 1 };
                         bufs.fields[2] = .{ .label = "Project name (optional, shown in the title)", .value = ui.setup.project.text(), .hint = "e.g. acme-api", .id = id.field0 + 2, .focused = f == 2 };
                         bufs.fields[3] = .{ .label = "Remote input (Left/Right to change)", .value = policyLabel(ui.setup.input), .id = id.field0 + 3, .focused = f == 3, .choice = true };
@@ -806,7 +769,9 @@ pub fn Panels(comptime devices: type) type {
                             bufs.fields[4] = .{ .label = "Show system monitor (Left/Right to change; applies now)", .value = if (ui.setup.sysmon) "On: a System button shows CPU, memory, GPU and each tab's load" else "Off", .id = id.field0 + 4, .focused = f == 4, .choice = true };
                             bufs.fields[5] = .{ .label = "Background art (Left/Right to change; applies now)", .value = if (ui.setup.bg_art) "On: the Portal art, faint, behind the terminal" else "Off", .id = id.field0 + 5, .focused = f == 5, .choice = true };
                             bufs.fields[6] = .{ .label = "Claude Code integration (Left/Right or click to install or remove; applies now)", .value = agentLabel(ui.setup.agent), .id = id.field0 + 6, .focused = f == 6, .choice = true };
-                            p.fields = bufs.fields[0..7];
+                            bufs.fields[7] = .{ .label = "Tunnel endpoint for devices (HOST:PORT)", .value = ui.setup.tunnel_endpoint.text(), .hint = "your public IP or dynamic-DNS name, and the port the router forwards, e.g. home.example.org:51820", .id = id.field0 + 7, .focused = f == 7 };
+                            p.fields = bufs.fields[0..8];
+                            ui.tunnelLines(bufs, &na, c);
                         }
                         L.add(&bufs.after, &na, .{ .text = policyHelp(ui.setup.input), .tone = if (ui.setup.input == .text) .bad else .muted });
                         if (!ui.setup.first_run and f == 6) L.add(&bufs.after, &na, .{ .text = "Adds Portal's hooks to Claude Code's settings.json (a backup is kept next to it): each runs `portalctl hook`, which tells this Portal, over a pipe only you can open, when Claude in a tab works, waits for an answer or is done. Nothing is sent outside this computer." });
@@ -814,82 +779,29 @@ pub fn Panels(comptime devices: type) type {
                     },
                     .pair_name => {
                         p.title = "Pair a device";
-                        L.add(&bufs.lines, &nl, .{ .text = "Name the device you are about to pair. A 2-minute pairing window opens; every device that asks appears here for you to approve." });
-                        bufs.fields[0] = .{ .label = "Device name (a-z, 0-9, -)", .value = ui.name.text(), .hint = "e.g. laptop, iphone", .id = id.field0, .focused = ui.focus.index == 0 };
-                        p.fields = bufs.fields[0..1];
-                        ui.caLines(bufs, &bufs.after, &na, c);
+                        L.add(&bufs.lines, &nl, .{ .text = "On the device, start Portal (portal connect): it shows its tunnel key and that key's check code. Enter a name for it and its key here (type it, or paste it if you copied it over)." });
+                        L.add(&bufs.lines, &nl, .{ .text = "Nothing is sent anywhere before you approve: the key decides which device may enter this desktop's tunnel." });
+                        bufs.fields[0] = .{ .label = "Device name (a-z, 0-9, -)", .value = ui.name.text(), .hint = "e.g. laptop, iphone, surface", .id = id.field0, .focused = ui.focus.index == 0 };
+                        bufs.fields[1] = .{ .label = "The device's tunnel key (44 characters ending in =)", .value = ui.key_text.text(), .hint = "as the device shows it", .id = id.field0 + 1, .focused = ui.focus.index == 1 };
+                        p.fields = bufs.fields[0..2];
                     },
-                    .pairing => {
-                        const win = ui.window;
-                        const name = if (win) |w| w.name.get() else ui.name.text();
-                        if (ui.asked) |code| {
-                            const ip = blk: {
-                                const w = win orelse break :blk "?";
-                                const i = w.findCode(&code) orelse break :blk "?";
-                                break :blk w.requests[i].?.ip.get();
-                            };
-                            p.title = bufs.fmt("Pair '{s}' from {s}, code {s}?", .{ name, ip, &code });
-                            p.title_tone = .warn;
-                            L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("Approve only if the device shows request code {s} and {s} is its address. Anyone else who reached Portal during the window can ask too.", .{ &code, ip }), .tone = .normal });
-                            L.add(&bufs.lines, &nl, .{ .text = "Y approves, N denies." });
-                        } else {
-                            p.title = bufs.fmt("Pairing open for '{s}'", .{name});
-                            p.title_tone = .good;
-                            if (c.until.len > 0) L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("Open until {s}. Nothing is typed on the device: you approve it here.", .{c.until}) });
-                            L.add(&bufs.lines, &nl, .{ .text = "" });
-                            L.add(&bufs.lines, &nl, .{ .text = "On the device, with WireGuard on:", .tone = .normal, .bold = true });
-                            if (c.url.len > 0) {
-                                L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("Browser: open {s} and tap \"Pair this device\".", .{c.url}) });
-                            }
-                            L.add(&bufs.lines, &nl, .{ .text = "Portal on a laptop: enter this address, pick or check the certificate, and click Pair." });
-                            if (bufs.pairQr(c)) |code| {
-                                L.add(&bufs.lines, &nl, .{ .text = "Portal on an iPhone: tap Scan QR code and point the camera here (it carries this address and the certificate's SHA-256, nothing secret)." });
-                                p.qr = code;
-                            }
-                            if (win) |w| switch (w.ca) {
-                                .up => L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("First time only: the certificate download is at http://{s}/ (compare the SHA-256 below).", .{w.ca_where.get()}) }),
-                                .failed => L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("WARNING: the certificate download on {s} could not be opened (another program may hold that port). Do not install a certificate from that address; use Export certificate instead.", .{w.ca_where.get()}), .tone = .bad }),
-                                .off => L.add(&bufs.lines, &nl, .{ .text = "This Portal serves plain HTTP (--no-tls): no certificate to install.", .tone = .warn }),
-                                .unknown => {},
-                            };
-                        }
-                        ui.caLines(bufs, &bufs.after, &na, c);
-                        // Requests seen in this window.
-                        var nr: usize = 0;
-                        if (win) |w| for (w.requests) |slot| {
-                            const r = slot orelse continue;
-                            if (nr == bufs.rows.len) break;
-                            const st: []const u8 = switch (r.state) {
-                                .pending => "waiting for you",
-                                .approved => "approved, collecting its credential",
-                                .denied => "denied",
-                                .done => "paired",
-                            };
-                            const t = std.fmt.bufPrint(&bufs.row_txt[nr], "request {s} from {s}: {s}", .{ &r.code, r.ip.get(), st }) catch "";
-                            bufs.rows[nr] = .{ .text = t, .tone = switch (r.state) {
-                                .pending => .warn,
-                                .denied => .muted,
-                                else => .good,
-                            } };
-                            nr += 1;
-                        };
-                        p.rows = bufs.rows[0..nr];
+                    .pair_check => {
+                        p.title = bufs.fmt("Pair '{s}': check code {s}?", .{ ui.name.text(), &ui.check });
+                        p.title_tone = .warn;
+                        L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("The key you entered has the check code {s}. Approve only if the device shows exactly this code.", .{&ui.check}), .tone = .normal });
+                        L.add(&bufs.lines, &nl, .{ .text = "A different code means the key was changed on the way (a mistyped key, or someone else's): deny and copy it again." });
+                        L.add(&bufs.lines, &nl, .{ .text = "Y approves, N denies." });
                     },
                     .pair_result => {
                         switch (ui.result) {
                             .paired => {
-                                p.title = bufs.fmt("Paired '{s}'", .{ui.result_name.get()});
+                                p.title = bufs.fmt("Paired '{s}' as {s}", .{ ui.result_name.get(), ui.result_ip.get() });
                                 p.title_tone = .good;
-                                L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("The device at {s} has its own credential now and signs in by itself. Unpair it any time from Devices.", .{ui.result_ip.get()}) });
-                            },
-                            .expired => {
-                                p.title = "The pairing window expired";
-                                p.title_tone = .warn;
-                                L.add(&bufs.lines, &nl, .{ .text = "Nothing was paired." });
-                            },
-                            .closed => {
-                                p.title = "Pairing stopped";
-                                L.add(&bufs.lines, &nl, .{ .text = "The pairing window was closed or replaced (e.g. by portalctl pair). Nothing was paired from here." });
+                                L.add(&bufs.lines, &nl, .{ .text = "On the device, enter this pairing code (or scan the QR code):", .tone = .normal, .bold = true });
+                                L.add(&bufs.lines, &nl, .{ .text = ui.resultCode(), .tone = .normal });
+                                L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("The device then shows this desktop's check code: it must be {s}.", .{&ui.result_desk_check}) });
+                                L.add(&bufs.lines, &nl, .{ .text = "The code holds nothing secret (this desktop's public key, where to reach it, the certificate's SHA-256 and the device's tunnel address). Unpair the device any time from Devices." });
+                                if (bufs.pairQr(ui.resultCode())) |code| p.qr = code;
                             },
                             .failed => {
                                 p.title = "Pairing failed";
@@ -954,6 +866,25 @@ pub fn Panels(comptime devices: type) type {
                 return p;
             }
 
+            /// Settings' tunnel section: this desktop's key and port, and
+            /// its peers (the paired devices, `ui.devs`).
+            fn tunnelLines(ui: *const Ui, bufs: *Bufs, n: *usize, c: Ctx) void {
+                const arr = &bufs.after;
+                const add = struct {
+                    fn f(a: []frame.PanelText, k: *usize, t: frame.PanelText) void {
+                        if (k.* < a.len) {
+                            a[k.*] = t;
+                            k.* += 1;
+                        }
+                    }
+                }.f;
+                add(arr, n, .{ .text = "Tunnel", .tone = .normal, .bold = true });
+                add(arr, n, .{ .text = bufs.fmt("This desktop's key: {s}  (check code {s})", .{ c.desk_key, c.desk_check }), .tone = .normal });
+                add(arr, n, .{ .text = bufs.fmt("Listening on UDP {d}; devices reach 10.8.0.1 inside the tunnel. A changed port applies at the next start.", .{c.tunnel_port}) });
+                if (ui.n_devs == 0) add(arr, n, .{ .text = "Peers: none yet (Pair a device)." });
+                for (ui.devs[0..ui.n_devs]) |d| add(arr, n, .{ .text = bufs.fmt("Peer {s: <16} {s: <10} key {s}", .{ d.name.get(), d.ip.get(), d.key.get() }) });
+            }
+
             fn caLines(ui: *const Ui, bufs: *Bufs, arr: []frame.PanelText, n: *usize, c: Ctx) void {
                 _ = ui;
                 if (n.* >= arr.len) return;
@@ -1000,21 +931,4 @@ pub fn Panels(comptime devices: type) type {
             return std.fmt.bufPrint(buf, "{d} days ago", .{@divTrunc(d, 86400)}) catch "?";
         }
     };
-}
-
-/// "IP:PORT" of "https://IP:PORT/" (the desk's sharing URL); null for
-/// anything else (plain HTTP has no CA to put in the QR).
-pub fn hostOfUrl(url: []const u8) ?[]const u8 {
-    const prefix = "https://";
-    if (!std.mem.startsWith(u8, url, prefix)) return null;
-    const rest = url[prefix.len..];
-    const end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
-    if (end == 0) return null;
-    return rest[0..end];
-}
-
-test "hostOfUrl" {
-    try std.testing.expectEqualStrings("10.8.0.1:8420", hostOfUrl("https://10.8.0.1:8420/").?);
-    try std.testing.expectEqualStrings("[fd00::1]:8420", hostOfUrl("https://[fd00::1]:8420/").?);
-    try std.testing.expect(hostOfUrl("http://10.8.0.1:8420/") == null);
 }

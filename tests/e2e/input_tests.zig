@@ -238,9 +238,9 @@ pub fn runInstruct(h: *proc.Harness, r: *Runner, port: u16) !void {
     {
         const dir = try h.dataDir("instruct-refused");
         var port_buf: [32]u8 = undefined;
-        const listen = try std.fmt.bufPrint(&port_buf, "127.0.0.1:{d}", .{port + 1});
+        const udp = try std.fmt.bufPrint(&port_buf, "{d}", .{port + 1});
         for ([_][]const u8{ "instruct", "text" }) |mode| {
-            const res = try proc.runCli(h, dir, &.{ "run", "--console", "--no-tls", "--listen", listen, "--input", mode, "--", "cmd.exe", "/k" });
+            const res = try proc.runCli(h, dir, &.{ "run", "--console", "--tunnel-loopback", "--tunnel-port", udp, "--input", mode, "--", "cmd.exe", "/k" });
             _ = r.check(if (std.mem.eql(u8, mode, "text")) "text mode refused for a shell without --allow-remote-shell" else "instruct mode refused for a shell without --allow-remote-shell", res.code != 0 and res.has("remote shell"), "code={d} {s}", .{ res.code, res.out[0..@min(res.out.len, 200)] });
         }
     }

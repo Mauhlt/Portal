@@ -6,8 +6,7 @@
 //!            image blob and placement parsing, client-side image limits
 //!   ws       WebSocket (RFC 6455) framing in both directions, handshake
 //!            key and accept values
-//!   http     HTTP/1.1 syntax checks (head end, tokens, field values) and
-//!            Portal's cookie names
+//!   http     HTTP/1.1 syntax checks (head end, tokens, field values)
 //!   pki      DER reader/writer, X.509 reading, PEM, SHA-256 fingerprints
 //!   tabs     project tabs (protocol v2): session ids, the session list in
 //!            hello/tabs, tab colours, program state
@@ -21,6 +20,11 @@
 //!   activity background tasks and token usage per tab (activity message)
 //!   sysinfo  the optional system monitor's numbers (sys message)
 //!   subtabs  subagent sub-tabs of the tab watched (subtabs message, a: frame)
+//!   transport the stream seam (OS sockets or the in-process tunnel) under
+//!            the HTTPS/WSS server and client, and an in-memory network
+//!            for tests
+//!   tunnelnet the in-process tunnel's addresses and ports (one definition)
+//!   bulk     the bulk WebSocket's request/reply messages (sync transfers)
 
 pub const screen = @import("screen.zig");
 pub const ws = @import("ws.zig");
@@ -34,6 +38,9 @@ pub const pairqr = @import("pairqr.zig");
 pub const activity = @import("activity.zig");
 pub const sysinfo = @import("sysinfo.zig");
 pub const subtabs = @import("subtabs.zig");
+pub const transport = @import("transport.zig");
+pub const tunnelnet = @import("tunnelnet.zig");
+pub const bulk = @import("bulk.zig");
 
 test {
     _ = screen;
@@ -48,4 +55,7 @@ test {
     _ = activity;
     _ = sysinfo;
     _ = subtabs;
+    _ = transport;
+    _ = tunnelnet;
+    _ = bulk;
 }

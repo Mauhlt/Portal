@@ -22,7 +22,6 @@ fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // ReleaseSafe builds releases are made of.
     opts.addOption(bool, "test_env", optimize == @TypeOf(optimize).Debug);
     root.addOptions("build_options", opts);
-    root.addAnonymousImport("app_wasm", .{ .root_source_file = browserStub(b) });
     root.addImport("shared", sharedModule(b, target, optimize));
     // src/vt.zig (a file of the root module) takes its cell widths from it.
     root.addImport("Font", fontModule(b, target, optimize));
@@ -32,8 +31,32 @@ fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     root.addImport("inputrules", rules);
     // Speech input (src/speech): microphone capture and the stt engines.
     root.addImport("speech", speechModule(b, target, optimize));
+    // The in-process tunnel (client/src/tunnel): the desk's side of it and
+    // its key and peer table (src/tunneldesk.zig).
+    root.addImport("WireGuard", wireguardModule(b, target, optimize));
+    root.addImport("tunnel_options", tunnelOptions(b));
     const gui_mods = addGuiModules(b, root, target, optimize, rules);
     return .{ .root = root, .gui = gui_mods };
+}
+
+/// The owner's Zig WireGuard (../WireGuard): the device, its UDP socket and
+/// the userspace TCP/IP stack (`netstack`) Portal's tunnel runs on.
+fn wireguardModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.dependency("WireGuard", .{ .target = target, .optimize = optimize }).module("WireGuard");
+}
+
+/// `-Dnetstack-ready=false`: build against a WireGuard whose netstack is
+/// still a stub; the tunnel then refuses to start and the e2e groups report
+/// PENDING instead of running.
+var tunnel_options_module: ?*std.Build.Module = null;
+
+fn tunnelOptions(b: *std.Build) *std.Build.Module {
+    if (tunnel_options_module) |m| return m;
+    const ready = b.option(bool, "netstack-ready", "The WireGuard netstack is implemented (default true)") orelse true;
+    const o = b.addOptions();
+    o.addOption(bool, "netstack_ready", ready);
+    tunnel_options_module = o.createModule();
+    return tunnel_options_module.?;
 }
 
 /// portal-show.exe: `portal-show <file.png>` (src/show.zig), a console
@@ -209,21 +232,6 @@ pub fn build(b: *std.Build) void {
     addPackage(b, test_step);
 }
 
-/// TEMPORARY: src/web.zig still embeds "app_wasm" (and tests its imports
-/// and exports) until feat/inproc-tunnel drops the browser routes. The
-/// browser client is gone; this is a do-nothing module with the same
-/// interface (src/web/app_stub.zig). Delete both with those routes.
-fn browserStub(b: *std.Build) std.Build.LazyPath {
-    const stub = b.addExecutable(.{ .name = "portal-app-stub", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/web/app_stub.zig"),
-        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
-        .optimize = .ReleaseSmall,
-    }) });
-    stub.entry = .disabled;
-    stub.rdynamic = true;
-    return stub.getEmittedBin();
-}
-
 /// Windows: links docs/brand/portal.ico as icon resource 1 (Explorer,
 /// the taskbar; the window sets it from there with WM_SETICON). The
 /// one-line resource script is generated here, next to a copy of the icon.
@@ -347,12 +355,14 @@ fn laptopClientCheck(b: *std.Build, t: std.Build.ResolvedTarget) *std.Build.Step
         .root_source_file = b.path("client/src/main.zig"),
         .target = t,
         .optimize = .Debug,
-        .link_libc = true, // libsecret / Security.framework via dlopen
+        .link_libc = true, // Security.framework via dlopen
         .imports = &.{
             .{ .name = "view", .module = gui.view },
             .{ .name = "portal_ui", .module = gui.ui },
             .{ .name = "shared", .module = sharedModule(b, t, .Debug) },
             .{ .name = "inputrules", .module = inputrules },
+            .{ .name = "WireGuard", .module = wireguardModule(b, t, .Debug) },
+            .{ .name = "tunnel_options", .module = tunnelOptions(b) },
         },
     }) });
 }
@@ -551,6 +561,8 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
             .{ .name = "portal_ui", .module = ui },
             .{ .name = "shared", .module = shared },
             .{ .name = "inputrules", .module = inputrules },
+            .{ .name = "WireGuard", .module = wireguardModule(b, target, optimize) },
+            .{ .name = "tunnel_options", .module = tunnelOptions(b) },
         },
     });
     mod.addImport("view", view);

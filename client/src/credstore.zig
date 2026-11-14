@@ -14,13 +14,13 @@
 //!            one, so unlocking the app and signing in take one Face ID.
 //!            Saving deletes and re-adds (an update would need a Face ID
 //!            prompt of its own).
-//!   Linux    Secret Service over D-Bus via libsecret-1.so.0 (dlopen); if
-//!            it is not installed or no keyring is running, this fails with
-//!            error.Unavailable and the client refuses to pair rather than
-//!            fall back to a file.
+//!   Linux    a 0600 file per secret in a 0700 directory,
+//!            $XDG_DATA_HOME/portal/secrets (default ~/.local/share/portal),
+//!            refused on load unless both belong to this user and are
+//!            private to it (no external dependency)
 //!
-//! The secret is never written to plain files, argv or logs. Buffers that
-//! held it are zeroed by the caller (see net/client.zig).
+//! The secret is never written anywhere else (no other file, argv or log).
+//! Buffers that held it are zeroed by the caller (see tunnel/keys.zig).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -309,123 +309,146 @@ const apple = struct {
         if (st != 0 and st != errSecItemNotFound) return error.Failed;
     }
 };
-
 // ------------------------------------------------------------------ Linux
 
+/// A file per secret, no external dependency:
+///   $XDG_DATA_HOME/portal/secrets/<target> (default ~/.local/share/...)
+/// The directories are created 0700 and the file 0600 (written to a
+/// temporary file and renamed into place). Every load checks, on the
+/// opened file and its directory, that they belong to this user and that
+/// neither group nor others can access them; anything else is refused
+/// (error.Failed), never "fixed" silently. Buffers that held the secret are
+/// wiped.
 const linux = struct {
-    const SchemaAttribute = extern struct { name: ?[*:0]const u8, type: c_int };
-    const Schema = extern struct {
-        name: [*:0]const u8,
-        flags: c_int,
-        attributes: [32]SchemaAttribute,
-        reserved: c_int = 0,
-        reserved1: ?*anyopaque = null,
-        reserved2: ?*anyopaque = null,
-        reserved3: ?*anyopaque = null,
-        reserved4: ?*anyopaque = null,
-        reserved5: ?*anyopaque = null,
-        reserved6: ?*anyopaque = null,
-        reserved7: ?*anyopaque = null,
-    };
-    const GError = extern struct { domain: u32, code: c_int, message: ?[*:0]const u8 };
-    const HashFn = *const fn (?*const anyopaque) callconv(.c) c_uint;
-    const EqFn = *const fn (?*const anyopaque, ?*const anyopaque) callconv(.c) c_int;
+    const L = std.os.linux;
 
-    const Api = struct {
-        secret_password_storev_sync: *const fn (*const Schema, *anyopaque, ?[*:0]const u8, [*:0]const u8, [*:0]const u8, ?*anyopaque, *?*GError) callconv(.c) c_int,
-        secret_password_lookupv_sync: *const fn (*const Schema, *anyopaque, ?*anyopaque, *?*GError) callconv(.c) ?[*:0]u8,
-        secret_password_clearv_sync: *const fn (*const Schema, *anyopaque, ?*anyopaque, *?*GError) callconv(.c) c_int,
-        secret_password_free: *const fn (?[*:0]u8) callconv(.c) void,
-        g_hash_table_new: *const fn (HashFn, EqFn) callconv(.c) ?*anyopaque,
-        g_hash_table_insert: *const fn (*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.c) c_int,
-        g_hash_table_unref: *const fn (*anyopaque) callconv(.c) void,
-        g_error_free: *const fn (*GError) callconv(.c) void,
-        g_str_hash: HashFn,
-        g_str_equal: EqFn,
-    };
-
-    var api: ?Api = null;
-
-    const schema: Schema = blk: {
-        var s: Schema = .{ .name = "org.portal.client.Device", .flags = 0, .attributes = undefined };
-        for (&s.attributes) |*a| a.* = .{ .name = null, .type = 0 };
-        s.attributes[0] = .{ .name = "target", .type = 0 }; // SECRET_SCHEMA_ATTRIBUTE_STRING
-        break :blk s;
-    };
-
-    fn get() Error!*const Api {
-        if (api) |*a| return a;
-        var secret = std.DynLib.open("libsecret-1.so.0") catch return error.Unavailable;
-        var glib = std.DynLib.open("libglib-2.0.so.0") catch return error.Unavailable;
-        var a: Api = undefined;
-        inline for (@typeInfo(Api).@"struct".field_names, @typeInfo(Api).@"struct".field_types) |f_name, f_type| {
-            const lib = if (comptime std.mem.startsWith(u8, f_name, "secret_")) &secret else &glib;
-            @field(a, f_name) = lib.lookup(f_type, f_name) orelse return error.Unavailable;
-        }
-        api = a;
-        return &api.?;
+    fn ok(rc: usize) bool {
+        return L.errno(rc) == .SUCCESS;
     }
 
-    fn attrs(a: *const Api, target_z: [*:0]const u8) Error!*anyopaque {
-        const t = a.g_hash_table_new(a.g_str_hash, a.g_str_equal) orelse return error.Failed;
-        _ = a.g_hash_table_insert(t, @constCast(@ptrCast("target")), @constCast(@ptrCast(target_z)));
-        return t;
+    /// `<dir>/secrets` with every level created 0700 if missing.
+    fn dir(buf: *[1024]u8) Error![:0]const u8 {
+        var env_buf: [512]u8 = undefined;
+        const base = blk: {
+            if (envVar("XDG_DATA_HOME", &env_buf)) |x| if (x.len > 0 and x[0] == '/') break :blk std.fmt.bufPrint(buf, "{s}/portal", .{x}) catch return error.TooLong;
+            const home = envVar("HOME", &env_buf) orelse return error.Unavailable;
+            break :blk std.fmt.bufPrint(buf, "{s}/.local/share/portal", .{home}) catch return error.TooLong;
+        };
+        var tmp: [1024]u8 = undefined;
+        // Each missing level, 0700 (existing parents such as ~/.local stay as they are).
+        var i: usize = 1;
+        while (i <= base.len) : (i += 1) {
+            if (i < base.len and base[i] != '/') continue;
+            const z = std.fmt.bufPrintSentinel(&tmp, "{s}", .{base[0..i]}, 0) catch return error.TooLong;
+            _ = L.mkdir(z, 0o700);
+        }
+        const full = std.fmt.bufPrintSentinel(buf, "{s}/secrets", .{base}, 0) catch return error.TooLong;
+        _ = L.mkdir(full, 0o700);
+        try checkPrivate(full, true);
+        return full;
     }
 
-    fn check(a: *const Api, err: ?*GError) Error!void {
-        if (err) |e| {
-            a.g_error_free(e);
-            return error.Unavailable; // usually: no Secret Service running
-        }
+    fn envVar(comptime name: []const u8, buf: []u8) ?[]const u8 {
+        const v = std.c.getenv(std.fmt.comptimePrint("{s}", .{name})) orelse return null;
+        const s = std.mem.sliceTo(v, 0);
+        if (s.len == 0 or s.len > buf.len) return null;
+        @memcpy(buf[0..s.len], s);
+        return buf[0..s.len];
+    }
+
+    /// Owned by this user, no group/other permission bits, the right type
+    /// (no symlink followed).
+    fn checkPrivate(p: [:0]const u8, want_dir: bool) Error!void {
+        var st: L.Statx = undefined;
+        if (!ok(L.statx(L.AT.FDCWD, p, L.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true, .MODE = true, .UID = true }, &st))) return error.Failed;
+        const fmt = st.mode & 0o170000;
+        if (fmt != (if (want_dir) @as(u16, 0o040000) else 0o100000)) return error.Failed;
+        if (st.uid != L.getuid() or st.mode & 0o077 != 0) return error.Failed;
+    }
+
+    fn fileName(target: []const u8, buf: []u8) Error![]const u8 {
+        // Targets are "Portal-tunnel/device-key"-like: keep [A-Za-z0-9._-],
+        // anything else becomes '_' (never a path separator).
+        if (target.len == 0 or target.len > max_target) return error.TooLong;
+        for (target, 0..) |c, i| buf[i] = switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '.', '-' => c,
+            else => '_',
+        };
+        if (buf[0] == '.') buf[0] = '_';
+        return buf[0..target.len];
+    }
+
+    fn path(target: []const u8, buf: *[1024]u8, suffix: []const u8) Error![:0]const u8 {
+        var dbuf: [1024]u8 = undefined;
+        const d = try dir(&dbuf);
+        var nb: [max_target]u8 = undefined;
+        const n = try fileName(target, &nb);
+        return std.fmt.bufPrintSentinel(buf, "{s}/{s}{s}", .{ d, n, suffix }, 0) catch error.TooLong;
     }
 
     fn load(target: []const u8, out: []u8) Error!?[]u8 {
-        const a = try get();
-        var tz: [max_target + 1]u8 = undefined;
-        const t = std.fmt.bufPrintSentinel(&tz, "{s}", .{target}, 0) catch return error.TooLong;
-        const table = try attrs(a, t);
-        defer a.g_hash_table_unref(table);
-        var err: ?*GError = null;
-        const pw = a.secret_password_lookupv_sync(&schema, table, null, &err);
-        try check(a, err);
-        const p = pw orelse return null;
-        defer a.secret_password_free(p);
-        const s = std.mem.span(p);
-        defer std.crypto.secureZero(u8, s);
-        if (s.len > out.len) return error.TooLong;
-        @memcpy(out[0..s.len], s);
-        return out[0..s.len];
+        var pb: [1024]u8 = undefined;
+        const p = try path(target, &pb, "");
+        const rc = L.open(p, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        switch (L.errno(rc)) {
+            .SUCCESS => {},
+            .NOENT => return null,
+            else => return error.Failed,
+        }
+        const fd: L.fd_t = @intCast(rc);
+        defer _ = L.close(fd);
+        try checkPrivate(p, false);
+        var n: usize = 0;
+        while (n < out.len) {
+            const r = L.read(fd, out[n..].ptr, out.len - n);
+            if (!ok(r)) {
+                std.crypto.secureZero(u8, out[0..n]);
+                return error.Failed;
+            }
+            if (r == 0) return out[0..n];
+            n += r;
+        }
+        std.crypto.secureZero(u8, out);
+        return error.TooLong;
     }
 
     fn save(target: []const u8, secret: []const u8) Error!void {
-        const a = try get();
-        var tz: [max_target + 1]u8 = undefined;
-        const t = std.fmt.bufPrintSentinel(&tz, "{s}", .{target}, 0) catch return error.TooLong;
-        var sz: [max_secret + 1]u8 = undefined;
-        defer std.crypto.secureZero(u8, &sz);
-        const s = std.fmt.bufPrintSentinel(&sz, "{s}", .{secret}, 0) catch return error.TooLong;
-        const table = try attrs(a, t);
-        defer a.g_hash_table_unref(table);
-        var err: ?*GError = null;
-        const okv = a.secret_password_storev_sync(&schema, table, null, t, s, null, &err);
-        try check(a, err);
-        if (okv == 0) return error.Failed;
+        var pb: [1024]u8 = undefined;
+        var tb: [1024]u8 = undefined;
+        const p = try path(target, &pb, "");
+        const tmp = try path(target, &tb, ".new");
+        _ = L.unlink(tmp);
+        const rc = L.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600);
+        if (!ok(rc)) return error.Failed;
+        const fd: L.fd_t = @intCast(rc);
+        var good = ok(L.fchmod(fd, 0o600)); // whatever the umask did
+        var n: usize = 0;
+        while (good and n < secret.len) {
+            const r = L.write(fd, secret[n..].ptr, secret.len - n);
+            if (!ok(r) or r == 0) good = false else n += r;
+        }
+        good = good and ok(L.fsync(fd));
+        _ = L.close(fd);
+        if (!good or !ok(L.rename(tmp, p))) {
+            _ = L.unlink(tmp);
+            return error.Failed;
+        }
     }
 
     fn delete(target: []const u8) Error!void {
-        const a = try get();
-        var tz: [max_target + 1]u8 = undefined;
-        const t = std.fmt.bufPrintSentinel(&tz, "{s}", .{target}, 0) catch return error.TooLong;
-        const table = try attrs(a, t);
-        defer a.g_hash_table_unref(table);
-        var err: ?*GError = null;
-        _ = a.secret_password_clearv_sync(&schema, table, null, &err);
-        try check(a, err);
+        var pb: [1024]u8 = undefined;
+        const p = try path(target, &pb, "");
+        const rc = L.unlink(p);
+        switch (L.errno(rc)) {
+            .SUCCESS, .NOENT => {},
+            else => return error.Failed,
+        }
     }
 };
 
+
 test "credential store round trip" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest; // needs a desktop keyring
+    if (builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest; // the Keychain needs a signed app
     const target = "Portal-client-unittest/127.0.0.1:1";
     try delete(target);
     var buf: [max_secret]u8 = undefined;

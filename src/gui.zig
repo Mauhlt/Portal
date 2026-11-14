@@ -41,8 +41,10 @@ const deskui = @import("deskui.zig");
 const devices = @import("devices.zig");
 const settings = @import("settings.zig");
 const agenthooks = @import("agenthooks.zig");
-const guard = @import("guard.zig");
 const pki = @import("tls/pki.zig");
+const tunneldesk = @import("tunneldesk.zig");
+const tunnelnet = @import("shared").tunnelnet;
+const main = @import("main.zig");
 const web = @import("web.zig");
 const sync = @import("sync.zig");
 const client = @import("client");
@@ -72,7 +74,7 @@ pub const Options = struct {
 /// What the first-run (or fix-it) panel starts with.
 pub const SetupInput = struct {
     first_run: bool,
-    listen: []const u8,
+    tunnel_port: []const u8,
     program: []const u8,
     project: []const u8,
     policy: keymap.Policy,
@@ -82,7 +84,7 @@ pub const SetupInput = struct {
 
 /// What the desk entered; slices into the host, valid until the next runSetup.
 pub const SetupValues = struct {
-    listen: []const u8,
+    tunnel_port: []const u8,
     program: []const u8,
     project: []const u8,
     policy: keymap.Policy,
@@ -93,12 +95,20 @@ pub const SetupValues = struct {
 pub const Desk = struct {
     srv: *web.Server,
     paths: devices.Paths,
-    /// "AB:CD:..." of the Portal CA; null with --no-tls.
-    fingerprint: ?[]const u8,
+    /// "AB:CD:..." of the Portal CA, and its 32 bytes (pairing codes).
+    fingerprint: []const u8,
+    ca_sha256: [32]u8,
+    /// This desktop's WireGuard public key.
+    desk_public: tunneldesk.Key,
+    /// The UDP port the tunnel listens on.
+    tunnel_port: u16,
     /// %USERPROFILE%\Downloads\Portal-CA
     export_default: []const u8,
     /// %LOCALAPPDATA%\Portal\tls
     tls_dir: []const u8,
+    /// Filled by attachDesk: the key's text and check code (Settings).
+    desk_key_text: [44]u8 = undefined,
+    desk_check: [tunnelnet.check_code_len]u8 = undefined,
     /// settings.txt as of startup (the Settings panel edits it).
     saved: settings.Settings,
     /// Opens a folder (absolute) as a new tab: main.openFolder. Returns
@@ -157,8 +167,6 @@ pub const LocalHost = struct {
     ui: deskui.Ui = .{},
     desk: ?Desk = null,
     bufs: deskui.Ui.Bufs = .{},
-    until_buf: [16]u8 = undefined,
-    until_len: usize = 0,
     /// runSetup: the panel was submitted.
     setup_submitted: bool = false,
     /// Whether the OS touch keyboard was last asked to show.
@@ -218,6 +226,8 @@ pub const LocalHost = struct {
     /// The desk panels' context. Call before any thread starts.
     pub fn attachDesk(h: *LocalHost, d: Desk) void {
         h.desk = d;
+        h.desk.?.desk_key_text = @import("WireGuard").device.keys.encode(&d.desk_public);
+        h.desk.?.desk_check = tunnelnet.checkCode(&d.desk_public);
         h.p.setBackgroundArt(d.saved.background_art orelse true);
         const s = h.gpa.create(deskspeech.DeskSpeech) catch return;
         s.* = .{ .gpa = h.gpa, .io = h.io, .data_dir = d.paths.dir, .notify_ctx = h, .notify_fn = notifyThunk, .mic = undefined };
@@ -269,9 +279,9 @@ pub const LocalHost = struct {
         if (!h.wake_pending.swap(true, .acq_rel)) h.p.wake();
     }
 
-    /// web.Server.pairing_notify_fn (any thread): the pairing window or
-    /// the device store may have changed.
-    pub fn pairingNotify(ctx: *anyopaque) void {
+    /// web.Server.store_notify_fn (any thread): the device store may have
+    /// changed.
+    pub fn storeNotify(ctx: *anyopaque) void {
         const h: *LocalHost = @ptrCast(@alignCast(ctx));
         h.pair_dirty.store(true, .release);
         notifyThunk(ctx);
@@ -284,7 +294,7 @@ pub const LocalHost = struct {
     /// until the desk submits it, or returns null if the window is closed.
     pub fn runSetup(h: *LocalHost, in: SetupInput) ?SetupValues {
         h.p.endSplash(); // the panel needs answers
-        h.ui.openSetup(in.first_run, in.listen, in.program, in.project, in.policy);
+        h.ui.openSetup(in.first_run, in.tunnel_port, in.program, in.project, in.policy);
         if (in.problem.len > 0) h.ui.setNote(.bad, "{s}", .{in.problem});
         h.setup_submitted = false;
         h.p.setTitle(if (in.first_run) "Portal \u{2014} first start" else "Portal \u{2014} settings");
@@ -299,7 +309,7 @@ pub const LocalHost = struct {
         }
         h.ui.close();
         return .{
-            .listen = std.mem.trim(u8, h.ui.setup.listen.text(), " "),
+            .tunnel_port = std.mem.trim(u8, h.ui.setup.tunnel_port.text(), " "),
             .program = std.mem.trim(u8, h.ui.setup.program.text(), " "),
             .project = std.mem.trim(u8, h.ui.setup.project.text(), " "),
             .policy = h.ui.setup.input,
@@ -316,9 +326,9 @@ pub const LocalHost = struct {
     ///
     /// Purely event-driven: it sleeps until window input or a wake()
     /// (any tab's output, the tab list, viewer count changes, pairing
-    /// changes all call notifyThunk). The only timeout is a real deadline:
-    /// the expiry of a pairing window this desk opened. Returns
-    /// `.finished` once every tab has ended.
+    /// changes all call notifyThunk). The only timeouts are real
+    /// deadlines (an animation, a speech toast). Returns `.finished` once
+    /// every tab has ended.
     pub fn run(h: *LocalHost) Ended {
         h.updateTitle();
         const ended: Ended = while (true) {
@@ -327,11 +337,11 @@ pub const LocalHost = struct {
             const changed = h.checkPairing();
             h.frame(changed);
             // A sub-tab's conversation may animate (scrolling to new
-            // items): its real deadline, else the pairing window's.
+            // items): its real deadline.
             const anim: u32 = if (h.sub_shown != null) (h.convo_view.frameTimeout() orelse Presenter.forever) else Presenter.forever;
             // Speech: a toast ending, the Audio panel's Test (real deadlines).
             const sp: u32 = if (h.speech) |s| (if (s.deadlineMs()) |ms| @intCast(@min(ms, 3600 * 1000)) else Presenter.forever) else Presenter.forever;
-            h.p.waitEvents(@min(@min(h.waitMs(), anim), sp));
+            h.p.waitEvents(@min(anim, sp));
             h.wakeups += 1;
         };
         h.hide();
@@ -344,30 +354,14 @@ pub const LocalHost = struct {
         return std.Io.Timestamp.now(h.io, .real).toSeconds();
     }
 
-    /// Until our pairing window's expiry (plus a second), else forever.
-    fn waitMs(h: *LocalHost) u32 {
-        const w = h.ui.window orelse return Presenter.forever;
-        if (h.ui.own_nonce == 0) return Presenter.forever;
-        const left = w.expires - h.nowUnix() + 1;
-        if (left <= 0) {
-            h.pair_dirty.store(true, .release);
-            return 0;
-        }
-        return @intCast(@min(left * 1000, 3600 * 1000));
-    }
-
-    /// Applies pairing changes reported since the last frame. True if the
-    /// panels may look different.
+    /// Applies device store changes reported since the last frame. True if
+    /// the panels may look different.
     fn checkPairing(h: *LocalHost) bool {
-        const d = h.desk orelse return false;
-        var expired = false;
-        if (h.ui.window) |w| expired = h.ui.own_nonce != 0 and h.nowUnix() > w.expires;
-        if (!h.pair_dirty.swap(false, .acq_rel) and !expired) return false;
-        const snap = d.srv.deskWindow();
-        h.perform(h.ui.pairingChanged(snap, h.nowUnix()));
-        h.updateUntil();
-        // The device list follows the store (pairing, `portalctl unpair`).
-        if (h.ui.screen == .devices) h.loadDevices();
+        if (h.desk == null) return false;
+        if (!h.pair_dirty.swap(false, .acq_rel)) return false;
+        // The device list (and Settings' peers) follow the store (pairing,
+        // `portalctl unpair`, a device forgetting this desktop).
+        if (h.ui.screen == .devices or h.ui.screen == .setup) h.loadDevices();
         return true;
     }
 
@@ -525,8 +519,9 @@ pub const LocalHost = struct {
             .sub_shown = h.sub_shown,
             .panel = audio_panel orelse h.ui.panel(&h.bufs, .{
                 .fingerprint = if (d) |x| x.fingerprint else null,
-                .url = h.opts.url,
-                .until = h.until_buf[0..h.until_len],
+                .desk_key = if (d) |*x| x.desk_key_text[0..] else "",
+                .desk_check = if (d) |*x| x.desk_check[0..] else "",
+                .tunnel_port = if (d) |x| x.tunnel_port else 0,
                 .now = h.nowUnix(),
             }),
             .desk = .{
@@ -561,12 +556,6 @@ pub const LocalHost = struct {
         h.p.setTitle(t);
     }
 
-    /// "14:32" (local time) for our pairing window's expiry.
-    fn updateUntil(h: *LocalHost) void {
-        h.until_len = 0;
-        const w = h.ui.window orelse return;
-        h.until_len = localClock(w.expires, &h.until_buf).len;
-    }
 
     // ------------------------------------------------------------ desk actions
 
@@ -585,43 +574,42 @@ pub const LocalHost = struct {
             },
             .setup_cancel => {},
             .agent_hooks => h.agentHooks(),
-            .begin_pair => {
+            .check_key => {
+                const k = tunneldesk.tunnel.keys.parsePublic(h.ui.key_text.text()) orelse
+                    return h.ui.setNote(.bad, "That is not a WireGuard public key: 44 characters ending in =, exactly as the device shows it.", .{});
                 const d = h.desk orelse return;
-                const nonce = d.srv.deskBegin(h.ui.name.text(), devices.default_pair_window_s) catch |err| {
-                    h.ui.pairFailed("Could not open the pairing window: {s}.", .{devices.describeError(err)});
-                    return;
-                };
-                h.perform(h.ui.pairBegun(nonce, d.srv.deskWindow()));
-                h.updateUntil();
+                if (std.mem.eql(u8, &k, &d.desk_public)) return h.ui.setNote(.bad, "That is this desktop's own key. Enter the key the device shows.", .{});
+                h.ui.keyChecked(tunnelnet.checkCode(&k));
             },
-            .answer => |ans| {
-                const d = h.desk orelse return;
-                const r = d.srv.deskAnswer(&ans.code, ans.approve) catch |err| {
-                    h.ui.setNote(.bad, "Could not record the answer: {s}.", .{devices.describeError(err)});
-                    return;
-                };
-                switch (r) {
-                    .approved => h.ui.setNote(.good, "Approved request {s}. Waiting for the device to collect its credential.", .{&ans.code}),
-                    .denied => h.ui.setNote(.muted, "Denied request {s}. Further requests from that address are refused in this window.", .{&ans.code}),
-                    .not_pending, .no_such_request => h.ui.setNote(.muted, "Request {s} is no longer waiting.", .{&ans.code}),
-                    .window_gone => {},
-                }
-                h.perform(h.ui.pairingChanged(d.srv.deskWindow(), h.nowUnix()));
-            },
-            .stop_pair => {
-                const d = h.desk orelse return;
-                d.srv.deskCancel() catch {};
-                h.ui.own_nonce = 0;
-                h.ui.window = null;
-                h.ui.asked = null;
-                h.until_len = 0;
-            },
+            .approve_pair => h.approvePair(),
             .load_devices => h.loadDevices(),
             .unpair => |i| h.unpair(i),
             .export_ca => h.exportCa(),
             .load_subs => |i| h.loadSubs(i),
             .toggle_sub => |i| h.toggleSub(i),
         }
+    }
+
+    /// The owner approved the key's check code: record the device and show
+    /// its pairing code. The running tunnel lets the key in as soon as the
+    /// store watcher sees the change.
+    fn approvePair(h: *LocalHost) void {
+        const d = h.desk orelse return;
+        const k = tunneldesk.tunnel.keys.parsePublic(h.ui.key_text.text()) orelse return h.ui.pairFailed("The key changed; enter it again.", .{});
+        const name = h.ui.name.text();
+        const desk: devices.Desk = .{ .gpa = h.gpa, .io = h.io, .paths = d.paths };
+        const paired = desk.pair(name, k, d.desk_public) catch |err|
+            return h.ui.pairFailed("Could not pair '{s}': {s}.", .{ name, devices.describeError(err) });
+        for (paired.replaced.items()) |old| d.srv.log.print("pairing '{s}' replaced the earlier record of '{s}'", .{ name, old.name.get() });
+        var ib: [tunnelnet.max_ip_text]u8 = undefined;
+        const ip = paired.device.ipText(&ib);
+        d.srv.log.print("device '{s}' paired at the desk as {s} (key check code {s})", .{ name, ip, &tunnelnet.checkCode(&k) });
+        const endpoint = d.saved.tunnel_endpoint.get() orelse main.placeholder_endpoint;
+        const info = main.PairingInfo.make(&d.desk_public, endpoint, d.ca_sha256, &paired.device) catch
+            return h.ui.pairFailed("The tunnel endpoint in Settings is too long.", .{});
+        h.ui.paired(ip, info.code(), info.desk_check);
+        if (d.saved.tunnel_endpoint.get() == null)
+            h.ui.setNote(.warn, "Set the tunnel endpoint in Settings (where devices reach this desktop's UDP {d}): the code above has a placeholder.", .{d.tunnel_port});
     }
 
     /// A device's sync packages: the known ids, everything published, and
@@ -691,7 +679,11 @@ pub const LocalHost = struct {
             fn op(c: Ctx, st: *devices.Store) !bool {
                 for (st.devices) |slot| {
                     const dev = slot orelse continue;
-                    c.rows[c.n.*] = .{ .name = dev.name, .ip = dev.ip, .last_seen = dev.last_seen };
+                    var r: deskui.DevRow = .{ .name = dev.name, .last_seen = dev.last_seen };
+                    var ib: [tunnelnet.max_ip_text]u8 = undefined;
+                    r.ip.set(dev.ipText(&ib));
+                    r.key.set(&tunnelnet.checkCode(&dev.key));
+                    c.rows[c.n.*] = r;
                     c.n.* += 1;
                 }
                 return false;
@@ -719,21 +711,16 @@ pub const LocalHost = struct {
         if (i >= h.ui.n_devs) return;
         const name_t = h.ui.devs[i].name;
         const name = name_t.get();
-        var removed = false;
-        const Ctx = struct { name: []const u8, removed: *bool };
-        devices.withStore(h.gpa, h.io, d.paths, h.nowUnix(), Ctx{ .name = name, .removed = &removed }, struct {
-            fn op(c: Ctx, st: *devices.Store) !bool {
-                c.removed.* = st.remove(c.name);
-                return c.removed.*;
-            }
-        }.op) catch |err| {
+        const desk: devices.Desk = .{ .gpa = h.gpa, .io = h.io, .paths = d.paths };
+        const removed = desk.unpair(name) catch |err| {
             h.ui.setNote(.bad, "Could not update the device list: {s}.", .{devices.describeError(err)});
             return;
         };
-        // The pairing watcher sees the change and ends its sessions.
-        if (removed) d.srv.log.print("device '{s}' unpaired from the Portal window", .{name});
+        // The store watcher sees the change: the key leaves the tunnel and
+        // the device's connections end with a logout.
+        if (removed != null) d.srv.log.print("device '{s}' unpaired from the Portal window", .{name});
         h.loadDevices();
-        h.ui.setNote(.good, "Unpaired '{s}'. Its viewers are disconnected.", .{name});
+        h.ui.setNote(.good, "Unpaired '{s}'. Its key is no longer let in; its viewers are disconnected.", .{name});
     }
 
     fn exportCa(h: *LocalHost) void {
@@ -763,7 +750,10 @@ pub const LocalHost = struct {
     fn openSettings(h: *LocalHost) void {
         const d = h.desk orelse return;
         const s = &d.saved;
-        h.ui.openSetup(false, s.listen.get() orelse h.opts.listen_host, s.program.get() orelse "", s.project.get() orelse "", s.input orelse h.opts.policy);
+        var pb: [settings.max_port_text]u8 = undefined;
+        h.ui.openSetup(false, std.fmt.bufPrint(&pb, "{d}", .{s.tunnelPort()}) catch "", s.program.get() orelse "", s.project.get() orelse "", s.input orelse h.opts.policy);
+        h.ui.setup.tunnel_endpoint.set(s.tunnel_endpoint.get() orelse "");
+        h.loadDevices(); // the tunnel's peers
         h.ui.setup.sysmon = s.system_monitor orelse false;
         h.ui.setup.bg_art = s.background_art orelse true;
         h.ui.setup.agent = h.agentStatus(false);
@@ -831,10 +821,13 @@ pub const LocalHost = struct {
     fn saveSettings(h: *LocalHost) void {
         const d = &(h.desk orelse return);
         const st = &h.ui.setup;
-        const listen = std.mem.trim(u8, st.listen.text(), " ");
+        const port = std.mem.trim(u8, st.tunnel_port.text(), " ");
+        const endpoint = std.mem.trim(u8, st.tunnel_endpoint.text(), " ");
         const program = std.mem.trim(u8, st.program.text(), " ");
         const project = std.mem.trim(u8, st.project.text(), " ");
-        if (checkListen(listen)) |why| return h.ui.setNote(.bad, "{s}", .{why});
+        if (settings.parsePort(port) == null) return h.ui.setNote(.bad, "The tunnel port must be 1-65535.", .{});
+        if (endpoint.len > 0 and !validEndpoint(endpoint))
+            return h.ui.setNote(.bad, "The tunnel endpoint is HOST:PORT: a public IP or DNS name, then the UDP port devices reach (e.g. home.example.org:51820).", .{});
         var split_buf: [settings.max_program]u8 = undefined;
         var split_args: [settings.max_args][]const u8 = undefined;
         _ = settings.splitCommand(program, &split_buf, &split_args) catch
@@ -843,7 +836,8 @@ pub const LocalHost = struct {
             return h.ui.setNote(.bad, "The project name must be 1-{d} bytes of printable text.", .{max_project_bytes});
         // Merged into settings.txt as it is now (hand edits stay).
         var s = settings.loadOrNull(h.gpa, h.io, d.paths.dir) orelse d.saved;
-        _ = s.listen.set(listen);
+        _ = s.tunnel_port.set(port);
+        _ = s.tunnel_endpoint.set(endpoint);
         _ = s.program.set(program);
         _ = s.project.set(project);
         s.input = st.input;
@@ -1175,35 +1169,20 @@ pub const LocalHost = struct {
     }
 };
 
-/// Why `text` can't be the listen address, or null if it can.
-pub fn checkListen(text: []const u8) ?[]const u8 {
-    const addr = std.Io.net.IpAddress.parseLiteral(text) catch return "Bad listen address: want IP:PORT, e.g. 127.0.0.1:8420.";
-    if (addr.getPort() == 0) return "Bad listen address: the port must be 1-65535.";
-    guard.checkListenAddress(addr) catch |err| return switch (err) {
-        error.WildcardAddress => "Refusing to listen on all interfaces: use your WireGuard address.",
-        error.PublicAddress => "Refusing to listen on a public address: use loopback or your WireGuard address.",
-    };
-    return null;
+/// A tunnel endpoint as devices will use it: zwg's own parser decides
+/// (an IP literal or a DNS name, a port).
+pub fn validEndpoint(text: []const u8) bool {
+    _ = @import("WireGuard").device.config.Endpoint.parse(text) catch return false;
+    return true;
 }
 
 
-/// Unix time `t` as local "HH:MM" (empty if it can't be converted).
-fn localClock(t: i64, buf: []u8) []const u8 {
-    if (t <= 0) return buf[0..0];
-    const ticks: u64 = (@as(u64, @intCast(t)) + 11644473600) * 10_000_000;
-    const ft: win32.FILETIME = .fromU64(ticks);
-    var local: win32.FILETIME = undefined;
-    var st: win32.SYSTEMTIME = undefined;
-    if (win32.FileTimeToLocalFileTime(&ft, &local) == 0 or win32.FileTimeToSystemTime(&local, &st) == 0) return buf[0..0];
-    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ st.wHour, st.wMinute }) catch buf[0..0];
-}
 
-
-test "checkListen" {
-    try std.testing.expect(checkListen("127.0.0.1:8420") == null);
-    try std.testing.expect(checkListen("10.8.0.1:8420") == null);
-    try std.testing.expect(checkListen("0.0.0.0:8420") != null);
-    try std.testing.expect(checkListen("8.8.8.8:8420") != null);
-    try std.testing.expect(checkListen("10.8.0.1") != null);
-    try std.testing.expect(checkListen("10.8.0.1:0") != null);
+test "validEndpoint" {
+    try std.testing.expect(validEndpoint("home.example.org:51820"));
+    try std.testing.expect(validEndpoint("203.0.113.7:51820"));
+    try std.testing.expect(validEndpoint("[2001:db8::1]:51820"));
+    try std.testing.expect(!validEndpoint("home.example.org"));
+    try std.testing.expect(!validEndpoint("home example:1"));
+    try std.testing.expect(!validEndpoint("h:0"));
 }

@@ -77,10 +77,10 @@ pub fn loadPublicKey(io: Io, paths: Paths) !?[32]u8 {
 pub fn loadKey(gpa: Allocator, io: Io, paths: Paths) !?ReleaseKey {
     const public = (try loadPublicKey(io, paths)) orelse return null;
     var pb: [1024]u8 = undefined;
-    const data = try Io.Dir.cwd().readFileAlloc(io, try paths.join(&pb, &.{ "sync-key", "release.key" }), gpa, .limited(64 * 1024));
-    defer gpa.free(data);
-    if (!std.mem.startsWith(u8, data, key_magic)) return error.BadSyncKey;
-    const plain = try dpapi.unprotect(gpa, data[key_magic.len..], key_purpose);
+    const plain = dpapi.readSealedFile(gpa, io, try paths.join(&pb, &.{ "sync-key", "release.key" }), key_magic, key_purpose) catch |err| return switch (err) {
+        error.BadSealedFile => error.BadSyncKey,
+        else => err,
+    };
     defer {
         std.crypto.secureZero(u8, plain);
         gpa.free(plain);
@@ -106,13 +106,9 @@ pub fn initKey(gpa: Allocator, io: Io, paths: Paths, force: bool) ![32]u8 {
         break;
     }
     defer std.crypto.secureZero(u8, std.mem.asBytes(&kp.secret_key));
-    const sealed = try dpapi.protect(gpa, &seed, key_purpose);
-    defer gpa.free(sealed);
-    const data = try std.mem.concat(gpa, u8, &.{ key_magic, sealed });
-    defer gpa.free(data);
     // The key first, then its public half: a crash in between leaves the
     // old public key, which then fails the match on load (fail closed).
-    try writeAtomic(gpa, io, try paths.join(&pb, &.{ "sync-key", "release.key" }), data);
+    try dpapi.writeSealedFile(gpa, io, try paths.join(&pb, &.{ "sync-key", "release.key" }), key_magic, &seed, key_purpose);
     var hex: [65]u8 = undefined;
     const pk = kp.public_key.toBytes();
     _ = manifest.hexLower(&pk, hex[0..64]);

@@ -10,24 +10,22 @@
 //! sync panels; what the shell's input means comes back through `Host`
 //! (keys.zig turns keys into protocol frames per the desktop's input mode).
 //!
-//!   connect                                             the last server, or
-//!                                                       the first-run screen
-//!   connect --server 10.8.0.1:8420 --ca portal-ca.pem   pin the CA, connect
-//!   connect --server 10.8.0.1:8420                      connect (CA pinned)
-//!   connect --server ADDR --forget     forget that desktop: credential, pins,
-//!                                      its sync folder
+//!   connect                       the paired desktop, or the first-run screen
+//!   connect --key                 print this device's tunnel key (and check code)
+//!   connect --pairing-code CODE   pair with the code the desk showed
+//!   connect --forget              forget the desktop (both ways)
 //!
-//! Everything happens in the window: with no server or no trusted CA yet,
-//! a first-run screen (setup.zig) asks for the address and the certificate
-//! (file, or the SHA-256 for the pairing-time download), then pairs. Errors
-//! that end the program go to `report_fn` (a message box in portal.exe) as
-//! well as stderr.
+//! Everything goes through the in-process WireGuard tunnel
+//! (devicelink.zig, tunnel/root.zig): this device is its tunnel key,
+//! generated here and kept in the OS credential store. On a first run the
+//! window shows the key; the owner enters it at the desk, compares check
+//! codes, and enters the pairing code the desk shows here. Errors that end
+//! the program go to `report_fn` (a message box in portal.exe) as well as
+//! stderr.
 //!
-//! HTTPS/WSS only, with the server certificate pinned to the Portal CA the
-//! user imported for that server (net/pin.zig, net/tlsconn.zig); plain HTTP
-//! only with an explicit --insecure-plain-http. The device credential lives
-//! only in the OS credential store; the session cookie only in memory.
-//! Nothing secret is accepted on the command line.
+//! TLS 1.3 inside the tunnel, with the server certificate pinned to the
+//! Portal CA whose SHA-256 the pairing code carried (net/pin.zig,
+//! net/tlsconn.zig). Nothing secret is accepted on the command line.
 
 const std = @import("std");
 const view = @import("view");
@@ -55,6 +53,11 @@ pub const net_ws = @import("shared").ws;
 pub const tlsconn = @import("net/tlsconn.zig");
 pub const watchdog = @import("net/watchdog.zig");
 pub const credstore_mod = credstore;
+/// The in-process WireGuard tunnel (the desk uses it too: src/tunneldesk.zig).
+pub const tunnel = @import("tunnel/root.zig");
+/// The device's link to its desktop: pairing code, tunnel, trust.
+pub const devicelink = @import("devicelink.zig");
+pub const wsclient = @import("net/wsclient.zig");
 pub const pin = pin_mod;
 pub const x509check_mod = x509check;
 
@@ -88,44 +91,20 @@ pub const Platform = struct {
 pub var platform: Platform = .{};
 
 const usage =
-    \\usage: {s} [--server IP:PORT] [--ca FILE | --ca-sha256 HEX] [--forget]
+    \\usage: {s} [--pairing-code CODE] [--key] [--forget]
     \\
-    \\  --server IP:PORT   Portal server address inside the WireGuard tunnel,
-    \\                     e.g. 10.8.0.1:8420 (literal IP, no host names).
-    \\                     Default: the last server; on first use the window
-    \\                     asks for it.
-    \\  --ca FILE          trust the Portal CA in FILE (portal-ca.pem or
-    \\                     portal-ca.cer, from Export certificate in the
-    \\                     Portal window or `portalctl ca export`) for this
-    \\                     server, and remember it
-    \\  --ca-sha256 HEX    the CA fingerprint the desk shows. With --ca: the
-    \\                     file must match it. Alone: download the CA from the
-    \\                     desktop while a pairing window is open
-    \\                     (http://IP:PORT+1/ca.cer), check it against HEX,
-    \\                     and remember it
-    \\  --forget           forget this server: delete this device's stored
-    \\                     credentials, the remembered CA and release key,
-    \\                     and its sync folder (packages), and exit
-    \\  --insecure-plain-http
-    \\                     talk plain HTTP to a server run with --no-tls
-    \\                     (tests only: keystrokes and credentials are not
-    \\                     encrypted; uses its own credential, never the
-    \\                     HTTPS one)
+    \\  --key              print this device's tunnel key and its check code
+    \\                     (to enter at the desk: Pair a device), and exit
+    \\  --pairing-code CODE
+    \\                     the code the desk showed after approving this
+    \\                     device (otherwise the window asks for it once)
+    \\  --forget           forget the paired desktop: tell it (through the
+    \\                     tunnel), then delete its pairing code, pinned CA
+    \\                     and release key, and its sync folder (packages)
     \\
-    \\First run: open Pair a device in the Portal window on the desktop, then
-    \\click Pair here. Later runs need nothing.
-    \\
-;
-
-const insecure_warning =
-    \\
-    \\  ********************************************************************
-    \\  *  WARNING: --insecure-plain-http                                  *
-    \\  *  No TLS. Anyone on the network path can read the screen and your *
-    \\  *  keystrokes and steal this device's credential. Use only against *
-    \\  *  a test server started with `portal run --no-tls`.               *
-    \\  ********************************************************************
-    \\
+    \\First run: the window shows this device's tunnel key. Enter it at the
+    \\desk (Pair a device), compare the check codes, then enter the pairing
+    \\code the desk shows. Later runs need nothing.
     \\
 ;
 
@@ -192,7 +171,7 @@ const Host = struct {
         s.mutex.lockUncancelable(h.client.io);
         const st = s.status;
         switch (st) {
-            .starting, .connecting, .refreshing => {},
+            .starting, .connecting => {},
             else => h.p.splashDone(),
         }
         const detail = detail_buf[0..s.detail_len];
@@ -239,7 +218,7 @@ const Host = struct {
                 .detail = detail,
                 .host = h.client.host(),
                 .has_grid = s.grid.cols > 0,
-                .code = s.pair_code,
+                .code = null,
                 .trust_error = trust,
                 .exit_code = s.exit_code,
                 .pin_fp = h.pin_fp_buf[0..h.pin_fp_len],
@@ -328,8 +307,8 @@ const Host = struct {
             .select_sub => |i| if (i) |j| {
                 if (j < h.subs.len) h.client.showSub(h.subs.items[j].id);
             } else h.client.showSub(null),
-            .pair => h.client.requestPairing(),
-            .cancel_pair => h.client.cancelPairing(),
+            // Pairing happens at the desk and on the first-run screen.
+            .pair, .cancel_pair => {},
             // A device opens and closes no tabs, has no selection yet, and
             // the remote grid size is the server's (the view scales to fit).
             .close_tab, .open_tab, .copy, .paste, .button, .resized => {},
@@ -359,30 +338,20 @@ const Host = struct {
 /// program/subcommand name; `prog` is used in messages ("portal connect").
 /// Objects live for the life of the process and are never freed.
 pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const []const u8) noreturn {
-    var server: ?[]const u8 = null;
     var forget = false;
-    var ca_file: ?[]const u8 = null;
-    var ca_sha256: ?[]const u8 = null;
-    var insecure = false;
+    var show_key = false;
+    var code_arg: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--server")) {
-            i += 1;
-            if (i >= args.len) fatal(prog, "--server needs a value", .{});
-            server = args[i];
-        } else if (std.mem.eql(u8, a, "--forget")) {
+        if (std.mem.eql(u8, a, "--forget")) {
             forget = true;
-        } else if (std.mem.eql(u8, a, "--ca")) {
+        } else if (std.mem.eql(u8, a, "--key")) {
+            show_key = true;
+        } else if (std.mem.eql(u8, a, "--pairing-code")) {
             i += 1;
-            if (i >= args.len) fatal(prog, "--ca needs a file", .{});
-            ca_file = args[i];
-        } else if (std.mem.eql(u8, a, "--ca-sha256")) {
-            i += 1;
-            if (i >= args.len) fatal(prog, "--ca-sha256 needs a fingerprint", .{});
-            ca_sha256 = args[i];
-        } else if (std.mem.eql(u8, a, "--insecure-plain-http")) {
-            insecure = true;
+            if (i >= args.len) fatal(prog, "--pairing-code needs the code", .{});
+            code_arg = args[i];
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             report(usage, .{prog});
             std.process.exit(0);
@@ -390,28 +359,39 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
             fatal(prog, "unknown argument '{s}'\n\n" ++ usage, .{ a, prog });
         }
     }
-    var last_buf: [64]u8 = undefined;
-    if (server == null) server = pin_mod.loadLastServer(io, &last_buf);
+
+    // This device's WireGuard key: made on first use, kept in the OS
+    // credential store, wiped from memory once the tunnel has it.
+    var key = tunnel.keys.loadOrCreate(io) catch |err|
+        fatal(prog, "cannot load or create this device's tunnel key in the OS credential store: {t}", .{err});
+    const key_text = key.publicText();
+    const key_check = key.checkCode();
+    if (show_key) {
+        key.wipe();
+        report("{s}: this device's tunnel key: {s}  (check code {s})", .{ prog, &key_text, &key_check });
+        std.process.exit(0);
+    }
 
     if (forget) {
-        const s = server orelse fatal(prog, "--forget needs --server IP:PORT", .{});
-        var hb: [64]u8 = undefined;
-        const host = http.canonicalHost(s, &hb) catch fatal(prog, "bad --server '{s}' (want a literal IP:PORT such as 10.8.0.1:8420)", .{s});
-        const r = forgetHost(gpa, io, host, null);
+        const c = devicelink.load(io) orelse {
+            key.wipe();
+            const r = forgetDesktop(io, devicelink.server);
+            var mb: [600]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&mb);
+            r.describe(&w, devicelink.server) catch {};
+            report("{s}: {s}", .{ prog, w.buffered() });
+            std.process.exit(if (r.first_error == null) 0 else 1);
+        };
+        const r = forgetLinked(gpa, io, &c, &key);
+        key.wipe();
         var mb: [600]u8 = undefined;
         var w: std.Io.Writer = .fixed(&mb);
-        r.describe(&w, host) catch {};
+        r.describe(&w, devicelink.server) catch {};
         report("{s}: {s}", .{ prog, w.buffered() });
         std.process.exit(if (r.first_error == null) 0 else 1);
     }
-    if (insecure) {
-        if (ca_file != null or ca_sha256 != null) fatal(prog, "--insecure-plain-http cannot be combined with --ca / --ca-sha256", .{});
-        if (server == null) fatal(prog, "--insecure-plain-http needs --server IP:PORT", .{});
-        std.debug.print(insecure_warning, .{});
-    }
 
-    // The window comes first: a first run, or a server that can't be
-    // trusted yet, is answered inside it.
+    // The window comes first: a first run is answered inside it.
     const tv = Presenter.init(gpa, io, .{ .title = "Portal" }) catch |err| {
         // No monospace font: say which files were tried (on iOS the
         // system font paths are found at run time and may differ).
@@ -419,78 +399,67 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
             fatal(prog, "cannot open the window: no monospace font (tried: {s})", .{view.font.fontset.triedPaths()});
         fatal(prog, "cannot open the window: {t}", .{err});
     };
-    // The hero art while connecting and signing in (Presenter.beginSplash:
-    // ends once connected or the user is needed, at any input, or after a
-    // few seconds).
+    // The hero art while connecting (Presenter.beginSplash: ends once
+    // connected or the user is needed, at any input, or after a few seconds).
     tv.beginSplash(view.hero_png);
 
-    const ca_buf = gpa.create([x509check.max_cert_len]u8) catch fatal(prog, "out of memory", .{});
-    const host_store = gpa.create([64]u8) catch fatal(prog, "out of memory", .{});
-    var server_text: []const u8 = server orelse "";
-    var transport: client_mod.Transport = .insecure_plain_http;
-    var pair_now = false;
-    if (!insecure) {
-        var why_buf: [600]u8 = undefined;
-        var why: ?[]const u8 = null;
-        // Try what the command line (or the last run) gave, without asking.
-        if (server) |s| {
-            const want_pin = ca_file != null or ca_sha256 != null or hasPin(io, s);
-            if (want_pin) {
-                switch (pinnedCa(gpa, io, s, ca_file, ca_sha256, ca_buf, &why_buf)) {
-                    .ok => |der| transport = .{ .tls = der },
-                    .problem => |m| why = m,
-                }
-            } else why = "";
-        } else why = "";
-        if (why) |first_note| {
-            // First-run screen.
-            var cert_prefill: []const u8 = ca_file orelse ca_sha256 orelse "";
-            var dbuf: [pin_mod.max_path]u8 = undefined;
-            if (cert_prefill.len == 0) if (pin_mod.defaultCaFile(&dbuf)) |p| {
-                if (std.Io.Dir.cwd().statFile(io, p, .{})) |_| cert_prefill = p else |_| {}
-            };
-            var st = setup_mod.Setup.init(server orelse "", cert_prefill);
-            st.scan_offered = platform.scan_qr != null;
-            if (first_note.len > 0) st.setNote("{s}", .{first_note});
-            while (true) {
-                if (!runSetup(tv, &st)) std.process.exit(0); // window closed
-                const s_in = std.mem.trim(u8, st.server.text(), " ");
-                var hb: [64]u8 = undefined;
-                _ = http.canonicalHost(s_in, &hb) catch {
-                    st.setNote("Enter the desktop's address as a literal IP:PORT, e.g. 10.8.0.1:8420.", .{});
-                    continue;
-                };
-                const cert = classify(st.cert.text());
-                const file: ?[]const u8 = if (cert == .file) cert.file else null;
-                const sha: ?[]const u8 = if (cert == .sha256) cert.sha256 else null;
-                if (cert == .pinned and !hasPin(io, s_in)) {
-                    st.setNote("Give the Portal certificate (portal-ca.pem from Export certificate at the desk) or the SHA-256 the desk shows.", .{});
-                    continue;
-                }
-                switch (pinnedCa(gpa, io, s_in, file, sha, ca_buf, &why_buf)) {
-                    .ok => |der| {
-                        transport = .{ .tls = der };
-                        @memcpy(host_store[0..s_in.len], s_in);
-                        server_text = host_store[0..s_in.len];
-                        pair_now = true;
-                        break;
-                    },
-                    .problem => |m| st.setNote("{s}", .{m}),
-                }
+    // The pairing code: given, saved earlier, or asked for in the window.
+    const code = gpa.create(devicelink.Code) catch fatal(prog, "out of memory", .{});
+    var newly_paired = false;
+    if (code_arg) |t| {
+        code.* = devicelink.parse(t) catch |err| fatal(prog, "{s}", .{devicelink.describe(err)});
+        newly_paired = true;
+    } else if (devicelink.load(io)) |c| {
+        code.* = c;
+    } else {
+        var st = setup_mod.Setup.init(key_text, key_check);
+        st.scan_offered = platform.scan_qr != null;
+        while (true) {
+            switch (runSetup(tv, &st)) {
+                .closed => std.process.exit(0),
+                .submit => {
+                    const c = devicelink.parse(st.code.text()) catch |err| {
+                        st.setNote("{s}", .{devicelink.describe(err)});
+                        continue;
+                    };
+                    st.askConfirm(c.deskCheck());
+                },
+                .confirmed => {
+                    code.* = devicelink.parse(st.code.text()) catch |err| {
+                        st.setNote("{s}", .{devicelink.describe(err)});
+                        continue;
+                    };
+                    newly_paired = true;
+                    break;
+                },
             }
         }
     }
+    if (newly_paired) devicelink.save(io, code) catch |err|
+        std.debug.print("portal connect: could not save the pairing code ({t}); it is asked for again next time\n", .{err});
+
+    const tun = devicelink.startTunnel(gpa, io, code, &key) catch |err|
+        fatal(prog, "cannot start this device's tunnel: {t}", .{err});
+    key.wipe();
+    const ca_buf = gpa.create([x509check.max_cert_len]u8) catch fatal(prog, "out of memory", .{});
+    const trust = devicelink.trust(io, code, ca_buf);
 
     const shared = gpa.create(client_mod.Shared) catch fatal(prog, "out of memory", .{});
     shared.* = .{};
     const client = gpa.create(client_mod.Client) catch fatal(prog, "out of memory", .{});
-    client.* = client_mod.Client.init(gpa, io, shared, server_text, transport) catch
-        fatal(prog, "bad --server '{s}' (want a literal IP:PORT such as 10.8.0.1:8420)", .{server_text});
-    pin_mod.saveLastServer(io, client.host()) catch {};
+    client.* = client_mod.Client.init(gpa, io, shared, devicelink.server, tun.dialer(), trust) catch
+        fatal(prog, "bad desktop address", .{});
+    const io_ptr = gpa.create(std.Io) catch fatal(prog, "out of memory", .{});
+    io_ptr.* = io;
+    client.on_pinned = devicelink.savePin;
+    client.on_pinned_ctx = io_ptr;
+    // First connection with this code: the sync worker pins the desktop's
+    // release key once the CA is pinned (and offers voice packages).
+    if (trust == .fingerprint) shared.just_paired.store(true, .release);
 
     const host_ui = gpa.create(Host) catch fatal(prog, "out of memory", .{});
     const sync_state = gpa.create(SyncState) catch fatal(prog, "out of memory", .{});
-    sync_state.* = .{ .client = client, .shared = shared };
+    sync_state.* = .{ .client = client, .shared = shared, .code = code };
     host_ui.* = .{ .p = tv, .shared = shared, .client = client, .sync = sync_state };
     host_ui.shell = ui.Shell.init(gpa, .viewer, host_ui.uiHost());
     host_ui.shell.modal = sync_state.modal();
@@ -507,13 +476,10 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     // Portal sync (docs/sync-design.md): a worker that runs a pass on
     // every (re)connect and {"t":"updates"}; only over TLS, where the
     // release key was pinned at pairing.
-    if (transport == .tls and platform.sync) {
+    if (platform.sync) {
         if (std.Thread.spawn(.{}, SyncState.run, .{sync_state})) |t| t.detach() else |_| {}
     }
-    switch (transport) {
-        .tls => |der| host_ui.pin_fp_len = x509check.formatFingerprint(x509check.fingerprint(der), &host_ui.pin_fp_buf).len,
-        .insecure_plain_http => {},
-    }
+    host_ui.pin_fp_len = x509check.formatFingerprint(code.ca_sha256, &host_ui.pin_fp_buf).len;
     tv.setLiveRedraw(host_ui, Host.liveRedraw);
     shared.wake_ctx = tv;
     shared.wake_fn = struct {
@@ -522,8 +488,6 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
             v.wake();
         }
     }.f;
-    // The first-run screen's Pair button: pair as soon as we know we must.
-    if (pair_now) shared.pair_requested.store(true, .release);
 
     // The network thread runs for the life of the process (its socket reads
     // cannot be cancelled portably); exiting the process ends it.
@@ -545,7 +509,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
         // worker and no sync store, so here).
         if (!gone_handled and shared.desktop_gone.load(.acquire)) {
             gone_handled = true;
-            if (transport == .tls) {
+            if (platform.sync) {
                 sync_state.forget_gone.store(true, .release);
                 sync_state.pending.store(@intFromEnum(SyncState.Op.forget), .release);
                 shared.sync_wake.set(io);
@@ -588,6 +552,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
 const SyncState = struct {
     client: *client_mod.Client,
     shared: *client_mod.Shared,
+    /// The pairing code this device connects with.
+    code: *const devicelink.Code,
     mutex: std.Io.Mutex = .init,
     ui: sync.ui.Ui = .{},
     /// Worker only.
@@ -673,13 +639,11 @@ const SyncState = struct {
     }
 
     fn pass(s: *SyncState) void {
-        var session: ?client_mod.http_Cookie = null;
-        s.shared.mutex.lockUncancelable(s.io());
-        session = s.shared.session;
-        s.shared.mutex.unlock(s.io());
-        var sess = session orelse return;
-        defer sess.wipe();
         const host = s.client.host();
+        // Right after pairing: pin the desktop's release key, over the
+        // tunnel and the CA the first connection pinned.
+        if (s.shared.just_paired.load(.acquire)) if (s.client.pinReleaseKey()) |_| {} else |err|
+            std.debug.print("portal connect: no release key pinned ({t}); sync stays off until this device is paired again\n", .{err});
         const pinned = s.loadPin() orelse {
             s.mutex.lockUncancelable(s.io());
             s.ui.setNote("Sync is off for {s}: pair this device again to pin the desktop's release key.", .{host});
@@ -701,7 +665,7 @@ const SyncState = struct {
         const rep = s.client.gpa.create(sync.engine.Report) catch return;
         defer s.client.gpa.destroy(rep);
         rep.* = .{};
-        const rem = s.client.syncRemote(sess.value());
+        const rem = s.client.syncRemote();
         sync.engine.run(&rem, st, pinned, opts, rep, .{ .f = logLine }) catch |err| {
             std.debug.print("portal connect: sync: {s}\n", .{sync.engine.describe(err)});
             return;
@@ -771,12 +735,7 @@ const SyncState = struct {
                     r = forgetDesktop(s.io(), host);
                     r.remote = .gone_by_desktop;
                 } else {
-                    var session: ?client_mod.http_Cookie = null;
-                    s.shared.mutex.lockUncancelable(s.io());
-                    session = s.shared.session;
-                    s.shared.mutex.unlock(s.io());
-                    defer if (session) |*x| x.wipe();
-                    r = forgetBothWays(s.client, if (session) |*x| x else null);
+                    r = forgetBothWays(s.client);
                 }
                 s.store = null;
                 var w: std.Io.Writer = .fixed(&s.dropped_msg_buf);
@@ -894,10 +853,8 @@ pub const Forgotten = struct {
 
     pub const Remote = enum {
         not_asked,
-        /// It removed this device (POST /device/forget).
+        /// It removed this device ("f:" on the interactive WebSocket).
         forgotten,
-        /// It no longer had this device.
-        already_gone,
         /// It could not be reached: it lists the device until it next
         /// sees it or the owner unpairs it there.
         unreachable_desktop,
@@ -909,26 +866,24 @@ pub const Forgotten = struct {
     pub fn describe(r: *const Forgotten, w: *std.Io.Writer, host: []const u8) !void {
         if (r.remote == .gone_by_desktop)
             try w.print("{s} no longer has this device paired (it was unpaired at the desk, or forgotten), so this device forgot it too. ", .{host});
-        try w.print("Forgot {s}: its certificate pin, release-key pin, this device's credential and its sync folder", .{host});
+        try w.print("Forgot {s}: its pairing code, certificate pin, release-key pin and its sync folder", .{host});
         if (r.folders.kept > 0) try w.print(" (except {d} folder(s) still in use: close the programs running from them, then delete them)", .{r.folders.kept});
         try w.writeAll(".");
         if (r.first_error) |e| try w.print(" Some items could not be removed: {t}.", .{e});
         switch (r.remote) {
             .forgotten => try w.writeAll(" The desktop removed this device too."),
-            .already_gone, .gone_by_desktop => try w.writeAll(" The desktop no longer lists this device."),
-            .unreachable_desktop, .not_asked => try w.writeAll(" The desktop could not be told: it still lists this device until it next sees it (then it is told this device is gone) or you unpair it there."),
+            .gone_by_desktop => try w.writeAll(" The desktop no longer lists this device."),
+            .unreachable_desktop, .not_asked => try w.writeAll(" The desktop could not be told: it still lists this device until you unpair it there."),
         }
     }
 };
 
 /// Forget this desktop, both ways: first asks the desktop to remove this
-/// device (Client.forgetOnDesktop, with `session` or a fresh sign-in),
-/// then forgets it here whatever the answer (an unreachable desktop is
-/// reported, not waited for).
-pub fn forgetBothWays(c: *client_mod.Client, session: ?*const http.Cookie) Forgotten {
-    const told: Forgotten.Remote = switch (c.forgetOnDesktop(session)) {
+/// device (Client.forgetOnDesktop), then forgets it here whatever the
+/// answer (an unreachable desktop is reported, not waited for).
+pub fn forgetBothWays(c: *client_mod.Client) Forgotten {
+    const told: Forgotten.Remote = switch (c.forgetOnDesktop()) {
         .forgotten => .forgotten,
-        .already_gone => .already_gone,
         .unreachable_desktop => .unreachable_desktop,
     };
     var r = forgetDesktop(c.io, c.host());
@@ -936,42 +891,36 @@ pub fn forgetBothWays(c: *client_mod.Client, session: ?*const http.Cookie) Forgo
     return r;
 }
 
-/// `connect --forget` / `sync-device --forget`: connects with `ca_der`
-/// (sync-device's --ca) or the pinned CA for `host` to tell the desktop,
-/// then forgets it here. Without either the desktop can't be reached
-/// securely: it is forgotten here only, and the result says so.
-pub fn forgetHost(gpa: std.mem.Allocator, io: std.Io, host: []const u8, ca_der: ?[]const u8) Forgotten {
-    var ca_buf: [x509check.max_cert_len]u8 = undefined;
-    const der: ?[]const u8 = ca_der orelse blk: {
-        const p = pin_mod.Pin.forHost(host) catch break :blk null;
-        break :blk p.load(io, &ca_buf) catch null;
+/// `connect --forget` / `sync-device --forget`: brings the tunnel up with
+/// the saved pairing code to tell the desktop, then forgets it here.
+pub fn forgetLinked(gpa: std.mem.Allocator, io: std.Io, code: *const devicelink.Code, key: *const tunnel.keys.KeyPair) Forgotten {
+    const tun = devicelink.startTunnel(gpa, io, code, key) catch {
+        var r = forgetDesktop(io, devicelink.server);
+        r.remote = .unreachable_desktop;
+        return r;
     };
-    if (der) |d| {
-        var shared: client_mod.Shared = .{};
-        if (client_mod.Client.init(gpa, io, &shared, host, .{ .tls = d })) |cl| {
-            var c = cl;
-            c.quiet = true;
-            return forgetBothWays(&c, null);
-        } else |_| {}
-    }
-    var r = forgetDesktop(io, host);
-    r.remote = .unreachable_desktop;
-    return r;
+    defer tun.destroy();
+    var ca_buf: [x509check.max_cert_len]u8 = undefined;
+    var shared: client_mod.Shared = .{};
+    var c = client_mod.Client.init(gpa, io, &shared, devicelink.server, tun.dialer(), devicelink.trust(io, code, &ca_buf)) catch {
+        var r = forgetDesktop(io, devicelink.server);
+        r.remote = .unreachable_desktop;
+        return r;
+    };
+    c.quiet = true;
+    return forgetBothWays(&c);
 }
 
-/// Forgets a paired desktop on this device: both credentials (TLS and
-/// plain), the pinned CA, the pinned release key, every sync folder of
-/// that host, and the "last server" if it was this one. Shared by
-/// `connect --forget`, Forget this desktop (Packages) and
-/// `portalctl sync-device --forget`.
+/// Forgets the paired desktop on this device: its pairing code, the
+/// pinned CA, the pinned release key and every sync folder of it. This
+/// device's own tunnel key stays (it is the device's identity, for the
+/// next pairing). Shared by `connect --forget`, Forget this desktop
+/// (Packages) and `portalctl sync-device --forget`.
 pub fn forgetDesktop(io: std.Io, host: []const u8) Forgotten {
     var r: Forgotten = .{};
-    var tbuf: [credstore.max_target]u8 = undefined;
-    for ([_]bool{ false, true }) |plain| {
-        credstore.delete(credstore.targetName(host, plain, &tbuf)) catch |err| {
-            if (r.first_error == null) r.first_error = err;
-        };
-    }
+    devicelink.delete(io) catch |err| {
+        r.first_error = err;
+    };
     if (pin_mod.Pin.forHost(host)) |p| p.delete(io) catch |err| {
         if (r.first_error == null) r.first_error = err;
     } else |_| {}
@@ -982,55 +931,27 @@ pub fn forgetDesktop(io: std.Io, host: []const u8) Forgotten {
         if (r.first_error == null) r.first_error = err;
         break :blk .{};
     };
-    var lb: [64]u8 = undefined;
-    if (pin_mod.loadLastServer(io, &lb)) |last| if (std.mem.eql(u8, last, host)) {
-        var pb: [pin_mod.max_path]u8 = undefined;
-        if (pin_mod.lastServerPath(&pb)) |p| std.Io.Dir.cwd().deleteFile(io, p) catch {} else |_| {}
-    };
     return r;
 }
 
 /// The version manifests' min-client is compared with (Portal's version).
 pub const client_version = "0.1.0";
 
-fn hasPin(io: std.Io, server: []const u8) bool {
-    var hb: [64]u8 = undefined;
-    const host = http.canonicalHost(server, &hb) catch return false;
-    const p = pin_mod.Pin.forHost(host) catch return false;
-    var probe: [x509check.max_cert_len]u8 = undefined;
-    const got = p.load(io, &probe) catch return false;
-    return got != null;
-}
+const SetupResult = enum { closed, submit, confirmed };
 
-/// How the certificate field reads.
-pub const Cert = union(enum) {
-    /// Nothing entered: use the CA pinned earlier for this server.
-    pinned,
-    /// A fingerprint: download the CA and check it against this.
-    sha256: []const u8,
-    /// A file path (.pem or .cer).
-    file: []const u8,
-};
-
-pub fn classify(text: []const u8) Cert {
-    const t = std.mem.trim(u8, text, " \"");
-    if (t.len == 0) return .pinned;
-    if (x509check.parseFingerprint(t)) |_| return .{ .sha256 = t } else |_| {}
-    return .{ .file = t };
-}
-
-/// The first-run screen's event loop (event-driven). False if the window
-/// was closed.
-fn runSetup(tv: *Presenter, st: *setup_mod.Setup) bool {
+/// The first-run screen's event loop (event-driven), until the user
+/// submits a code, confirms one, or closes the window.
+fn runSetup(tv: *Presenter, st: *setup_mod.Setup) SetupResult {
     const Ctx = struct {
         st: *setup_mod.Setup,
         tv: *Presenter,
-        submitted: bool = false,
+        result: ?SetupResult = null,
 
         fn on(c: *@This(), e: setup_mod.Event) void {
             switch (e) {
                 .none => {},
-                .submit => c.submitted = true,
+                .submit => c.result = .submit,
+                .confirmed => c.result = .confirmed,
                 .scan => if (platform.scan_qr) |f| f(),
                 .paste => {
                     const raw = c.tv.window.clipboardText(std.heap.page_allocator, 4096) orelse return;
@@ -1062,110 +983,28 @@ fn runSetup(tv: *Presenter, st: *setup_mod.Setup) bool {
     const empty: ui.grid.Grid = .{};
     var bufs: setup_mod.Setup.Bufs = .{};
     while (true) {
-        if (!tv.pollEvents(sink)) return false;
+        if (!tv.pollEvents(sink)) return .closed;
         if (platform.take_scanned) |take| {
-            var qbuf: [256]u8 = undefined;
-            // A good scan fills the form and pairs at once.
-            if (take(&qbuf)) |text| if (st.fromQr(text)) return true;
+            var qbuf: [512]u8 = undefined;
+            // A scan fills the code and checks it at once.
+            if (take(&qbuf)) |text| {
+                st.fromQr(text);
+                return .submit;
+            }
         }
         if (platform.take_scan_note) |take| {
             var nbuf: [256]u8 = undefined;
             if (take(&nbuf)) |note| st.setNote("{s}", .{note});
         }
-        if (ctx.submitted) return true;
+        if (ctx.result) |r| return r;
         tv.build(&empty, shell_mod.standby(null, "not connected", "", st.panel(&bufs)));
         tv.present();
         tv.waitEvents(Presenter.forever);
     }
 }
 
-const PinResult = union(enum) { ok: []const u8, problem: []const u8 };
-
-/// The CA to trust for `server`: imported from `ca_file`, downloaded and
-/// checked against `ca_sha256`, or the one pinned earlier. Never trusts a
-/// server on first use: with none of these it is a problem to show.
-fn pinnedCa(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    server: []const u8,
-    ca_file: ?[]const u8,
-    ca_sha256: ?[]const u8,
-    out: *[x509check.max_cert_len]u8,
-    why_buf: []u8,
-) PinResult {
-    const P = struct {
-        fn f(buf: []u8, comptime fmt: []const u8, args: anytype) PinResult {
-            return .{ .problem = std.fmt.bufPrint(buf, fmt, args) catch "cannot use that certificate" };
-        }
-    };
-    var hb: [64]u8 = undefined;
-    const host = http.canonicalHost(server, &hb) catch
-        return P.f(why_buf, "Bad server address '{s}' (want a literal IP:PORT such as 10.8.0.1:8420).", .{server});
-    const p = pin_mod.Pin.forHost(host) catch |err|
-        return P.f(why_buf, "No per-user config directory for the pinned CA ({t}).", .{err});
-    const expected: ?[32]u8 = if (ca_sha256) |t| (x509check.parseFingerprint(t) catch
-        return P.f(why_buf, "The SHA-256 must be the 64 hex digits the desk shows (AB:CD:...).", .{})) else null;
-
-    var old_buf: [x509check.max_cert_len]u8 = undefined;
-    const old: ?[]const u8 = p.load(io, &old_buf) catch |err| blk: {
-        if (ca_file == null and ca_sha256 == null)
-            return P.f(why_buf, "The CA pinned for {s} ({s}) is unreadable ({t}); give the certificate again.", .{ host, p.path(), err });
-        break :blk null;
-    };
-
-    var der: []const u8 = undefined;
-    var source: []const u8 = undefined;
-    if (ca_file) |f| {
-        der = pin_mod.readCaFile(io, f, out) catch |err|
-            return P.f(why_buf, "Cannot use {s} as the Portal CA ({t}): give portal-ca.pem or portal-ca.cer from Export certificate at the desk.", .{ f, err });
-        source = f;
-    } else if (expected) |want| {
-        if (old) |o| if (std.mem.eql(u8, &x509check.fingerprint(o), &want)) {
-            @memcpy(out[0..o.len], o);
-            return .{ .ok = out[0..o.len] };
-        };
-        der = client_mod.fetchCaCertificate(gpa, io, host, out) catch |err| {
-            // iOS: unreachable on the local network is usually the Local
-            // Network permission, not the desktop.
-            if (client_mod.localNetworkHint(err, host)) |hint|
-                return P.f(why_buf, "Could not reach the desktop: {s}. {s}", .{ client_mod.describe(err), hint });
-            return P.f(why_buf, "Could not download the CA from the desktop: {s}. Open Pair a device in the Portal window first (the download runs while pairing is open), or give the certificate file.", .{client_mod.describe(err)});
-        };
-        source = "the download";
-    } else if (old) |o| {
-        @memcpy(out[0..o.len], o);
-        return .{ .ok = out[0..o.len] };
-    } else {
-        return P.f(why_buf, "No Portal CA is trusted for {s} yet, so the server cannot be authenticated. Give the certificate file or its SHA-256.", .{host});
-    }
-
-    var fp_buf: [95]u8 = undefined;
-    const fp = x509check.fingerprint(der);
-    if (expected) |want| if (!std.mem.eql(u8, &fp, &want)) {
-        return P.f(why_buf, "The CA from {s} has SHA-256 {s}, which is not the one given. Not trusted.", .{ source, x509check.formatFingerprint(fp, &fp_buf) });
-    };
-    // A Portal CA is self-signed; this catches passing the server
-    // certificate or some unrelated file by mistake.
-    const parsed = x509check.parse(der) catch return P.f(why_buf, "{s} is not a usable CA certificate.", .{source});
-    parsed.verify(parsed, std.Io.Clock.real.now(io).toSeconds()) catch |err|
-        return P.f(why_buf, "{s} is not a valid self-signed CA certificate ({t}).", .{ source, err });
-
-    if (old) |o| if (!std.mem.eql(u8, o, der)) {
-        var ofp: [95]u8 = undefined;
-        std.debug.print("portal connect: replacing the CA pinned for {s} (was SHA-256 {s})\n", .{ host, x509check.formatFingerprint(x509check.fingerprint(o), &ofp) });
-    };
-    p.save(io, der) catch |err| return P.f(why_buf, "Cannot save the pinned CA to {s}: {t}.", .{ p.path(), err });
-    std.debug.print("portal connect: https://{s}/ must present a certificate from SHA-256 {s} (pinned: {s})\n", .{ host, x509check.formatFingerprint(fp, &fp_buf), p.path() });
-    return .{ .ok = der };
-}
-
-test "classify the certificate field" {
-    try std.testing.expect(classify("  ") == .pinned);
-    const fp = "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89";
-    try std.testing.expect(classify(fp) == .sha256);
-    try std.testing.expectEqualStrings("C:\\Users\\me\\portal-ca.pem", classify("\"C:\\Users\\me\\portal-ca.pem\"").file);
-}
-
 test {
     _ = @import("tests.zig");
+    _ = tunnel;
+    _ = devicelink;
 }
