@@ -4,6 +4,7 @@ test {
     _ = @import("gframe.zig");
     _ = @import("keys.zig");
     _ = @import("touchkbd.zig");
+    _ = @import("localtime.zig");
     _ = @import("credstore.zig");
     _ = @import("net/http.zig");
     _ = @import("net/x509check.zig");

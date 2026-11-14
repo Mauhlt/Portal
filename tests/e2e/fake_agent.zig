@@ -38,6 +38,9 @@
 //! A tab whose folder's name contains "quiet" writes no transcript at all.
 //! A tab whose folder's name contains "probe" only does OSC 7501 feature
 //! detection (`probe`; the probe group, tests/e2e/probe_tests.zig).
+//! One whose folder's name contains "usage" runs the statusLine command
+//! Portal passed with `--settings` (the usage group,
+//! tests/e2e/usage_tests.zig).
 //! In a folder whose name contains "showcase" (manual visual checks only,
 //! never the e2e suite) the reply carries a code block and the question a
 //! third option. (Not a PORTAL_* variable: Portal keeps those from its
@@ -275,6 +278,12 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     }
     if (std.mem.indexOf(u8, std.fs.path.basename(cwd), "probe") != null) {
         probe();
+        return 0;
+    }
+    // The usage group: the statusLine Portal passed (tests/e2e/usage_tests.zig).
+    if (std.mem.indexOf(u8, std.fs.path.basename(cwd), "usage") != null) {
+        @import("usage_tests.zig").fakeRun(gpa, io, env, args, cwd, &say);
+        drain("END");
         return 0;
     }
     const config = env.get("CLAUDE_CONFIG_DIR") orelse {

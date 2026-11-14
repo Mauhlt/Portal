@@ -229,11 +229,24 @@ pub fn deviceStartText(d: DeviceStart, buf: []u8) []const u8 {
     };
 }
 
+/// The agent whose configured arguments pass no `--settings` of their
+/// own: Portal then layers its status line settings file over the user's
+/// (usage_desk.zig; the plan-usage bar).
+pub fn wantsSettings(argv: []const []const u8) bool {
+    if (argv.len == 0 or !isAgent(argv[0])) return false;
+    for (argv[1..]) |a| {
+        if (std.mem.eql(u8, a, "--")) break;
+        if (std.mem.eql(u8, a, "--settings") or std.mem.startsWith(u8, a, "--settings=")) return false;
+    }
+    return true;
+}
+
 /// The one place a tab's launch arguments are decided (tabs.Hub.open):
 /// `--permission-mode <mode>` for a device start (the agent's value, from
 /// shared/projects.zig Mode.agentArg), then `--session-id <id>` when
-/// Portal picks the session. For withArgs.
-pub fn launchArgs(buf: *[4][]const u8, permission_mode: ?[]const u8, session_id: ?*const [36]u8) []const []const u8 {
+/// Portal picks the session, then `--settings <file>` (Portal's status
+/// line, usage_desk.zig). For withArgs.
+pub fn launchArgs(buf: *[6][]const u8, permission_mode: ?[]const u8, session_id: ?*const [36]u8, settings_file: ?[]const u8) []const []const u8 {
     var n: usize = 0;
     if (permission_mode) |m| {
         buf[n] = "--permission-mode";
@@ -243,6 +256,11 @@ pub fn launchArgs(buf: *[4][]const u8, permission_mode: ?[]const u8, session_id:
     if (session_id) |id| {
         buf[n] = "--session-id";
         buf[n + 1] = id;
+        n += 2;
+    }
+    if (settings_file) |f| {
+        buf[n] = "--settings";
+        buf[n + 1] = f;
         n += 2;
     }
     return buf[0..n];
@@ -271,13 +289,18 @@ pub fn uuidV4(random: [16]u8) [36]u8 {
 /// program's arguments: inside the quotes of a `cmd.exe /d /s /c "..."`
 /// line (a .cmd program), else at the end. Each argument must be letters,
 /// digits and dashes only (Portal's own: a mode name, a UUID), so it needs
-/// no quoting and is safe for cmd.exe; anything else is refused.
+/// no quoting and is safe for cmd.exe, or a Windows path of Portal's own
+/// (pathArg: letters, digits, spaces and `\ : . _ - ( )`), which goes in
+/// double quotes; anything else is refused.
 pub fn withArgs(gpa: Allocator, line: []const u16, args: []const []const u8) ![:0]u16 {
     var add_len: usize = 0;
     for (args) |a| {
         if (a.len == 0) return error.UnsafeArgument;
-        for (a) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return error.UnsafeArgument;
-        add_len += 1 + a.len;
+        if (plainArg(a)) {
+            add_len += 1 + a.len;
+        } else if (pathArg(a)) {
+            add_len += 3 + a.len;
+        } else return error.UnsafeArgument;
     }
     const batch_prefix = std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"");
     const batch = std.mem.startsWith(u16, line, batch_prefix) and line.len > batch_prefix.len and line[line.len - 1] == '"';
@@ -288,13 +311,41 @@ pub fn withArgs(gpa: Allocator, line: []const u16, args: []const []const u8) ![:
     for (args) |a| {
         out[at] = ' ';
         at += 1;
+        const quote = !plainArg(a);
+        if (quote) {
+            out[at] = '"';
+            at += 1;
+        }
         for (a) |c| {
             out[at] = c;
+            at += 1;
+        }
+        if (quote) {
+            out[at] = '"';
             at += 1;
         }
     }
     @memcpy(out[at..], line[cut..]);
     return out;
+}
+
+fn plainArg(a: []const u8) bool {
+    for (a) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
+    return a.len > 0;
+}
+
+/// An absolute Windows path safe in double quotes for CreateProcess and
+/// cmd.exe: no quote, `%`, `^`, `&`, `|`, `<`, `>`, `!`, no control or
+/// non-ASCII character, and no trailing backslash (it would escape the
+/// closing quote).
+pub fn pathArg(a: []const u8) bool {
+    if (a.len < 3 or a.len > 1024 or !std.ascii.isAlphabetic(a[0]) or a[1] != ':' or a[2] != '\\') return false;
+    if (a[a.len - 1] == '\\') return false;
+    for (a) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', ' ', '\\', ':', '.', '_', '-', '(', ')' => {},
+        else => return false,
+    };
+    return true;
 }
 
 /// `line` with ` --session-id <id>` appended (withArgs).
@@ -328,19 +379,34 @@ test "deviceStart: the agent only, never with a permissive flag" {
 }
 
 test "launchArgs + withArgs: the permission mode, then the session id; nothing unsafe" {
+    @setEvalBranchQuota(10_000);
     const gpa = testing.allocator;
-    var ab: [4][]const u8 = undefined;
+    var ab: [6][]const u8 = undefined;
     const id = "0123abcd-0000-4000-8000-00000000beef";
-    const a = launchArgs(&ab, "plan", id);
+    const a = launchArgs(&ab, "plan", id, null);
     const plain = std.unicode.utf8ToUtf16LeStringLiteral("C:\\x\\claude.exe --model opus");
     const got = try withArgs(gpa, plain, a);
     defer gpa.free(got);
     try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("C:\\x\\claude.exe --model opus --permission-mode plan --session-id 0123abcd-0000-4000-8000-00000000beef"), got);
     const bat = std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"C:\\npm\\claude.cmd\"");
-    const got2 = try withArgs(gpa, bat, launchArgs(&ab, "default", null));
+    const got2 = try withArgs(gpa, bat, launchArgs(&ab, "default", null, null));
     defer gpa.free(got2);
     try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"C:\\npm\\claude.cmd --permission-mode default\""), got2);
-    try testing.expectEqual(@as(usize, 0), launchArgs(&ab, null, null).len);
+    try testing.expectEqual(@as(usize, 0), launchArgs(&ab, null, null, null).len);
+    // The status line settings file: a quoted path, inside a .cmd's quotes too.
+    const set = launchArgs(&ab, null, null, "C:\\Users\\Bo B\\AppData\\Local\\Portal\\agent-statusline.json");
+    const got3 = try withArgs(gpa, bat, set);
+    defer gpa.free(got3);
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"C:\\npm\\claude.cmd --settings \"C:\\Users\\Bo B\\AppData\\Local\\Portal\\agent-statusline.json\"\""), got3);
+    for ([_][]const u8{ "C:\\a\"b", "C:\\a%b", "C:\\a&b", "C:\\a^b", "C:\\a!b", "C:\\dir\\", "relative\\x", "C:\\a\nb", "C:\\caf\xc3\xa9" }) |bad| {
+        try testing.expect(!pathArg(bad));
+        try testing.expectError(error.UnsafeArgument, withArgs(gpa, plain, &.{ "--settings", bad }));
+    }
+    try testing.expect(wantsSettings(&.{"claude"}));
+    try testing.expect(!wantsSettings(&.{ "claude", "--settings", "x.json" }));
+    try testing.expect(!wantsSettings(&.{ "claude", "--settings={}" }));
+    try testing.expect(wantsSettings(&.{ "claude", "--", "--settings" }));
+    try testing.expect(!wantsSettings(&.{"cmd.exe"}));
     try testing.expectError(error.UnsafeArgument, withArgs(gpa, plain, &.{"a b"}));
     try testing.expectError(error.UnsafeArgument, withArgs(gpa, plain, &.{"x&calc"}));
     try testing.expectError(error.UnsafeArgument, withArgs(gpa, plain, &.{""}));

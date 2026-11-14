@@ -52,6 +52,8 @@ const tunnelnet = @import("shared").tunnelnet;
 const bulk = @import("shared").bulk;
 const tabs = @import("tabs.zig");
 const tabs_wire = @import("shared").tabs;
+const planusage = @import("shared").planusage;
+const usage_desk = @import("usage_desk.zig");
 const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
 const tls = @import("tls/server.zig");
@@ -1196,6 +1198,10 @@ pub const Server = struct {
         defer act_out.deinit();
         // The system monitor's sample last sent (section 3d).
         var sys_seen: u64 = 0;
+        // The plan-usage bar (section 3h): after hello, then at most once
+        // per 5 minutes, at once on a threshold (usage_desk.Throttle). Its
+        // one deadline is part of this loop's wait.
+        var usage_t: usage_desk.Throttle = .{};
         // The startable projects (section 3f): after hello, then whenever
         // the list or a project's running state changes.
         const proj = srv.gpa.create(projects_ws.Feed) catch return;
@@ -1215,7 +1221,8 @@ pub const Server = struct {
                 break :blk cv.epoch != convo_epoch or cv.rev != convo_rev or c.subs.gen != subs_gen;
             } else false;
             const sys_due = if (srv.sysmon) |m| ws.sys_on.load(.acquire) and m.gen.load(.acquire) != sys_seen else false;
-            if (!hub.finished and !full and cur_gen == sent_gen and !(cur_closed and !ended_sent) and !convo_changed and
+            const usage_next = usage_t.decide(hub.usage.latest, srv.nowMs());
+            if (usage_next != .now and !hub.finished and !full and cur_gen == sent_gen and !(cur_closed and !ended_sent) and !convo_changed and
                 hub.activity_gen == activity_seen and !sys_due and !fy.due(hub) and
                 hub.activity_gen == activity_seen and !sys_due and !proj.dueLocked(hub) and
                 ws.want == .none and ws.sub_want == .none and hub.gen == seen_gen and !ws.dead.load(.acquire) and !gone and
@@ -1224,7 +1231,13 @@ pub const Server = struct {
                 // Forever, or while an image blob waits for this viewer's
                 // byte budget: exactly until the budget has refilled
                 // enough for it.
-                const timeout: Io.Timeout = if (images.wait_ms) |ms| .{ .duration = .{ .raw = .fromMilliseconds(@max(ms, 1)), .clock = .awake } } else .none;
+                // ... or until the usage message held back is due.
+                var wait_ms: ?i64 = images.wait_ms;
+                if (usage_next == .at) {
+                    const left = usage_next.at -| srv.nowMs();
+                    wait_ms = if (wait_ms) |ms| @min(ms, left) else left;
+                }
+                const timeout: Io.Timeout = if (wait_ms) |ms| .{ .duration = .{ .raw = .fromMilliseconds(@max(ms, 1)), .clock = .awake } } else .none;
                 hub.cond.waitTimeout(srv.io, &hub.mutex, timeout) catch |err| switch (err) {
                     error.Timeout => {},
                     error.Canceled => {
@@ -1354,6 +1367,17 @@ pub const Server = struct {
                 };
                 activity_seen = hub.activity_gen;
             }
+            // The usage message, if it is due now.
+            var usage_buf: [planusage.max_message]u8 = undefined;
+            var usage_msg: []const u8 = "";
+            const now_ms = srv.nowMs();
+            if (usage_t.decide(hub.usage.latest, now_ms) == .now) {
+                var uw: std.Io.Writer = .fixed(&usage_buf);
+                if (planusage.write(&uw, hub.usage.latest)) {
+                    usage_msg = uw.buffered();
+                    usage_t.markSent(hub.usage.latest, now_ms);
+                } else |_| {}
+            }
             if (encode_ok) fy.fill(hub) catch {
                 encode_ok = false;
             };
@@ -1396,6 +1420,9 @@ pub const Server = struct {
             }
             if (act_out.written().len > 0) {
                 if (!ws.send(srv, act_out.written(), .text)) return;
+            }
+            if (usage_msg.len > 0) {
+                if (!ws.send(srv, usage_msg, .text)) return;
             }
             var fy_msgs = fy.messages();
             while (fy_msgs.next()) |m| if (!ws.send(srv, m, .text)) return;

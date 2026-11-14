@@ -40,6 +40,7 @@ const tabs_wire = @import("shared").tabs;
 const convo_wire = @import("shared").convo;
 const subtabs_wire = @import("shared").subtabs;
 const activity_wire = @import("shared").activity;
+const planusage = @import("shared").planusage;
 const projects_wire = @import("shared").projects;
 const sysinfo = @import("shared").sysinfo;
 const tlsconn = @import("tlsconn.zig");
@@ -156,6 +157,9 @@ pub const Shared = struct {
     /// is open.
     sys: sysinfo.Snapshot = .{},
     has_sys: bool = false,
+    /// The plan's usage (`usage`, section 3h), once the desk sent it.
+    usage: planusage.Usage = .{},
+    has_usage: bool = false,
     /// The System panel is open: `y:on` was sent (and is sent again after
     /// a reconnect).
     sys_wanted: std.atomic.Value(bool) = .init(false),
@@ -475,6 +479,16 @@ pub const Client = struct {
         c.shared.mutex.lockUncancelable(c.io);
         c.shared.activity = a.*;
         c.shared.has_activity = true;
+        c.shared.mutex.unlock(c.io);
+        c.notify();
+    }
+
+    /// A `usage` message (section 3h): parsed strictly, each replaces the last.
+    fn applyUsage(c: *Client, payload: []const u8) void {
+        const u = planusage.parse(payload) orelse return;
+        c.shared.mutex.lockUncancelable(c.io);
+        c.shared.usage = u;
+        c.shared.has_usage = true;
         c.shared.mutex.unlock(c.io);
         c.notify();
     }
@@ -903,6 +917,10 @@ pub const Client = struct {
                 }
                 if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"sys\"")) {
                     c.applySys(frame.payload);
+                    return null;
+                }
+                if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"usage\"")) {
+                    c.applyUsage(frame.payload);
                     return null;
                 }
                 // For you (larger than the generic parser takes).

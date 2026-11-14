@@ -33,6 +33,27 @@ pub const Usage = struct {
     }
 };
 
+/// 0 below 75 %, 1 from 75, 2 from 90, 3 at 100 (unknown: 0): the bar's
+/// colour steps (neutral, amber, red) and the desk's "send at once" steps.
+pub fn band(w: ?Window) u8 {
+    const p = (w orelse return 0).pct;
+    return if (p >= 100) 3 else if (p >= 90) 2 else if (p >= 75) 1 else 0;
+}
+
+pub const Shown = struct { kind: WindowKind, window: Window };
+
+/// The window closer to its limit (the five-hour one on a tie: it fills
+/// and resets first); null when neither is known. What the bar shows, and
+/// the window a rate limit is taken to be about.
+pub fn higher(u: Usage) ?Shown {
+    if (u.five_hour) |f| {
+        if (u.week) |w| if (w.pct > f.pct) return .{ .kind = .week, .window = w };
+        return .{ .kind = .five_hour, .window = f };
+    }
+    if (u.week) |w| return .{ .kind = .week, .window = w };
+    return null;
+}
+
 /// Room for any `usage` message.
 pub const max_message = 160;
 
@@ -158,6 +179,19 @@ test "round trip" {
     // Unknown scalars are ignored, in the message and in a window.
     const u = parse("{ \"t\":\"usage\", \"week\":{\"pct\":5,\"src\":\"x\"}, \"later\":true }").?;
     try testing.expectEqual(@as(u8, 5), u.week.?.pct);
+}
+
+test "band and higher" {
+    try testing.expectEqual(@as(u8, 0), band(null));
+    try testing.expectEqual(@as(u8, 0), band(.{ .pct = 74 }));
+    try testing.expectEqual(@as(u8, 1), band(.{ .pct = 75 }));
+    try testing.expectEqual(@as(u8, 2), band(.{ .pct = 90 }));
+    try testing.expectEqual(@as(u8, 3), band(.{ .pct = 100 }));
+    try testing.expect(higher(.{}) == null);
+    try testing.expectEqual(WindowKind.week, higher(.{ .week = .{ .pct = 62 }, .five_hour = .{ .pct = 38 } }).?.kind);
+    try testing.expectEqual(WindowKind.five_hour, higher(.{ .week = .{ .pct = 94 }, .five_hour = .{ .pct = 97 } }).?.kind);
+    try testing.expectEqual(WindowKind.five_hour, higher(.{ .week = .{ .pct = 50 }, .five_hour = .{ .pct = 50 } }).?.kind);
+    try testing.expectEqual(WindowKind.week, higher(.{ .week = .{ .pct = 1 } }).?.kind);
 }
 
 test "malformed messages are rejected" {

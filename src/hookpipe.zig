@@ -34,6 +34,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const w = @import("win32.zig");
 const hookmsg = @import("hookmsg.zig");
+const statusline = @import("statusline.zig");
 const elevation = @import("elevation.zig");
 const settings = @import("settings.zig");
 const json_text = @import("shared").convo;
@@ -210,6 +211,9 @@ pub const Server = struct {
     ctx: *anyopaque,
     /// Called on the server thread with each well-formed message.
     on_message: *const fn (ctx: *anyopaque, m: *const hookmsg.Message) void,
+    /// Called on the server thread with each well-formed status line
+    /// report (`portalctl statusline`, statusline.zig); null: dropped.
+    on_usage: ?*const fn (ctx: *anyopaque, r: *const statusline.Report) void = null,
     /// Messages that did not parse: counted, never echoed or logged as
     /// received.
     rejected: std.atomic.Value(u32) = .init(0),
@@ -306,7 +310,11 @@ pub const Server = struct {
                 var buf: [hookmsg.max_message + 1]u8 = undefined;
                 const got = s.readAll(cur, &buf);
                 if (got) |text| {
-                    if (hookmsg.parse(text)) |m| s.on_message(s.ctx, &m) else _ = s.rejected.fetchAdd(1, .monotonic);
+                    if (hookmsg.parse(text)) |m| {
+                        s.on_message(s.ctx, &m);
+                    } else if (statusline.parse(text)) |r| {
+                        if (s.on_usage) |f| f(s.ctx, &r);
+                    } else _ = s.rejected.fetchAdd(1, .monotonic);
                 }
             }
             if (next) |n| {
@@ -553,7 +561,7 @@ fn printDecision(reason: []const u8) void {
     }
 }
 
-fn stdinHandle() ?w.HANDLE {
+pub fn stdinHandle() ?w.HANDLE {
     const h = w.validHandle(w.GetStdHandle(w.STD_INPUT_HANDLE)) orelse return null;
     // Only a pipe or a file: never wait on a console someone types into.
     const t = GetFileType(h);
@@ -561,7 +569,7 @@ fn stdinHandle() ?w.HANDLE {
 }
 
 /// Reads all of stdin into buf; null if it does not fit.
-fn readInput(in: ?w.HANDLE, buf: []u8) ?usize {
+pub fn readInput(in: ?w.HANDLE, buf: []u8) ?usize {
     const h = in orelse return null;
     var n: usize = 0;
     while (true) {
@@ -574,7 +582,7 @@ fn readInput(in: ?w.HANDLE, buf: []u8) ?usize {
 
 /// Reads stdin to its end (bounded), so the writer never sees a broken
 /// pipe.
-fn drain(in: ?w.HANDLE) void {
+pub fn drain(in: ?w.HANDLE) void {
     const h = in orelse return;
     var buf: [16 * 1024]u8 = undefined;
     var total: usize = 0;

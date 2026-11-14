@@ -75,6 +75,40 @@ pub const TopBar = struct {
     /// Clickable actions, drawn right-aligned left of `right`; a click
     /// reaches the sink as InputSink.button(id).
     buttons: []const TopButton = &.{},
+    /// A device's "⋯ N hidden" after the tabs, at their right end (its
+    /// hidden tabs, ui/hidden_tabs.zig); null: none.
+    hidden: ?HiddenButton = null,
+};
+
+/// The tab strip's hidden-tabs button: amber with a dot (`alert`) while a
+/// hidden tab waits for the user.
+pub const HiddenButton = struct {
+    label: []const u8,
+    alert: bool = false,
+    id: u32,
+};
+
+/// The plan-usage strip under the top bar (ui/usage_strip.zig): one line
+/// and a slim meter, or (expanded) a row per window and a note. A click
+/// anywhere on it reaches the sink as InputSink.button(id).
+pub const UsageStrip = struct {
+    /// "Week 62% \u{00B7} resets Mon".
+    label: []const u8,
+    pct: u8,
+    tone: Tone = .muted,
+    id: u32,
+    /// Expanded: these rows and the note instead of the line.
+    rows: []const UsageRow = &.{},
+    note: []const u8 = "",
+};
+
+pub const UsageRow = struct {
+    /// "Week 62%".
+    name: []const u8,
+    pct: u8,
+    tone: Tone = .muted,
+    /// "resets Mon 09:00".
+    right: []const u8 = "",
 };
 
 pub const TopButton = struct {
@@ -98,7 +132,15 @@ pub const TopTab = struct {
     /// hides it. A click on it reaches the sink as InputSink.button(badge_id).
     badge: []const u8 = "",
     badge_id: ?u32 = null,
+    /// The tab's menu (a device's "Hide this tab"): a right-click, or on a
+    /// touch screen a press held at least `long_press_ms`, reaches the
+    /// sink as InputSink.button(menu_id) instead of `id`.
+    menu_id: ?u32 = null,
 };
+
+/// How long a touch press must be held to be a long press (measured
+/// between the press and its release: no timer).
+pub const long_press_ms: i64 = 500;
 
 /// A line of panel text. Long lines wrap at spaces.
 pub const PanelText = struct {
@@ -124,6 +166,8 @@ pub const PanelButton = struct {
     id: u32,
     focused: bool = false,
     tone: Tone = .normal,
+    /// Shown dimmed and not clickable (an action this device can't take).
+    disabled: bool = false,
 };
 
 /// A list entry (e.g. a paired device) with an optional button at its right.
@@ -199,6 +243,9 @@ pub const Layout = struct {
     /// The Data slice (Overlay.data), full width between the main slice and
     /// the bottom region; zero-sized without one.
     data: Rect = .{},
+    /// The plan-usage strip (Overlay.usage), under the top bar; zero-sized
+    /// without one.
+    usage: Rect = .{},
     /// Each bottom pane's rectangle (same order as Overlay.bottom).
     panes: [max_panes]Rect = @splat(.{}),
     n_panes: usize = 0,
@@ -307,6 +354,8 @@ pub const Overlay = struct {
     /// The Data slice under the main slice.
     data: ?DataSlice = null,
     top_bar: ?TopBar = null,
+    /// The plan-usage strip under the top bar; null: hidden (no data).
+    usage: ?UsageStrip = null,
     selection: ?Selection = null,
     /// The bottom region under the main slice (at most `max_panes`).
     bottom: []const Pane = &.{},
@@ -348,6 +397,9 @@ const Hit = struct {
     /// A content view's button: fires on release when the press did not
     /// turn into a drag (scrolling over a card never presses its buttons).
     tap: bool = false,
+    /// The alternative action (a tab's menu): right-click, or a long press
+    /// on a touch screen.
+    alt: ?u32 = null,
 };
 
 /// A press in a content view: a tap on one of its buttons, or a drag that
@@ -368,9 +420,14 @@ const Press = struct {
     /// What the press began on (answer keys copied: the view's strings may
     /// change before the release).
     action: union(enum) { none, answer: struct { buf: [16]u8 = undefined, len: u8 = 0 }, button: u32 } = .none,
+    /// What a long press on it does instead (Hit.alt), and when it began
+    /// (Frame.now_ms).
+    alt: ?u32 = null,
+    t0_ms: i64 = 0,
 
-    fn setAction(pr: *Press, a: @FieldType(Hit, "action")) void {
-        switch (a) {
+    fn setAction(pr: *Press, h: Hit) void {
+        pr.alt = h.alt;
+        switch (h.action) {
             .answer => |k| if (k.len <= 16) {
                 pr.action = .{ .answer = .{ .len = @intCast(k.len) } };
                 @memcpy(pr.action.answer.buf[0..k.len], k);
@@ -465,6 +522,9 @@ pub const Frame = struct {
     /// release if the finger did not move off it or drag), and a drag over
     /// the grid scrolls its rows.
     touch: bool = false,
+    /// The glue's clock (awake ms), set before each pointer event: a long
+    /// press is measured between press and release (long_press_ms).
+    now_ms: i64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, sizing: Sizing) Frame {
         return .{ .gpa = gpa, .sizing = sizing };
@@ -500,12 +560,14 @@ pub const Frame = struct {
 
     pub fn pointerDown(f: *Frame, x: f32, y: f32, button: input.MouseButton, mods: input.Mods, sink: input.InputSink) void {
         f.press = .{};
+        // A right-click on something with a menu (a tab): its menu.
+        if (button == .right) if (f.hitFull(x, y)) |h| if (h.alt) |alt| return sink.button(alt);
         const hit = if (button == .left) f.hitFull(x, y) else null;
         if (f.touch and button == .left) {
             const in_view = f.view_shown and f.regions.terminal.contains(x, y);
             const pan = !in_view and f.regions.terminal.contains(x, y);
-            f.press = .{ .active = true, .x0 = x, .y0 = y, .in_view = in_view, .pan = pan, .last_y = y };
-            if (hit) |h| f.press.setAction(h.action);
+            f.press = .{ .active = true, .x0 = x, .y0 = y, .in_view = in_view, .pan = pan, .last_y = y, .t0_ms = f.now_ms };
+            if (hit) |h| f.press.setAction(h);
             if (in_view) sink.drag(.{ .phase = .down, .x = x, .y = y, .scale = f.scale });
             return;
         }
@@ -519,7 +581,7 @@ pub const Frame = struct {
         if (button == .left and f.view_shown and f.regions.terminal.contains(x, y)) {
             f.press = .{ .active = true, .x0 = x, .y0 = y };
             sink.drag(.{ .phase = .down, .x = x, .y = y, .scale = f.scale });
-            if (hit) |h| f.press.setAction(h.action);
+            if (hit) |h| f.press.setAction(h);
             return;
         }
         sink.mouse(f.mouseAt(.down, button, x, y, mods));
@@ -554,6 +616,8 @@ pub const Frame = struct {
             // A tap: what it began on, if the release is still on it.
             const h = f.hitFull(x, y) orelse return;
             if (!h.tap and !f.touch) return;
+            // Held long enough on something with a menu: the menu.
+            if (pr.alt) |alt| if (h.alt == alt and f.now_ms - pr.t0_ms >= long_press_ms) return sink.button(alt);
             switch (pr.action) {
                 .none => {},
                 .answer => |a| if (h.action == .answer and std.mem.eql(u8, h.action.answer, a.buf[0..a.len])) sink.answer(a.buf[0..a.len]),
@@ -643,7 +707,11 @@ pub const Frame = struct {
         const ui = fonts.metrics(@round(chrome_em * s));
         const act = fonts.metrics(@round(action_em * s));
         const status_h: f32 = @round(@as(f32, @floatFromInt(ui.cell_h)) * 1.6);
-        const top_h: f32 = if (overlay.top_bar != null) topBarHeight(ui, overlay.touch, s) else 0;
+        const bar_top_h: f32 = if (overlay.top_bar != null) topBarHeight(ui, overlay.touch, s) else 0;
+        // The usage strip sits under the top bar; below it all is as if the
+        // top bar were that much taller.
+        const usage_h: f32 = if (overlay.usage) |u| usageHeight(ui, u, s) else 0;
+        const top_h = bar_top_h + usage_h;
         // The bottom region (interaction slice): its panes' heights, but never
         // more than half the window (the main slice and data keep the rest).
         var panes: [max_panes]Pane = undefined;
@@ -673,7 +741,8 @@ pub const Frame = struct {
         const data_h: f32 = if (overlay.data) |d| dataHeight(middle, dataHeaderHeight(ui), dataContentHeight(ui, d, W, s), d.collapsed) else 0;
         const grid_h = @max(0, middle - data_h);
         f.regions = .{
-            .top = .{ .w = W, .h = top_h },
+            .top = .{ .w = W, .h = bar_top_h },
+            .usage = .{ .y = bar_top_h, .w = W, .h = usage_h },
             .terminal = .{ .y = top_h, .w = W, .h = grid_h },
             .data = .{ .y = top_h + grid_h, .w = W, .h = data_h },
             .bottom = .{ .y = top_h + middle, .w = W, .h = bar_h },
@@ -703,7 +772,8 @@ pub const Frame = struct {
                 v.draw(v.ctx, &p, f.regions.terminal);
             },
         }
-        if (overlay.top_bar) |tb| f.drawTopBar(ui, tb, W, top_h, s);
+        if (overlay.top_bar) |tb| f.drawTopBar(ui, tb, W, bar_top_h, s);
+        if (overlay.usage) |u| f.drawUsage(ui, u, f.regions.usage, s);
         if (overlay.data) |d| if (data_h > 0) f.drawData(ui, d, f.regions.data, s);
         for (panes[0..n_panes], 0..) |p, i| f.drawPane(act, p, f.regions.panes[i], s);
         f.drawStatus(ui, overlay.status, H - status_h, W, status_h, s);
@@ -747,7 +817,7 @@ pub const Frame = struct {
             b.x += dx;
             b.y += dy;
         }
-        const rs = [_]*Rect{ &f.regions.top, &f.regions.terminal, &f.regions.bottom, &f.regions.status, &f.regions.data };
+        const rs = [_]*Rect{ &f.regions.top, &f.regions.terminal, &f.regions.bottom, &f.regions.status, &f.regions.data, &f.regions.usage };
         for (rs) |r| {
             r.x += dx;
             r.y += dy;
@@ -986,7 +1056,28 @@ pub const Frame = struct {
                 right_w += tw + pad;
             }
         }
-        if (tb.tabs.len > 0 or tb.add_id != null) return f.drawTabs(ui, tb, x, W - right_w - pad, h, s);
+        var tabs_x1 = W - right_w - pad;
+        // The hidden-tabs button at the tabs' right end.
+        if (tb.hidden) |hb| {
+            const cw: f32 = @floatFromInt(ui.cell_w);
+            const th = @round(h * 0.8);
+            const ty0 = h - th;
+            const dot_w: f32 = if (hb.alert) 2 * cw else 0;
+            const bw = textWidth(ui, hb.label) + 2 * cw + dot_w;
+            const bx = @max(x, tabs_x1 - bw);
+            f.rect(bx, ty0, bw, th, if (hb.alert) theme.palette.yellow_warmer else theme.ui.button);
+            const fg: Rgb = if (hb.alert) theme.palette.bg else theme.ui.tab_text_inactive;
+            const text_y = ty0 + @round((th - @as(f32, @floatFromInt(ui.cell_h))) / 2);
+            var tx = bx + cw;
+            if (hb.alert) {
+                _ = f.text(ui, tx, text_y, "\u{25CF}", fg, true);
+                tx += dot_w;
+            }
+            _ = f.text(ui, tx, text_y, hb.label, fg, hb.alert);
+            f.registerButton(bx, ty0, bw, th, hb.id);
+            tabs_x1 = bx - @round(4 * s);
+        }
+        if (tb.tabs.len > 0 or tb.add_id != null) return f.drawTabs(ui, tb, x, tabs_x1, h, s);
         // Title, cut to the space left of the right-hand text.
         const avail = W - x - right_w - 2 * pad;
         _ = f.text(ui, x, ty, clipText(ui, tb.title, avail, false), theme.ui.text, true);
@@ -1032,7 +1123,7 @@ pub const Frame = struct {
             const label_room = @max(0, x + w - cw - close_w - badge_w - tx);
             const fg: Rgb = if (t.active) theme.ui.tab_text else theme.ui.tab_text_inactive;
             _ = f.text(ui, tx, text_y, clipText(ui, t.label, label_room, false), fg, t.active);
-            f.registerButton(x, ty, w - close_w - badge_w, th, t.id);
+            f.addHit(.{ .x = x, .y = ty, .w = w - close_w - badge_w, .h = th, .action = .{ .button = t.id }, .alt = t.menu_id });
             if (t.badge.len > 0) {
                 // A filled pill left of the close box: the tab's running
                 // background tasks.
@@ -1233,6 +1324,43 @@ pub const Frame = struct {
         }
     }
 
+    /// The usage strip in `r`: the line with a slim meter under it, or a
+    /// row per window (name, meter, reset) and the note. Neutral, amber
+    /// from 75 %, red from 90 % (the tone).
+    fn drawUsage(f: *Frame, ui: Metrics, u: UsageStrip, r: Rect, s: f32) void {
+        f.rect(r.x, r.y, r.w, r.h, theme.palette.bg);
+        const pad = @round(14 * s);
+        const lh: f32 = @floatFromInt(ui.cell_h);
+        const meter_h = @max(2, @round(3 * s));
+        const inner = @max(0, r.w - 2 * pad);
+        if (u.rows.len == 0) {
+            const y = r.y + @round(2 * s);
+            _ = f.text(ui, pad, y, clipText(ui, u.label, inner, false), usageColor(u.tone, true), u.tone != .muted);
+            f.meter(pad, y + lh + @round(3 * s), inner, meter_h, u.pct, u.tone);
+        } else {
+            var y = r.y + @round(4 * s);
+            const name_w: f32 = @floatFromInt(ui.cell_w * 13);
+            for (u.rows) |row| {
+                const right_w = textWidth(ui, row.right);
+                _ = f.text(ui, pad, y, clipText(ui, row.name, name_w, false), usageColor(row.tone, true), row.tone != .muted);
+                const mx = pad + name_w;
+                const mw = @max(0, inner - name_w - right_w - @round(8 * s));
+                f.meter(mx, y + @round((lh - 5 * s) / 2), mw, @max(3, @round(5 * s)), row.pct, row.tone);
+                _ = f.text(ui, pad + inner - right_w, y, row.right, theme.ui.dim, false);
+                y += @round(lh * 1.4);
+            }
+            if (u.note.len > 0) _ = f.text(ui, pad, y, clipText(ui, u.note, inner, false), theme.ui.dim, false);
+        }
+        f.registerButton(r.x, r.y, r.w, r.h, u.id);
+    }
+
+    /// A slim meter: the track, then `pct` of it in the tone's colour.
+    fn meter(f: *Frame, x: f32, y: f32, w: f32, h: f32, pct: u8, tone: Tone) void {
+        f.rect(x, y, w, h, theme.palette.inactive);
+        const fill = @round(w * @as(f32, @floatFromInt(@min(pct, 100))) / 100);
+        if (fill > 0) f.rect(x, y, fill, h, usageColor(tone, false));
+    }
+
     fn drawStatus(f: *Frame, ui: Metrics, st: StatusLine, y: f32, W: f32, h: f32, s: f32) void {
         f.rect(0, y, W, h, theme.ui.bar);
         const ty = y + @round((h - @as(f32, @floatFromInt(ui.cell_h))) / 2);
@@ -1281,6 +1409,12 @@ pub const Frame = struct {
             .warn => theme.ui.caution,
             else => theme.ui.button,
         };
+        if (b.disabled) {
+            // Dimmed, outlined, no hit area.
+            f.outline(x, y, w, h, @max(1, @round(s)), theme.ui.border);
+            _ = f.text(m, x + pad, y + @round((h - @as(f32, @floatFromInt(m.cell_h))) / 2), b.label, theme.ui.dim, false);
+            return w;
+        }
         f.rect(x, y, w, h, bg);
         if (b.focused) f.outline(x, y, w, h, @max(2, @round(2 * s)), theme.ui.focus);
         _ = f.text(m, x + pad, y + @round((h - @as(f32, @floatFromInt(m.cell_h))) / 2), b.label, theme.ui.button_text, true);
@@ -1629,6 +1763,25 @@ pub fn fitImage(w: u32, h: u32, box_w: f32, box_h: f32) [2]f32 {
     const fh: f32 = @floatFromInt(h);
     const k = @min(@min(box_w / fw, box_h / fh), 2);
     return .{ @max(1, @round(fw * k)), @max(1, @round(fh * k)) };
+}
+
+/// The usage strip's height: a line and the meter, or the expanded rows
+/// and note.
+fn usageHeight(ui: Metrics, u: UsageStrip, s: f32) f32 {
+    const lh: f32 = @floatFromInt(ui.cell_h);
+    if (u.rows.len == 0) return @round(2 * s) + lh + @round(3 * s) + @max(2, @round(3 * s)) + @round(6 * s);
+    const n: f32 = @floatFromInt(u.rows.len);
+    return @round(4 * s) + n * @round(lh * 1.4) + (if (u.note.len > 0) lh else 0) + @round(6 * s);
+}
+
+/// The usage strip's colours (shared/theme.zig): neutral (dim text, the
+/// border colour's meter), amber (yellow_warmer), red.
+fn usageColor(t: Tone, text_colour: bool) Rgb {
+    return switch (t) {
+        .warn => theme.palette.yellow_warmer,
+        .bad => theme.palette.red,
+        else => if (text_colour) theme.ui.dim else theme.palette.border,
+    };
 }
 
 /// The top bar's height; on touch, tall enough that the tabs (80% of it)
@@ -2067,4 +2220,124 @@ test "a panel row's two buttons and its dot: both buttons are hit, the text keep
     const o: Overlay = .{ .panel = .{ .title = "Projects", .rows = &rows } };
     f.build(&fs, .{ 1200, 800 }, 1, &g, o);
     try expectHits(&f, &.{ 1810, 1830, 1811 }, &.{1831});
+}
+
+/// Records which button ids reached the sink.
+const IdRec = struct {
+    ids: [8]u32 = undefined,
+    n: usize = 0,
+    fn button(p: *anyopaque, id: u32) void {
+        const r: *IdRec = @ptrCast(@alignCast(p));
+        if (r.n < r.ids.len) {
+            r.ids[r.n] = id;
+            r.n += 1;
+        }
+    }
+    fn last(r: *const IdRec) ?u32 {
+        return if (r.n == 0) null else r.ids[r.n - 1];
+    }
+    const vt: input.InputSink.VTable = .{ .key = TapRec.key, .char = TapRec.char, .answer = TapRec.answer, .button = button, .resized = TapRec.resized, .mouse = TapRec.mouse, .scroll = TapRec.scroll, .drag = TapRec.drag };
+};
+
+/// The centre of the hit for button `id` in the last frame.
+fn hitCentre(f: *const Frame, id: u32) ?[2]f32 {
+    for (f.hits[0..f.n_hits]) |h| switch (h.action) {
+        .button => |b| if (b == id) return .{ h.x + h.w / 2, h.y + h.h / 2 },
+        else => {},
+    };
+    return null;
+}
+
+test "tab strip: the hidden button's hit, a tab's menu by right-click and by long press" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    const tabs_ = [_]TopTab{
+        .{ .label = "Alpha", .color = .{ 0x33, 0x66, 0xCC }, .active = true, .id = 1000, .menu_id = 1780 },
+        .{ .label = "Beta", .color = .{ 0x10, 0xB9, 0x81 }, .id = 1001, .menu_id = 1781 },
+    };
+    const o: Overlay = .{ .top_bar = .{ .tabs = &tabs_, .hidden = .{ .label = "\u{22EF} 3 hidden", .alert = true, .id = 1700 } } };
+    f.build(&fs, .{ 1200, 800 }, 1, &g, o);
+    try expectHits(&f, &.{ 1000, 1001, 1700 }, &.{ 1780, 1781 });
+    // The hidden button sits right of the last tab.
+    try std.testing.expect(hitCentre(&f, 1700).?[0] > hitCentre(&f, 1001).?[0]);
+    var r: IdRec = .{};
+    const sink: input.InputSink = .{ .ctx = &r, .vtable = &IdRec.vt };
+    const beta = hitCentre(&f, 1001).?;
+    // Mouse: a left click switches at once, a right click opens the menu.
+    f.pointerDown(beta[0], beta[1], .left, .{}, sink);
+    try std.testing.expectEqual(@as(?u32, 1001), r.last());
+    f.pointerDown(beta[0], beta[1], .right, .{}, sink);
+    try std.testing.expectEqual(@as(?u32, 1781), r.last());
+    // A right click on something without a menu is the terminal's.
+    const n = r.n;
+    f.pointerDown(hitCentre(&f, 1700).?[0], beta[1], .right, .{}, sink);
+    try std.testing.expectEqual(n, r.n);
+    // Touch: a short tap switches, a long press (timed on release) opens
+    // the menu, a long press that moved off does nothing.
+    f.touch = true;
+    r = .{};
+    f.now_ms = 1000;
+    f.pointerDown(beta[0], beta[1], .left, .{}, sink);
+    f.now_ms = 1000 + long_press_ms - 1;
+    f.pointerUp(beta[0], beta[1], .left, sink);
+    try std.testing.expectEqual(@as(?u32, 1001), r.last());
+    f.now_ms = 5000;
+    f.pointerDown(beta[0], beta[1], .left, .{}, sink);
+    f.now_ms = 5000 + long_press_ms;
+    f.pointerUp(beta[0], beta[1], .left, sink);
+    try std.testing.expectEqual(@as(?u32, 1781), r.last());
+    try std.testing.expectEqual(@as(usize, 2), r.n);
+    f.now_ms = 9000;
+    f.pointerDown(beta[0], beta[1], .left, .{}, sink);
+    f.pointerMove(beta[0] + 300, beta[1], sink);
+    f.now_ms = 9000 + 2 * long_press_ms;
+    f.pointerUp(beta[0] + 300, beta[1], .left, sink);
+    try std.testing.expectEqual(@as(usize, 2), r.n);
+    // The hidden button is a plain tap.
+    const hb = hitCentre(&f, 1700).?;
+    f.pointerDown(hb[0], hb[1], .left, .{}, sink);
+    f.pointerUp(hb[0], hb[1], .left, sink);
+    try std.testing.expectEqual(@as(?u32, 1700), r.last());
+}
+
+test "usage strip: under the top bar, clickable, pushes the main slice down" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    var o: Overlay = .{ .top_bar = .{ .title = "Portal" } };
+    f.build(&fs, .{ 800, 600 }, 1, &g, o);
+    const plain_top = f.regions.terminal.y;
+    try std.testing.expectEqual(@as(f32, 0), f.regions.usage.h);
+    o.usage = .{ .label = "Week 62% \u{00B7} resets Mon", .pct = 62, .id = 916 };
+    f.build(&fs, .{ 800, 600 }, 1, &g, o);
+    try std.testing.expect(f.regions.usage.h > 0);
+    try std.testing.expectEqual(f.regions.top.h, f.regions.usage.y);
+    try std.testing.expectEqual(plain_top + f.regions.usage.h, f.regions.terminal.y);
+    try expectHits(&f, &.{916}, &.{});
+    const collapsed = f.regions.usage.h;
+    const rows = [_]UsageRow{ .{ .name = "Week 62%", .pct = 62, .right = "resets Mon 09:00" }, .{ .name = "5-hour 91%", .pct = 91, .tone = .bad } };
+    o.usage.?.rows = &rows;
+    o.usage.?.note = "From Claude Code.";
+    f.build(&fs, .{ 800, 600 }, 1, &g, o);
+    try std.testing.expect(f.regions.usage.h > collapsed);
+}
+
+test "panel: a disabled button has no hit; a row's dot" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    const rows = [_]PanelRow{.{ .text = "Beta \u{00B7} idle", .dot = .{ 1, 2, 3 }, .button = .{ .label = "Show", .id = 1711 } }};
+    const buttons = [_]PanelButton{ .{ .label = "Hide this tab", .id = 1702 }, .{ .label = "Close (desk only)", .id = 1703, .disabled = true } };
+    f.build(&fs, .{ 800, 600 }, 1, &g, .{ .panel = .{ .title = "Beta", .rows = &rows, .buttons = &buttons } });
+    try expectHits(&f, &.{ 1711, 1702 }, &.{1703});
 }

@@ -270,10 +270,17 @@ pub fn pollEvents(p: *Presenter, sink: input.InputSink) bool {
                 p.frame.scroll_back = 0;
                 sink.char(c.cp, mods(c.mods));
             },
-            .mouse_down => |m| p.frame.pointerDown(m.x, m.y, button(m.button), mods(m.mods), sink),
+            .mouse_down => |m| {
+                // Long presses are measured between press and release.
+                p.frame.now_ms = p.nowMs();
+                p.frame.pointerDown(m.x, m.y, button(m.button), mods(m.mods), sink);
+            },
             .mouse_move => |m| p.frame.pointerMove(m.x, m.y, sink),
             // Cancelled (iOS: the system took the touch): no tap, no swipe.
-            .mouse_up => |m| if (m.cancelled) p.frame.pointerCancel(sink) else p.frame.pointerUp(m.x, m.y, button(m.button), sink),
+            .mouse_up => |m| {
+                p.frame.now_ms = p.nowMs();
+                if (m.cancelled) p.frame.pointerCancel(sink) else p.frame.pointerUp(m.x, m.y, button(m.button), sink);
+            },
             // A headset's play / pause button (Win32 WM_APPCOMMAND): the
             // shell decides (dictation, only with a headset microphone).
             // Play, pause and stop alone are not toggles: ignored.
