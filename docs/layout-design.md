@@ -8,6 +8,7 @@ top bar.
 ```
 ┌────────────────────────────────────────────┐
 │ top bar (project name, project tabs later) │
+│ usage strip (plan limits; hidden w/o data) │
 ├────────────────────────────────────────────┤
 │ ① terminal                                 │  the biggest share
 │                                            │
@@ -207,6 +208,58 @@ keeps the terminal. In the Conversation view the window is minimal:
   grab feedback (≤ 180 ms) and a fly-off / spring-back (≤ 180 ms) set frame
   deadlines while they run.
 
+## The usage strip (every screen)
+
+A thin strip under the top bar, desk and devices alike (`ui/usage_strip.zig`,
+drawn by `frame.drawUsage`; owner-approved mockup, 2026-11-14):
+
+```
+┌────────────────────────────────────────────┐
+│ ● Portal  ● WireGuard          [⋯ 3 hidden]│  top bar (tabs)
+│ Week 62% · resets Mon                      │  the usage strip: one line
+│ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬───────────────│  and a slim meter
+├────────────────────────────────────────────┤
+```
+
+* It shows whichever plan window is closer to its limit (`planusage.higher`:
+  the week or the five-hour window) with its reset: "resets 14:20" within a
+  day, "resets Mon" further out, local time. At the limit: "5-hour limit
+  reached · resets 14:20".
+* Neutral below 75 %, amber (`yellow_warmer`) from 75 %, red from 90 % and
+  at the limit (shared/theme.zig). A toast says once when a window passes
+  75 % or 90 %, or the limit is reached (each window's steps start over
+  when it resets); the toast's end is the glue's one deadline for it.
+* A tap or click toggles the detail: both windows, each with its meter and
+  reset day and time, and where the numbers come from.
+* No data (API-key sessions, or nothing reported yet): no strip. Where the
+  numbers come from and when devices get them: docs/protocol.md section
+  3h, docs/tabs-design.md "The plan-usage bar".
+
+## Hidden tabs (devices)
+
+A device may hide tabs from its own tab bar (`ui/hidden_tabs.zig`;
+docs/protocol.md section 5). A tidy-up of this device's bar, not a
+security control: the desk and other devices still show every tab, and a
+hidden tab still gets every message.
+
+* Hide: a long press on a tab (held at least 500 ms, measured between
+  press and release: no timer) or a right-click opens its menu: "Hide this
+  tab", and "Close (desk only)" shown disabled. Ctrl+Shift+H hides the tab
+  shown. Hiding the tab shown switches to the next visible one; a hidden
+  tab that is shown (the desk's choice on a first connect) stays in the bar
+  until the user switches away. Ctrl+Tab skips hidden tabs.
+* The bar then ends in "⋯ N hidden" (the open tabs hidden). It turns
+  amber with a dot while a hidden tab is waiting for an answer (the tab
+  state `waiting`) or has For-you items that need the desk.
+* It opens the sheet "Hidden on this device": each hidden tab's colour
+  dot, name and state (waiting for your answer / working / idle) and
+  Show, which puts the tab back and switches to it. Esc or Close closes it.
+* The list is tab names, at most 64 (the oldest dropped), in
+  `hidden-tabs.txt` next to the device's `settings.txt` (one name per line;
+  client/src/net/pin.zig), so it survives reconnects and restarts. Names of
+  projects that are closed may stay in it; a tab of that name that opens
+  again starts hidden.
+
 ## Terminal scaling (viewers)
 
 The remote grid's size is the desk's. A viewer picks its cell size from the
@@ -225,7 +278,7 @@ The desk itself keeps a fixed font and sizes the PTY to its terminal slice.
 ## Implementation notes
 
 * Native (desk and laptop): TermView's `Layout` (`regions`): top bar,
-  terminal, `data` (`Overlay.data`, a `DataSlice`), the bottom panes
+  the usage strip (`usage`, `Overlay.usage`), terminal, `data` (`Overlay.data`, a `DataSlice`), the bottom panes
   (`Overlay.bottom`: `.answers`, `.field` with its `send` button), status
   line; a modal panel layer over all of them; a single focus owner per host.
   The feed: `client/src/dataview.zig`, used by `portal connect` and the

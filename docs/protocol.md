@@ -536,9 +536,20 @@ WINDOW = {"pct":<0..100>[,"resets_at":<unix s>]}
 
 * An absent window is unknown; an absent `resets_at` is unknown.
   `limit_reached` names the window whose limit is reached.
-* The desk sends it to a device on connect, then at most once per 5
-  minutes, and at once when a window crosses 75 %, 90 % or reaches its
-  limit. The throttling is the desk's; each message replaces the last.
+* The desk sends it to a device on connect (after `hello`, once anything
+  is known), then at most once per 5 minutes, and at once when a window
+  crosses 75 %, 90 % or 100 %, or `limit_reached` changes. The throttling
+  is the desk's (`src/usage_desk.zig` Throttle: per viewer, timestamps and
+  one deadline in the viewer's wait, no polling); each message replaces
+  the last.
+* Where the desk gets it: the agent's status line in the sessions Portal
+  starts (`portalctl statusline`, passed with `--settings`; it reads only
+  `rate_limits.five_hour` / `seven_day`: `used_percentage`, floored, and
+  `resets_at`), and the `StopFailure` hook with `error` = `rate_limit`
+  (docs/tabs-design.md, "The plan-usage bar"). `limit_reached` names the
+  window closer to its limit then; a later finished turn (`Stop`), a new
+  window or its reset time clears it. Windows appear only for claude.ai
+  subscriptions: an API-key desk never sends `usage`.
 * Strict parser and writer: `shared/planusage.zig` (a percentage over
   100, a field twice, an unknown window: rejected).
 

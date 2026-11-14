@@ -315,6 +315,27 @@ notification type travel; prompts, tool input and paths don't. One hook
 takes about 20 ms. Sessions started before the install normally pick it up
 without a restart (the agent watches its settings).
 
+**Plan usage.** A thin strip under the top bar, on the desk and every
+device, shows how much of your agent plan's limits is used: "Week 62% ·
+resets Mon" over a slim meter, whichever window (week or five hours) is
+closer to its limit; amber from 75 %, red from 90 %, a one-time notice at
+each step, a tap shows both windows. Portal gets the numbers from the agent's
+status line in the sessions it starts: it passes `--settings
+%LOCALAPPDATA%\Portal\agent-statusline.json` (a status line running
+`portalctl statusline`, nothing else), so your own settings.json and its
+status line are never touched and your hooks still run; with the hooks
+installed, a rate-limit stop marks the limit as reached. Only percentages
+and reset times reach devices. The agent reports them for claude.ai
+Pro / Max plans only, after a session's first reply; with an API key
+there is no strip.
+
+**Hidden tabs (devices).** Long-press a tab (or right-click it, or
+Ctrl+Shift+H for the tab shown) and choose "Hide this tab" to keep it out
+of this device's tab bar; "⋯ N hidden" at the end of the bar lists them
+(amber while one of them waits for you) with Show. Only this device's bar
+changes: the desk and other devices still show every tab. The list is kept
+in `hidden-tabs.txt` next to the device's settings.
+
 **Inline images.** `portal-show picture.png [--cols N]`, run inside the
 session (by you, or by the session program through its shell tool), shows a
 PNG in the window, in `portal connect` and in the iPhone app. Portal puts

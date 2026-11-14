@@ -133,6 +133,47 @@ never open or close projects. That stays desk-only: Ctrl+T folder picker, or
    the agent ring BEL, and vt.zig counts BEL per session. Also a settings
    change, so it too needs the owner's approval.
 
+## The plan-usage bar (implemented 2026-11-14)
+
+The plan's limits (the five-hour and the weekly window) are not in
+transcripts; the agent hands them to its **status line** command, as JSON
+on stdin (`rate_limits.five_hour` / `rate_limits.seven_day`:
+`used_percentage`, `resets_at` in Unix seconds; only for claude.ai
+subscriptions, only after the session's first reply, each window may be
+absent).
+
+* **Portal's own status line, for its own sessions only.** At start Portal
+  writes `%LOCALAPPDATA%\Portal\agent-statusline.json`, holding exactly
+  `{"statusLine":{"type":"command","command":"<...>/portalctl.exe
+  statusline","padding":0}}`, and launches the agent with `--settings
+  <that file>` (cmdline.launchArgs; the path quoted, cmdline.pathArg). The
+  agent layers it over the user's settings for that session: the user's
+  files are never written, their `statusLine` stays theirs everywhere
+  else, and their hooks still run (the file has no `hooks` key: keys a
+  layer leaves out keep their values, and hook entries merge across
+  layers). The command runs in the agent's shell (Git Bash or
+  PowerShell), so its path has forward slashes and only `[A-Za-z0-9/:._-]`
+  (else its 8.3 short form; else no bar, logged). A program setting that
+  passes its own `--settings`, or that is not the agent, gets nothing.
+* **`portalctl statusline`** (src/statusline.zig) reads stdin (at most
+  256 KB), keeps only the two windows (percent floored, so 99.6 % is not
+  the limit), sends them with the tab's `PORTAL_TAB` over the hook pipe
+  (`portal-usage-v1`: the same pipe, this user only, no remote clients;
+  only an open tab's key counts), prints "5-hour 23% · week 41%" for the
+  agent to show, and exits 0. Milliseconds, well inside the agent's
+  300 ms debounce. The transcript path, folder, model and costs in the
+  same JSON are never kept or sent.
+* **The limit:** the `StopFailure` hook (installed with the others, no
+  matcher) carries `error=rate_limit` on the pipe when the agent's `error`
+  is `rate_limit` (only that value travels). The desk then marks the
+  window closer to its limit as reached; a finished turn (`Stop`), a new
+  window (another reset time) or its reset time clears it.
+* **The desk** keeps the latest values (`Hub.usage`, src/usage_desk.zig)
+  and shows the strip itself; each device viewer sends `{"t":"usage"}`
+  on connect, then at most every 5 minutes, at once on 75 %, 90 %, 100 %
+  or a limit change (docs/protocol.md section 3h). Only percentages and
+  Unix times leave the desk.
+
 ## Subagent sub-tabs (implemented 2026-11-13)
 
 When the program in a tab starts subagents, each becomes a read-only
