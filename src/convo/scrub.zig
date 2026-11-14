@@ -34,9 +34,10 @@
 //! Paths of rules 1-3 start at a word boundary, except that drive paths
 //! (and `\\?\`, `\\.\`, `file://`, `%VAR%\`) also match glued to the text
 //! before them (`-LC:\x`, `x_C:\`, `a.C:\`); a glued `x://` is a URL
-//! scheme, not a drive. No regular expressions: a byte scanner, so the
-//! output is valid UTF-8 whenever the input is (it only cuts at ASCII
-//! bytes or at whole UTF-8 sequences).
+//! scheme, and the last letter of a longer word (`Result:` before an
+//! escape) is not a drive letter either. No regular expressions: a byte
+//! scanner, so the output is valid UTF-8 whenever the input is (it only
+//! cuts at ASCII bytes or at whole UTF-8 sequences).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -197,6 +198,11 @@ fn boundaryBefore(s: []const u8, i: usize) bool {
 /// prefix, `file://`, or `%VAR%` and a separator.
 fn gluedStart(s: []const u8, i: usize) bool {
     if (driveAt(s, i)) |after| {
+        // A drive letter ends a word of one letter at most (`-LC:\x`);
+        // `Result:\n` is a word and an escape, not a drive.
+        var k = i;
+        while (k > 0 and std.ascii.isAlphabetic(s[k - 1])) k -= 1;
+        if (i - k > 1) return false;
         // "https://": a scheme glued to its name. A real drive path is
         // never written "C://" glued to a word.
         const first = charAt(s, after).?;
@@ -388,14 +394,15 @@ fn hostAt(s: []const u8, j0: usize) bool {
 }
 
 /// After a single leading `\` at `j`: a well-known top-level folder, or a
-/// first component of two or more letters followed by another component
-/// (so escapes such as `\n\t` or `\x00\x01` stay).
+/// capitalised first component of two or more letters followed by another
+/// component (so escapes such as `\n\t`, `\nDone\n` or `\x00\x01` stay).
 fn rootRelative(s: []const u8, j: usize) bool {
     for (windows_roots) |r| {
         if (j + r.len > s.len or !std.ascii.eqlIgnoreCase(s[j..][0..r.len], r)) continue;
         const e = j + r.len;
         if (e == s.len or isSep(s[e]) or !pathChar(s[e])) return true;
     }
+    if (j >= s.len or !std.ascii.isUpper(s[j])) return false;
     var k = j;
     while (k < s.len and std.ascii.isAlphabetic(s[k])) k += 1;
     if (k - j < 2 or k >= s.len or !isSep(s[k])) return false;
@@ -698,8 +705,11 @@ test "glued drive paths are removed too" {
     try check(c, "-I%USERPROFILE%\\inc", "-I[path]");
     try check(c, "-ID:\\work\\proj\\inc", "-Iproj\\inc");
     try check(acme, "-IC:\\Users\\bob\\code\\acme-api\\inc", "-Iacme-api\\inc");
-    // A glued URL scheme is not a drive.
+    // A glued URL scheme is not a drive, nor is a word's last letter
+    // before an escape.
     try check(c, "see https://example.com/a/b and ftp://h/x", "see https://example.com/a/b and ftp://h/x");
+    try check(c, "print(\"Result:\\n\") and ERROR:\\t", "print(\"Result:\\n\") and ERROR:\\t");
+    try check(c, "-Lc:\\x", "-L[path]");
 }
 
 test "every name of the user, in any case" {
@@ -741,6 +751,8 @@ test "more path spellings" {
     try check(c, "D%253A%255Cwork%255Cproj%255Cx", "proj%255Cx");
     // Escapes and markup stay.
     try check(c, "use \\n\\t here and \\x00\\x01", "use \\n\\t here and \\x00\\x01");
+    try check(c, "print(\"\\nDone\\n\")", "print(\"\\nDone\\n\")");
+    try check(c, "cd \\Projects\\acme", "cd [path]");
     try check(c, "split on \\\\n", "split on \\\\n");
 }
 
