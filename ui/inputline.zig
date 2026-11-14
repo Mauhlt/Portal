@@ -141,6 +141,15 @@ pub const Line = struct {
 
     /// The server refused the last line (`reason`: a LineError name): say
     /// why, and put the line back unless something new was typed.
+    /// Appends text that did not come from the keyboard (a transcript):
+    /// up to its first line break, as typing it would. Returns the
+    /// characters added.
+    pub fn append(l: *Line, s: []const u8) usize {
+        const n = l.field.insertText(s);
+        l.preview();
+        return n;
+    }
+
     pub fn rejected(l: *Line, reason: []const u8) void {
         if (l.field.len == 0 and l.last_len > 0) l.field.set(l.last_buf[0..l.last_len]);
         if (rules.serverRefusal(reason)) |r| {

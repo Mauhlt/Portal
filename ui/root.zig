@@ -17,6 +17,8 @@
 //!              tasks, usage, system): state machines / builders that
 //!              describe frame.Panels
 //!   inputline  the interaction slice's input line (rules: "inputrules")
+//!   dictation  what a dictated transcript in the line becomes (stt
+//!              feedback: learn, discard, or nothing)
 //!   dataview   the Data slice's state (model: "datafeed")
 //!   convo      the conversation items a device keeps (shared/convo.zig)
 //!   convoview  the Conversation view (a frame.ContentView): the items as a
@@ -44,12 +46,14 @@ pub const inputline = @import("inputline.zig");
 pub const dataview = @import("dataview.zig");
 pub const convo = @import("convo.zig");
 pub const convoview = @import("convoview.zig");
+pub const dictation = @import("dictation.zig");
 pub const theme = @import("shared").theme;
 pub const panels = struct {
     pub const desk = @import("panels/desk.zig");
     pub const setup = @import("panels/setup.zig");
     pub const sync = @import("panels/sync.zig");
     pub const status = @import("panels/status.zig");
+    pub const audio = @import("panels/audio.zig");
 };
 
 pub const Shell = shell.Shell;
@@ -71,4 +75,6 @@ test {
     _ = panels.setup;
     _ = panels.desk;
     _ = panels.status;
+    _ = panels.audio;
+    _ = dictation;
 }

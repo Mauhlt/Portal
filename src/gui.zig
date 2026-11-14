@@ -52,6 +52,7 @@ const activity_wire = @import("shared").activity;
 const sysinfo = @import("shared").sysinfo;
 const subtabs_wire = @import("shared").subtabs;
 const convo_wire = @import("shared").convo;
+const deskspeech = @import("deskspeech.zig");
 
 /// Font size of the local terminal, in logical pixels (zoom with Ctrl+= / -).
 pub const font_em: f32 = 15;
@@ -181,6 +182,9 @@ pub const LocalHost = struct {
     sub_rev: u64 = 0,
     sub_convo: ui.convo.Conversation = .{},
     convo_view: ui.convoview.View = undefined,
+    /// Speech input: the 🎤, the Audio panel, the microphone thread and
+    /// stt.Home (deskspeech.zig); null until attachDesk.
+    speech: ?*deskspeech.DeskSpeech = null,
 
     const title_max = title.max_title_bytes;
 
@@ -215,6 +219,30 @@ pub const LocalHost = struct {
     pub fn attachDesk(h: *LocalHost, d: Desk) void {
         h.desk = d;
         h.p.setBackgroundArt(d.saved.background_art orelse true);
+        const s = h.gpa.create(deskspeech.DeskSpeech) catch return;
+        s.* = .{ .gpa = h.gpa, .io = h.io, .data_dir = d.paths.dir, .notify_ctx = h, .notify_fn = notifyThunk, .mic = undefined };
+        s.start(&h.desk.?.saved);
+        h.speech = s;
+        h.shell.dictation = s.hooks();
+        h.shell.headset_mic = .{ .ctx = s, .present = headsetPresent };
+    }
+
+    /// A headset with a microphone is attached (its media button then
+    /// toggles dictation).
+    fn headsetPresent(ctx: ?*anyopaque) bool {
+        const s: *deskspeech.DeskSpeech = @ptrCast(@alignCast(ctx.?));
+        return s.snap.list.anyHeadset();
+    }
+
+    /// Stops the microphone thread and the speech engine (stt.Home
+    /// confirms what is pending and closes).
+    fn stopSpeech(h: *LocalHost) void {
+        const s = h.speech orelse return;
+        h.shell.dictation = null;
+        h.shell.headset_mic = null;
+        s.deinit();
+        h.gpa.destroy(s);
+        h.speech = null;
     }
 
     /// Cells that fit the window now: the PTY's initial size.
@@ -301,10 +329,13 @@ pub const LocalHost = struct {
             // A sub-tab's conversation may animate (scrolling to new
             // items): its real deadline, else the pairing window's.
             const anim: u32 = if (h.sub_shown != null) (h.convo_view.frameTimeout() orelse Presenter.forever) else Presenter.forever;
-            h.p.waitEvents(@min(h.waitMs(), anim));
+            // Speech: a toast ending, the Audio panel's Test (real deadlines).
+            const sp: u32 = if (h.speech) |s| (if (s.deadlineMs()) |ms| @intCast(@min(ms, 3600 * 1000)) else Presenter.forever) else Presenter.forever;
+            h.p.waitEvents(@min(@min(h.waitMs(), anim), sp));
             h.wakeups += 1;
         };
         h.hide();
+        h.stopSpeech();
         h.p.releaseGpu();
         return ended;
     }
@@ -437,6 +468,8 @@ pub const LocalHost = struct {
             h.applySubConvo(sub_msg.written());
             sub_changed = true;
         }
+        // Speech: transcripts into the line, the microphone list, toasts.
+        const speech_changed = if (h.speech) |s| s.poll(&h.shell) else false;
         // New images become Data items (h.grid is ours: no lock needed).
         if (changed) _ = h.shell.data.sync(h.gpa, &h.grid.images);
 
@@ -444,7 +477,7 @@ pub const LocalHost = struct {
         // The session shows something: the splash may end.
         if (changed and h.shown != null) h.p.splashDone();
         h.shell.touch = client.touchkbd.query();
-        if (!force and !changed and !list_changed and !act_changed and !sub_changed and old == null and !h.p.needsRedraw() and h.viewers == h.drawn_viewers) return;
+        if (!force and !changed and !list_changed and !act_changed and !sub_changed and !speech_changed and old == null and !h.p.needsRedraw() and h.viewers == h.drawn_viewers) return;
         h.drawn_viewers = h.viewers;
         h.updateTitle();
 
@@ -483,12 +516,14 @@ pub const LocalHost = struct {
     /// viewers, the remote input policy.
     fn overlay(h: *LocalHost) ui.Overlay {
         const d = h.desk;
-        return h.shell.overlay(.{
+        const sp = h.speech;
+        const audio_panel: ?ui.frame.Panel = if (sp) |s| s.panel.panel(&s.bufs, s.panelView()) else null;
+        var o = h.shell.overlay(.{
             .tabs = h.list.slice(),
             .current = if (h.shown) |t| t.id else null,
             .subs = h.subs.slice(),
             .sub_shown = h.sub_shown,
-            .panel = h.ui.panel(&h.bufs, .{
+            .panel = audio_panel orelse h.ui.panel(&h.bufs, .{
                 .fingerprint = if (d) |x| x.fingerprint else null,
                 .url = h.opts.url,
                 .until = h.until_buf[0..h.until_len],
@@ -506,6 +541,8 @@ pub const LocalHost = struct {
             .sys = if (h.sys_sub and h.sys_gen != 0) &h.sys else null,
             .now = h.nowUnix(),
         });
+        if (sp) |s| o.toast = s.toast();
+        return o;
     }
 
     /// The shown tab's name (desk-assigned, never a path).
@@ -828,19 +865,73 @@ pub const LocalHost = struct {
     /// The desk panels as the shell's modal layer: their actions are
     /// performed here.
     fn panelActive(ctx: *anyopaque) bool {
-        return self(ctx).ui.open();
+        const h = self(ctx);
+        return h.ui.open() or h.audioOpen();
     }
     fn panelKey(ctx: *anyopaque, key: input.Key, mods: input.Mods) void {
         const h = self(ctx);
+        if (h.audioOpen()) return h.audioAct(h.speech.?.panel.key(key, mods));
         h.perform(h.ui.key(key, mods));
     }
     fn panelChar(ctx: *anyopaque, cp: u21, mods: input.Mods) void {
         const h = self(ctx);
+        if (h.audioOpen()) return h.audioAct(h.speech.?.panel.char(cp, mods));
         h.perform(h.ui.char(cp, mods));
     }
     fn panelButton(ctx: *anyopaque, b: u32) void {
         const h = self(ctx);
+        if (h.audioOpen()) return h.audioAct(h.speech.?.panel.button(b));
         h.perform(h.ui.button(b));
+    }
+
+    fn audioOpen(h: *const LocalHost) bool {
+        const s = h.speech orelse return false;
+        return s.panel.open();
+    }
+
+    /// The Audio panel (top bar "Audio", Ctrl+Shift+A).
+    fn openAudio(h: *LocalHost) void {
+        const s = h.speech orelse return;
+        if (h.ui.open()) h.ui.close();
+        s.openPanel();
+    }
+
+    /// An Audio panel action; the microphone choice and the model path
+    /// are saved with the other settings.
+    fn audioAct(h: *LocalHost, a: ui.panels.audio.Action) void {
+        const s = h.speech orelse return;
+        if (a == .paste) {
+            const raw = h.p.window.clipboardText(h.gpa, 4096) orelse return;
+            defer h.gpa.free(raw);
+            s.panel.paste(raw);
+            return;
+        }
+        const saved = s.act(a);
+        const d = &(h.desk orelse return);
+        var st = d.saved;
+        switch (saved) {
+            .none => return,
+            .reload => {
+                // settings.txt again (the desk may have edited it): the
+                // speech limits apply now; the rest keeps its own rules.
+                const fresh = settings.load(h.gpa, h.io, d.paths.dir);
+                s.setLimits(fresh.speech);
+                h.desk.?.saved.speech = fresh.speech;
+                s.panel.setNote(.good, "Speech limits reloaded from settings.txt.", .{});
+                h.frame(true);
+                return;
+            },
+            .mic => |id| if (id) |x| {
+                _ = st.mic.set(x);
+            } else {
+                st.mic = .{};
+            },
+            .model => |p| _ = st.speech_model.set(p),
+        }
+        settings.save(h.gpa, h.io, d.paths.dir, &st) catch |err|
+            return s.panel.setNote(.bad, "Could not save the settings: {t}.", .{err});
+        h.desk.?.saved = st;
+        h.frame(true);
     }
 
     const host_vtable: shell_mod.Host.VTable = .{
@@ -923,6 +1014,7 @@ pub const LocalHost = struct {
                 deskui.id.tb_devices => if (h.desk != null) h.perform(h.ui.openDevices()),
                 deskui.id.tb_export => if (h.desk) |d| h.ui.openExport(d.export_default),
                 deskui.id.tb_settings => h.openSettings(),
+                deskui.id.tb_audio => h.openAudio(),
                 else => {},
             },
             // The window decides the PTY size (of every tab); web viewers adapt.
@@ -944,6 +1036,7 @@ pub const LocalHost = struct {
             'd', 'D' => h.perform(h.ui.openDevices()),
             'e', 'E' => h.ui.openExport(h.desk.?.export_default),
             's', 'S' => h.openSettings(),
+            'a', 'A' => h.openAudio(),
             else => return false,
         }
         return true;

@@ -33,6 +33,8 @@ pub fn Panels(comptime devices: type) type {
             pub const tb_devices: u32 = 11;
             pub const tb_export: u32 = 12;
             pub const tb_settings: u32 = 13;
+            /// The Audio panel (ui/panels/audio.zig; Ctrl+Shift+A).
+            pub const tb_audio: u32 = 14;
 
             pub const ok: u32 = 1;
             pub const cancel: u32 = 2;
@@ -59,6 +61,7 @@ pub fn Panels(comptime devices: type) type {
             .{ .label = "Devices", .id = id.tb_devices },
             .{ .label = "Export certificate\u{2026}", .id = id.tb_export },
             .{ .label = "Settings", .id = id.tb_settings },
+            .{ .label = "Audio", .id = id.tb_audio },
         };
 
         pub const Action = union(enum) {

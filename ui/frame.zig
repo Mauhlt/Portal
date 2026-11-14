@@ -312,6 +312,14 @@ pub const Overlay = struct {
     /// Touch input: finger-sized targets (tabs at least `touch_target`
     /// logical px tall).
     touch: bool = false,
+    /// A short notice over the bottom right of the main slice (a headset
+    /// connected); the glue removes it at its own deadline.
+    toast: ?Toast = null,
+};
+
+pub const Toast = struct {
+    text: []const u8,
+    tone: Tone = .normal,
 };
 
 /// Smallest height (logical px) of a tab's hit area on touch devices.
@@ -695,6 +703,7 @@ pub const Frame = struct {
         if (overlay.data) |d| if (data_h > 0) f.drawData(ui, d, f.regions.data, s);
         for (panes[0..n_panes], 0..) |p, i| f.drawPane(act, p, f.regions.panes[i], s);
         f.drawStatus(ui, overlay.status, H - status_h, W, status_h, s);
+        if (overlay.toast) |t| f.drawToast(ui, t, W, top_h + middle, s);
         if (overlay.panel) |p| {
             // Modal: buttons (and the text field) under the panel stop reacting.
             f.n_hits = 0;
@@ -1242,6 +1251,20 @@ pub const Frame = struct {
             }
         }
         if (st.right.len > 0) _ = f.text(ui, W - pad - textWidth(ui, st.right), ty, st.right, toneColor(.muted), false);
+    }
+
+    /// A boxed line right-aligned just above `bottom` (no hit area).
+    fn drawToast(f: *Frame, ui: Metrics, t: Toast, W: f32, bottom: f32, s: f32) void {
+        const pad = @round(10 * s);
+        const ch: f32 = @floatFromInt(ui.cell_h);
+        const text_s = clipText(ui, t.text, @max(0, W - 4 * pad), false);
+        const w = textWidth(ui, text_s) + 2 * pad;
+        const h = @round(ch * 1.8);
+        const x = @max(0, W - w - pad);
+        const y = @max(0, bottom - h - pad);
+        f.rect(x, y, w, h, theme.ui.bar);
+        f.outline(x, y, w, h, @max(1, @round(s)), toneColor(if (t.tone == .normal) .muted else t.tone));
+        _ = f.text(ui, x + pad, y + @round((h - ch) / 2), text_s, toneColor(t.tone), false);
     }
 
     fn panelButton(f: *Frame, m: Metrics, x: f32, y: f32, h: f32, b: PanelButton, s: f32, paint: bool) f32 {
