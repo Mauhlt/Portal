@@ -1,7 +1,7 @@
 //! The server's view of remote input: the policy, key name -> bytes, the
 //! instruction-line checks and the text-mode guard. Defined once in the
 //! shared module "inputrules" (src/inputrules/keys.zig), which the native
-//! and browser clients use too, so all devices offer exactly what the server
+//! clients use too, so all devices offer exactly what the server
 //! accepts.
 
 const rules = @import("inputrules");

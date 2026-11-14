@@ -1,7 +1,7 @@
 //! Maps local key presses to protocol input frames (docs/protocol.md
 //! section 4) under the server's `hello.input` policy. Translation only:
 //! which keys are allowed in which mode is the shared rule (module
-//! "inputrules", the same tables the server and the browser client use).
+//! "inputrules", the same tables the server uses).
 //! The server filters again; this keeps the client honest and the UI
 //! accurate.
 
@@ -153,7 +153,7 @@ test "answer buttons: the shared list, accepted in every mode with input" {
     try testing.expectEqualStrings("k:enter", answerFrame(.text, "enter", &b).?);
     try testing.expect(answerFrame(.keys, "rm -rf", &b) == null);
     try testing.expect(answerFrame(.text, "backspace", &b) == null);
-    // The UI draws input.answers: the same buttons as the browser.
+    // The UI draws input.answers: the shared answer buttons.
     try testing.expectEqual(rules.answer_buttons.len, input.answers.len);
     for (rules.answer_buttons, input.answers) |r, v| {
         try testing.expectEqualStrings(r.label, v.label);

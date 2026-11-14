@@ -1,8 +1,8 @@
 //! Project tabs on the wire (docs/protocol.md, protocol v2): the session
 //! list in `hello` and `tabs`, session ids, tab colours and the per-tab
-//! program state. One implementation for the server (web.zig), the native
-//! client (client/src/net/client.zig) and the browser client (src/wasm), so
-//! both ends agree on the format and its limits.
+//! program state. One implementation for the server (web.zig) and the
+//! native client (client/src/net/client.zig), so both ends agree on the
+//! format and its limits.
 //!
 //! A session entry is `{"id":"<32 hex>","name":"<name>","color":"#rrggbb",
 //! "state":"<state>"}`:

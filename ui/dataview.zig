@@ -1,7 +1,7 @@
 //! The Data slice's state (docs/layout-design.md): the images the session
 //! pushed, newest first, in a strip under the main slice (frame.DataSlice)
-//! on every device. The model is the browser's
-//! (module "datafeed": bounded history, a badge for what arrived while
+//! on every device. The model is module "datafeed" (bounded history, a
+//! badge for what arrived while
 //! collapsed, the slice's size rule); here the payload is the PNG bytes,
 //! which the view module decodes and scales like the terminal's inline images.
 //!

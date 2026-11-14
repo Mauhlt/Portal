@@ -1,7 +1,7 @@
 //! Local copy of the remote terminal grid, updated from 'G', 'I' and 'P'
 //! frames (docs/protocol.md section 3).
 //!
-//! Decoding is shared/screen.zig, the same decoder the browser uses: it
+//! Decoding is shared/screen.zig, the same decoder the e2e tests use: it
 //! validates a whole frame before anything here touches the grid, so a
 //! malformed frame changes nothing and returns an error. This file only
 //! writes what the decoder yields into the UI's Grid.

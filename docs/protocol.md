@@ -1,7 +1,7 @@
 # Portal client protocol (v2: project tabs)
 
-Used by every client: the browser viewer, and the native Zig + Vulkan clients
-for Windows, Linux and macOS. Transport is HTTP/1.1 + WebSocket (RFC 6455)
+Used by every client: the native Zig + Vulkan clients for Windows, Linux,
+macOS and the iPhone. Transport is HTTP/1.1 + WebSocket (RFC 6455)
 over the WireGuard tunnel, inside TLS 1.3 (HTTPS / WSS on the same port).
 The server certificate is issued by the desktop's private Portal CA; clients
 must trust that CA (Export certificate in the Portal window, or `portalctl
@@ -628,9 +628,8 @@ hooks are installed; its folder-trust prompt comes before any transcript
 and any hook)
 never gets `up` / `down`, and must be answered at the desk. Clients show
 Up/Down only while they would be accepted: in `instruct` mode while the
-shown tab's `state` is `waiting` or (native client) its conversation has
-an open question (the browser: ↑ ↓ after the answer buttons; the native
-client: in its instruct panel's key row, docs/layout-design.md).
+shown tab's `state` is `waiting` or its conversation has an open question
+(in the instruct panel's key row, docs/layout-design.md).
 
 The server maps names to the exact bytes the terminal expects, applies the
 session's input policy, and silently drops anything not allowed (except the
@@ -655,15 +654,13 @@ Shift+Tab is `shift-tab`.
   `s:<id>`. After a reconnect, switch back to the tab the user had chosen
   if it is still open. After `nosession` or `ended`, pick the tab shown if
   it is still open, else the first.
-* Both Portal clients send instruction lines from an input line (the
-  browser's text box, so phone dictation works; the native client's field
-  in its instruct panel) and map answer words to keys before sending
+* Portal clients send instruction lines from an input line (the field in
+  the instruct panel) and map answer words to keys before sending
   ("Yes." → `k:y`, "two" → `k:2`, "OK" → `k:enter`; one shared table and
   `decide` in `src/inputrules/send.zig`). They check lines with the
   server's rules first, so a refusal is shown without a round trip;
   `rejected` still covers anything they missed, and the line comes back.
-  The browser's answer buttons are Yes, No, 1, 2, 3, Esc, Enter (then ↑ ↓
-  in `instruct` mode while the shown tab waits, section 4). The native
+  The native
   remote viewers and the desk's own window (owner's decisions,
   2026-11-12) show only Instruct; its panel has Esc, Enter, ↑ ↓ while
   waiting and the question's number keys while no card shows them

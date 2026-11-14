@@ -1,6 +1,6 @@
 //! Decoder for the server's binary screen frames (docs/protocol.md section
-//! 3), shared by both clients: the native viewer (client/src/gframe.zig)
-//! and the browser (src/wasm/proto.zig). Each client only writes what this
+//! 3), used by the native viewer (client/src/gframe.zig) and the e2e
+//! tests. Each client only writes what this
 //! yields into its own grid; the encoder is src/vt.zig `encodeRows` and
 //! src/vt_gfx.zig.
 //!
@@ -10,8 +10,8 @@
 //!   'P'  placements     `parsePlacements`
 //!
 //! Frames come from the network and are untrusted. Nothing here panics,
-//! overflows or reads out of bounds on any input (a trap in wasm kills the
-//! page). The rules are strict, and the same in every client:
+//! overflows or reads out of bounds on any input (a panic would kill the
+//! client). The rules are strict, and the same in every client:
 //!
 //!   * A malformed frame is rejected whole, before anything is applied: a
 //!     truncation, trailing bytes, a row index outside the grid, a size of

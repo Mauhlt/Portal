@@ -3,12 +3,12 @@
 <p align="center"><img src="docs/brand/portal-hero.jpg" alt="Portal: a neon ring opening onto a split moon and sun, a brain-shaped constellation above and a mountain meadow of neuroscience instruments below" width="480"></p>
 
 Watch a terminal session running on your Windows desktop (typically the
-agent CLI) from a browser or a laptop, and answer its prompts, while you
+agent CLI) from a laptop or an iPhone, and answer its prompts, while you
 are away from home.
 
 ```
-laptop browser ──WireGuard tunnel──▶ desktop 10.8.0.1:8420 ──▶ portal ──ConPTY──▶ the session program
-portal connect   (encrypted, only                              │
+portal connect ──WireGuard tunnel──▶ desktop 10.8.0.1:8420 ──▶ portal ──ConPTY──▶ the session program
+the iPhone app   (encrypted, only                              │
                   your devices)                                └──▶ the Portal window on the desktop
 ```
 
@@ -52,8 +52,8 @@ Input modes (`--input`, or Remote input in the window's Settings):
   (`rejected` `NotWaiting`), because at an idle prompt Up recalls an older
   prompt from history (possibly a `!` shell command or a slash command
   typed at the desk) and Enter would submit it past the line checks.
-  Devices show ↑/↓ only while they would be accepted (the browser's
-  button row; the native viewers' instruct panel). A program
+  Devices show ↑/↓ only while they would be accepted (in the
+  instruct panel). A program
   that never reports OSC 7501 and asks nothing in its transcript (no
   question open) never gets them; that includes the agent if it does not
   detect OSC 7501 support in Portal's terminal (it does not under ConPTY)
@@ -74,7 +74,7 @@ Input modes (`--input`, or Remote input in the window's Settings):
   for the session program, slash commands and Shift+Tab change modes,
   Ctrl+C exits. A `!` typed by a device at the start of a line is dropped
   (best effort, because Portal can't see the program's input box). Anyone
-  holding a logged-in browser session could start new work. This
+  holding a paired device's session could start new work. This
   contradicts "no new projects from the laptop", so it is opt-in and
   Portal warns loudly when you use it.
 
@@ -320,7 +320,7 @@ without a restart (the agent watches its settings).
 
 **Inline images.** `portal-show picture.png [--cols N]`, run inside the
 session (by you, or by the session program through its shell tool), shows a
-PNG in the window, in `portal connect`, and for browser viewers. Portal puts
+PNG in the window, in `portal connect` and in the iPhone app. Portal puts
 its own folder first on the session's PATH, so `portal-show` is always
 found there (`portalctl show` does the same). Images scroll with the text
 and disappear when their cells are erased or the screen is cleared.
@@ -330,9 +330,7 @@ only; see `src/vt_gfx.zig`). Limits: 6 MiB per PNG, 8192 px per side and
 32 Mpx, 64 images and 64 MiB per session. Images only ever come from a
 program in the session; viewers can't request files. Every image is checked
 with the owner's `Image.check` before it is stored, sent or decoded (see
-`docs/image-decoder-findings.md`); the browser decodes images up to
-1024 px per side within a 96 MiB budget and draws a labelled box for
-anything it can't decode.
+`docs/image-decoder-findings.md`).
 
 ### 4. Pair each device once (at the desk)
 
@@ -343,11 +341,6 @@ shows the Portal CA's SHA-256 fingerprint and whether the certificate
 download is up. Within 2 minutes, on that device: turn the WireGuard tunnel
 **on**, then
 
-* **browser**: if this device does not trust the Portal CA yet, first open
-  `http://10.8.0.1:8421/` (listen port + 1; served only while a pairing
-  window is open), install the certificate (see below) and check that its
-  fingerprint matches the one the desk shows. Then open
-  `https://10.8.0.1:8420/` and tap **Pair this device**;
 * **Portal on a laptop** (`portal connect`): enter `10.8.0.1:8420` and the
   certificate (the exported `portal-ca.pem`, or the SHA-256 the desk shows,
   to download it now), then click **Pair**.
@@ -362,7 +355,7 @@ Approve only if the address and code match your device (Deny has the
 focus; `y` approves, `n` denies); a denied request keeps the window open for
 the right one. The device then signs in by itself. Pair through the
 WireGuard address even at home, because that's the address the device will
-use when away (browsers keep credentials per address). If your router can't
+use when away (devices keep credentials per address). If your router can't
 reach its own public IP from inside the house, put the phone on cellular for
 those 30 seconds.
 
@@ -371,8 +364,8 @@ for scripts. If either reports that the certificate download could not be
 opened, another program may be holding that port: don't install a
 certificate from it; use Export certificate instead.
 
-From then on, opening `https://10.8.0.1:8420/` from anywhere with the tunnel on
-just works. **Devices** (or `portalctl devices`) lists paired devices;
+From then on, the device connects from anywhere with the tunnel on.
+**Devices** (or `portalctl devices`) lists paired devices;
 Unpair (or `portalctl unpair <name>`) revokes one.
 
 ### HTTPS certificates
@@ -451,67 +444,21 @@ portalctl sync subscriptions
 * Devices paired before this existed have no pinned release key: pair them
   again to turn sync on.
 
-## The browser viewer (Zig → WebAssembly)
+## Answer words
 
-The page a browser (including iPhone Safari) shows is written in Zig and
-compiled to `wasm32-freestanding` (`src/wasm/`): protocol decoding, layout
-and fit-to-width, a TrueType parser and antialiasing rasteriser, drawing into
-an RGBA framebuffer, key mapping, reconnect logic, the page layout and
-what the input box sends. It embeds DejaVu Sans Mono (`src/web/fonts/`, Bitstream Vera
-licence), because a phone page cannot use system fonts. `zig build` compiles
-it and embeds the `.wasm` in `portal.exe`, served at `/static/app.wasm`.
+Every device sends from the same instruction line (`portal connect`, the
+iPhone app and the desk's own window; see docs/layout-design.md). If the
+text is an *answer word*, Enter presses that key instead: "yes", "yeah",
+"yep", "y" → `y`; "no", "nope", "n" → `n`; "zero"…"nine" or "0"…"9" (also
+"option two", "number 3") → that digit; "escape", "esc", "cancel" → Esc;
+"enter", "ok", "okay" → Enter. Case, full-width forms and the punctuation
+dictation adds ("Yes.", "Two!") are ignored. Anything else is sent as an
+instruction line; if it would be refused the reason shows under the line
+and the text stays. In `keys` mode the line takes answer words only. The
+rules are `src/inputrules/send.zig`.
 
-Browsers can only start WebAssembly from JavaScript, so `src/web/app.js` is a
-small bridge with no application logic: it instantiates the module, forwards
-events to it and wraps a handful of browser APIs (WebSocket, putImageData,
-timers). The CSP allows `'wasm-unsafe-eval'` for exactly this; see `web.zig`.
-
-The page is made of **slices**, the same on every platform:
-
-* **Terminal**: the live terminal (fit to width, A−/A+ zoom, drag or
-  scroll to pan) under the project tabs (the desktop's open projects, in
-  their colours, amber while one waits for an answer; tap one to switch,
-  left of the zoom buttons) and a status line: the project shown, viewer
-  state, input mode, and the session state (working / waiting for you /
-  done; a placeholder until the program reports it, see
-  `docs/protocol.md`).
-* **Interaction**: the input box and buttons, described below.
-* **Data**: what the session pushed, newest first. Today that is every
-  inline image it showed (a card with its size, and a preview where the
-  pixels were decoded);
-  tables and charts can be added as further kinds in `src/wasm/data.zig`.
-
-On a phone (narrow) the interaction slice is pinned at the bottom and the
-area above switches between Terminal and Data with a segmented control;
-the Data tab shows a dot when something new arrives. From 900 px wide
-(laptop, desktop, iPad landscape) Data is a right-hand column; drag the
-divider to resize it. The interaction slice:
-
-* **an input box**, a native `<textarea>`, so the iPhone keyboard's
-   dictation mic fills it, and so does Win+H on Windows. Enter sends,
-   Shift+Enter adds a line (sent as a space: an instruction is one line).
-   If the text is an *answer word*, Send presses that key instead: "yes",
-   "yeah", "yep", "y" → `y`; "no", "nope", "n" → `n`; "zero"…"nine" or
-   "0"…"9" (also "option two", "number 3") → that digit; "escape", "esc",
-   "cancel" → Esc; "enter", "ok", "okay" → Enter. Case, full-width forms
-   and the punctuation dictation adds ("Yes.", "Two!") are ignored.
-   Anything else is sent as an instruction line; if it would be refused
-   the reason shows under the box and the text stays. In `keys` mode the
-   box takes answer words only;
-* **buttons**: Yes, No, 1, 2, 3, Esc, Enter, Send; in `instruct` mode
-  also ↑ and ↓ while the shown tab's program waits for an answer. (The
-  native remote viewers, `portal connect` and the iPhone app, and the
-  desk's own window show only an Instruct button; its panel holds the
-  line and a compact key row, see docs/layout-design.md.)
-
-On the iPhone, voice is Apple's keyboard dictation into the input box;
-Portal never records or sends audio from the phone.
-
-The slices follow the visible viewport, so when the iPhone keyboard opens,
-the box and buttons sit right above it (the header is hidden if space is
-short) and the safe areas (notch, home indicator) are respected. The
-layout math is `src/wasm/slices.zig`, the input decisions
-`src/wasm/inputbox.zig`.
+On the iPhone, voice is Apple's keyboard dictation into the line; Portal
+never records or sends audio from the phone.
 
 ## Upgrading Zig safely
 
