@@ -139,7 +139,8 @@ pub const Settings = struct {
             } else if (std.mem.eql(u8, key, "speech_learning")) {
                 if (std.ascii.eqlIgnoreCase(val, "on")) s.speech_learning = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.speech_learning = false;
             } else if (std.mem.startsWith(u8, key, "speech.")) {
-                if (!s.speech.set(key["speech.".len..], val) and s.n_speech_extra < s.speech_extra.len) {
+                const name = key["speech.".len..];
+                if (!s.speech.set(name, val) and !removedSpeechKey(name) and s.n_speech_extra < s.speech_extra.len) {
                     if (s.speech_extra[s.n_speech_extra].set(line)) s.n_speech_extra += 1;
                 }
             } else if (std.mem.eql(u8, key, "color")) {
@@ -178,6 +179,20 @@ pub const Settings = struct {
         }
     }
 };
+
+/// Speech limits that existed and were removed (2026-11-14 trim): ignored
+/// on load and not written back, so the next save drops them.
+const removed_speech_keys = [_][]const u8{
+    "transcribe_per_hour",       "feedback_per_hour",         "global_feedback_per_hour",
+    "global_kept_clips_per_day", "global_bundles_per_day",    "global_bundle_mib_per_day",
+    "slot_max_hold_s",           "slot_idle_s",               "slot_cooldown_s",
+    "malformed_strikes",         "malformed_window_min",      "bundles_per_day",
+};
+
+fn removedSpeechKey(name: []const u8) bool {
+    for (removed_speech_keys) |k| if (std.mem.eql(u8, k, name)) return true;
+    return false;
+}
 
 /// Reads `<dir>\settings.txt`; a missing or unreadable file is empty settings.
 pub fn load(gpa: std.mem.Allocator, io: Io, dir: []const u8) Settings {
@@ -308,15 +323,27 @@ test "settings: speech model and microphone" {
 }
 
 test "settings: speech_learning; unknown speech.* lines survive a save" {
-    const s = Settings.parse("speech_learning = off\r\nspeech.from_the_future = 7\r\nspeech.transcribe_per_hour = 9\r\n");
+    const s = Settings.parse("speech_learning = off\r\nspeech.from_the_future = 7\r\nspeech.transcribe_per_day = 9\r\n");
     try testing.expect(!s.speech_learning.?);
     var buf: [2048]u8 = undefined;
     var out: Io.Writer = .fixed(&buf);
     try s.format(&out);
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech.from_the_future = 7") != null);
-    try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech.transcribe_per_hour = 9") != null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech.transcribe_per_day = 9") != null);
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech_learning = off") != null);
     try testing.expect(Settings.parse("").speech_learning == null);
+}
+
+test "settings: removed speech limits are ignored on load and dropped on save" {
+    const s = Settings.parse("speech.slot_idle_s = 90\r\nspeech.global_feedback_per_hour = 5\r\nspeech.transcribe_per_hour = 9\r\nspeech.transcribe_per_day = 70\r\n");
+    try testing.expectEqual(@as(u32, 70), s.speech.transcribe_per_day);
+    try testing.expectEqual(@as(usize, 0), s.n_speech_extra);
+    var buf: [1024]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    try s.format(&out);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "slot_idle") == null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "per_hour") == null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech.transcribe_per_day = 70") != null);
 }
 
 test "settings: instruct_mode" {
@@ -332,11 +359,11 @@ test "settings: instruct_mode" {
 }
 
 test "settings: speech limits load clamped and round-trip" {
-    const s = Settings.parse("speech.transcribe_per_hour = 50\r\nspeech.clip_max_s = 9999\r\nspeech.feedback_burst = 0\r\nspeech.bogus = 3\r\n");
-    try testing.expectEqual(@as(u32, 50), s.speech.transcribe_per_hour);
+    const s = Settings.parse("speech.transcribe_per_day = 50\r\nspeech.clip_max_s = 9999\r\nspeech.feedback_burst = 0\r\nspeech.bogus = 3\r\n");
+    try testing.expectEqual(@as(u32, 50), s.speech.transcribe_per_day);
     try testing.expectEqual(@as(u32, 120), s.speech.clip_max_s);
     try testing.expectEqual(@as(u32, 1), s.speech.feedback_burst);
-    try testing.expectEqual(@as(u32, 300), Settings.parse("").speech.transcribe_per_hour);
+    try testing.expectEqual(@as(u32, 2000), Settings.parse("").speech.transcribe_per_day);
     var buf: [2048]u8 = undefined;
     var out: Io.Writer = .fixed(&buf);
     try s.format(&out);

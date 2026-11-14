@@ -100,7 +100,7 @@ the active input where the platform reports it.
   `speech_learning = on|off`, applied live. Every device (laptop, Surface,
   iPhone) gets the same switch, default on, with the device speech work.
 * Future device routes: call `speech.gate.Gate` (begin / feedback /
-  bundle / malformed / end, `retain` with the device store's names when it
+  bundle / end, `retain` with the device store's names when it
   changes) and `home.Engine.deviceFeedback`, whose entries can take at
   most half the feedback queue, so they never evict the desk's.
 * `zig build mic-check -- <seconds>` records from the real microphone and
@@ -113,34 +113,30 @@ the active input where the platform reports it.
 
 Desk-only (no device can change them), clamped on load, applied live by
 the Audio panel's "Reload limits". Every refusal names the limit and when
-it frees up. Rolling windows are fixed slots (60 x 1 min, 24 x 1 h).
+it frees up. Daily windows are 24 hourly slots. Trimmed 2026-11-14 (one
+person, two desk-approved devices inside WireGuard): the hourly windows,
+the desktop-wide totals, the speech-slot lease and the malformed-data
+strikes are gone; their old `speech.*` lines are ignored on load and
+dropped on the next save.
 
 | name | default | range | meaning |
 |---|---|---|---|
 | clip_max_s | 120 | 1-120 | longest utterance (buffer allocated once for 120 s) |
 | clip_min_ms | 250 | 50-5000 | shorter clips: no stt call |
-| transcribe_burst / _refill_ms | 10 / 6000 | 1-100 / 100-3600000 | per-minute bucket (10/min) |
-| transcribe_per_hour / _per_day | 300 / 2000 | 1-100000 / 1-1000000 | rolling caps |
+| transcribe_burst / _refill_ms | 10 / 6000 | 1-100 / 100-3600000 | per-minute bucket (10/min), per source |
+| transcribe_per_day | 2000 | 1-1000000 | rolling day, per source |
 | job_timeout_s | 60 | 5-600 | a transcription not back is dropped |
 | feedback_burst / _refill_ms | 5 / 6000 | 1-100 / 100-3600000 | corrections bucket, per source |
-| feedback_per_hour / _per_day | 120 / 1000 | 1-100000 / 1-1000000 | rolling caps, per source |
+| feedback_per_day | 1000 | 1-1000000 | rolling day, per source |
 | text_max | 8192 | 256-8192 | transcript / correction bytes |
 | feedback_queue | 16 | 1-64 | queued feedback calls (oldest dropped) |
-| kept_clips_per_day | 500 | 1-100000 | clips kept as training samples per source |
-| bundles_per_day | 50 | 1-10000 | training bundles per device |
-| bundle_mib_per_day | 100 | 1-10240 | bundle MiB per device |
+| kept_clips_per_day | 500 | 1-100000 | clips kept as training samples, per source |
+| bundle_mib_per_day | 100 | 1-10240 | bundle MiB per device, rolling day |
 | bundle_max_kib | 5120 | 64-5120 | one bundle |
-| concurrent_devices | 2 | 1-16 | devices doing speech traffic at once (desk mic not counted) |
-| global_feedback_per_hour | 300 | 1-100000 | all devices together |
-| global_kept_clips_per_day | 1000 | 1-1000000 | all devices together |
-| global_bundles_per_day | 100 | 1-100000 | all devices together |
-| global_bundle_mib_per_day | 250 | 1-102400 | all devices together |
+| concurrent_devices | 2 | 1-16 | devices with speech requests in flight at once (desk mic not counted) |
+| device_inflight | 2 | 1-16 | requests one device may have in flight |
 | payload_budget_mib | 16 | 1-64 | device payloads in flight, summed |
-| read_timeout_s | 30 | 1-300 | body read deadline (slow-loris) |
-| malformed_strikes / _window_min | 3 / 10 | 1-100 / 1-60 | then the device's speech traffic closes until it reconnects |
-| slot_max_hold_s | 300 | 10-3600 | longest hold on a speech slot |
-| slot_idle_s | 60 | 5-600 | idle release |
-| slot_cooldown_s | 30 | 1-600 | re-acquire wait after expiry while others wait |
+| read_timeout_s | 30 | 1-300 | body read deadline |
 
 Fixed: one transcription in flight (others Busy), one bundle import and
 one update export queued at most, all on the engine's one thread (the
