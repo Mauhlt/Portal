@@ -141,7 +141,8 @@ keeps the terminal. In the Conversation view the window is minimal:
 │                       ┌──────────────────┐ │  the owner's prompt: bubble
 │                       │ fix the tests    │ │
 │                       └──────────────────┘ │
-│ Assistant text, word-wrapped, full width   │
+│ Assistant text, word-wrapped, full width;  │  `inline code` in the code
+│ inline code in the code colour             │  colour, backticks hidden
 │ ┌────────────────────────────────────────┐ │  ``` code: monospaced, panel
 │ │ zig build test                         │ │  colour, clipped not wrapped
 │ └────────────────────────────────────────┘ │
@@ -328,6 +329,19 @@ The desk itself keeps a fixed font and sizes the PTY to its terminal slice.
   line; a modal panel layer over all of them; a single focus owner per host.
   The feed: `client/src/dataview.zig`, used by `portal connect` and the
   desk window (src/gui.zig).
+* A modal panel taller than the window keeps its buttons at the bottom of
+  the box and scrolls the rest (the wheel, a drag on a touch screen, a slim
+  bar at its right edge); a newly focused field or chosen row is scrolled
+  into view (`frame.panelScroll`).
+* Text that does not fit is shortened with an ellipsis (`frame.fitText`):
+  labels at their end, folder paths in a panel row in the middle so their
+  end stays (`PanelRow.detail`). Short of room, tabs give up the longest
+  labels first but keep three characters each; when even that does not
+  fit, the bar shows the tabs around the active one with a "‹" / "›" that
+  switches to the next tab out of view (`frame.fitTabs`). The status line
+  never overlaps: the label, then the tab's tasks, then the right-hand
+  text, then the extra get room, cut or dropped in that order
+  (`frame.packStatus`).
 * Data frames reuse the image path ('I'/'P'), plus later typed data frames
   with explicit size limits.
 * Interaction is one manner on every device: the input policy, the key
