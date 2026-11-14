@@ -259,6 +259,14 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     const cwd = std.process.currentPathAlloc(io, gpa) catch return 2;
     openInputLog(gpa, cwd);
     if (session_id) |s| say(if (validUuid(s)) "FAKE-SESSION-ID\r\n" else "FAKE-BAD-SESSION-ID\r\n") else say("FAKE-NO-SESSION-ID\r\n");
+    // The foryou group: the tab's hook key and guard, for its synthetic
+    // hooks (test only).
+    if (std.mem.indexOf(u8, std.fs.path.basename(cwd), "foryou") != null) {
+        for ([_][2][]const u8{ .{ "e2e-tabkey", env.get("PORTAL_TAB") orelse "" }, .{ "e2e-guard", env.get("PORTAL_GUARD") orelse "none" } }) |kv| {
+            const p = std.fs.path.join(gpa, &.{ cwd, kv[0] }) catch continue;
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = kv[1] }) catch {};
+        }
+    }
     const quiet = std.mem.indexOf(u8, std.fs.path.basename(cwd), "quiet") != null;
     if (quiet) {
         say("FAKE-QUIET\r\n");
@@ -307,6 +315,10 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.
     };
     var ts_buf: [32]u8 = undefined;
     t.ts = isoTime(std.Io.Timestamp.now(io, .real).toSeconds(), &ts_buf);
+    if (std.mem.indexOf(u8, std.fs.path.basename(cwd), "foryou") != null) {
+        forYouRun(&t);
+        return 0;
+    }
     if (std.mem.indexOf(u8, std.fs.path.basename(cwd), "subagent") != null) {
         subagentRun(gpa, io, &t, dir, stem, env.get("PORTAL_TAB") orelse "");
         return 0;
@@ -423,6 +435,44 @@ fn subagentRun(gpa: std.mem.Allocator, io: std.Io, t: *Transcript, dir: []const 
     t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"MAIN-REPLY the subagent finished.\"}]},\"cwd\":\"{c}\"}");
     say("FAKE-SUB-DONE\r\n");
     drain("END");
+}
+
+/// A folder whose name contains "foryou" (the foryou group,
+/// tests/e2e/foryou_tests.zig): one turn whose reply suggests commands
+/// (one in a shell block holding a home path, which must never become a
+/// card), names a project and ends with a yes/no question; then idle. Every
+/// line typed into it afterwards is shown as FAKE-LINE: <line> (bracketed
+/// paste marks dropped), every lone key as FAKE-KEY.
+fn forYouRun(t: *Transcript) void {
+    t.rec("{\"parentUuid\":null,\"isSidechain\":false,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"fix the build in {c}\"},\"cwd\":\"{c}\",\"sessionId\":\"x\",\"origin\":{\"kind\":\"human\"}}");
+    t.rec("{\"type\":\"assistant\",\"message\":{\"id\":\"f1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"I fixed {c}\\\\src\\\\build.zig for {u}. Next run `zig build e2e` to check it. Don't run `zig build release` yet.\\n\\nTo see the notes:\\n\\n```sh\\ntype C:\\\\Users\\\\{u}\\\\notes.txt\\n```\\n\\nShall I commit this?\"}]},\"cwd\":\"{c}\"}");
+    say("\x1b]7501;state=idle\x07FAKE-TURN-DONE\r\n");
+    var line: [2048]u8 = undefined;
+    var n: usize = 0;
+    var buf: [512]u8 = undefined;
+    while (chunk(&buf)) |got| {
+        if (n == 0 and (std.mem.eql(u8, got, "1") or std.mem.eql(u8, got, "\x1b"))) {
+            say(if (got[0] == '1') "FAKE-KEY-1\r\n" else "FAKE-KEY-ESC\r\n");
+            continue;
+        }
+        for (got) |c| {
+            if (c == '\r') {
+                var s: []const u8 = line[0..n];
+                for ([_][]const u8{ "\x1b[200~", "\x1b[201~" }) |m| if (std.mem.indexOf(u8, s, m)) |i| {
+                    std.mem.copyForwards(u8, line[i .. n - m.len], line[i + m.len .. n]);
+                    n -= m.len;
+                    s = line[0..n];
+                };
+                say("FAKE-LINE: ");
+                say(s);
+                say("\r\n");
+                n = 0;
+            } else if (n < line.len) {
+                line[n] = c;
+                n += 1;
+            }
+        }
+    }
 }
 
 /// Replaces `t.path` with one record (`fmt` as in Transcript.rec), the way
