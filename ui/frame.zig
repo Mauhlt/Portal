@@ -132,6 +132,10 @@ pub const PanelRow = struct {
     tone: Tone = .normal,
     selected: bool = false,
     button: ?PanelButton = null,
+    /// A second button, left of `button` (a project's Stop beside Open).
+    button2: ?PanelButton = null,
+    /// A coloured dot before the text (a project's colour).
+    dot: ?Rgb = null,
 };
 
 /// A QR code to show in a panel: `size` x `size` modules, row-major, 1 =
@@ -1393,13 +1397,21 @@ pub const Frame = struct {
             for (p.rows) |r| {
                 if (paint and r.selected) f.rect(x - @round(4 * s), y, w + @round(8 * s), rh, theme.ui.selected_row);
                 var tw = w;
-                if (r.button) |b| {
-                    const bh = @round(rh * 0.8);
+                const bh = @round(rh * 0.8);
+                for ([_]?PanelButton{ r.button, r.button2 }) |ob| if (ob) |b| {
                     const bw = f.panelButton(ui, 0, 0, bh, b, s, false);
-                    _ = f.panelButton(ui, x + w - bw, y + @round((rh - bh) / 2), bh, b, s, paint);
-                    tw = w - bw - @round(8 * s);
+                    tw -= bw;
+                    _ = f.panelButton(ui, x + tw, y + @round((rh - bh) / 2), bh, b, s, paint);
+                    tw -= @round(8 * s);
+                };
+                var tx = x;
+                if (r.dot) |c| {
+                    const cw: f32 = @floatFromInt(ui.cell_w);
+                    if (paint) _ = f.text(ui, tx, y + @round((rh - lh) / 2), "\u{25CF}", c, true);
+                    tx += 2 * cw;
+                    tw = @max(0, tw - 2 * cw);
                 }
-                if (paint) _ = f.text(ui, x, y + @round((rh - lh) / 2), clipText(ui, r.text, tw, false), toneColor(r.tone), false);
+                if (paint) _ = f.text(ui, tx, y + @round((rh - lh) / 2), clipText(ui, r.text, tw, false), toneColor(r.tone), false);
                 y += rh;
             }
         }

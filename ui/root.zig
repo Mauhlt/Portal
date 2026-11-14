@@ -21,6 +21,8 @@
 //!              feedback: learn, discard, or nothing)
 //!   dataview   the Data slice's state (model: "datafeed")
 //!   convo      the conversation items a device keeps (shared/convo.zig)
+//!   projects_sheet  a device's Projects sheet (start / open / stop the
+//!              projects the desk allowed)
 //!   convoview  the Conversation view (a frame.ContentView): the items as a
 //!              scrollable list, question cards, Yes/No swipe cards
 //!   grid       the terminal snapshot model the frame draws
@@ -46,6 +48,7 @@ pub const inputline = @import("inputline.zig");
 pub const dataview = @import("dataview.zig");
 pub const convo = @import("convo.zig");
 pub const convoview = @import("convoview.zig");
+pub const projects_sheet = @import("projects_sheet.zig");
 pub const dictation = @import("dictation.zig");
 pub const theme = @import("shared").theme;
 pub const panels = struct {
@@ -72,6 +75,7 @@ test {
     _ = dataview;
     _ = convo;
     _ = convoview;
+    _ = projects_sheet;
     _ = panels.setup;
     _ = panels.desk;
     _ = panels.status;
