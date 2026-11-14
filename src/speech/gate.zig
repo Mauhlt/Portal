@@ -177,6 +177,7 @@ pub const Gate = struct {
 
     pub fn holdsSlot(g: *const Gate, device: []const u8) bool {
         for (0..g.per_device.n) |k| {
+            if (g.per_device.lens[k] == 0) continue; // a freed entry
             if (std.mem.eql(u8, g.per_device.names[k][0..g.per_device.lens[k]], device)) return g.held_since[k] != null;
         }
         return false;
@@ -423,6 +424,19 @@ test "permanent refusals carry no retry time" {
     var z: Gate = .{};
     z.setLimits(.{ .global_bundle_mib_per_day = 1 });
     try testing.expectEqual(limits.Limit.global_bytes_per_day, z.bundle("a", 2 * 1024 * 1024, 0, 0).exceeds);
+}
+
+test "holdsSlot skips freed entries" {
+    var g: Gate = .{};
+    _ = g.begin("old", 1, 0).ok;
+    g.retain(&.{}); // in flight: kept
+    try testing.expect(g.holdsSlot("old"));
+    var h: Gate = .{};
+    const t = h.begin("old", 1, 0).ok;
+    h.end(t, 0);
+    h.retain(&.{});
+    try testing.expect(!h.holdsSlot("old"));
+    try testing.expect(!h.holdsSlot(""));
 }
 
 test "retain: unpaired devices' entries are reused, totals stay" {

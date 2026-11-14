@@ -100,7 +100,7 @@ pub const Config = struct {
 };
 
 pub const SubmitError = error{ TooShort, TooLong, Busy, RateLimited, SpeechUnavailable };
-pub const SyncError = error{ Busy, TooLarge, SpeechUnavailable, OutOfMemory };
+pub const SyncError = error{ Busy, TooLarge, SpeechUnavailable, LearningOff, OutOfMemory };
 pub const FeedbackError = error{ RateLimited, UnknownId, TextTooLong, OutOfMemory };
 
 const Clip = struct { purpose: Purpose, pcm: []i16, seq: u64 };
@@ -362,6 +362,18 @@ pub const Engine = struct {
         _ = sys.SetEvent(e.job_ev);
     }
 
+    /// Portal's own discard of a transcript (it was cut on its way into
+    /// the line): costs no feedback token, so the user is never told of a
+    /// limit for something they didn't do. The id must be waiting.
+    pub fn discard(e: *Engine, id: u64) FeedbackError!void {
+        e.lock.lock();
+        defer e.lock.unlock();
+        if (!e.takePendingId(id)) return error.UnknownId;
+        const t = try e.gpa.dupe(u8, "");
+        e.pushFeedback(.{ .id = id, .text = t, .ok = false, .source = .portal });
+        _ = sys.SetEvent(e.job_ev);
+    }
+
     /// A paired device's correction (the future device routes call it
     /// after gate.Gate allowed it: rate limits, session, permission). The
     /// id must be one this engine handed out; its entries can't push the
@@ -401,6 +413,13 @@ pub const Engine = struct {
         // Devices get at most half the queue (at least one entry): their
         // oldest goes first.
         const device_cap = @max(1, cap / 2);
+        // A device entry never pushes out the desk's or Portal's: with the
+        // queue full of those, the incoming device entry is the one dropped.
+        if (f.source == .device and e.feedbacks.items.len >= cap and devices == 0) {
+            e.gpa.free(f.text);
+            e.dropped += 1;
+            return;
+        }
         const evict_device = (f.source == .device and devices >= device_cap) or
             (e.feedbacks.items.len >= cap and devices > 0);
         if (evict_device) {
@@ -428,6 +447,9 @@ pub const Engine = struct {
         defer e.lock.unlock();
         if (bytes.len > @as(usize, e.cfg.bundle_max_kib) * 1024 or device.len > limits.max_device_name) return error.TooLarge;
         if (e.status.state == .failed) return error.SpeechUnavailable;
+        // "Learn from my voice" off: no training data comes in either
+        // (stt's import doesn't look at the profile's learning flag).
+        if (!e.learning) return error.LearningOff;
         if (e.import_job != null) return error.Busy;
         var j: @TypeOf(e.import_job.?) = .{ .bytes = bytes, .device = undefined, .device_len = device.len };
         @memcpy(j.device[0..device.len], device);
@@ -566,7 +588,8 @@ pub const Engine = struct {
         }
     }
 
-    fn drain(e: *Engine, home: *stt.Home) void {
+    /// `home` is the *stt.Home (tests pass a fake with the same methods).
+    fn drain(e: *Engine, home: anytype) void {
         while (true) {
             e.lock.lock();
             var fb: ?Feedback = null;
@@ -590,10 +613,9 @@ pub const Engine = struct {
                 e.export_job = null;
             }
             e.lock.unlock();
-            if (learn) |on| {
-                home.setLearning(on) catch {};
-                continue;
-            }
+            // A learning change first, then whatever was taken with it in
+            // this pass (never dropped).
+            if (learn) |on| home.setLearning(on) catch {};
             if (imp) |j| {
                 defer e.gpa.free(j.bytes);
                 const ok = if (home.importBundle(e.gpa, j.bytes)) |_| true else |_| false;
@@ -667,7 +689,7 @@ pub const Engine = struct {
         e.notify();
     }
 
-    fn transcribeOne(e: *Engine, home: *stt.Home, purpose: Purpose, pcm: []const i16) Result {
+    fn transcribeOne(e: *Engine, home: anytype, purpose: Purpose, pcm: []const i16) Result {
         const failed = struct {
             fn f(gpa: std.mem.Allocator, p: Purpose, comptime fmt: []const u8, args: anytype) Result {
                 const t: []u8 = std.fmt.allocPrint(gpa, fmt, args) catch &.{};
@@ -832,6 +854,77 @@ test "create: no leak when the allocator fails part-way" {
             e.destroy();
         } else |_| {}
     }
+}
+
+/// stt.Home's methods drain uses, recorded (no GPU).
+const FakeHome = struct {
+    learning: ?bool = null,
+    transcribed: usize = 0,
+    feedbacks: usize = 0,
+    imports: usize = 0,
+    fn setLearning(h: *FakeHome, on: bool) !void {
+        h.learning = on;
+    }
+    fn transcribe(h: *FakeHome, gpa: std.mem.Allocator, _: []const u8, _: []const u8) !stt.home.Result {
+        h.transcribed += 1;
+        return .{ .id = 7, .text = try gpa.dupe(u8, "hello") };
+    }
+    fn feedback(h: *FakeHome, _: u64, _: []const u8, _: bool) !void {
+        h.feedbacks += 1;
+    }
+    fn importBundle(h: *FakeHome, _: std.mem.Allocator, _: []const u8) !void {
+        h.imports += 1;
+    }
+    fn exportUpdate(_: *FakeHome, _: std.mem.Allocator, _: u32) !?[]u8 {
+        return null;
+    }
+};
+
+test "drain: a learning change and a queued clip in one pass are both handled; not Busy after" {
+    const e = try bare();
+    defer e.destroy();
+    var h: FakeHome = .{};
+    try e.transcribe(.dictation, try testClip(limits.min_samples));
+    e.setLearning(false);
+    e.drain(&h);
+    try testing.expectEqual(@as(?bool, false), h.learning);
+    try testing.expectEqual(@as(usize, 1), h.transcribed);
+    try testing.expectEqual(@as(u32, 0), e.getStatus().busy);
+    try testing.expect(e.jobDeadline() == null);
+    const r = e.takeResult().?;
+    defer testing.allocator.free(r.text);
+    // Learning off: transcribed, discarded at once (Portal's discard ran too).
+    try testing.expectEqual(@as(u64, 0), r.id);
+    try testing.expect(!r.not_kept);
+    try testing.expectEqual(@as(usize, 1), h.feedbacks);
+    // A new clip is accepted: nothing stuck.
+    try e.transcribe(.dictation, try testClip(limits.min_samples));
+    // A bundle import with learning off is refused.
+    try testing.expectError(error.LearningOff, e.importBundle("laptop", try testing.allocator.dupe(u8, "b")));
+}
+
+test "device feedback into a queue full of the desk's: the device entry is dropped" {
+    const e = try bare();
+    defer e.destroy();
+    e.setLimits(.{ .feedback_queue = 2 });
+    for (1..10) |i| e.addPendingId(i);
+    e.lock.lock();
+    e.pushFeedback(.{ .id = 1, .text = try testing.allocator.dupe(u8, "a"), .ok = true, .source = .desk });
+    e.pushFeedback(.{ .id = 2, .text = try testing.allocator.dupe(u8, "b"), .ok = false, .source = .portal });
+    e.lock.unlock();
+    try e.deviceFeedback(3, "device", true);
+    try testing.expectEqual(@as(usize, 2), e.feedbacks.items.len);
+    for (e.feedbacks.items) |f| try testing.expect(f.source != .device);
+}
+
+test "Portal's own discard costs no feedback token" {
+    const e = try bare();
+    defer e.destroy();
+    for (1..20) |i| e.addPendingId(i);
+    for (1..limits.feedback_burst + 1) |i| try e.discard(i);
+    // The desk's burst is untouched.
+    for (0..limits.feedback_burst) |k| try e.feedback(10 + k, "fix", true);
+    try testing.expectError(error.UnknownId, e.discard(999));
 }
 
 test "capOwned and wavBytes bounds" {

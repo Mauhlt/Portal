@@ -131,6 +131,8 @@ pub const DeskSpeech = struct {
         const e = s.engine orelse return;
         s.engine = null;
         s.tracker = .{};
+        // A Test waiting on this engine gets no result now: say so.
+        if (s.panel.test_state == .transcribing) s.panel.testResult("Speech restarted (the model changed): try the Test again.", true);
         s.retiring.store(true, .release);
         s.retire_thread = std.Thread.spawn(.{}, reap, .{ s, e }) catch {
             // No thread: stop it here (the window waits this once).
@@ -305,7 +307,13 @@ pub const DeskSpeech = struct {
                         // Cut or changed on the way into the line (its
                         // limit, a line break, a tab): never learned as
                         // if sent unchanged; discarded instead.
-                        if (!sh.dictated(add)) s.perform(s.tracker.cleared());
+                        if (!sh.dictated(add)) switch (s.tracker.cleared()) {
+                            // Portal's discard: no token, no toast.
+                            .discard => |id| if (speech.has_home) if (s.engine) |e2| {
+                                e2.discard(id) catch {};
+                            },
+                            else => {},
+                        };
                     },
                 }
             }
@@ -540,3 +548,19 @@ pub const DeskSpeech = struct {
         }
     }
 };
+
+test "a model swap during a Test's transcription ends the Test with a message" {
+    if (!speech.has_home) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const Nop = struct {
+        fn f(_: *anyopaque) void {}
+    };
+    var dummy: u8 = 0;
+    var s: DeskSpeech = .{ .gpa = gpa, .io = std.testing.io, .data_dir = ".", .notify_ctx = &dummy, .notify_fn = Nop.f, .mic = undefined };
+    s.engine = try Engine.create(gpa, std.testing.io, .{ .model_path = "m", .profile_dir = "p" });
+    s.panel.test_state = .transcribing;
+    s.retireEngine();
+    try std.testing.expectEqual(audio_panel.TestState.failed, s.panel.test_state);
+    if (s.retire_thread) |t| t.join();
+    try std.testing.expect(!s.retiring.load(.acquire));
+}
