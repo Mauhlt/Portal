@@ -132,7 +132,8 @@ the viewer watches, which is the desk's tab at connect (`hello.session`)
 and then whatever the viewer chose with `s:<id>` (answered by `session`,
 then a full snapshot). Only the desk opens and closes tabs (the window,
 `portal open <dir>`); no message a client sends can create, start, close
-or reopen one. The shared parser and writer are `shared/tabs.zig`.
+or reopen one, except `p:start` / `p:stop` for a project the desk marked
+startable (section 3f). The shared parser and writer are `shared/tabs.zig`.
 
 #### Program status (OSC 7501), desk side
 

@@ -11,7 +11,7 @@
 //!
 //! Groups: pairing, grid, keys, text, transport, privacy, images, instruct,
 //! console, idle, tls, sync, webinput, ended, tabs, convo, status, probe,
-//! hooks, subtabs, usage (default: all).
+//! hooks, subtabs, projects, usage (default: all).
 
 const std = @import("std");
 const net = @import("net.zig");
@@ -31,6 +31,7 @@ const status_tests = @import("status_tests.zig");
 const probe_tests = @import("probe_tests.zig");
 const hooks_tests = @import("hooks_tests.zig");
 const subtabs_tests = @import("subtabs_tests.zig");
+const projects_tests = @import("projects_tests.zig");
 const usage_tests = @import("usage_tests.zig");
 
 /// Each run picks its own base port (a multiple of 200 in 20000..59800),
@@ -68,7 +69,8 @@ const groups = [_]Group{
     .{ .name = "probe", .run = probe_tests.run, .port_offset = 170 },
     .{ .name = "hooks", .run = hooks_tests.run, .port_offset = 180 },
     .{ .name = "subtabs", .run = subtabs_tests.run, .port_offset = 190 },
-    .{ .name = "usage", .run = usage_tests.run, .port_offset = 120 },
+    .{ .name = "projects", .run = projects_tests.run, .port_offset = 120 },
+    .{ .name = "usage", .run = usage_tests.run, .port_offset = 50 },
 };
 
 pub fn main(init: std.process.Init) !void {

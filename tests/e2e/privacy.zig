@@ -6,6 +6,7 @@
 const std = @import("std");
 const proc = @import("proc.zig");
 const client = @import("client.zig");
+const Runner = @import("runner.zig").Runner;
 
 /// A session program that prints a banner, then idles (ping).
 pub const ping_child = [_][]const u8{ "--", "cmd.exe", "/c", "echo PORTAL-SMOKE-TEST & ping -n 600 127.0.0.1" };
@@ -49,3 +50,20 @@ pub const Leaks = struct {
         return l;
     }
 };
+
+/// One check: no text message `v` got (hello included) carries any of
+/// `leaks`' needles. The grid is not checked (the terminal is the
+/// program's own output).
+pub fn checkMessages(r: *Runner, v: *const client.Viewer, leaks: *const Leaks, what: []const u8) void {
+    var dirty: ?[]const u8 = null;
+    var where: []const u8 = "";
+    if (leaks.find(v.helloText())) |n| {
+        dirty = n;
+        where = v.helloText();
+    }
+    for (v.texts.items) |t| if (leaks.find(t)) |n| {
+        dirty = n;
+        where = t;
+    };
+    _ = r.check(what, dirty == null, "{?s} in {s}", .{ dirty, where[0..@min(where.len, 400)] });
+}

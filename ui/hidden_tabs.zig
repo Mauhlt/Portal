@@ -135,16 +135,17 @@ pub const Sheet = union(enum) {
     menu: usize,
 };
 
-/// Button ids, clear of the shell's and the other panels' ranges.
+/// Button ids (1900-1949), clear of the shell's and the other panels'
+/// ranges (the desk's Audio panel has 1700-1799, Projects 1800-1899).
 pub const ids = struct {
-    pub const button: u32 = 1700;
-    pub const close: u32 = 1701;
-    pub const hide: u32 = 1702;
-    pub const desk_close: u32 = 1703;
+    pub const button: u32 = 1900;
+    pub const close: u32 = 1901;
+    pub const hide: u32 = 1902;
+    pub const desk_close: u32 = 1903;
     /// Show the hidden tab at bar position i: show0 + i.
-    pub const show0: u32 = 1710;
+    pub const show0: u32 = 1910;
     /// The menu of the tab at bar position i: menu0 + i.
-    pub const menu0: u32 = 1780;
+    pub const menu0: u32 = 1930;
 };
 
 pub const Bufs = struct {

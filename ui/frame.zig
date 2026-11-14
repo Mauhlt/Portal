@@ -176,6 +176,8 @@ pub const PanelRow = struct {
     tone: Tone = .normal,
     selected: bool = false,
     button: ?PanelButton = null,
+    /// A second button, left of `button` (a project's Stop beside Open).
+    button2: ?PanelButton = null,
     /// A coloured dot before the text (a project's colour).
     dot: ?Rgb = null,
 };
@@ -1529,20 +1531,21 @@ pub const Frame = struct {
             for (p.rows) |r| {
                 if (paint and r.selected) f.rect(x - @round(4 * s), y, w + @round(8 * s), rh, theme.ui.selected_row);
                 var tw = w;
-                if (r.button) |b| {
-                    const bh = @round(rh * 0.8);
+                const bh = @round(rh * 0.8);
+                for ([_]?PanelButton{ r.button, r.button2 }) |ob| if (ob) |b| {
                     const bw = f.panelButton(ui, 0, 0, bh, b, s, false);
-                    _ = f.panelButton(ui, x + w - bw, y + @round((rh - bh) / 2), bh, b, s, paint);
-                    tw = w - bw - @round(8 * s);
+                    tw -= bw;
+                    _ = f.panelButton(ui, x + tw, y + @round((rh - bh) / 2), bh, b, s, paint);
+                    tw -= @round(8 * s);
+                };
+                var tx = x;
+                if (r.dot) |c| {
+                    const cw: f32 = @floatFromInt(ui.cell_w);
+                    if (paint) _ = f.text(ui, tx, y + @round((rh - lh) / 2), "\u{25CF}", c, true);
+                    tx += 2 * cw;
+                    tw = @max(0, tw - 2 * cw);
                 }
-                var rx = x;
-                if (r.dot) |dc| {
-                    if (paint) _ = f.text(ui, x, y + @round((rh - lh) / 2), "\u{25CF}", dc, true);
-                    const dw: f32 = @floatFromInt(ui.cell_w * 2);
-                    rx += dw;
-                    tw -= dw;
-                }
-                if (paint) _ = f.text(ui, rx, y + @round((rh - lh) / 2), clipText(ui, r.text, tw, false), toneColor(r.tone), false);
+                if (paint) _ = f.text(ui, tx, y + @round((rh - lh) / 2), clipText(ui, r.text, tw, false), toneColor(r.tone), false);
                 y += rh;
             }
         }
@@ -2201,6 +2204,22 @@ test "badges, the status line's task summary and panel buttons are hit by what w
     o.panel = .{ .title = "Usage", .rows = &rows, .buttons = &buttons };
     f.build(&fs, .{ 1200, 800 }, 1, &g, o);
     try expectHits(&f, &.{ 1310, 1300 }, &.{ 1000, 1200, 912, 910 });
+}
+
+test "a panel row's two buttons and its dot: both buttons are hit, the text keeps room" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    const rows = [_]PanelRow{
+        .{ .text = "Notes  [Plan]", .dot = .{ 0xFF, 0xC9, 0x40 }, .button = .{ .label = "Open", .id = 1810 }, .button2 = .{ .label = "Stop", .id = 1830, .tone = .bad } },
+        .{ .text = "Portal  [Ask]", .dot = .{ 0x4D, 0xA3, 0xFF }, .button = .{ .label = "Start", .id = 1811 } },
+    };
+    const o: Overlay = .{ .panel = .{ .title = "Projects", .rows = &rows } };
+    f.build(&fs, .{ 1200, 800 }, 1, &g, o);
+    try expectHits(&f, &.{ 1810, 1830, 1811 }, &.{1831});
 }
 
 /// Records which button ids reached the sink.

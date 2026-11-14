@@ -55,6 +55,11 @@ const sysinfo = @import("shared").sysinfo;
 const subtabs_wire = @import("shared").subtabs;
 const convo_wire = @import("shared").convo;
 const deskspeech = @import("deskspeech.zig");
+const deskprojects = @import("deskprojects.zig");
+const projects_panel = ui.panels.projects;
+
+/// The desk's top-bar tools: the desk panels', then Projects.
+const desk_tools = deskui.tools ++ [_]ui.frame.TopButton{projects_panel.tool};
 
 /// Font size of the local terminal, in logical pixels (zoom with Ctrl+= / -).
 pub const font_em: f32 = 15;
@@ -195,6 +200,10 @@ pub const LocalHost = struct {
     /// Speech input: the 🎤, the Audio panel, the microphone thread and
     /// stt.Home (deskspeech.zig); null until attachDesk.
     speech: ?*deskspeech.DeskSpeech = null,
+    /// The Projects panel (startable projects) and the tabs' "started by"
+    /// notes; hub.projects_gen as last drawn.
+    projects: deskprojects.DeskProjects = .{},
+    projects_gen: u64 = 0,
 
     const title_max = title.max_title_bytes;
 
@@ -414,9 +423,12 @@ pub const LocalHost = struct {
         var list_changed = false;
         if (hub.gen != h.list_gen) {
             hub.entriesLocked(&h.list);
+            _ = h.projects.notesLocked(hub);
             h.list_gen = hub.gen;
             list_changed = true;
         }
+        const projects_changed = hub.projects_gen != h.projects_gen;
+        h.projects_gen = hub.projects_gen;
         const changed = if (h.shown) |t| h.sync.sync(h.gpa, &h.grid, &t.session.term) else false;
         // The sub-tabs, and the conversation of the one shown.
         var sub_changed = false;
@@ -480,7 +492,7 @@ pub const LocalHost = struct {
         // The session shows something: the splash may end.
         if (changed and h.shown != null) h.p.splashDone();
         h.shell.touch = client.touchkbd.query();
-        if (!force and !changed and !list_changed and !act_changed and !sub_changed and !speech_changed and old == null and !h.p.needsRedraw() and h.viewers == h.drawn_viewers) return;
+        if (!force and !changed and !list_changed and !projects_changed and !act_changed and !sub_changed and !speech_changed and old == null and !h.p.needsRedraw() and h.viewers == h.drawn_viewers) return;
         h.drawn_viewers = h.viewers;
         h.updateTitle();
 
@@ -532,14 +544,15 @@ pub const LocalHost = struct {
                 .desk_check = if (d) |*x| x.desk_check[0..] else "",
                 .tunnel_port = if (d) |x| x.tunnel_port else 0,
                 .now = h.nowUnix(),
-            }),
+            }) orelse h.projectsPanel(),
             .desk = .{
                 .title = windowLabel(h.shownName(), &h.label_buf),
                 .viewers = h.viewers,
                 .policy = h.opts.policy,
                 .url = h.opts.url,
-                .tools = if (d != null) &deskui.tools else &.{},
+                .tools = if (d != null) &desk_tools else &.{},
                 .can_add = h.list.len < tabs.max_tabs,
+                .notes = h.projects.notes[0..h.projects.n_notes],
             },
             .activity = if (h.hub != null) &h.act else null,
             .sys = if (h.sys_sub and h.sys_gen != 0) &h.sys else null,
@@ -552,6 +565,38 @@ pub const LocalHost = struct {
             o.toast = t;
         };
         return o;
+    }
+
+    /// The Projects panel, when it is open (refreshed from the hub).
+    fn projectsPanel(h: *LocalHost) ?ui.frame.Panel {
+        if (!h.projects.panel.open()) return null;
+        const hub = h.hub orelse return null;
+        h.projects.refresh(hub, h.shown);
+        return h.projects.panel.panel(h.projects.view, &h.projects.bufs);
+    }
+
+    /// The Projects panel (top bar "Projects", Ctrl+Shift+J).
+    fn openProjects(h: *LocalHost) void {
+        const hub = h.hub orelse return;
+        if (h.desk == null) return;
+        if (h.ui.open()) h.ui.close();
+        if (h.audioOpen()) h.audioAct(h.speech.?.panel.close());
+        h.projects.refresh(hub, h.shown);
+        h.projects.panel.show();
+        h.frame(true);
+    }
+
+    /// Only the Projects panel is open (the others come first).
+    fn projectsOnly(h: *const LocalHost) bool {
+        return h.projects.panel.open() and !h.ui.open() and !h.audioOpen();
+    }
+
+    /// A Projects panel action: settings.txt and the hub (deskprojects).
+    fn projectsAct(h: *LocalHost, a: projects_panel.Action) void {
+        const hub = h.hub orelse return;
+        const d = &(h.desk orelse return);
+        h.projects.perform(a, .{ .gpa = h.gpa, .io = h.io, .dir = d.paths.dir, .hub = hub, .shown = h.shown, .saved = &h.desk.?.saved, .env = d.env });
+        h.frame(true);
     }
 
     /// The shown tab's name (desk-assigned, never a path).
@@ -875,21 +920,24 @@ pub const LocalHost = struct {
     /// performed here.
     fn panelActive(ctx: *anyopaque) bool {
         const h = self(ctx);
-        return h.ui.open() or h.audioOpen();
+        return h.ui.open() or h.audioOpen() or h.projects.panel.open();
     }
     fn panelKey(ctx: *anyopaque, key: input.Key, mods: input.Mods) void {
         const h = self(ctx);
         if (h.audioOpen()) return h.audioAct(h.speech.?.panel.key(key, mods));
+        if (h.projectsOnly()) return h.projectsAct(h.projects.panel.key(key, h.projects.view));
         h.perform(h.ui.key(key, mods));
     }
     fn panelChar(ctx: *anyopaque, cp: u21, mods: input.Mods) void {
         const h = self(ctx);
         if (h.audioOpen()) return h.audioAct(h.speech.?.panel.char(cp, mods));
+        if (h.projectsOnly()) return; // no text fields, no letter shortcuts
         h.perform(h.ui.char(cp, mods));
     }
     fn panelButton(ctx: *anyopaque, b: u32) void {
         const h = self(ctx);
         if (h.audioOpen()) return h.audioAct(h.speech.?.panel.button(b));
+        if (h.projectsOnly()) return h.projectsAct(h.projects.panel.button(b, h.projects.view));
         h.perform(h.ui.button(b));
     }
 
@@ -902,6 +950,7 @@ pub const LocalHost = struct {
     fn openAudio(h: *LocalHost) void {
         const s = h.speech orelse return;
         if (h.ui.open()) h.ui.close();
+        h.projects.panel.close();
         s.openPanel();
     }
 
@@ -1031,6 +1080,7 @@ pub const LocalHost = struct {
                 deskui.id.tb_export => if (h.desk) |d| h.ui.openExport(d.export_default),
                 deskui.id.tb_settings => h.openSettings(),
                 deskui.id.tb_audio => h.openAudio(),
+                projects_panel.id.tool => h.openProjects(),
                 else => {},
             },
             // The window decides the PTY size (of every tab); web viewers adapt.
@@ -1055,6 +1105,7 @@ pub const LocalHost = struct {
             'e', 'E' => h.ui.openExport(h.desk.?.export_default),
             's', 'S' => h.openSettings(),
             'a', 'A' => h.openAudio(),
+            'j', 'J' => h.openProjects(),
             else => return false,
         }
         return true;

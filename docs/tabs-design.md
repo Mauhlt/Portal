@@ -15,7 +15,8 @@ and the terminal-bell fallback for "waiting". What exists:
 * Protocol v2 (docs/protocol.md): `hello` lists the sessions, `tabs`,
   `session`, `nosession`, `ended`; `s:<id>` from viewers. Both clients
   (`portal connect`, the iPhone app) draw the same top bar and switch tabs;
-  neither can open or close one.
+  neither can open or close one, except the projects the desk marked
+  startable ("Starting projects from a device", below, 2026-11-14).
 * OSC 7501 is parsed per session (`src/vt.zig`, `parseProgramState`) and
   only highlights a tab (`waiting` = `state=blocked`). Portal answers the
   feature-detection query (docs/protocol.md, "Program status (OSC
@@ -44,7 +45,8 @@ can be overridden. When the agent in any tab needs an answer, that tab is
 highlighted, so the owner knows which project is asking. Remote viewers
 (laptop, iPhone) see the same tab bar and can switch tabs and answer, but can
 never open or close projects. That stays desk-only: Ctrl+T folder picker, or
-`portal open <dir>`.
+`portal open <dir>`. (Since 2026-11-14 with one exception: the projects
+the desk marked startable, "Starting projects from a device" below.)
 
 ## Detecting "The agent is waiting for you"
 
@@ -267,9 +269,91 @@ value equals a known id; no message text was printed, copied or kept.
 * **Devices never reopen or start projects** (owner chose "switch open tabs
   only"). Reopening a closed project is desk-only: Ctrl+T, `portal open
   <dir>`, or the desk's own recent list. No protocol message can create a
-  session.
+  session. *Superseded in part (owner, 2026-11-14): a device may start a
+  project the desk marked startable, nothing else; see "Starting projects
+  from a device".*
 * Unpairing a device deletes its recent-projects list. It is metadata, not
   training data.
+
+## Starting projects from a device (owner's decision, 2026-11-14)
+
+The owner approved (mockup, screen 3) that a paired device may start a
+project, but only one the desk allowed, and only as safely as the desk
+chose. What exists:
+
+* **The list is the desk's.** settings.txt `startable = NAME | MODE |
+  FOLDER`, at most 16 (src/settings.zig), edited in the desk's Projects
+  panel (ui/panels/projects.zig, src/deskprojects.zig; Ctrl+Shift+J) or
+  with `portalctl startable add | remove | list`. The file is the one
+  source; the running Portal follows it (main.zig, SettingsWatch: a
+  directory change notification, no polling) and devices get the new
+  list at once.
+* **Devices see names only.** `{"t":"projects"}` (docs/protocol.md 3f)
+  carries each project's name, colour, mode and whether it runs and may
+  be stopped; never a folder (privacy rule 1, checked by the e2e
+  `projects` group with privacy.checkMessages). A name is a
+  `startableName` (shared/projects.zig): a tab name without `\ / : | "`,
+  not starting with `-`, `.` or a space, so it can never be read as a
+  path, a drive, an option or a settings field.
+* **A request is a name, nothing more.** `p:start <name>` / `p:stop
+  <name>` (src/projects_ws.zig): the exact verb, then a name that must
+  equal one of the desk's (case-sensitive). The folder, the program, its
+  arguments and the permission mode all come from the desk; nothing of
+  the request but the name is used, and answers carry the desk's own
+  spelling, never the device's text.
+* **Never a permissive session.** Portal itself adds `--permission-mode
+  default` (Ask: every edit and command asks) or `--permission-mode plan`
+  (Plan: read-only planning) to the launch (cmdline.launchArgs), and only
+  for the agent: a device start is refused (`unsafe_program`) when the
+  program setting is not the agent or its arguments hold a flag that
+  skips, widens or pre-answers permission prompts, or picks the mode
+  itself (`--dangerously-*`, `--allow-dangerously-*`, `--permission-mode`,
+  `--allowedTools` / `--allowed-tools`, `--permission-prompt-tool`;
+  cmdline.deviceStart). The program is found on PATH again for every tab
+  (tabs.Program, Hub.open), so a reopened project runs the agent installed
+  now even if an update moved it, and the check runs again on the program
+  as found (cmdline.deviceStartResolved).
+* **Bounded.** Refused in input mode `none`; at most 3 starts and 3 stops
+  a minute per paired device, across its connections (timestamps only,
+  no timer); a malformed or unknown name counts too, so probing is
+  limited. An already running project is not started twice: the device
+  is switched to it (`switched`).
+* **Only what a device started can a device stop.** `p:stop` of a
+  session started at the desk is `not_device_started`; a device-started
+  one is asked to exit like the desk's ×, and ended after 10 s.
+* **The desk sees it.** The tab reads "<name> · started by <device>"
+  ("(plan)" for plan mode), then "stopped by <device>"; the desk's log
+  names the device, the project and the permission mode. A device start
+  does not take the desk's view away from the tab it shows. The device
+  that started it is switched to the new tab.
+
+Residual risks (accepted by design, or outside Portal's reach):
+
+* **Ask is the agent's own guard.** `--permission-mode default` only
+  makes the agent ask; what it asks and how it enforces the answer is
+  the agent's. Its settings files (`~/.claude/settings.json`, a project's
+  `.claude/settings.json` / `settings.local.json`) can pre-allow tools
+  (`permissions.allow`) or hooks that then run without a question; Portal
+  checks its own command line, not those files. Plan mode is likewise
+  enforced by the agent.
+* **Input mode `text` can leave Ask or Plan.** In `text` mode a device may
+  send Shift+Tab, which cycles the agent's permission modes. `text` is
+  full remote control by definition (README); `instruct` and `keys` can't.
+* **A started session is driven by the same device rules as any tab.**
+  Approving prompts from the device (keys, For you) is as strong as the
+  input mode allows; a stolen paired device gains "start an allowed
+  project" on top of what it could already do in open tabs, until it is
+  unpaired.
+* **PATH decides which `claude` runs.** Portal runs what PATH finds when
+  the tab opens (never the current folder); a program planted earlier on
+  PATH under the agent's name would run, exactly as for a desk start. The
+  name check (deviceStartResolved) does not authenticate the binary.
+* **settings.txt is the user's file.** Any process running as the user can
+  add startable folders, the same trust as the program setting.
+* **Any device can stop any device-started session**, not only its own;
+  stopping asks the agent to exit, and Portal ends it 10 s later.
+* **Rate limits are per device.** A re-paired device starts with a fresh
+  window; 3 a minute bounds bursts, not slow abuse.
 
 ## Privacy rules (owner's requirement: nothing reveals closed projects or other folders)
 

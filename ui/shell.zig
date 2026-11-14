@@ -59,12 +59,14 @@ const status_panels = @import("panels/status.zig");
 const hidden_tabs = @import("hidden_tabs.zig");
 const usage_strip = @import("usage_strip.zig");
 const planusage = @import("shared").planusage;
+const projects_wire = @import("shared").projects;
+const projects_sheet = @import("projects_sheet.zig");
 
 pub const Device = enum { desk, viewer };
 
 /// Ids of the shell's own controls, clear of the panels' ranges (desk
 /// panels 1-13, 100-279; setup 1-101; sync 301-699; status panels
-/// 1500-1521; content view 1300-1399). Ids it doesn't know
+/// 1500-1521; content view 1300-1399; hidden tabs 1900-1949). Ids it doesn't know
 /// go to the host (Command.button), e.g. the desk tools.
 pub const ids = struct {
     pub const line: u32 = 900;
@@ -90,8 +92,10 @@ pub const ids = struct {
     pub const usage: u32 = 913;
     pub const system: u32 = 914;
     pub const tasks: u32 = 915;
+    /// A device's top bar: Projects (the Projects sheet, projects_sheet.zig).
+    pub const projects: u32 = 916;
     /// The plan-usage strip under the top bar (toggles its detail).
-    pub const usage_strip: u32 = 916;
+    pub const usage_strip: u32 = 917;
     /// badge0 + position: that tab's background-task badge.
     pub const badge0: u32 = 1200;
     /// tab0 + position: show that tab; close0 + position: close it.
@@ -199,6 +203,10 @@ pub const Desk = struct {
     tools: []const frame.TopButton = &.{},
     /// Room for another tab ("+").
     can_add: bool = true,
+    /// Per tab, in bar order: who started or stopped it from a device
+    /// ("started by iPhone", "stopped by iPhone"; "" for none), shown on
+    /// the desk's tab after its name. Never sent to devices.
+    notes: []const []const u8 = &.{},
 };
 
 /// What a device's window shows about its connection.
@@ -250,6 +258,12 @@ pub const State = struct {
     activity: ?*const activity_wire.Activity = null,
     /// The latest system monitor sample, if any.
     sys: ?*const sysinfo.Snapshot = null,
+    /// Devices: the projects the desk lets them start (`projects`, section
+    /// 3f; null: not known, no Projects button), and the desk's latest
+    /// answer to a request with a count bumped for each one.
+    projects: ?*const projects_wire.List = null,
+    project_answer: ?projects_wire.Answer = null,
+    project_answer_gen: u64 = 0,
     /// Unix seconds now (task ages in the panel).
     now: i64 = 0,
     /// The glue's awake clock (ms): the usage toast's deadline.
@@ -509,6 +523,11 @@ pub const Shell = struct {
     /// last saw.
     usage: usage_strip.Strip = .{},
     usage_seen: ?planusage.Usage = null,
+    /// Devices: the Projects sheet, and what it showed as of the last
+    /// overlay (the glue's copies, valid until the next one).
+    proj_sheet: projects_sheet.Sheet = .{},
+    proj_list: ?*const projects_wire.List = null,
+    proj_tabs: []const tabs_wire.Entry = &.{},
     bufs: Bufs = .{},
 
     const Bufs = struct {
@@ -524,12 +543,14 @@ pub const Shell = struct {
         top_tabs: [tabs_wire.max_tabs + subtabs_wire.max_subs]frame.TopTab = undefined,
         sub_labels: [subtabs_wire.max_subs][subtabs_wire.max_name + 16]u8 = undefined,
         sub_status: [subtabs_wire.max_name + 48]u8 = undefined,
+        tab_labels: [tabs_wire.max_tabs][tabs_wire.max_name + 96]u8 = undefined,
         buttons: [8]frame.TopButton = undefined,
         badges: [tabs_wire.max_tabs][8]u8 = undefined,
         tasks: [64]u8 = undefined,
         info: status_panels.Bufs = .{},
         hidden: hidden_tabs.Bufs = .{},
         hidden_label: [32]u8 = undefined,
+        projects: projects_sheet.Bufs = .{},
     };
 
     pub fn init(gpa: std.mem.Allocator, device: Device, host: Host) Shell {
@@ -552,7 +573,7 @@ pub const Shell = struct {
     }
 
     pub fn focus(sh: *const Shell) Focus {
-        if (sh.modalActive() != null or sh.info != .none or sh.sheet != .none) return .panel;
+        if (sh.modalActive() != null or sh.info != .none or sh.sheet != .none or sh.proj_sheet.open) return .panel;
         // A sub-tab: its conversation (scrolling), nothing reaches a
         // terminal or a line.
         if (sh.sub_at != null and sh.conversation != null) return .view;
@@ -730,6 +751,12 @@ pub const Shell = struct {
         const sysmon = if (st.activity) |a| a.sysmon else false;
         const live = sh.device == .desk or st.viewer.status == .connected;
         if (!live or st.activity == null) sh.setInfo(.none) else if (sh.info == .system and !sysmon) sh.setInfo(.none);
+        // The Projects sheet: a device's, while connected and the desk has
+        // said which projects it may start.
+        if (sh.device != .viewer or st.viewer.status != .connected or st.projects == null) sh.proj_sheet.close();
+        sh.proj_list = st.projects;
+        sh.proj_tabs = st.tabs;
+        if (sh.projInput(st)) |in| sh.proj_sheet.sync(in);
         var o = switch (sh.device) {
             .desk => sh.deskOverlay(st),
             .viewer => sh.viewerOverlay(st),
@@ -753,6 +780,9 @@ pub const Shell = struct {
         };
         o.panel = st.panel;
         if (o.panel == null) o.panel = hidden_tabs.panel(sh.sheet, &sh.hidden, st.tabs, st.needs_desk, &sh.bufs.hidden);
+        if (o.panel == null and sh.proj_sheet.open) if (sh.projInput(st)) |in| {
+            o.panel = sh.proj_sheet.panel(in, &sh.bufs.projects);
+        };
         if (o.panel == null) o.panel = status_panels.panel(sh.info, .{
             .desk = sh.device == .desk,
             .tabs = st.tabs,
@@ -790,7 +820,7 @@ pub const Shell = struct {
     /// `focus` as of `st` (without asking the modal: the glue may hold its
     /// lock while building the overlay).
     fn focusFor(sh: *const Shell, st: State) Focus {
-        if (st.panel != null or sh.info != .none or sh.sheet != .none) return .panel;
+        if (st.panel != null or sh.info != .none or sh.sheet != .none or sh.proj_sheet.open) return .panel;
         if (sh.sub_at != null and sh.conversation != null) return .view;
         return switch (sh.device) {
             .desk => if (sh.line_focus) .line else .terminal,
@@ -825,8 +855,10 @@ pub const Shell = struct {
             // stays until the user switches away).
             if (sh.device == .viewer and !active and sh.hidden.contains(e.name())) continue;
             const act: ?*const activity_wire.Tab = if (st.activity) |a| a.find(e.id) else null;
+            // The desk's note on a tab a device started or stopped.
+            const note: []const u8 = if (sh.device == .desk and i < st.desk.notes.len) st.desk.notes[i] else "";
             sh.bufs.top_tabs[k] = .{
-                .label = e.name(),
+                .label = if (note.len == 0) e.name() else std.fmt.bufPrint(&sh.bufs.tab_labels[i], "{s} \u{00B7} {s}", .{ e.name(), note }) catch e.name(),
                 .color = theme.fromU32(e.color),
                 // A sub-tab shown: the tab is its parent, not shown itself.
                 .active = active and sh.sub_at == null,
@@ -887,6 +919,7 @@ pub const Shell = struct {
     /// Opens (or closes) a status panel; the System panel's opening and
     /// closing go to the host (the monitor samples only while one is open).
     fn setInfo(sh: *Shell, to: status_panels.Screen) void {
+        if (to != .none) sh.proj_sheet.close();
         if (sh.info == to) return;
         const was_sys = sh.info == .system;
         sh.info = to;
@@ -899,6 +932,37 @@ pub const Shell = struct {
         if (sh.info == to and (first == null or sh.info_first == null or std.mem.eql(u8, &first.?, &sh.info_first.?))) return sh.setInfo(.none);
         sh.info_first = first;
         sh.setInfo(to);
+    }
+
+    /// The Projects sheet's input as of `st` (null: no list).
+    fn projInput(_: *const Shell, st: State) ?projects_sheet.Input {
+        const l = st.projects orelse return null;
+        return .{ .list = l, .tabs = st.tabs, .answer = st.project_answer, .answer_gen = st.project_answer_gen };
+    }
+
+    /// The same, as of the last overlay (for input between frames).
+    fn projLast(sh: *const Shell) ?projects_sheet.Input {
+        const l = sh.proj_list orelse return null;
+        return .{ .list = l, .tabs = sh.proj_tabs, .answer_gen = sh.proj_sheet.seen };
+    }
+
+    /// The top bar's Projects: opens the sheet (closing a status panel), or
+    /// closes it.
+    fn toggleProjects(sh: *Shell) void {
+        if (sh.device != .viewer or sh.proj_list == null) return;
+        if (!sh.proj_sheet.open) {
+            sh.setInfo(.none);
+            sh.sheet = .none;
+        }
+        sh.proj_sheet.toggle();
+    }
+
+    fn projEffect(sh: *Shell, e: projects_sheet.Effect) void {
+        switch (e) {
+            .none => {},
+            .send => |f| _ = sh.host.vtable.send(sh.host.ctx, f),
+            .select_tab => |i| sh.command(.{ .select_tab = i }),
+        }
     }
 
     fn lineField(sh: *Shell, hint: []const u8, focused: bool) frame.Pane {
@@ -1148,11 +1212,17 @@ pub const Shell = struct {
         };
         // The tabs (connected only): a device switches, never opens or closes.
         if (s == .connected and st.tabs.len > 0) {
-            const toggle = [_]frame.TopButton{
-                .{ .label = "Terminal", .id = ids.view_terminal, .active = sh.main == .terminal },
-                .{ .label = "Conversation", .id = ids.view_conversation, .active = sh.main == .conversation },
-            };
-            o.top_bar = .{ .tabs = sh.tabBar(st, false), .buttons = sh.statusButtons(st, &toggle) };
+            // Projects (once the desk has said which ones), then the view
+            // toggle.
+            var toggle: [3]frame.TopButton = undefined;
+            var nt: usize = 0;
+            if (st.projects != null) {
+                toggle[0] = .{ .label = "Projects", .id = ids.projects, .active = sh.proj_sheet.open };
+                nt = 1;
+            }
+            toggle[nt] = .{ .label = "Terminal", .id = ids.view_terminal, .active = sh.main == .terminal };
+            toggle[nt + 1] = .{ .label = "Conversation", .id = ids.view_conversation, .active = sh.main == .conversation };
+            o.top_bar = .{ .tabs = sh.tabBar(st, false), .buttons = sh.statusButtons(st, toggle[0 .. nt + 2]) };
             o.status.tasks = sh.shownTasks(st);
             o.status.tasks_id = ids.tasks;
         }
@@ -1255,6 +1325,11 @@ pub const Shell = struct {
         // The hidden-tabs sheet or a tab's menu: Esc closes it.
         if (sh.sheet != .none) {
             if (key == .escape) sh.sheet = .none;
+            return;
+        }
+        // The Projects sheet: its rows' keys; nothing else is typed.
+        if (sh.proj_sheet.open) {
+            if (sh.projLast()) |in| sh.projEffect(sh.proj_sheet.key(key, in)) else sh.proj_sheet.close();
             return;
         }
         // A status panel: Esc or Enter closes it; nothing else is typed.
@@ -1375,7 +1450,7 @@ pub const Shell = struct {
 
     fn onAnswer(ctx: *anyopaque, key: []const u8) void {
         const sh = self(ctx);
-        if (sh.modalActive() != null or sh.info != .none) return;
+        if (sh.modalActive() != null or sh.info != .none or sh.proj_sheet.open) return;
         sh.select.active = false;
         sh.host.vtable.answer(sh.host.ctx, key);
     }
@@ -1423,12 +1498,14 @@ pub const Shell = struct {
             },
             ids.pair => sh.command(.pair),
             ids.cancel_pair => sh.command(.cancel_pair),
+            ids.projects => sh.toggleProjects(),
             ids.usage => sh.toggleInfo(.usage, null),
             ids.system => sh.toggleInfo(.system, null),
             ids.tasks => sh.toggleInfo(.tasks, if (sh.shown) |i| sh.tab_ids[i] else null),
             ids.usage_strip => sh.usage.toggle(),
             hidden_tabs.ids.button => if (sh.device == .viewer) {
                 sh.setInfo(.none);
+                sh.proj_sheet.close();
                 sh.sheet = if (sh.sheet == .list) .none else .list;
             },
             hidden_tabs.ids.close => sh.sheet = .none,
@@ -1439,6 +1516,7 @@ pub const Shell = struct {
             hidden_tabs.ids.show0...hidden_tabs.ids.show0 + tabs_wire.max_tabs - 1 => if (sh.sheet == .list) sh.showTab(id - hidden_tabs.ids.show0),
             hidden_tabs.ids.menu0...hidden_tabs.ids.menu0 + tabs_wire.max_tabs - 1 => if (sh.device == .viewer and id - hidden_tabs.ids.menu0 < sh.n_tabs) {
                 sh.setInfo(.none);
+                sh.proj_sheet.close();
                 sh.sheet = .{ .menu = id - hidden_tabs.ids.menu0 };
             },
             ids.badge0...ids.badge0 + tabs_wire.max_tabs - 1 => if (id - ids.badge0 < sh.n_tabs) sh.toggleInfo(.tasks, sh.tab_ids[id - ids.badge0]),
@@ -1450,7 +1528,10 @@ pub const Shell = struct {
                 sh.setInfo(.none);
                 sh.command(.{ .usage_slash = id - status_panels.ids.slash0 });
             },
-            else => sh.command(.{ .button = id }),
+            else => {
+                if (sh.proj_sheet.open) if (sh.projLast()) |in| if (sh.proj_sheet.button(id, in)) |e| return sh.projEffect(e);
+                sh.command(.{ .button = id });
+            },
         }
     }
 
@@ -2583,6 +2664,87 @@ test "sub-tabs: after the shown tab, read-only (no Instruct, no keys), labelled;
         o = sh.overlay(.{ .viewer = v, .tabs = &list, .current = @splat(2), .subs = &subs, .sub_shown = @splat(9) });
         try testing.expect(o.bottom.len > 0);
     }
+}
+
+test "projects sheet (devices): the top bar's Projects, its rows' keys and buttons, answers" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .viewer, r.host());
+    defer sh.deinit();
+    var list: [2]tabs_wire.Entry = undefined;
+    var a: activity_wire.Activity = undefined;
+    activityFixture(&list, &a);
+    var pl: projects_wire.List = .{};
+    pl.items[0] = .{ .color = 0x112233, .mode = .plan };
+    pl.items[0].setName("Gamma");
+    pl.len = 1;
+    const v: Viewer = .{ .status = .connected, .mode = .instruct, .host = "h", .has_grid = true };
+    var st: State = .{ .viewer = v, .tabs = &list, .current = @splat(2), .activity = &a };
+    // Not known yet: no Projects button.
+    var o = sh.overlay(st);
+    for (o.top_bar.?.buttons) |b| try testing.expect(b.id != ids.projects);
+    st.projects = &pl;
+    o = sh.overlay(st);
+    try testing.expectEqualStrings("Projects", o.top_bar.?.buttons[0].label);
+    Shell.onButton(&sh, ids.projects);
+    o = sh.overlay(st);
+    try testing.expectEqualStrings("Projects you allowed at the desk", o.panel.?.title);
+    try testing.expectEqual(Focus.panel, sh.focus());
+    // Enter starts the chosen row: the frame goes out through the host.
+    Shell.onKey(&sh, .enter, .{});
+    try testing.expectEqualStrings("p:start Gamma", r.lastFrame());
+    // Answers go nowhere while it is open.
+    Shell.onAnswer(&sh, "y");
+    try testing.expectEqual(@as(usize, 0), r.answers);
+    // The desk's answer: shown; an accepted start closes the sheet.
+    st.project_answer = .{ .op = .start, .result = .rate_limited };
+    st.project_answer_gen = 1;
+    o = sh.overlay(st);
+    try testing.expect(o.panel != null);
+    try testing.expectEqualStrings(projects_wire.Result.rate_limited.text(), o.panel.?.lines[0].text);
+    st.project_answer = .{ .op = .start, .result = .started };
+    st.project_answer_gen = 2;
+    try testing.expect(sh.overlay(st).panel == null);
+    // A status panel and the sheet replace each other.
+    Shell.onButton(&sh, ids.projects);
+    Shell.onButton(&sh, ids.usage);
+    o = sh.overlay(st);
+    try testing.expectEqualStrings("Usage", o.panel.?.title);
+    Shell.onButton(&sh, ids.projects);
+    try testing.expectEqualStrings("Projects you allowed at the desk", sh.overlay(st).panel.?.title);
+    // Its Start button too; Esc closes.
+    Shell.onButton(&sh, projects_sheet.ids.open0);
+    try testing.expectEqualStrings("p:start Gamma", r.lastFrame());
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expect(sh.overlay(st).panel == null);
+    // Disconnected: it closes.
+    Shell.onButton(&sh, ids.projects);
+    _ = sh.overlay(.{ .viewer = .{ .status = .retrying, .host = "h", .has_grid = true }, .projects = &pl });
+    try testing.expect(!sh.proj_sheet.open);
+    // The desk has no Projects sheet.
+    var dr: Rec = .{};
+    var desk = Shell.init(testing.allocator, .desk, dr.host());
+    defer desk.deinit();
+    desk.proj_list = &pl;
+    Shell.onButton(&desk, ids.projects);
+    try testing.expect(!desk.proj_sheet.open);
+}
+
+test "desk: a device-started tab says who started it; devices never get the note" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    var list: [2]tabs_wire.Entry = undefined;
+    var a: activity_wire.Activity = undefined;
+    activityFixture(&list, &a);
+    const notes = [_][]const u8{ "", "started by iPhone (plan)" };
+    const o = sh.overlay(.{ .tabs = &list, .current = @splat(1), .desk = .{ .notes = &notes } });
+    try testing.expectEqualStrings(list[0].name(), o.top_bar.?.tabs[0].label);
+    try testing.expect(std.mem.endsWith(u8, o.top_bar.?.tabs[1].label, " \u{00B7} started by iPhone (plan)"));
+    var vr: Rec = .{};
+    var dev = Shell.init(testing.allocator, .viewer, vr.host());
+    defer dev.deinit();
+    const vo = dev.overlay(.{ .tabs = &list, .current = @splat(1), .desk = .{ .notes = &notes }, .viewer = .{ .status = .connected, .mode = .instruct, .host = "h", .has_grid = true } });
+    try testing.expectEqualStrings(list[1].name(), vo.top_bar.?.tabs[1].label);
 }
 
 test "hidden tabs (devices): the menu hides, the bar skips them, the amber button's sheet shows them again" {

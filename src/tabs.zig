@@ -458,9 +458,13 @@ pub const Tab = struct {
 
 /// Everything a new tab needs that is the same for all of them.
 pub const Program = struct {
-    /// cmdline.Resolved: the program and its command line (WTF-16).
-    app: [:0]const u16,
-    cmdline: [:0]const u16,
+    /// The configured command (`program` / `-- <program> [args]`), found
+    /// on PATH again for every tab (cmdline.resolve in Hub.open): a tab
+    /// opened later runs the program installed then, even if an update
+    /// moved it. Lives as long as the hub.
+    argv: []const []const u8,
+    path_env: ?[]const u8 = null,
+    system_root: ?[]const u8 = null,
     /// For log lines only.
     command_name: []const u8,
     /// The agent without a session chosen in its arguments: each tab's
@@ -594,6 +598,18 @@ pub const Hub = struct {
         // A device start never runs a program whose permission mode Portal
         // can't pin to the desk's choice (cmdline.deviceStart).
         if (opts.device != null and h.program.device_start != .ok) return error.UnsafeProgram;
+        // The program as installed now (an update may have moved it).
+        var resolved = cmdline.resolve(h.gpa, h.io, h.program.argv, h.program.path_env, h.program.system_root) catch |err| {
+            h.log.print("tab '{s}': cannot find the program '{s}' now: {t}", .{ name, h.program.command_name, err });
+            return error.SpawnFailed;
+        };
+        defer resolved.deinit(h.gpa);
+        // ...and checked again as found: a device start only ever runs the
+        // agent, without a permissive flag.
+        if (opts.device != null and cmdline.deviceStartResolved(resolved.program, h.program.argv[1..]) != .ok) {
+            h.log.print("tab '{s}': the program found for '{s}' is not safe to start from a device; not started", .{ name, h.program.command_name });
+            return error.UnsafeProgram;
+        }
         h.mutex.lockUncancelable(h.io);
         const full = h.n >= max_tabs;
         const done = h.finished;
@@ -678,7 +694,7 @@ pub const Hub = struct {
         // session id.
         var arg_buf: [6][]const u8 = undefined;
         const extra = cmdline.launchArgs(&arg_buf, if (opts.device) |d| d.mode.agentArg() else null, if (t.session_uuid) |*u| u else null, h.program.settings_file);
-        const line = cmdline.withArgs(h.gpa, h.program.cmdline, extra) catch {
+        const line = cmdline.withArgs(h.gpa, resolved.cmdline, extra) catch {
             t.session.term.deinit();
             h.gpa.destroy(t);
             return error.OutOfMemory;
@@ -700,7 +716,7 @@ pub const Hub = struct {
             return error.SpawnFailed;
         };
         defer h.gpa.free(env_block);
-        t.pty = conpty.Pty.spawn(h.program.app, line, cwd, env_block, size, &t.attr_buf) catch |err| {
+        t.pty = conpty.Pty.spawn(resolved.app, line, cwd, env_block, size, &t.attr_buf) catch |err| {
             h.log.print("tab '{s}': could not start '{s}': {t}", .{ t.name(), h.program.command_name, err });
             t.session.term.deinit();
             h.gpa.destroy(t);
@@ -779,7 +795,7 @@ pub const Hub = struct {
 
     /// Caller holds `mutex`. The open tab running startable entry `e`
     /// (its folder), if any.
-    fn runningLocked(h: *Hub, e: *const settings.StartableEntry) ?*Tab {
+    pub fn runningLocked(h: *Hub, e: *const settings.StartableEntry) ?*Tab {
         const path = e.path.get() orelse return null;
         for (h.tabs[0..h.n]) |t| if (settings.samePath(t.cwd, path)) return t;
         return null;

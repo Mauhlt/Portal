@@ -147,6 +147,8 @@ const Host = struct {
     /// This frame's copies of the status panels' data.
     activity: client_mod.Activity = .{},
     sys: client_mod.SysSnapshot = .{},
+    /// This frame's copy of the startable projects (the Projects sheet).
+    projects: client_mod.ProjectList = .{},
     /// The Conversation view (the devices' default main view): its own
     /// copy of Shared.convo, synced under the lock each frame.
     convo_view: ui.convoview.View = undefined,
@@ -203,6 +205,7 @@ const Host = struct {
         // the network thread replaces Shared's.
         h.activity = s.activity;
         if (s.has_sys) h.sys = s.sys;
+        h.projects = s.projects;
         const qk = h.convo_view.questionKeys();
         const now_unix = std.Io.Timestamp.now(h.client.io, .real).toSeconds();
         const o = h.shell.overlay(.{
@@ -213,6 +216,9 @@ const Host = struct {
             .panel = panel,
             .activity = if (s.has_activity) &h.activity else null,
             .sys = if (s.has_sys) &h.sys else null,
+            .projects = if (s.has_projects) &h.projects else null,
+            .project_answer = s.project_answer,
+            .project_answer_gen = s.project_answer_gen,
             .now = now_unix,
             .now_ms = watchdog.nowMs(h.client.io),
             .utc_offset_s = localtime.offsetAt(now_unix),
