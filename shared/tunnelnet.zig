@@ -3,9 +3,8 @@
 //! the device store and the tests all use these.
 //!
 //!   10.8.0.0/24     the tunnel network
-//!   10.8.0.1        the desk (hub); Portal listens on 8420 (HTTPS/WSS)
-//!                   and, while a pairing window is open, 8421 (the plain
-//!                   HTTP certificate download), both inside the tunnel only
+//!   10.8.0.1        the desk (hub); Portal listens on 8420 (HTTPS/WSS),
+//!                   inside the tunnel only
 //!   10.8.0.2..254   devices, one /32 each, assigned at pairing (lowest
 //!                   free first: the owner's laptop .2, iPhone .3, Surface .4
 //!                   when paired in that order)
@@ -23,8 +22,6 @@ pub const first_device: u8 = 2;
 pub const last_device: u8 = 254;
 
 pub const https_port: u16 = 8420;
-/// The pairing-time certificate download: always the HTTPS port + 1.
-pub const ca_port: u16 = https_port + 1;
 pub const default_udp_port: u16 = 51820;
 pub const persistent_keepalive_s: u16 = 25;
 
@@ -131,7 +128,6 @@ test "addresses and ports are defined once and agree" {
     try testing.expectEqualStrings("10.8.0.1", formatIp(desk_ip, &b));
     var sb: [32]u8 = undefined;
     try testing.expectEqualStrings(desk_server, try std.fmt.bufPrint(&sb, "{s}:{d}", .{ formatIp(desk_ip, &b), https_port }));
-    try testing.expectEqual(@as(u16, 8421), ca_port);
     try testing.expect(!isDeviceIp(desk_ip));
     try testing.expect(isDeviceIp(.{ 10, 8, 0, 2 }));
     try testing.expect(!isDeviceIp(.{ 10, 8, 0, 255 }));

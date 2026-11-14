@@ -124,11 +124,11 @@ Rules:
 
 ### 5. QR pairing
 
-* Text (shared/pairqr.zig): `portal-pair 1 <IP:PORT> <SHA-256 hex>`.
-  Public values only: the QR grants nothing by itself. No nonce: the
-  pairing request code the owner approves at the desk is already the
-  per-request check, and the CA is only trusted if the downloaded
-  certificate's SHA-256 matches.
+* Text (shared/pairqr.zig): `portal-pair 2 <IP:PORT> <CA SHA-256 hex>
+  <endpoint> <desk key> <device address>`. Public values only: the QR
+  grants nothing by itself (the desk lets in only the device key the
+  owner approved there), and the CA the server sends is only trusted if
+  its SHA-256 matches.
 * Desk: "Pair a device" shows the QR under the instructions when Portal
   serves TLS (`ui/panels/desk.zig` `Bufs.pairQr`). Encoder: ui/qr.zig (byte mode,
   level M, versions 1-10, mask by penalty; checked module-for-module
