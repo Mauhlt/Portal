@@ -48,6 +48,8 @@ const projects_wire = @import("shared").projects;
 const openreq = @import("openreq.zig");
 const hookmsg = @import("hookmsg.zig");
 const hookpipe = @import("hookpipe.zig");
+const statusline = @import("statusline.zig");
+const usage_desk = @import("usage_desk.zig");
 const agenthooks = @import("agenthooks.zig");
 const Log = @import("log.zig").Log;
 const devices = @import("devices.zig");
@@ -168,6 +170,10 @@ const usage =
     \\  portalctl hook
     \\      Run by Claude Code (reads the hook's JSON on stdin); does nothing
     \\      outside a Portal tab.
+    \\  portalctl statusline
+    \\      Claude Code's status line in the sessions Portal starts (Portal
+    \\      passes it with --settings; your own settings stay as they are):
+    \\      hands the plan's usage percentages to Portal's usage bar.
     \\
     \\  portalctl ca [show]
     \\      Show the private CA that signs Portal's HTTPS certificate.
@@ -267,6 +273,14 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "hook")) {
         const dir = dataDir(gpa, init.environ_map) catch null;
         hookpipe.hookCommand(init.environ_map.get(hookmsg.env_name), dir);
+        std.process.exit(0);
+    }
+    // The agent's status line in the sessions Portal starts (only those:
+    // usage_desk.zig): reads the plan's windows from stdin, hands them to
+    // Portal, prints a short line; always exits 0.
+    if (std.mem.eql(u8, cmd, "statusline")) {
+        const dir = dataDir(gpa, init.environ_map) catch null;
+        statusline.command(init.environ_map.get(hookmsg.env_name), dir);
         std.process.exit(0);
     }
     if (std.mem.eql(u8, cmd, "hooks")) std.process.exit(agenthooks.command(gpa, io, init.environ_map, args[1..]));
@@ -374,6 +388,29 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 fn dataDir(gpa: Allocator, env: *const std.process.Environ.Map) ![]u8 {
     const base = env.get("LOCALAPPDATA") orelse return error.NoLocalAppData;
     return std.fs.path.join(gpa, &.{ base, "Portal" });
+}
+
+/// Portal's status line settings file for the agent (the plan-usage bar,
+/// usage_desk.zig), when the program is the agent and passes no
+/// `--settings` itself; null (and a log line saying why) otherwise.
+fn statusSettings(gpa: Allocator, io: Io, log: *Log, env: *const std.process.Environ.Map, command: []const []const u8) ?[]const u8 {
+    if (!cmdline.wantsSettings(command)) {
+        if (cmdline.isAgent(command[0])) log.print("usage: the program setting passes --settings itself; no plan-usage bar", .{});
+        return null;
+    }
+    const dir = dataDir(gpa, env) catch return null;
+    defer gpa.free(dir);
+    var why: []const u8 = "unknown";
+    const path = usage_desk.prepare(gpa, io, dir, &why) orelse {
+        log.print("usage: no plan-usage bar: {s}", .{why});
+        return null;
+    };
+    if (!cmdline.pathArg(path)) {
+        log.print("usage: no plan-usage bar: the data folder's path has characters a command line would misread", .{});
+        gpa.free(path);
+        return null;
+    }
+    return path;
 }
 
 fn devicePaths(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) !devices.Paths {
@@ -1253,6 +1290,11 @@ const HookWatch = struct {
         hub.log.print("hooks: {s}", .{what});
     }
 
+    fn usageReport(ctx: *anyopaque, r: *const statusline.Report) void {
+        const hub: *tabs.Hub = @ptrCast(@alignCast(ctx));
+        hub.applyUsage(r);
+    }
+
     /// Starts the pipe server thread; logs (and runs without hooks) if it
     /// can't.
     fn start(gpa: Allocator, hub: *tabs.Hub, log: *Log, data_dir: []const u8) void {
@@ -1266,7 +1308,7 @@ const HookWatch = struct {
             return;
         };
         const srv = gpa.create(hookpipe.Server) catch return;
-        srv.* = .{ .stop = ev[0], .conn_ev = ev[1], .read_ev = ev[2], .ctx = hub, .on_message = message, .on_problem = problem };
+        srv.* = .{ .stop = ev[0], .conn_ev = ev[1], .read_ev = ev[2], .ctx = hub, .on_message = message, .on_problem = problem, .on_usage = usageReport };
         srv.init(name) catch |err| {
             log.print("hooks: cannot create the hook pipe ({s}); Claude Code hooks are not listened to", .{switch (err) {
                 error.NameTaken => "another process holds its name: another Portal with the same data folder?",
@@ -1582,6 +1624,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .command_name = std.fs.path.basename(command[0]),
             .session_id = cmdline.wantsSessionId(command),
             .device_start = cmdline.deviceStart(command),
+            .settings_file = statusSettings(gpa, io, &log, env, command),
         },
         .colors = saved.colorChoices(&colors_buf),
         .convo_projects = convoProjects(gpa, env),
@@ -1817,6 +1860,8 @@ test {
     _ = @import("openreq.zig");
     _ = @import("hookmsg.zig");
     _ = @import("hookpipe.zig");
+    _ = @import("statusline.zig");
+    _ = @import("usage_desk.zig");
     _ = @import("agenthooks.zig");
     _ = @import("log.zig");
     _ = @import("devices.zig");

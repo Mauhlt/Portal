@@ -17,6 +17,8 @@
 //!   tool=<tool name>              (PermissionRequest only, optional)
 //!   ntype=<notification type>     (Notification only)
 //!   agent=<subagent id>           (SubagentStart / SubagentStop only)
+//!   error=rate_limit              (StopFailure only, and only this value:
+//!                                  the plan's limit, usage_desk.zig)
 //!
 //! Untrusted on both ends: the sender only sends enumerated event names
 //! and `[A-Za-z0-9_-]{1,64}` names; the receiver accepts only those, maps
@@ -90,6 +92,8 @@ pub const Message = struct {
     ntype_len: u8 = 0,
     agent_buf: [max_name]u8 = undefined,
     agent_len: u8 = 0,
+    /// StopFailure because of the plan's rate limit (`error`: `rate_limit`).
+    rate_limit: bool = false,
 
     pub fn tool(m: *const Message) []const u8 {
         return m.tool_buf[0..m.tool_len];
@@ -123,6 +127,7 @@ pub const Message = struct {
         if (m.tool_len > 0) wr.print("tool={s}\n", .{m.tool()}) catch unreachable;
         if (m.ntype_len > 0) wr.print("ntype={s}\n", .{m.ntype()}) catch unreachable;
         if (m.agent_len > 0) wr.print("agent={s}\n", .{m.agent()}) catch unreachable;
+        if (m.rate_limit) wr.writeAll("error=rate_limit\n") catch unreachable;
         return wr.buffered();
     }
 };
@@ -137,6 +142,7 @@ pub fn parse(text: []const u8) ?Message {
     var tool: []const u8 = "";
     var ntype: []const u8 = "";
     var agent: []const u8 = "";
+    var rate_limit = false;
     while (it.next()) |line| {
         if (line.len == 0) continue;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse return null;
@@ -155,12 +161,16 @@ pub fn parse(text: []const u8) ?Message {
         } else if (std.mem.eql(u8, k, "agent")) {
             if (!validName(v)) return null;
             agent = v;
+        } else if (std.mem.eql(u8, k, "error")) {
+            if (!validName(v)) return null;
+            rate_limit = std.mem.eql(u8, v, "rate_limit");
         } // unknown keys: ignored (a newer sender)
     }
     var m: Message = .{ .key = key orelse return null, .event = event orelse return null };
     m.setTool(tool);
     m.setNtype(ntype);
     m.setAgent(agent);
+    m.rate_limit = rate_limit and m.event == .StopFailure;
     return m;
 }
 
@@ -173,12 +183,16 @@ pub fn fromHookJson(scratch: std.mem.Allocator, key: Key, json: []const u8) ?Mes
         tool_name: ?[]const u8 = null,
         notification_type: ?[]const u8 = null,
         agent_id: ?[]const u8 = null,
+        @"error": ?[]const u8 = null,
     };
     const in = std.json.parseFromSliceLeaky(In, scratch, json, .{ .ignore_unknown_fields = true, .duplicate_field_behavior = .use_last }) catch return null;
     const event = Event.fromName(in.hook_event_name orelse return null) orelse return null;
     var m: Message = .{ .key = key, .event = event };
     switch (event) {
         .PermissionRequest => if (in.tool_name) |t| m.setTool(t),
+        // Only the plan's limit travels (the matcher's value): other
+        // errors are just `error`.
+        .StopFailure => m.rate_limit = if (in.@"error") |e| std.mem.eql(u8, e, "rate_limit") else false,
         .Notification => {
             const nt = in.notification_type orelse return null;
             if (!std.mem.eql(u8, nt, "permission_prompt") and !std.mem.eql(u8, nt, "idle_prompt")) return null;
@@ -282,6 +296,13 @@ test "fromHookJson: the documented inputs; unknown fields, other events and type
     try testing.expectEqual(@as(u8, 0), bad.tool_len);
     const stopf = fromHookJson(a, key, "{\"hook_event_name\":\"StopFailure\",\"error\":\"rate_limit\"}").?;
     try testing.expectEqual(Event.StopFailure, stopf.event);
+    try testing.expect(stopf.rate_limit);
+    var fb: [max_message]u8 = undefined;
+    try testing.expect(parse(stopf.format(&fb)).?.rate_limit);
+    try testing.expect(!fromHookJson(a, key, "{\"hook_event_name\":\"StopFailure\",\"error\":\"server_error\",\"error_details\":\"x\"}").?.rate_limit);
+    try testing.expect(!fromHookJson(a, key, "{\"hook_event_name\":\"Stop\",\"error\":\"rate_limit\"}").?.rate_limit);
+    try testing.expect(!parse("portal-hook-v1\ntab=01010101010101010101010101010101\nevent=Stop\nerror=rate_limit\n").?.rate_limit);
+    try testing.expect(parse("portal-hook-v1\ntab=01010101010101010101010101010101\nevent=StopFailure\nerror=a b\n") == null);
 }
 
 test "format and parse round-trip; the parser is strict" {

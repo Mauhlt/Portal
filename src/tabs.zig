@@ -50,6 +50,8 @@ const transcript = @import("convo/transcript.zig");
 const cmdline = @import("cmdline.zig");
 const childenv = @import("childenv.zig");
 const hookmsg = @import("hookmsg.zig");
+const statusline = @import("statusline.zig");
+const usage_desk = @import("usage_desk.zig");
 const projects_wire = @import("shared").projects;
 const settings = @import("settings.zig");
 
@@ -467,6 +469,10 @@ pub const Program = struct {
     /// Whether devices may start sessions of it (cmdline.deviceStart:
     /// the agent, without a permissive flag); checked on every start.
     device_start: cmdline.DeviceStart = .not_agent,
+    /// Portal's status line settings file, passed as `--settings` (the
+    /// agent without a `--settings` of its own: usage_desk.zig); null:
+    /// none (no plan-usage bar).
+    settings_file: ?[]const u8 = null,
 };
 
 /// How a tab is opened (Hub.open).
@@ -533,6 +539,11 @@ pub const Hub = struct {
     finished: bool = false,
     last_code: u32 = 0,
     finished_event: Io.Event = .unset,
+
+    /// The plan's usage as the status line and hooks report it (the
+    /// plan-usage bar, usage_desk.zig). Guarded by `mutex`; changes
+    /// broadcast.
+    usage: usage_desk.State = .{},
 
     /// When a hook message for no open tab was last logged (awake ms).
     /// Guarded by `mutex`.
@@ -665,8 +676,8 @@ pub const Hub = struct {
         // The launch's own arguments, decided in one place
         // (cmdline.launchArgs): a device start's permission mode, the
         // session id.
-        var arg_buf: [4][]const u8 = undefined;
-        const extra = cmdline.launchArgs(&arg_buf, if (opts.device) |d| d.mode.agentArg() else null, if (t.session_uuid) |*u| u else null);
+        var arg_buf: [6][]const u8 = undefined;
+        const extra = cmdline.launchArgs(&arg_buf, if (opts.device) |d| d.mode.agentArg() else null, if (t.session_uuid) |*u| u else null, h.program.settings_file);
         const line = cmdline.withArgs(h.gpa, h.program.cmdline, extra) catch {
             t.session.term.deinit();
             h.gpa.destroy(t);
@@ -1054,9 +1065,34 @@ pub const Hub = struct {
             return;
         };
         defer t.release();
+        // The plan's limit: a StopFailure for it sets it, a finished turn
+        // clears it (usage_desk.State).
+        if (m.rate_limit or m.event == .Stop) {
+            h.mutex.lockUncancelable(h.io);
+            const changed = if (m.rate_limit) h.usage.limitReached() else h.usage.turnDone();
+            h.mutex.unlock(h.io);
+            if (changed) {
+                if (m.rate_limit) h.log.print("usage: tab '{s}' hit the plan's limit", .{t.name()});
+                h.broadcast();
+            }
+        }
         // Desktop log only: the tab's name (shown on the desk anyway),
         // the event and the new state; never the key or anything else.
         if (t.session.setHookState(e)) h.log.print("hooks: tab '{s}': {t} -> {t}", .{ t.name(), m.event, stateOf(e.state) });
+    }
+
+    /// A report from `portalctl statusline` (hookpipe.zig's server
+    /// thread): only an open tab's own key counts, like applyHook.
+    pub fn applyUsage(h: *Hub, r: *const statusline.Report) void {
+        const now = Io.Timestamp.now(h.io, .real).toSeconds();
+        h.mutex.lockUncancelable(h.io);
+        var ours = false;
+        for (h.tabs[0..h.n]) |t| {
+            if (std.crypto.timing_safe.eql(hookmsg.Key, t.hook_key, r.key)) ours = true;
+        }
+        const changed = ours and h.usage.report(r.usage, now);
+        h.mutex.unlock(h.io);
+        if (changed) h.broadcast();
     }
 
     /// SubagentStart / SubagentStop from `portalctl hook`: only an open
