@@ -30,6 +30,8 @@ fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // (portal connect) share it.
     const rules = inputrulesModule(b, target, optimize);
     root.addImport("inputrules", rules);
+    // Speech input (src/speech): microphone capture and the stt engines.
+    root.addImport("speech", speechModule(b, target, optimize));
     const gui_mods = addGuiModules(b, root, target, optimize, rules);
     return .{ .root = root, .gui = gui_mods };
 }
@@ -202,6 +204,26 @@ pub fn build(b: *std.Build) void {
         .{ .cpu_arch = .aarch64, .os_tag = .macos },
     }) |q| test_step.dependOn(&laptopClientCheck(b, b.resolveTargetQuery(q)).step);
 
+    // Speech input: the microphone thread with a fake backend, the
+    // selection rules, and (with an NVIDIA GPU and ../SpeechToText's model)
+    // a recording through stt.Home.
+    const speech_tests = b.addRunArtifact(b.addTest(.{ .root_module = speechModule(b, target, optimize) }));
+    test_step.dependOn(&speech_tests.step);
+    b.step("test-speech", "Run only the speech module's tests").dependOn(&speech_tests.step);
+    // A manual check of the real microphone (never part of `test`).
+    const mic_check_mod = b.createModule(.{ .root_source_file = b.path("src/speech/mic_check.zig"), .target = target, .optimize = optimize });
+    const speech_mod = speechModule(b, target, optimize);
+    mic_check_mod.addImport("speech", speech_mod);
+    mic_check_mod.addImport("speech_options", speech_mod.import_table.get("speech_options").?);
+    const mic_check = b.addRunArtifact(b.addExecutable(.{ .name = "portal-mic-check", .root_module = mic_check_mod }));
+    mic_check.addPassthruArgs();
+    b.step("mic-check", "Record from the real microphone and transcribe it (manual check; -- <seconds> [model])").dependOn(&mic_check.step);
+    // stt-local (the laptop's engine, built from ../SpeechToText into
+    // this build's zig-out: Portal never builds inside SpeechToText).
+    // `zig build stt-local -Dtarget=aarch64-windows` for the Snapdragon X
+    // (needs the QAIRT SDK headers that ../TranslateNPU reads, nothing more).
+    const stt_local = b.dependency("stt", .{ .target = target, .optimize = .fast }).artifact("stt-local");
+    b.step("stt-local", "Build stt-local (the laptop speech engine) into zig-out/bin").dependOn(&b.addInstallArtifact(stt_local, .{}).step);
     addE2e(b, target, optimize, gui_mods, ctl_exe, show_exe);
     addIos(b, optimize, test_step);
     addBrand(b, test_step);
@@ -490,7 +512,27 @@ fn imageModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
                 .{ .name = "ImageCheck", .module = check },
             },
         });
-    } else dep.module("Image");
+    } else blk: {
+        // Natively the same module as Image's own "Image" (its root, its
+        // ImageCheck, the shared Vulkan), but with build options of
+        // Portal's: Image's options file has exactly the content of
+        // ../Audio's (`vector_bytes = 0`), and stt brings Audio into the
+        // same compilation, where one file can't root two modules. The
+        // marker makes this file different; the value is Image's default.
+        const opts = b.addOptions();
+        opts.addOption(usize, "vector_bytes", 0); // 0: suggested for the target, as in Image
+        opts.addOption([]const u8, "portal_options_for", "Image");
+        break :blk b.createModule(.{
+            .root_source_file = dep.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "Vulkan", .module = dep.builder.dependency("Vulkan", .{ .target = target, .optimize = optimize }).module("Vulkan") },
+                .{ .name = "build_options", .module = opts.createModule() },
+                .{ .name = "ImageCheck", .module = check },
+            },
+        });
+    };
     const imgdec = b.createModule(.{
         .root_source_file = b.path("client/src/image/imgdec.zig"),
         .target = target,
@@ -890,4 +932,29 @@ fn infoPlist(b: *std.Build, bundle_id: []const u8) []const u8 {
         \\</plist>
         \\
     , .{bundle_id});
+}
+
+// ---- speech (src/speech; docs/audio-design.md, docs/stt-sync-contract.md) ----
+
+/// "speech" (src/speech/root.zig): WASAPI capture and the stt engines.
+/// stt.Home is linked only for x86_64 Windows (the desktop, NVIDIA GPU);
+/// other targets get the capture side and the stt-local client. stt is
+/// always built ReleaseFast (inference is ~100x slower in Debug). "Audio"
+/// is the instance stt itself uses (one module per compilation).
+fn speechModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const home = target.result.os.tag == .windows and target.result.cpu.arch == .x86_64;
+    const stt_dep = b.dependency("stt", .{ .target = target, .optimize = .fast });
+    const opts = b.addOptions();
+    opts.addOption(bool, "home", home);
+    // Tests read its testdata and models (skipped when missing).
+    opts.addOptionPathUntracked("stt_dir", stt_dep.path("."));
+    const m = b.createModule(.{
+        .root_source_file = b.path("src/speech/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    m.addOptions("speech_options", opts);
+    m.addImport("Audio", stt_dep.builder.dependency("Audio", .{ .target = target }).module("Audio"));
+    if (home) m.addImport("stt", stt_dep.module("stt"));
+    return m;
 }

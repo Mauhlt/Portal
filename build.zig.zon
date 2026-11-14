@@ -23,5 +23,10 @@
         // extension (client/src/ios/tunnel_ext) runs it. Only iOS builds
         // and the extension's host tests compile it.
         .WireGuard = .{ .path = "../WireGuard" },
+        // The owner's speech-to-text (read-only): stt.Home runs in-process
+        // on the desktop GPU (src/speech/home.zig); its stt-local program
+        // is the laptop's engine. stt brings ../Audio (the WAV Portal hands
+        // it is encoded there) and ../TranslateNPU.
+        .stt = .{ .path = "../SpeechToText" },
     },
 }

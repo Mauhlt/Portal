@@ -18,12 +18,22 @@
 //! configured, the window asks for one. `system_monitor` (`on` / `off`,
 //! default off) shows the System button and lets the system monitor
 //! sample while a System panel is open (sysmon.zig).
+//!
+//! Speech input (the Audio panel): `speech_model` is the stt model file
+//! (default: speech.defaultModel, models\ggml-base.en.bin in the data
+//! directory); `mic` is `auto` (headset first, the default) or the
+//! endpoint id of the microphone chosen by hand. `speech.<name> = <n>`
+//! sets one of the speech limits (src/speech/limits.zig Config: rates,
+//! caps, clip lengths, sizes), clamped to its range; only the desk edits
+//! this file (no device can), and the Audio panel's "Reload limits"
+//! applies a change without a restart.
 
 const std = @import("std");
 const Io = std.Io;
 const keymap = @import("keymap.zig");
 const fsutil = @import("fsutil.zig");
 const tabs_wire = @import("shared").tabs;
+const speech_limits = @import("speech").limits;
 
 pub const file_name = "settings.txt";
 
@@ -32,6 +42,8 @@ pub const max_project = 64;
 pub const max_program = 1024;
 pub const max_cwd = 1024;
 pub const max_args = 64;
+pub const max_model = 1024;
+pub const max_mic = 256;
 /// Tab colour choices (`color = NAME #rrggbb`, one line each).
 pub const max_colors = 16;
 
@@ -70,6 +82,20 @@ pub const Settings = struct {
     /// "Background art": the hero art, faint, behind the window's content
     /// (null: not set, i.e. on).
     background_art: ?bool = null,
+    /// The speech model file (null: the default).
+    speech_model: Str(max_model) = .{},
+    /// The microphone chosen by hand (an endpoint id); null: automatic.
+    mic: Str(max_mic) = .{},
+    /// "Learn from my voice" (null: on).
+    speech_learning: ?bool = null,
+    /// `speech.*` lines this Portal doesn't know (a newer one wrote them, or
+    /// a typo): kept as they are and written back, never dropped.
+    speech_extra: [8]Str(160) = @splat(.{}),
+    n_speech_extra: usize = 0,
+    /// The desk's Instruct button (null: auto).
+    instruct_mode: ?@import("portal_ui").shell.InstructMode = null,
+    /// The speech limits (defaults unless set; always clamped).
+    speech: speech_limits.Config = .{},
     /// Tab colours overriding the one derived from the name.
     colors: [max_colors]ColorEntry = undefined,
     n_colors: usize = 0,
@@ -104,6 +130,18 @@ pub const Settings = struct {
                 if (std.ascii.eqlIgnoreCase(val, "on")) s.system_monitor = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.system_monitor = false;
             } else if (std.mem.eql(u8, key, "background_art")) {
                 if (std.ascii.eqlIgnoreCase(val, "on")) s.background_art = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.background_art = false;
+            } else if (std.mem.eql(u8, key, "speech_model")) {
+                _ = s.speech_model.set(val);
+            } else if (std.mem.eql(u8, key, "mic")) {
+                if (!std.ascii.eqlIgnoreCase(val, "auto")) _ = s.mic.set(val);
+            } else if (std.mem.eql(u8, key, "instruct_mode")) {
+                s.instruct_mode = @import("portal_ui").shell.InstructMode.parse(val);
+            } else if (std.mem.eql(u8, key, "speech_learning")) {
+                if (std.ascii.eqlIgnoreCase(val, "on")) s.speech_learning = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.speech_learning = false;
+            } else if (std.mem.startsWith(u8, key, "speech.")) {
+                if (!s.speech.set(key["speech.".len..], val) and s.n_speech_extra < s.speech_extra.len) {
+                    if (s.speech_extra[s.n_speech_extra].set(line)) s.n_speech_extra += 1;
+                }
             } else if (std.mem.eql(u8, key, "color")) {
                 // NAME #rrggbb: the name may contain spaces.
                 const sp = std.mem.lastIndexOfScalar(u8, val, ' ') orelse continue;
@@ -128,6 +166,12 @@ pub const Settings = struct {
         if (s.cwd.get()) |v| try out.print("cwd = {s}\r\n", .{v});
         if (s.system_monitor) |v| try out.print("system_monitor = {s}\r\n", .{if (v) "on" else "off"});
         if (s.background_art) |v| try out.print("background_art = {s}\r\n", .{if (v) "on" else "off"});
+        if (s.speech_model.get()) |v| try out.print("speech_model = {s}\r\n", .{v});
+        if (s.mic.get()) |v| try out.print("mic = {s}\r\n", .{v});
+        if (s.instruct_mode) |m| try out.print("instruct_mode = {s}\r\n", .{m.text()});
+        if (s.speech_learning) |v| try out.print("speech_learning = {s}\r\n", .{if (v) "on" else "off"});
+        try s.speech.format(out);
+        for (s.speech_extra[0..s.n_speech_extra]) |*x| if (x.get()) |l| try out.print("{s}\r\n", .{l});
         for (s.colors[0..s.n_colors]) |*c| {
             const name = c.name.get() orelse continue;
             try out.print("color = {s} {s}\r\n", .{ name, &tabs_wire.colorHex(c.color) });
@@ -144,9 +188,23 @@ pub fn load(gpa: std.mem.Allocator, io: Io, dir: []const u8) Settings {
     return Settings.parse(text);
 }
 
+/// Like `load`, but null when the file exists and can't be read (so a
+/// caller merging one change into it doesn't overwrite it with defaults);
+/// a missing file is empty settings.
+pub fn loadOrNull(gpa: std.mem.Allocator, io: Io, dir: []const u8) ?Settings {
+    const path = std.fs.path.join(gpa, &.{ dir, file_name }) catch return null;
+    defer gpa.free(path);
+    const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch |err| return switch (err) {
+        error.FileNotFound => .{},
+        else => null,
+    };
+    defer gpa.free(text);
+    return Settings.parse(text);
+}
+
 /// Writes `<dir>\settings.txt` atomically (a temporary file renamed over it).
 pub fn save(gpa: std.mem.Allocator, io: Io, dir: []const u8, s: *const Settings) !void {
-    var buf: [4096]u8 = undefined;
+    var buf: [8192]u8 = undefined;
     var out: Io.Writer = .fixed(&buf);
     try s.format(&out);
     const path = try std.fs.path.join(gpa, &.{ dir, file_name });
@@ -234,6 +292,56 @@ test "settings parse and format round trip" {
     try testing.expectEqualStrings(s.program.get().?, again.program.get().?);
     try testing.expectEqualStrings(s.cwd.get().?, again.cwd.get().?);
     try testing.expectEqual(@as(u32, 0x3366CC), again.colors[0].color);
+}
+
+test "settings: speech model and microphone" {
+    const s = Settings.parse("speech_model = C:\\m\\ggml-base.en.bin\r\nmic = {0.0.1.00000000}.{abc}\r\n");
+    try testing.expectEqualStrings("C:\\m\\ggml-base.en.bin", s.speech_model.get().?);
+    try testing.expectEqualStrings("{0.0.1.00000000}.{abc}", s.mic.get().?);
+    try testing.expect(Settings.parse("mic = Auto").mic.get() == null);
+    var buf: [2048]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    try s.format(&out);
+    const again = Settings.parse(out.buffered());
+    try testing.expectEqualStrings(s.mic.get().?, again.mic.get().?);
+    try testing.expectEqualStrings(s.speech_model.get().?, again.speech_model.get().?);
+}
+
+test "settings: speech_learning; unknown speech.* lines survive a save" {
+    const s = Settings.parse("speech_learning = off\r\nspeech.from_the_future = 7\r\nspeech.transcribe_per_hour = 9\r\n");
+    try testing.expect(!s.speech_learning.?);
+    var buf: [2048]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    try s.format(&out);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech.from_the_future = 7") != null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech.transcribe_per_hour = 9") != null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech_learning = off") != null);
+    try testing.expect(Settings.parse("").speech_learning == null);
+}
+
+test "settings: instruct_mode" {
+    const ui_shell = @import("portal_ui").shell;
+    try testing.expectEqual(ui_shell.InstructMode.typing, Settings.parse("instruct_mode = type").instruct_mode.?);
+    try testing.expectEqual(ui_shell.InstructMode.record, Settings.parse("instruct_mode=Record").instruct_mode.?);
+    try testing.expect(Settings.parse("instruct_mode = sometimes").instruct_mode == null);
+    var s: Settings = .{ .instruct_mode = .record };
+    var buf: [512]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    try s.format(&out);
+    try testing.expectEqual(ui_shell.InstructMode.record, Settings.parse(out.buffered()).instruct_mode.?);
+}
+
+test "settings: speech limits load clamped and round-trip" {
+    const s = Settings.parse("speech.transcribe_per_hour = 50\r\nspeech.clip_max_s = 9999\r\nspeech.feedback_burst = 0\r\nspeech.bogus = 3\r\n");
+    try testing.expectEqual(@as(u32, 50), s.speech.transcribe_per_hour);
+    try testing.expectEqual(@as(u32, 120), s.speech.clip_max_s);
+    try testing.expectEqual(@as(u32, 1), s.speech.feedback_burst);
+    try testing.expectEqual(@as(u32, 300), Settings.parse("").speech.transcribe_per_hour);
+    var buf: [2048]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    try s.format(&out);
+    const again = Settings.parse(out.buffered());
+    try testing.expectEqual(s.speech, again.speech);
 }
 
 test "settings: bad values are ignored, nothing defaults" {

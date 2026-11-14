@@ -254,18 +254,73 @@ pub const State = struct {
 /// terminal from there).
 pub const Focus = enum { panel, pair_screen, wait_screen, line, terminal, view };
 
-/// Where a device's speech-to-text plugs in (future: Portal's mic capture
-/// from ../Audio, then stt, typing into the instruction line for review;
-/// the user sends). Dictation toggles: `start`, then `stop`.
+/// Where a device's speech-to-text plugs in: the glue's microphone
+/// capture and stt engine (desk: src/speech, stt.Home). Dictation toggles:
+/// `start`, then `stop`; the transcript comes back through
+/// `Shell.dictated` into the instruction line for review, and the user
+/// sends. `sent` / `cleared` report what became of the line (the glue's
+/// dictation.Tracker turns that into stt feedback).
 pub const Dictation = struct {
     ctx: *anyopaque,
-    start: *const fn (ctx: *anyopaque) void,
+    /// True if recording started (false: the microphone is busy, e.g. the
+    /// Audio panel's Test; the 🎤 stays off).
+    start: *const fn (ctx: *anyopaque) bool,
     stop: *const fn (ctx: *anyopaque) void,
+    /// The line was sent (Enter / Send) with this text.
+    sent: ?*const fn (ctx: *anyopaque, line: []const u8) void = null,
+    /// A non-empty line was cleared without being sent (Esc).
+    cleared: ?*const fn (ctx: *anyopaque) void = null,
+    /// Give up the transcription in progress (the "Transcribing" button,
+    /// or the panel closed while it runs).
+    cancel: ?*const fn (ctx: *anyopaque) void = null,
 };
 
-/// Whether a headset with a microphone is attached (the audio work
-/// implements it: ../Audio, IMMDevice form factor). Its media button
-/// toggles dictation only then.
+/// What the desk's Instruct button does (setting `instruct_mode`):
+///   auto     with a working microphone and speech ready: open the input
+///            box and start recording (pressed again: stop); otherwise just
+///            open the box (the 🎤 says why speech is off), no popup;
+///   typing   only open the box; recording only through the 🎤 or the
+///            headset's media key;
+///   record   as auto when speech works; otherwise open the box and say
+///            why once (`unavailable_notice`, until speech works again).
+pub const InstructMode = enum {
+    auto,
+    typing,
+    record,
+
+    /// Settings text: "auto", "type", "record".
+    pub fn parse(s: []const u8) ?InstructMode {
+        if (std.ascii.eqlIgnoreCase(s, "auto")) return .auto;
+        if (std.ascii.eqlIgnoreCase(s, "type")) return .typing;
+        if (std.ascii.eqlIgnoreCase(s, "record")) return .record;
+        return null;
+    }
+    pub fn text(m: InstructMode) []const u8 {
+        return switch (m) {
+            .auto => "auto",
+            .typing => "type",
+            .record => "record",
+        };
+    }
+    pub fn label(m: InstructMode) []const u8 {
+        return switch (m) {
+            .auto => "Record when the microphone works, else type",
+            .typing => "Type (record only with the \u{1F3A4})",
+            .record => "Record (say why when it can't)",
+        };
+    }
+    pub fn next(m: InstructMode) InstructMode {
+        return switch (m) {
+            .auto => .typing,
+            .typing => .record,
+            .record => .auto,
+        };
+    }
+};
+
+/// Whether a headset with a microphone is attached (the desk glue
+/// implements it from the microphone thread's device list: form factor
+/// and bus). Its media button toggles dictation only then.
 pub const HeadsetMic = struct {
     ctx: ?*anyopaque = null,
     present: *const fn (ctx: ?*anyopaque) bool,
@@ -380,6 +435,21 @@ pub const Shell = struct {
     dictating: bool = false,
     /// The headset predicate (headsetMicPresent); none yet: false.
     headset_mic: ?HeadsetMic = null,
+    /// Set by the glue each frame: the microphone in use (shown by the
+    /// 🎤; "" if none), a recording is being transcribed, and why
+    /// dictation can't work now ("": it can).
+    mic_label: []const u8 = "",
+    transcribing: bool = false,
+    speech_off: []const u8 = "",
+    /// The desk's Instruct behaviour, and whether a microphone is usable
+    /// and speech is ready (the glue re-evaluates it on device changes).
+    instruct_mode: InstructMode = .auto,
+    speech_ready: bool = true,
+    /// `record` mode found speech unusable: the glue shows `speech_off`
+    /// once (a toast) and clears this. `told_unavailable` keeps it to
+    /// once until speech works again.
+    unavailable_notice: bool = false,
+    told_unavailable: bool = false,
     /// Set by the glue from the OS (Touch).
     touch: Touch = .{},
     /// The on-screen keyboard should be up: the glue shows or hides the
@@ -419,6 +489,7 @@ pub const Shell = struct {
         right: [128]u8 = undefined,
         panes: [frame.max_panes]frame.Pane = undefined,
         row: [2]frame.PanelButton = undefined,
+        mic: [200]u8 = undefined,
         keys: [16]input.Answer = undefined,
         top_tabs: [tabs_wire.max_tabs + subtabs_wire.max_subs]frame.TopTab = undefined,
         sub_labels: [subtabs_wire.max_subs][subtabs_wire.max_name + 16]u8 = undefined,
@@ -479,17 +550,71 @@ pub const Shell = struct {
     /// the device has it. Esc on an empty line, Send or Close shut it.
     /// On the desk (full control) the line also takes the keyboard.
     pub fn startDictation(sh: *Shell) void {
-        const mode = sh.policy() orelse return;
-        if (!mode.acceptsAnswers()) return;
+        if (!sh.openInstruct()) return;
+        if (sh.dictating) return;
+        // No microphone or no speech: the box only; the 🎤 says why.
+        if (!sh.speech_ready) return;
+        if (sh.dictation) |d| {
+            sh.dictating = d.start(d.ctx);
+        }
+    }
+
+    /// Opens the instruct panel with its line focused; false if this mode
+    /// has no line (or takes no input).
+    fn openInstruct(sh: *Shell) bool {
+        const mode = sh.policy() orelse return false;
+        if (!mode.acceptsAnswers()) return false;
         sh.instructing = true;
-        if (!hasLine(mode)) return;
+        if (!hasLine(mode)) return false;
         if (sh.device == .desk) sh.line_focus = true;
         if (sh.touch.on_screen_keyboard) sh.keyboard = true;
-        if (sh.dictating) return;
-        if (sh.dictation) |d| {
-            d.start(d.ctx);
-            sh.dictating = true;
+        return true;
+    }
+
+    /// The Instruct button (the panel closed): per `instruct_mode` on the
+    /// desk; a device opens and dictates when it can, as before.
+    pub fn instructPressed(sh: *Shell) void {
+        if (sh.device != .desk) return sh.startDictation();
+        switch (sh.instruct_mode) {
+            .typing => _ = sh.openInstruct(),
+            .auto => sh.startDictation(),
+            .record => {
+                if (!sh.speech_ready and sh.dictation != null and !sh.told_unavailable) {
+                    sh.unavailable_notice = true;
+                    sh.told_unavailable = true;
+                }
+                sh.startDictation();
+            },
         }
+    }
+
+    /// The glue's view of the microphone and speech (each frame, and on
+    /// device changes). Working again re-arms record mode's one notice.
+    pub fn setSpeechReady(sh: *Shell, ready: bool) void {
+        sh.speech_ready = ready;
+        if (ready) sh.told_unavailable = false;
+    }
+
+    /// A transcript for the instruction line (the glue's speech engine):
+    /// appended for review; the line takes the keyboard on the desk.
+    /// Returns true only if the line now ends with exactly `text` after
+    /// what it had: the line's limit, a line break, a tab or bad UTF-8 can
+    /// cut or change it, and then the transcript must not be learned from
+    /// as if the user had sent it unchanged (the glue discards it).
+    pub fn dictated(sh: *Shell, text: []const u8) bool {
+        if (text.len == 0) return false;
+        const before = sh.line.text().len;
+        _ = sh.line.append(text);
+        if (sh.device == .desk and sh.instructing) sh.line_focus = true;
+        const now = sh.line.text();
+        return now.len == before + text.len and std.mem.eql(u8, now[before..], text);
+    }
+
+    /// Gives up the transcription in progress (nothing lands in the line).
+    pub fn cancelTranscription(sh: *Shell) void {
+        sh.transcribing = false;
+        const d = sh.dictation orelse return;
+        if (d.cancel) |f| f(d.ctx);
     }
 
     /// Stops dictation; its text stays in the line for review.
@@ -518,6 +643,7 @@ pub const Shell = struct {
 
     fn closeInstruct(sh: *Shell) void {
         sh.stopDictation();
+        if (sh.transcribing) sh.cancelTranscription();
         sh.instructing = false;
         sh.line_focus = false;
         sh.keyboard = false;
@@ -739,10 +865,13 @@ pub const Shell = struct {
         var r: usize = 0;
         // With speech-to-text: its toggle, and the recording indicator.
         if (line and sh.dictation != null) {
+            const mic = sh.mic_label;
             b.row[r] = if (sh.dictating)
-                .{ .label = "\u{25CF} Listening\u{2026}  (stop)", .id = ids.instruct, .tone = .bad }
+                .{ .label = std.fmt.bufPrint(&b.mic, "\u{25CF} Listening\u{2026}  (stop){s}{s}", .{ if (mic.len > 0) "  \u{00B7}  " else "", mic }) catch "\u{25CF} Listening\u{2026}  (stop)", .id = ids.instruct, .tone = .bad }
+            else if (sh.transcribing)
+                .{ .label = "\u{2026} Transcribing  (cancel)", .id = ids.instruct, .tone = .warn }
             else
-                .{ .label = "\u{1F3A4} Dictate", .id = ids.instruct, .tone = .good };
+                .{ .label = std.fmt.bufPrint(&b.mic, "\u{1F3A4} Dictate{s}{s}", .{ if (mic.len > 0) "  \u{00B7}  " else "", mic }) catch "\u{1F3A4} Dictate", .id = ids.instruct, .tone = if (sh.speech_off.len > 0) .normal else .good };
             r += 1;
         }
         b.row[r] = .{ .label = "Close", .id = ids.instruct_close };
@@ -756,6 +885,10 @@ pub const Shell = struct {
                 "Click here to type (keys go to the terminal)"
             else if (sh.dictating)
                 "Listening \u{2014} the text lands here; Send when ready (Esc closes)"
+            else if (sh.transcribing)
+                "Transcribing\u{2026} the text lands here"
+            else if (sh.dictation != null and sh.speech_off.len > 0)
+                sh.speech_off
             else if (sh.dictation != null)
                 "Type, or Dictate (Esc closes)"
             else if (sh.device == .desk)
@@ -1055,7 +1188,7 @@ pub const Shell = struct {
             .wait_screen => if (key == .escape) sh.command(.cancel_pair),
             .view => {},
             .line => {
-                _ = sh.line.onKey(key, mods, LineSender{ .sh = sh });
+                sh.lineKey(key, mods);
                 // Sent: back to the minimal view.
                 if (sh.instructing and key == .enter and sh.line.text().len == 0) sh.closeInstruct();
             },
@@ -1063,6 +1196,23 @@ pub const Shell = struct {
                 sh.select.active = false;
                 sh.host.vtable.key(sh.host.ctx, key, mods);
             },
+        }
+    }
+
+    /// A key for the input line; what became of a non-empty line (sent or
+    /// cleared) goes to the dictation hooks.
+    fn lineKey(sh: *Shell, key: input.Key, mods: input.Mods) void {
+        var before: [inputline.cap]u8 = undefined;
+        const had = sh.line.text();
+        @memcpy(before[0..had.len], had);
+        const was = before[0..had.len];
+        _ = sh.line.onKey(key, mods, LineSender{ .sh = sh });
+        if (was.len == 0 or sh.line.text().len != 0) return;
+        const d = sh.dictation orelse return;
+        switch (key) {
+            .enter => if (d.sent) |f| f(d.ctx, was),
+            .escape => if (d.cleared) |f| f(d.ctx),
+            else => {},
         }
     }
 
@@ -1154,7 +1304,7 @@ pub const Shell = struct {
             },
             // Send: what Enter in the line does.
             ids.send => if (sh.focus() == .line or sh.device == .desk) {
-                _ = sh.line.onKey(.enter, .{}, LineSender{ .sh = sh });
+                sh.lineKey(.enter, .{});
                 if (sh.instructing and sh.line.text().len == 0) sh.closeInstruct();
             },
             ids.data_toggle => sh.data.toggle(),
@@ -1164,7 +1314,9 @@ pub const Shell = struct {
                 sh.instructing = false;
             },
             ids.view_conversation => sh.main = .conversation,
-            ids.instruct => if (sh.instructing) sh.toggleDictation() else sh.startDictation(),
+            ids.instruct => if (sh.instructing and sh.transcribing and !sh.dictating)
+                sh.cancelTranscription()
+            else if (sh.instructing) sh.toggleDictation() else sh.instructPressed(),
             ids.instruct_close => sh.closeInstruct(),
             ids.view0...ids.view_last => if (sh.conversation) |c| if (c.button) |f| {
                 _ = f(c.ctx, id);
@@ -1666,6 +1818,197 @@ test "desk dictation: the panel's mic and the headset's media key, never Space" 
     try testing.expectEqual(@as(usize, 2), d.stops);
 }
 
+const DictSeen = struct {
+    sent_buf: [64]u8 = undefined,
+    sent_len: usize = 0,
+    clears: usize = 0,
+    fn of(p: *anyopaque) *DictSeen {
+        return @ptrCast(@alignCast(p));
+    }
+    fn nop(_: *anyopaque) void {}
+    fn go(_: *anyopaque) bool {
+        return true;
+    }
+    fn sent(p: *anyopaque, line: []const u8) void {
+        const d = of(p);
+        @memcpy(d.sent_buf[0..line.len], line);
+        d.sent_len = line.len;
+    }
+    fn cleared(p: *anyopaque) void {
+        of(p).clears += 1;
+    }
+};
+
+test "desk dictation: the transcript lands in the line; Send and Esc are reported; the mic is shown" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    var d: DictSeen = .{};
+    sh.dictation = .{ .ctx = &d, .start = DictSeen.go, .stop = DictSeen.nop, .sent = DictSeen.sent, .cleared = DictSeen.cleared };
+    sh.mic_label = "Jabra Evolve2";
+    Shell.onButton(&sh, ids.instruct);
+    var o = sh.overlay(.{});
+    try testing.expect(hasLabel(o, "Jabra Evolve2"));
+    Shell.onButton(&sh, ids.instruct); // stop: transcribing
+    sh.transcribing = true;
+    o = sh.overlay(.{});
+    try testing.expect(hasLabel(o, "Transcribing"));
+    sh.transcribing = false;
+    try testing.expect(sh.dictated("Hello world."));
+    try testing.expectEqualStrings("Hello world.", sh.line.text());
+    try testing.expectEqual(Focus.line, sh.focus());
+    // Edited, then Send: the line as sent goes to the hook.
+    Shell.onChar(&sh, '!', .{});
+    Shell.onButton(&sh, ids.send);
+    try testing.expectEqualStrings("Hello world.!", d.sent_buf[0..d.sent_len]);
+    // Esc on a dictated line: cleared, reported once.
+    Shell.onButton(&sh, ids.instruct);
+    _ = sh.dictated("wrong words");
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expectEqual(@as(usize, 1), d.clears);
+    try testing.expectEqualStrings("", sh.line.text());
+    // Speech off: the reason is the line's hint.
+    sh.speech_off = "No microphone found (Audio in the top bar).";
+    Shell.onButton(&sh, ids.instruct); // stops the dictation started above
+    o = sh.overlay(.{});
+    try testing.expectEqualStrings(sh.speech_off, o.bottom[1].content.field.hint);
+}
+
+const DictCount = struct {
+    starts: usize = 0,
+    fn of(p: *anyopaque) *DictCount {
+        return @ptrCast(@alignCast(p));
+    }
+    fn start(p: *anyopaque) bool {
+        of(p).starts += 1;
+        return true;
+    }
+    fn stop(_: *anyopaque) void {}
+};
+
+fn instructCase(mode: InstructMode, ready: bool) !struct { starts: usize, notice: bool, dictating: bool, line: bool } {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    var d: DictCount = .{};
+    sh.dictation = .{ .ctx = &d, .start = DictCount.start, .stop = DictCount.stop };
+    sh.instruct_mode = mode;
+    sh.setSpeechReady(ready);
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.instructing);
+    return .{ .starts = d.starts, .notice = sh.unavailable_notice, .dictating = sh.dictating, .line = sh.focus() == .line };
+}
+
+test "dictated: only an exact append counts (line limit, line break, tab, bad UTF-8)" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    try testing.expect(sh.dictated("Hello world."));
+    // 2.3 KB: the line keeps about 2000 bytes.
+    const long: [2300]u8 = @splat('a');
+    sh.line.field.clear();
+    try testing.expect(!sh.dictated(&long));
+    sh.line.field.clear();
+    try testing.expect(!sh.dictated("first line\nsecond line"));
+    sh.line.field.clear();
+    try testing.expect(!sh.dictated("a\tb"));
+    sh.line.field.clear();
+    try testing.expect(!sh.dictated("bad \xff utf8"));
+    try testing.expect(!sh.dictated(""));
+}
+
+test "a cut transcript is discarded, never learned: 2.3 KB, and one with a line break" {
+    const dict = @import("dictation.zig");
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    var out: [dict.max_text + 2]u8 = undefined;
+    for ([_][]const u8{ "first part\nsecond part", "" }, 0..) |text, round| {
+        var t: dict.Tracker = .{};
+        var long: [2300]u8 = @splat('w');
+        const transcript: []const u8 = if (round == 0) text else &long;
+        sh.line.field.clear();
+        var settled: dict.Decision = .none;
+        const add = t.added(42, transcript, sh.line.text(), &out, &settled);
+        // What the desk glue does: an inexact append is discarded at once.
+        const d: dict.Decision = if (!sh.dictated(add)) t.cleared() else .none;
+        try testing.expectEqual(@as(u64, 42), d.discard);
+        // Sending what is in the line afterwards learns nothing.
+        try testing.expect(t.sent(sh.line.text()) == .none);
+    }
+}
+
+test "dictation: a start the glue refuses leaves the 🎤 off" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    const No = struct {
+        fn start(_: *anyopaque) bool {
+            return false;
+        }
+        fn stop(_: *anyopaque) void {}
+    };
+    var x: u8 = 0;
+    sh.dictation = .{ .ctx = &x, .start = No.start, .stop = No.stop };
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.instructing and !sh.dictating);
+}
+
+test "desk instruct_mode: auto, type and record, with and without a microphone" {
+    // auto: records with a microphone; without, the box only, no notice.
+    var c = try instructCase(.auto, true);
+    try testing.expect(c.starts == 1 and c.dictating and c.line and !c.notice);
+    c = try instructCase(.auto, false);
+    try testing.expect(c.starts == 0 and !c.dictating and c.line and !c.notice);
+    // type: the box only, either way.
+    c = try instructCase(.typing, true);
+    try testing.expect(c.starts == 0 and !c.dictating and c.line and !c.notice);
+    c = try instructCase(.typing, false);
+    try testing.expect(c.starts == 0 and c.line and !c.notice);
+    // record: records with a microphone; without, the box and the reason once.
+    c = try instructCase(.record, true);
+    try testing.expect(c.starts == 1 and c.dictating and !c.notice);
+    c = try instructCase(.record, false);
+    try testing.expect(c.starts == 0 and c.line and c.notice);
+}
+
+test "desk instruct_mode: auto stops on the second press; record says why once until the mic is back" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    var d: DictCount = .{};
+    sh.dictation = .{ .ctx = &d, .start = DictCount.start, .stop = DictCount.stop };
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.dictating);
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(!sh.dictating and sh.instructing);
+    Shell.onButton(&sh, ids.instruct_close);
+    // type mode: the 🎤 in the open panel still records.
+    sh.instruct_mode = .typing;
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(!sh.dictating);
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.dictating);
+    Shell.onButton(&sh, ids.instruct_close);
+    // record mode, the microphone unplugged: one notice, not two.
+    sh.instruct_mode = .record;
+    sh.setSpeechReady(false);
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.unavailable_notice);
+    sh.unavailable_notice = false; // the glue showed it
+    Shell.onButton(&sh, ids.instruct_close);
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(!sh.unavailable_notice);
+    Shell.onButton(&sh, ids.instruct_close);
+    // Plugged in again (a device change), then out: told again.
+    sh.setSpeechReady(true);
+    sh.setSpeechReady(false);
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.unavailable_notice);
+    // Recording started twice: auto's press and type mode's 🎤.
+    try testing.expectEqual(@as(usize, 2), d.starts);
+}
+
 test "touch: the keyboard button, the keyboard follows the line's focus" {
     var r: Rec = .{};
     var sh = Shell.init(testing.allocator, .desk, r.host());
@@ -1875,9 +2218,10 @@ const StubView = struct {
 
 const DictRec = struct {
     started: usize = 0,
-    fn start(p: *anyopaque) void {
+    fn start(p: *anyopaque) bool {
         const d: *DictRec = @ptrCast(@alignCast(p));
         d.started += 1;
+        return true;
     }
     fn stop(_: *anyopaque) void {}
 };
@@ -1991,8 +2335,9 @@ const DictToggle = struct {
     fn of(p: *anyopaque) *DictToggle {
         return @ptrCast(@alignCast(p));
     }
-    fn start(p: *anyopaque) void {
+    fn start(p: *anyopaque) bool {
         of(p).starts += 1;
+        return true;
     }
     fn stop(p: *anyopaque) void {
         of(p).stops += 1;
