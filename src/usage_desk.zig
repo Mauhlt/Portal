@@ -9,7 +9,13 @@
 //!     Portal adds nothing to desk starts.
 //!   * `State`: the latest windows (`report`), the limit (`limitReached`
 //!     from a StopFailure hook with `error` = `rate_limit`, cleared by a
-//!     later finished turn or the window's reset).
+//!     later finished turn or the window's reset). Reports are kept per
+//!     tab (`reportFrom`, keyed by the tab's hook key) and the newest one
+//!     per window is shown; a tab's reports go when it closes (`forget`).
+//!     Any process in a tab can read PORTAL_TAB and send a report, so a
+//!     report must look like the status line's (`plausible`), is replaced
+//!     by the next one from any tab, and ends with its tab: a tool cannot
+//!     pin a made-up number on every device.
 //!   * `Throttle`: per viewer, when `{"t":"usage"}` goes out: after hello,
 //!     then at most once per `interval_ms`, at once when a window crosses
 //!     75 %, 90 % or 100 %, or the limit changes. The viewer's loop waits
@@ -25,11 +31,72 @@ const Window = planusage.Window;
 
 pub const interval_ms: i64 = 5 * 60 * 1000;
 
+pub const Key = [16]u8;
+/// Tabs whose reports are kept (more: the oldest report goes).
+pub const max_sources = 16;
+
 pub const State = struct {
     latest: Usage = .{},
     /// The limited window's `resets_at` when its limit was reached (0:
     /// unknown): a later report with another reset time is a new window.
     limit_resets_at: u64 = 0,
+    sources: [max_sources]Source = undefined,
+    n_sources: usize = 0,
+    seq: u64 = 0,
+
+    const Source = struct { key: Key, usage: Usage, seq: u64 };
+
+    /// A status line report from the tab with hook key `key`: kept as that
+    /// tab's, and the newest report of each window is shown. Implausible
+    /// ones are dropped. True if what is shown changed.
+    pub fn reportFrom(s: *State, key: Key, u: Usage, now_unix: i64) bool {
+        if (!plausible(u, now_unix)) return false;
+        s.seq += 1;
+        const src: Source = .{ .key = key, .usage = .{ .week = u.week, .five_hour = u.five_hour }, .seq = s.seq };
+        for (s.sources[0..s.n_sources]) |*x| if (std.mem.eql(u8, &x.key, &key)) {
+            // A window this report leaves out keeps the tab's last one.
+            x.usage = .{ .week = u.week orelse x.usage.week, .five_hour = u.five_hour orelse x.usage.five_hour };
+            x.seq = s.seq;
+            return s.show(now_unix);
+        };
+        if (s.n_sources == max_sources) {
+            var oldest: usize = 0;
+            for (s.sources[0..s.n_sources], 0..) |x, i| if (x.seq < s.sources[oldest].seq) {
+                oldest = i;
+            };
+            s.sources[oldest] = src;
+        } else {
+            s.sources[s.n_sources] = src;
+            s.n_sources += 1;
+        }
+        return s.show(now_unix);
+    }
+
+    /// The tab with hook key `key` closed: its reports no longer count.
+    /// True if what is shown changed.
+    pub fn forget(s: *State, key: Key, now_unix: i64) bool {
+        for (s.sources[0..s.n_sources], 0..) |x, i| if (std.mem.eql(u8, &x.key, &key)) {
+            s.sources[i] = s.sources[s.n_sources - 1];
+            s.n_sources -= 1;
+            return s.show(now_unix);
+        };
+        return false;
+    }
+
+    /// Shows each window from the newest report that has it.
+    fn show(s: *State, now_unix: i64) bool {
+        var week: ?Source = null;
+        var five: ?Source = null;
+        for (s.sources[0..s.n_sources]) |x| {
+            if (x.usage.week != null and (week == null or x.seq > week.?.seq)) week = x;
+            if (x.usage.five_hour != null and (five == null or x.seq > five.?.seq)) five = x;
+        }
+        const before = s.latest;
+        s.latest.week = if (week) |x| x.usage.week else null;
+        s.latest.five_hour = if (five) |x| x.usage.five_hour else null;
+        s.checkLimit(now_unix);
+        return !before.eql(s.latest);
+    }
 
     pub fn known(s: *const State) bool {
         return s.latest.week != null or s.latest.five_hour != null;
@@ -43,13 +110,17 @@ pub const State = struct {
         const before = s.latest;
         if (u.week) |w| s.latest.week = w;
         if (u.five_hour) |w| s.latest.five_hour = w;
+        s.checkLimit(now_unix);
+        return !before.eql(s.latest);
+    }
+
+    fn checkLimit(s: *State, now_unix: i64) void {
         if (s.latest.limit_reached) |k| {
             const w = s.windowOf(k);
             const reset_passed = s.limit_resets_at != 0 and now_unix >= @as(i64, @intCast(@min(s.limit_resets_at, std.math.maxInt(i63))));
             const new_window = w != null and w.?.resets_at != 0 and s.limit_resets_at != 0 and w.?.resets_at != s.limit_resets_at;
             if (reset_passed or new_window) s.clearLimit();
         }
-        return !before.eql(s.latest);
     }
 
     /// StopFailure with `rate_limit`: the window at 100 %, else the fuller
@@ -83,6 +154,20 @@ pub const State = struct {
         };
     }
 };
+
+/// What the status line can report: at most 100 %, and a reset time
+/// (when known) no further ahead than the window is long (plus an hour)
+/// nor more than a day past.
+pub fn plausible(u: Usage, now_unix: i64) bool {
+    const spans = [_]struct { ?Window, i64 }{ .{ u.week, 7 * 86400 }, .{ u.five_hour, 5 * 3600 } };
+    for (spans) |sp| if (sp[0]) |w| {
+        if (w.pct > 100) return false;
+        if (w.resets_at == 0) continue;
+        const at: i64 = @intCast(@min(w.resets_at, std.math.maxInt(i63)));
+        if (at > now_unix +| (sp[1] + 3600) or at < now_unix -| 86400) return false;
+    };
+    return true;
+}
 
 const band = planusage.band;
 
@@ -187,6 +272,38 @@ test "State: reports, the limit and its clearing" {
     try testing.expectEqual(planusage.WindowKind.week, s.latest.limit_reached.?);
     try testing.expect(s.turnDone());
     try testing.expect(!s.turnDone());
+}
+
+test "per tab: the newest report shows, a closed tab's go, implausible ones are dropped" {
+    var s: State = .{};
+    const now: i64 = 1_800_000_000;
+    const a: Key = @splat(1);
+    const b: Key = @splat(2);
+    try testing.expect(s.reportFrom(a, .{ .week = .{ .pct = 40, .resets_at = now + 86400 }, .five_hour = .{ .pct = 10, .resets_at = now + 3600 } }, now));
+    // A made-up report from another tab shows until a newer one comes...
+    try testing.expect(s.reportFrom(b, .{ .week = .{ .pct = 99, .resets_at = now + 86400 } }, now));
+    try testing.expectEqual(@as(u8, 99), s.latest.week.?.pct);
+    try testing.expectEqual(@as(u8, 10), s.latest.five_hour.?.pct);
+    try testing.expect(s.reportFrom(a, .{ .week = .{ .pct = 41, .resets_at = now + 86400 } }, now));
+    try testing.expectEqual(@as(u8, 41), s.latest.week.?.pct);
+    // ...or until its tab closes.
+    _ = s.reportFrom(b, .{ .week = .{ .pct = 99, .resets_at = now + 86400 } }, now);
+    try testing.expect(s.forget(b, now));
+    try testing.expectEqual(@as(u8, 41), s.latest.week.?.pct);
+    try testing.expect(!s.forget(b, now));
+    // Not what a status line reports: dropped.
+    try testing.expect(!s.reportFrom(b, .{ .week = .{ .pct = 101 } }, now));
+    try testing.expect(!s.reportFrom(b, .{ .five_hour = .{ .pct = 5, .resets_at = now + 6 * 3600 + 1 } }, now));
+    try testing.expect(!s.reportFrom(b, .{ .week = .{ .pct = 5, .resets_at = now + 9 * 86400 } }, now));
+    try testing.expect(!s.reportFrom(b, .{ .week = .{ .pct = 5, .resets_at = 1000 } }, now));
+    try testing.expect(plausible(.{ .week = .{ .pct = 5 } }, now));
+    // The last tab gone: nothing known.
+    try testing.expect(s.forget(a, now));
+    try testing.expect(!s.known());
+    // More tabs than kept: the oldest report goes.
+    for (0..max_sources + 1) |i| _ = s.reportFrom(@splat(@intCast(i + 10)), .{ .week = .{ .pct = @intCast(i) } }, now);
+    try testing.expectEqual(@as(usize, max_sources), s.n_sources);
+    try testing.expectEqual(@as(u8, max_sources), s.latest.week.?.pct);
 }
 
 test "Throttle: connect, 5 minutes, threshold crossings (fake clock)" {

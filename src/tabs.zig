@@ -1132,6 +1132,9 @@ pub const Hub = struct {
             h.finished = true;
             h.last_code = code;
         }
+        // Its status line reports go with it (usage_desk.State.forget;
+        // the broadcast below wakes the viewers that send it).
+        if (idx != null) _ = h.usage.forget(t.hook_key, Io.Timestamp.now(h.io, .real).toSeconds());
         h.mutex.unlock(h.io);
         if (t.convo_stop) |e| _ = w32.SetEvent(e);
         h.cond.broadcast(h.io);
@@ -1309,7 +1312,9 @@ pub const Hub = struct {
         for (h.tabs[0..h.n]) |t| {
             if (std.crypto.timing_safe.eql(hookmsg.Key, t.hook_key, r.key)) ours = true;
         }
-        const changed = ours and h.usage.report(r.usage, now);
+        // Kept per tab: the newest report shows, and a tab's go when it
+        // closes (usage_desk.State.reportFrom).
+        const changed = ours and h.usage.reportFrom(r.key, r.usage, now);
         h.mutex.unlock(h.io);
         if (changed) h.broadcast();
     }
