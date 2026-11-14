@@ -15,8 +15,13 @@
 //!     name already, Portal says so in its log and listens to no hooks.
 //!   * The client checks the other way round: the process serving the
 //!     pipe must run as the same user (GetNamedPipeServerProcessId, its
-//!     token's user SID), and it opens the pipe with SECURITY_IDENTIFICATION
-//!     so the server could never impersonate it.
+//!     token's user SID) at an integrity level no lower than the client's
+//!     (so a low-integrity process of the same user that grabbed the name
+//!     hears nothing from the agent), and it opens the pipe with
+//!     SECURITY_IDENTIFICATION so the server could never impersonate it.
+//!   * If another instance cannot be created, the server says so (once)
+//!     and keeps serving on the instance it has, trying again at the next
+//!     client; it only stops if that instance fails too.
 //!   * Event-driven: the server thread blocks in an overlapped
 //!     ConnectNamedPipe (and a bounded read) next to a stop event. No
 //!     polling, no timers besides the read deadline.
@@ -26,6 +31,7 @@
 //!     no answer to wait for.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const w = @import("win32.zig");
 const hookmsg = @import("hookmsg.zig");
 
@@ -44,6 +50,7 @@ const SID_AND_ATTRIBUTES = extern struct { Sid: *anyopaque, Attributes: w.DWORD 
 
 const TOKEN_QUERY: u32 = 0x0008;
 const TokenUser: u32 = 1;
+const TokenIntegrityLevel: u32 = 25;
 const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 const ACL_REVISION: u32 = 2;
 const PIPE_ACCESS_INBOUND: u32 = 0x00000001;
@@ -76,6 +83,8 @@ extern "advapi32" fn InitializeAcl(acl: *anyopaque, len: u32, rev: u32) callconv
 extern "advapi32" fn AddAccessAllowedAce(acl: *anyopaque, rev: u32, mask: u32, sid: *anyopaque) callconv(.winapi) w.BOOL;
 extern "advapi32" fn GetLengthSid(sid: *anyopaque) callconv(.winapi) u32;
 extern "advapi32" fn EqualSid(a: *anyopaque, b: *anyopaque) callconv(.winapi) w.BOOL;
+extern "advapi32" fn GetSidSubAuthorityCount(sid: *anyopaque) callconv(.winapi) *u8;
+extern "advapi32" fn GetSidSubAuthority(sid: *anyopaque, n: u32) callconv(.winapi) *u32;
 extern "kernel32" fn LocalFree(p: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn CreateNamedPipeW(name: [*:0]const u16, open_mode: u32, pipe_mode: u32, max: u32, out_size: u32, in_size: u32, timeout: u32, sa: ?*SECURITY_ATTRIBUTES) callconv(.winapi) ?w.HANDLE;
 extern "kernel32" fn ConnectNamedPipe(h: w.HANDLE, ov: ?*w.OVERLAPPED) callconv(.winapi) w.BOOL;
@@ -132,6 +141,22 @@ pub const UserSid = struct {
     }
 };
 
+/// The mandatory integrity level of `process` (its label SID's last
+/// sub-authority: 0x1000 low, 0x2000 medium, 0x3000 high, 0x4000 system).
+pub fn integrityOf(process: w.HANDLE) ?u32 {
+    var token: ?w.HANDLE = null;
+    if (OpenProcessToken(process, TOKEN_QUERY, &token) == 0) return null;
+    const t = token orelse return null;
+    defer _ = w.CloseHandle(t);
+    var buf: [128]u8 align(8) = undefined;
+    var len: u32 = 0;
+    if (GetTokenInformation(t, TokenIntegrityLevel, &buf, buf.len, &len) == 0) return null;
+    const label: *SID_AND_ATTRIBUTES = @ptrCast(&buf);
+    const n = GetSidSubAuthorityCount(label.Sid).*;
+    if (n == 0) return null;
+    return GetSidSubAuthority(label.Sid, n - 1).*;
+}
+
 /// This user's pipe for the data directory `data_dir`, as WTF-16.
 pub fn pipeNameW(buf: *[80:0]u16, data_dir: []const u8) ?[:0]const u16 {
     var me: UserSid = .{};
@@ -185,6 +210,13 @@ pub const Server = struct {
     /// Messages that did not parse: counted, never echoed or logged as
     /// received.
     rejected: std.atomic.Value(u32) = .init(0),
+    /// Called on the server thread with a problem worth logging (once per
+    /// change: degraded, recovered, stopped).
+    on_problem: ?*const fn (ctx: *anyopaque, what: []const u8) void = null,
+    /// Another instance could not be created: serving on the current one.
+    degraded: bool = false,
+    /// Tests: this many next instances fail to be created.
+    test_fail_instances: u32 = 0,
 
     pub const InitError = error{ NoSecurity, NameTaken, CreateFailed, NoEvent };
 
@@ -203,6 +235,10 @@ pub const Server = struct {
     }
 
     fn instance(s: *Server, first: bool) InitError!w.HANDLE {
+        if (builtin.is_test and !first and s.test_fail_instances > 0) {
+            s.test_fail_instances -= 1;
+            return error.CreateFailed;
+        }
         const mode = PIPE_ACCESS_INBOUND | w.FILE_FLAG_OVERLAPPED | (if (first) FILE_FLAG_FIRST_PIPE_INSTANCE else 0);
         const h = w.validHandle(CreateNamedPipeW(s.nameZ(), mode, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES, 0, hookmsg.max_message * 4, 0, &s.sec.sa));
         return h orelse {
@@ -256,22 +292,46 @@ pub const Server = struct {
             }
             // Keep the name alive before handling this client.
             const next = s.instance(false) catch null;
+            if (next == null and !s.degraded) {
+                s.degraded = true;
+                s.problem("cannot create another hook pipe instance; serving on the current one and trying again at the next hook");
+            } else if (next != null and s.degraded) {
+                s.degraded = false;
+                s.problem("hook pipe instances can be created again");
+            }
             if (connected) {
                 var buf: [hookmsg.max_message + 1]u8 = undefined;
                 const got = s.readAll(cur, &buf);
-                _ = DisconnectNamedPipe(cur);
                 if (got) |text| {
                     if (hookmsg.parse(text)) |m| s.on_message(s.ctx, &m) else _ = s.rejected.fetchAdd(1, .monotonic);
                 }
             }
-            _ = w.CloseHandle(cur);
-            s.cur = next;
+            if (next) |n| {
+                _ = DisconnectNamedPipe(cur);
+                _ = w.CloseHandle(cur);
+                s.cur = n;
+            } else if (connected) {
+                // Reuse this instance: disconnected, it can be connected
+                // to the next client (the name stays alive meanwhile).
+                _ = DisconnectNamedPipe(cur);
+            } else {
+                // This instance failed and no new one could be made:
+                // nothing is left to wait on.
+                _ = w.CloseHandle(cur);
+                s.cur = null;
+                s.problem("the hook pipe failed and no new instance could be created; Claude Code hooks are no longer listened to");
+                return;
+            }
             if (w.WaitForSingleObject(s.stop, 0) == w.WAIT_OBJECT_0) {
                 if (s.cur) |h| _ = w.CloseHandle(h);
                 s.cur = null;
                 return;
             }
         }
+    }
+
+    fn problem(s: *Server, what: []const u8) void {
+        if (s.on_problem) |f| f(s.ctx, what);
     }
 
     /// The client's bytes until it closes, at most max_message (more is
@@ -335,7 +395,8 @@ pub fn send(name: [:0]const u16, bytes: []const u8) SendError!void {
     }
 }
 
-/// The process serving the pipe runs as this user.
+/// The process serving the pipe runs as this user, at an integrity level
+/// no lower than this process's.
 fn servedByMe(pipe: w.HANDLE) bool {
     var pid: u32 = 0;
     if (GetNamedPipeServerProcessId(pipe, &pid) == 0) return false;
@@ -344,7 +405,15 @@ fn servedByMe(pipe: w.HANDLE) bool {
     var them: UserSid = .{};
     var me: UserSid = .{};
     if (!them.ofProcess(proc) or !me.current()) return false;
-    return them.eql(&me);
+    if (!them.eql(&me)) return false;
+    const their_level = integrityOf(proc) orelse return false;
+    const my_level = integrityOf(GetCurrentProcess()) orelse return false;
+    return trustedLevel(their_level, my_level);
+}
+
+/// A server at `server` integrity may receive from a client at `client`.
+fn trustedLevel(server: u32, client: u32) bool {
+    return server >= client;
 }
 
 // ------------------------------------------------------------ `portalctl hook`
@@ -483,6 +552,43 @@ test "server: messages in order, malformed ones dropped, the name can't be taken
     try testing.expect(remote == null);
     s.requestStop();
     th.join();
+}
+
+test "server: keeps serving on its instance when no new one can be created" {
+    var nb: [80:0]u16 = undefined;
+    const name = testName(&nb);
+    var got: Got = .{};
+    const ev = try Server.events();
+    defer inline for (0..3) |k| {
+        _ = w.CloseHandle(ev[k]);
+    };
+    const Problems = struct {
+        var n: std.atomic.Value(u32) = .init(0);
+        fn on(_: *anyopaque, _: []const u8) void {
+            _ = n.fetchAdd(1, .release);
+        }
+    };
+    var s: Server = .{ .stop = ev[0], .conn_ev = ev[1], .read_ev = ev[2], .ctx = &got, .on_message = Got.on, .on_problem = Problems.on, .test_fail_instances = 2 };
+    try s.init(name);
+    const th = try std.Thread.spawn(.{}, Server.run, .{&s});
+    var mb: [hookmsg.max_message]u8 = undefined;
+    for (0..4) |i| {
+        const m: hookmsg.Message = .{ .key = @splat(7), .event = .Stop };
+        try send(name, m.format(&mb));
+        try testing.expect(got.waitFor(i + 1));
+    }
+    // Degraded once (two failures), recovered once.
+    try testing.expectEqual(@as(u32, 2), Problems.n.load(.acquire));
+    s.requestStop();
+    th.join();
+}
+
+test "integrity: this process has a level, and a lower server is not trusted" {
+    const mine = integrityOf(GetCurrentProcess()).?;
+    try testing.expect(mine >= 0x1000);
+    try testing.expect(trustedLevel(mine, mine));
+    try testing.expect(trustedLevel(0x3000, 0x2000));
+    try testing.expect(!trustedLevel(0x1000, 0x2000));
 }
 
 test "pipeNameW: this user's name for a data directory" {

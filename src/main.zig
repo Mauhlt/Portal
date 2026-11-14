@@ -1580,6 +1580,11 @@ const HookWatch = struct {
         hub.applyHook(m);
     }
 
+    fn problem(ctx: *anyopaque, what: []const u8) void {
+        const hub: *tabs.Hub = @ptrCast(@alignCast(ctx));
+        hub.log.print("hooks: {s}", .{what});
+    }
+
     /// Starts the pipe server thread; logs (and runs without hooks) if it
     /// can't.
     fn start(gpa: Allocator, hub: *tabs.Hub, log: *Log, data_dir: []const u8) void {
@@ -1593,7 +1598,7 @@ const HookWatch = struct {
             return;
         };
         const srv = gpa.create(hookpipe.Server) catch return;
-        srv.* = .{ .stop = ev[0], .conn_ev = ev[1], .read_ev = ev[2], .ctx = hub, .on_message = message };
+        srv.* = .{ .stop = ev[0], .conn_ev = ev[1], .read_ev = ev[2], .ctx = hub, .on_message = message, .on_problem = problem };
         srv.init(name) catch |err| {
             log.print("hooks: cannot create the hook pipe ({s}); Claude Code hooks are not listened to", .{switch (err) {
                 error.NameTaken => "another process holds its name: another Portal with the same data folder?",
