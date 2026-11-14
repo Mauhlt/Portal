@@ -1885,6 +1885,7 @@ test {
     _ = @import("sync_cli.zig");
     _ = @import("fsutil.zig");
     _ = @import("bucket.zig");
+    _ = @import("ratelimit.zig");
     _ = @import("title.zig");
     _ = @import("convo/scrub.zig");
     _ = @import("convo/transcript.zig");

@@ -22,60 +22,14 @@ const frames = shared.frames;
 const tabs = @import("tabs.zig");
 const devices = @import("devices.zig");
 const keymap = @import("keymap.zig");
+const ratelimit = @import("ratelimit.zig");
 
 pub const per_minute = 3;
 pub const window_ms: i64 = 60_000;
 
-const Win = projects.Window(per_minute);
-
 /// Each paired device's request windows (`p:start` and `p:stop` apart),
 /// shared by all its connections: reconnecting doesn't reset them.
-pub const Limits = struct {
-    mutex: Io.Mutex = .init,
-    slots: [devices.max_devices]Slot = @splat(.{}),
-
-    const Slot = struct {
-        id: ?devices.DeviceId = null,
-        last_ms: i64 = 0,
-        start: Win = .{},
-        stop: Win = .{},
-        /// Requests over the limit (the log notes the first few only).
-        over: u32 = 0,
-    };
-
-    pub const Check = struct { ok: bool, over: u32 = 0 };
-
-    /// Counts one `op` request of device `id` at `now_ms`. A device not
-    /// seen yet takes a free slot, or the one unused longest (more devices
-    /// than slots only happens after a re-pairing).
-    pub fn allow(l: *Limits, io: Io, id: devices.DeviceId, op: projects.Op, now_ms: i64) Check {
-        l.mutex.lockUncancelable(io);
-        defer l.mutex.unlock(io);
-        const slot = l.slotFor(id);
-        slot.last_ms = now_ms;
-        const win = switch (op) {
-            .start => &slot.start,
-            .stop => &slot.stop,
-        };
-        if (win.allow(now_ms, window_ms)) return .{ .ok = true };
-        slot.over +|= 1;
-        return .{ .ok = false, .over = slot.over };
-    }
-
-    fn slotFor(l: *Limits, id: devices.DeviceId) *Slot {
-        for (&l.slots) |*s| if (s.id) |sid| if (std.mem.eql(u8, &sid, &id)) return s;
-        var pick: *Slot = &l.slots[0];
-        for (&l.slots) |*s| {
-            if (s.id == null) {
-                pick = s;
-                break;
-            }
-            if (s.last_ms < pick.last_ms) pick = s;
-        }
-        pick.* = .{ .id = id };
-        return pick;
-    }
-};
+pub const Limits = ratelimit.PerDevice(projects.Op, per_minute, window_ms);
 
 /// What to do with a `p:` frame (decide): nothing, answer at once, or ask
 /// the hub to start / stop the project named (a startable name).
@@ -222,18 +176,3 @@ test "decide: verb, then view-only, then the device's rate, then the name" {
     try testing.expect(decide(.keys, &lim, io, a, 60_001, "start acme").answer.result == .rate_limited);
 }
 
-test "limits: more devices than slots reuse the one unused longest" {
-    const io = testing.io;
-    var lim: Limits = .{};
-    for (0..devices.max_devices) |i| {
-        const id: devices.DeviceId = @splat(@intCast(i + 1));
-        try testing.expect(lim.allow(io, id, .start, @intCast(i)).ok);
-    }
-    const first: devices.DeviceId = @splat(1);
-    for (0..2) |_| try testing.expect(lim.allow(io, first, .start, 100).ok);
-    try testing.expect(!lim.allow(io, first, .start, 101).ok);
-    // A new device takes device 2's slot (unused longest), not device 1's.
-    const new: devices.DeviceId = @splat(200);
-    try testing.expect(lim.allow(io, new, .start, 102).ok);
-    try testing.expect(!lim.allow(io, first, .start, 103).ok);
-}

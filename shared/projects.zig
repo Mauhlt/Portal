@@ -322,28 +322,6 @@ pub fn parseResult(text: []const u8) ?Answer {
     return a;
 }
 
-// ---------------------------------------------------------- rate limits
-
-/// At most `n` events per `window_ms`, by timestamps (no timer): the
-/// times of the last `n` accepted events.
-pub fn Window(comptime n: usize) type {
-    return struct {
-        const Self = @This();
-        times: [n]i64 = @splat(std.math.minInt(i64)),
-        next: usize = 0,
-
-        /// True (and counted) if fewer than `n` events were accepted in
-        /// the `window_ms` before `now_ms`.
-        pub fn allow(w: *Self, now_ms: i64, window_ms: i64) bool {
-            const oldest = w.times[w.next];
-            if (oldest != std.math.minInt(i64) and now_ms - oldest < window_ms) return false;
-            w.times[w.next] = now_ms;
-            w.next = (w.next + 1) % n;
-            return true;
-        }
-    };
-}
-
 // ------------------------------------------------------------------ tests
 
 const testing = std.testing;
@@ -439,16 +417,4 @@ test "result messages round trip" {
     try testing.expect(b.name() == null and b.result == .unknown and b.op == .stop);
     try testing.expect(parseResult("{\"t\":\"project\",\"op\":\"start\",\"result\":\"nope\"}") == null);
     try testing.expect(Result.started.ok() and !Result.unknown.ok());
-}
-
-test "rate window: n per window, by timestamps" {
-    var r: Window(3) = .{};
-    try testing.expect(r.allow(0, 60_000));
-    try testing.expect(r.allow(10, 60_000));
-    try testing.expect(r.allow(20, 60_000));
-    try testing.expect(!r.allow(30, 60_000));
-    try testing.expect(!r.allow(59_999, 60_000));
-    try testing.expect(r.allow(60_000, 60_000)); // the first one aged out
-    try testing.expect(!r.allow(60_005, 60_000));
-    try testing.expect(r.allow(60_010, 60_000));
 }

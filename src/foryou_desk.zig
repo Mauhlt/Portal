@@ -27,6 +27,7 @@ const std = @import("std");
 const Io = std.Io;
 const foryou = @import("shared").foryou;
 const extract = @import("foryou_extract.zig");
+const ratelimit = @import("ratelimit.zig");
 
 pub const Item = foryou.Item;
 pub const Names = extract.Names;
@@ -86,7 +87,7 @@ pub const State = struct {
     long_fired: bool = false,
     long_seq: u32 = 0,
     /// When the tab last sent a recap prompt (awake ms).
-    recap_ms: i64 = std.math.minInt(i64),
+    recap: ratelimit.Window(1, recap_interval_ms) = .{},
 
     /// The last reply's texts changed (or not): new suggestions, and
     /// dismissals forgotten when it is another reply.
@@ -266,9 +267,7 @@ pub const State = struct {
     /// A recap for this tab now? (at most one per recap_interval_ms; the
     /// time is taken if so).
     pub fn recapAllowed(s: *State, now: i64) bool {
-        if (s.recap_ms != std.math.minInt(i64) and now -| s.recap_ms < recap_interval_ms) return false;
-        s.recap_ms = now;
-        return true;
+        return s.recap.allow(now);
     }
 };
 

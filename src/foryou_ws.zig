@@ -32,54 +32,15 @@ const tabs = @import("tabs.zig");
 const devices = @import("devices.zig");
 const Log = @import("log.zig").Log;
 const foryou_desk = @import("foryou_desk.zig");
+const ratelimit = @import("ratelimit.zig");
 
 /// Requests (`i:` and `r:`) one device may make in a minute.
 pub const max_per_minute = 30;
 const window_ms: i64 = 60_000;
 
-/// Per-device request times (a ring each), for every connection of the
-/// device together.
-pub const Limits = struct {
-    mutex: Io.Mutex = .init,
-    slots: [devices.max_devices]Slot = @splat(.{}),
-
-    const Slot = struct {
-        id: devices.DeviceId = undefined,
-        used: bool = false,
-        last: i64 = std.math.minInt(i64),
-        times: [max_per_minute]i64 = @splat(std.math.minInt(i64)),
-        next: usize = 0,
-    };
-
-    /// One more request from device `id` at `now` (awake ms)? Taken if so.
-    pub fn allow(l: *Limits, io: Io, id: devices.DeviceId, now: i64) bool {
-        l.mutex.lockUncancelable(io);
-        defer l.mutex.unlock(io);
-        var slot: ?*Slot = null;
-        for (&l.slots) |*s| if (s.used and std.mem.eql(u8, &s.id, &id)) {
-            slot = s;
-        };
-        const s = slot orelse blk: {
-            // A free slot, else the one used longest ago.
-            var pick = &l.slots[0];
-            for (&l.slots) |*c| {
-                if (!c.used) {
-                    pick = c;
-                    break;
-                }
-                if (c.last < pick.last) pick = c;
-            }
-            pick.* = .{ .id = id, .used = true };
-            break :blk pick;
-        };
-        const oldest = s.times[s.next];
-        if (oldest != std.math.minInt(i64) and now -| oldest < window_ms) return false;
-        s.times[s.next] = now;
-        s.next = (s.next + 1) % max_per_minute;
-        s.last = now;
-        return true;
-    }
-};
+/// Per-device request windows, for every connection of the device
+/// together (both families count in the one lane).
+pub const Limits = ratelimit.PerDevice(enum { request }, max_per_minute, window_ms);
 
 /// Who asks, and where.
 pub const Ctx = struct {
@@ -125,7 +86,7 @@ fn item(c: Ctx, rest: []const u8, buf: *[frames.max_answer]u8) []const u8 {
     const h = c.hub;
     const req = foryou.parseRequest(rest) orelse
         return answerItem(buf, if (std.mem.startsWith(u8, rest, "no ")) .no else .yes, .stale, null);
-    if (!c.limits.allow(h.io, c.device, c.now_ms)) return answerItem(buf, req.op, .rate_limited, null);
+    if (!c.limits.allow(h.io, c.device, .request, c.now_ms).ok) return answerItem(buf, req.op, .rate_limited, null);
 
     // The card, of whichever open tab holds it.
     h.mutex.lockUncancelable(h.io);
@@ -176,7 +137,7 @@ fn recapFrame(c: Ctx, rest: []const u8, buf: *[frames.max_answer]u8) []const u8 
     h.mutex.unlock(h.io);
     const tab = t orelse {
         // Counted like any request, so probing costs the same.
-        _ = c.limits.allow(h.io, c.device, c.now_ms);
+        _ = c.limits.allow(h.io, c.device, .request, c.now_ms);
         return answerRecap(buf, .unknown, null);
     };
     defer tab.release();
@@ -187,7 +148,7 @@ fn recapFrame(c: Ctx, rest: []const u8, buf: *[frames.max_answer]u8) []const u8 
 /// watched; null: none watched).
 pub fn recapTab(c: Ctx, tab: ?*tabs.Tab, buf: *[frames.max_answer]u8) []const u8 {
     const h = c.hub;
-    if (!c.limits.allow(h.io, c.device, c.now_ms)) return answerRecap(buf, .rate_limited, null);
+    if (!c.limits.allow(h.io, c.device, .request, c.now_ms).ok) return answerRecap(buf, .rate_limited, null);
     const t = tab orelse return answerRecap(buf, .unknown, null);
     if ((h.policy != .instruct and h.policy != .text) or h.program.device_start == .not_agent)
         return answerRecap(buf, .refused, t.id);
@@ -266,10 +227,10 @@ test "limits: per device, a minute's window" {
     var l: Limits = .{};
     const a: devices.DeviceId = @splat(1);
     const b: devices.DeviceId = @splat(2);
-    for (0..max_per_minute) |i| try testing.expect(l.allow(testing.io, a, @intCast(i)));
-    try testing.expect(!l.allow(testing.io, a, 100));
-    try testing.expect(l.allow(testing.io, b, 100));
-    try testing.expect(l.allow(testing.io, a, window_ms + 1));
+    for (0..max_per_minute) |i| try testing.expect(l.allow(testing.io, a, .request, @intCast(i)).ok);
+    try testing.expect(!l.allow(testing.io, a, .request, 100).ok);
+    try testing.expect(l.allow(testing.io, b, .request, 100).ok);
+    try testing.expect(l.allow(testing.io, a, .request, window_ms + 1).ok);
 }
 
 test "the recap line is exactly `recap`" {
