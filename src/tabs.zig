@@ -178,10 +178,6 @@ pub const Tab = struct {
         return std.fmt.bufPrint(buf, "started by {s}{s}", .{ by, if (t.start_mode == .plan) " (plan)" else "" }) catch "started by a device";
     }
 
-    pub fn fromSession(s: *Session) *Tab {
-        return @fieldParentPtr("session", s);
-    }
-
     pub fn acquire(t: *Tab) void {
         _ = t.refs.fetchAdd(1, .monotonic);
     }
@@ -1349,12 +1345,6 @@ pub const Hub = struct {
         }
         // A denied command does not run: nothing to wait for.
         if (m.guard != .denied) t.forYouEvent(.{ .pre_tool = .{ .marked = m.guard == .marked } });
-    }
-
-    pub fn setDeskActive(h: *Hub, t: *Tab) void {
-        h.mutex.lockUncancelable(h.io);
-        if (!t.removed) h.desk_active = t;
-        h.mutex.unlock(h.io);
     }
 
     /// The desk's terminal size, for every tab (new ones start with it).

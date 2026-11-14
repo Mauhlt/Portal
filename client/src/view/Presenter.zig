@@ -482,10 +482,6 @@ pub fn endSplash(p: *Presenter) void {
     p.dirty = true;
 }
 
-pub fn splashActive(p: *const Presenter) bool {
-    return p.splash != null;
-}
-
 /// Applies the splash's deadlines and the decode result.
 fn splashTick(p: *Presenter) void {
     const sp = p.splash orelse return;

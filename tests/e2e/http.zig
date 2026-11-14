@@ -30,35 +30,6 @@ pub const Response = struct {
     pub fn location(r: *const Response) []const u8 {
         return r.header("location") orelse "";
     }
-
-    pub fn setCookieCount(r: *const Response) usize {
-        var n: usize = 0;
-        for (r.headers.items) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "set-cookie")) n += 1;
-        }
-        return n;
-    }
-
-    /// Full Set-Cookie header value for cookie `name`.
-    pub fn setCookieLine(r: *const Response, name: []const u8) ?[]const u8 {
-        for (r.headers.items) |h| {
-            if (!std.ascii.eqlIgnoreCase(h.name, "set-cookie")) continue;
-            if (h.value.len > name.len and std.mem.startsWith(u8, h.value, name) and h.value[name.len] == '=') return h.value;
-        }
-        return null;
-    }
-
-    /// Value of cookie `name` from the Set-Cookie headers.
-    pub fn cookie(r: *const Response, name: []const u8) ?[]const u8 {
-        const line = r.setCookieLine(name) orelse return null;
-        const rest = line[name.len + 1 ..];
-        const end = std.mem.indexOfScalar(u8, rest, ';') orelse rest.len;
-        return rest[0..end];
-    }
-
-    pub fn bodyContains(r: *const Response, needle: []const u8) bool {
-        return std.mem.indexOf(u8, r.body, needle) != null;
-    }
 };
 
 pub const Error = error{ BadResponse, Closed } || tlsnet.Error;
@@ -115,20 +86,6 @@ pub fn readResponse(gpa: Allocator, sock: anytype, timeout_ms: u32) Error!Respon
     return r;
 }
 
-/// Status codes of every "HTTP/1.1 NNN" status line in a raw byte stream
-/// (for pipelining checks).
-pub fn statusLines(data: []const u8, out: []u16) []u16 {
-    var n: usize = 0;
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, data, i, "HTTP/1.1 ")) |p| {
-        if (p + 12 > data.len or n >= out.len) break;
-        out[n] = std.fmt.parseInt(u16, data[p + 9 .. p + 12], 10) catch 0;
-        n += 1;
-        i = p + 12;
-    }
-    return out[0..n];
-}
-
 /// First status code in raw response bytes, or 0.
 pub fn firstStatus(data: []const u8) u16 {
     if (data.len < 12 or !std.mem.startsWith(u8, data, "HTTP/1.1 ")) return 0;
@@ -140,8 +97,6 @@ pub const Request = struct {
     path: []const u8 = "/",
     /// Host header value; null omits it.
     host: ?[]const u8,
-    origin: ?[]const u8 = null,
-    cookie: ?[]const u8 = null,
     /// Sent with a Content-Length when non-null.
     body: ?[]const u8 = null,
     extra: []const Header = &.{},
@@ -155,8 +110,6 @@ pub fn format(gpa: Allocator, req: Request) Allocator.Error![]u8 {
     errdefer out.deinit(gpa);
     try out.print(gpa, "{s} {s} HTTP/1.1\r\n", .{ req.method, req.path });
     if (req.host) |h| try out.print(gpa, "Host: {s}\r\n", .{h});
-    if (req.origin) |o| try out.print(gpa, "Origin: {s}\r\n", .{o});
-    if (req.cookie) |c| try out.print(gpa, "Cookie: {s}\r\n", .{c});
     for (req.extra) |h| try out.print(gpa, "{s}: {s}\r\n", .{ h.name, h.value });
     if (req.body) |b| try out.print(gpa, "Content-Length: {d}\r\n", .{b.len});
     try out.appendSlice(gpa, "\r\n");
@@ -172,14 +125,4 @@ pub fn request(gpa: Allocator, port: u16, req: Request) Error!Response {
     defer gpa.free(bytes);
     try sock.sendAll(bytes);
     return readResponse(gpa, &sock, 10_000);
-}
-
-/// Sends raw bytes on a fresh connection and returns everything the server
-/// sends back until it closes (or `timeout_ms`).
-pub fn rawExchange(gpa: Allocator, port: u16, bytes: []const u8, timeout_ms: u32) ![]u8 {
-    var sock = try net.Socket.connect(port, .{});
-    defer sock.close();
-    sock.sendAll(bytes) catch {}; // the server may close before reading it all
-    const r = try sock.recvUntilClose(gpa, 1 << 20, timeout_ms);
-    return r.data;
 }

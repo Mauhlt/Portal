@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const pin = @import("net/pin.zig");
 
 pub const Error = error{ Unavailable, Failed, TooLong };
 
@@ -328,8 +329,8 @@ const linux = struct {
         var buf: [1024]u8 = undefined;
         var env_buf: [512]u8 = undefined;
         const base = blk: {
-            if (envVar("XDG_DATA_HOME", &env_buf)) |x| if (x.len > 0 and x[0] == '/') break :blk std.fmt.bufPrint(&buf, "{s}/portal", .{x}) catch return error.TooLong;
-            const home = envVar("HOME", &env_buf) orelse return error.Unavailable;
+            if (pin.envVar("XDG_DATA_HOME", &env_buf)) |x| if (x.len > 0 and x[0] == '/') break :blk std.fmt.bufPrint(&buf, "{s}/portal", .{x}) catch return error.TooLong;
+            const home = pin.envVar("HOME", &env_buf) orelse return error.Unavailable;
             break :blk std.fmt.bufPrint(&buf, "{s}/.local/share/portal", .{home}) catch return error.TooLong;
         };
         var tmp: [1024]u8 = undefined;
@@ -348,14 +349,6 @@ const linux = struct {
         errdefer _ = L.close(fd);
         try checkPrivate(fd, true);
         return fd;
-    }
-
-    fn envVar(comptime name: []const u8, buf: []u8) ?[]const u8 {
-        const v = std.c.getenv(std.fmt.comptimePrint("{s}", .{name})) orelse return null;
-        const s = std.mem.sliceTo(v, 0);
-        if (s.len == 0 or s.len > buf.len) return null;
-        @memcpy(buf[0..s.len], s);
-        return buf[0..s.len];
     }
 
     /// The open file or directory `fd` is owned by this user, has no

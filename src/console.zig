@@ -307,14 +307,6 @@ pub const TitleFilter = struct {
     }
 };
 
-/// True only if both stdout and stderr are attached to a real console
-/// (GetConsoleMode succeeds). False when either is redirected to a file or
-/// pipe, which is how agents, CI and `> file` capture output: anything
-/// printed then ends up in a transcript or on disk.
-pub fn stdioIsInteractive() bool {
-    return isConsole(w.STD_OUTPUT_HANDLE) and isConsole(w.STD_ERROR_HANDLE);
-}
-
 fn isConsole(which: w.DWORD) bool {
     const h = w.validHandle(w.GetStdHandle(which)) orelse return false;
     var mode: w.DWORD = 0;

@@ -76,7 +76,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     defer leaks.deinit();
 
     const creds = try client.pair(inst, "hooks");
-    const v = try client.Viewer.open(inst, creds.sessionCookie());
+    const v = try client.Viewer.open(inst, creds.device());
     defer v.deinit();
     var dump: [8192]u8 = undefined;
     _ = r.check("the tab's program runs", v.waitFor("HOOK-READY", 15_000), "{s}", .{v.dump(&dump)});

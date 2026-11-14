@@ -127,7 +127,6 @@ test "trust errors" {
 
 pub const Activity = activity_wire.Activity;
 pub const ProjectList = projects_wire.List;
-pub const ProjectAnswer = projects_wire.Answer;
 pub const SysSnapshot = sysinfo.Snapshot;
 
 pub const Shared = struct {

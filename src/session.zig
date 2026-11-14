@@ -332,15 +332,6 @@ pub const Session = struct {
 
         s.pty.closeConsole();
     }
-
-    pub fn markClosed(s: *Session, code: u32) void {
-        s.mutex.lockUncancelable(s.io);
-        s.closed = true;
-        s.exit_code = code;
-        s.mutex.unlock(s.io);
-        s.cond.broadcast(s.io);
-        s.notify();
-    }
 };
 
 /// The queue between the desktop's input (GUI thread, console input

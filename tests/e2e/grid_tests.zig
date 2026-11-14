@@ -14,7 +14,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const inst = try proc.Instance.start(h, dir, port, &pairing.ping_child);
     defer inst.kill();
     const creds = try client.pair(inst, "laptop");
-    const sess = creds.sessionCookie();
+    const sess = creds.device();
 
     var dump_buf: [4096]u8 = undefined;
     const v = try client.Viewer.open(inst, sess);

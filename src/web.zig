@@ -901,7 +901,7 @@ pub const Server = struct {
 
     fn serveHttp(srv: *Server, conn: *Conn, w: *Io.Writer) !void {
         const io = srv.io;
-        // Head (up to max_head_bytes) plus a login body.
+        // Head (up to max_head_bytes); no request has a body (max_body).
         var buf: [http1.max_head_bytes + max_body]u8 = undefined;
         var len: usize = 0;
 
@@ -937,23 +937,8 @@ pub const Server = struct {
                 return;
             };
 
-            var body: []const u8 = "";
-            if (req.method == .POST) {
-                if (req.has_transfer_encoding or req.has_expect) {
-                    // Answered by framingError below, without reading a body.
-                } else if (req.content_length) |cl_u64| {
-                    if (cl_u64 <= max_body) {
-                        const need = head_len + @as(usize, @intCast(cl_u64));
-                        while (len < need) {
-                            const got = try readSome(conn, io, buf[len..need]);
-                            if (got == 0) return;
-                            len += got;
-                        }
-                        body = buf[head_len..need];
-                    }
-                }
-            }
-
+            // A request with a body (none is valid) is refused by
+            // framingError in handleRequest, without reading the body.
             const keep = try srv.handleRequest(conn, w, &req, buf[head_len..len]);
             if (!keep or req.connection_close or req.method != .GET) return;
 

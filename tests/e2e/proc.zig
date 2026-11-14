@@ -372,15 +372,6 @@ pub const LiveCli = struct {
         return c.waitForCount(needle, 1, ms);
     }
 
-    /// Text after the last `prefix` in the output, up to `len` bytes.
-    pub fn lastAfter(c: *LiveCli, prefix: []const u8, len: usize) ?[]const u8 {
-        const o = c.output();
-        const i = std.mem.lastIndexOf(u8, o, prefix) orelse return null;
-        const s = i + prefix.len;
-        if (o.len < s + len) return null;
-        return o[s .. s + len];
-    }
-
     /// Types a line into its stdin.
     pub fn answer(c: *LiveCli, line: []const u8) void {
         const h = c.in_wr orelse return;
@@ -443,8 +434,6 @@ pub const Instance = struct {
     process: ?w.HANDLE = null,
     /// The Host every device sends: Portal's address inside the tunnel.
     host: []const u8 = tunnelnet.desk_server,
-    /// No browser any more: nothing sends an Origin.
-    origin: ?[]const u8 = null,
     /// TLS trusting only this instance's CA (exported once it exists).
     tls: ?*tlsnet.Trust = null,
     ca_dir: []const u8 = "",
@@ -487,9 +476,6 @@ pub const Instance = struct {
         inst.tls = try tlsnet.Trust.load(h.gpa, h.io, pem);
         return inst;
     }
-
-    /// The same as `start` (TLS is always on).
-    pub const startTls = start;
 
     /// Pairs a new in-process device called `name`, exactly as the owner
     /// does: `portalctl pair <name> <its key>`, compare the check code

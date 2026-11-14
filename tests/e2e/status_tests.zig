@@ -34,9 +34,9 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     defer leaks.deinit();
 
     const creds = try client.pair(inst, "status");
-    const v = try client.Viewer.open(inst, creds.sessionCookie());
+    const v = try client.Viewer.open(inst, creds.device());
     defer v.deinit();
-    const quiet = try client.Viewer.open(inst, creds.sessionCookie());
+    const quiet = try client.Viewer.open(inst, creds.device());
     defer quiet.deinit();
     const id = tabs_wire.idField(v.helloText(), "session") orelse {
         _ = r.check("hello names the tab shown", false, "{s}", .{v.helloText()});

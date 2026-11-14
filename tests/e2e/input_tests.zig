@@ -21,7 +21,7 @@ fn startShell(h: *proc.Harness, name: []const u8, port: u16, input: []const u8) 
         try proc.Instance.start(h, dir, port, &([_][]const u8{ "--input", input } ++ cmd_child));
     errdefer inst.kill();
     const creds = try client.pair(inst, "laptop");
-    const v = try client.Viewer.open(inst, creds.sessionCookie());
+    const v = try client.Viewer.open(inst, creds.device());
     return .{ .inst = inst, .v = v };
 }
 

@@ -209,8 +209,6 @@ fn copyHashed(io: Io, from: []const u8, to: []const u8, max: u64) !struct { size
     return .{ .size = total, .sha = d };
 }
 
-pub const PublishError = error{ BadFolderEntry, EmptyFolder, VersionUsed };
-
 /// Hashes and signs `opts.folder` as a new version of `opts.package`.
 /// `problem` gets a description of a refused file path.
 pub fn publish(gpa: Allocator, io: Io, paths: Paths, opts: PublishOptions, problem: *[300]u8) !Published {

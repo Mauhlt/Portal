@@ -59,7 +59,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     try leaks.add(beta_dir);
 
     const creds = try client.pair(inst, "tabs");
-    const sess = creds.sessionCookie();
+    const sess = creds.device();
     var dump: [4096]u8 = undefined;
 
     const v = try client.Viewer.open(inst, sess);

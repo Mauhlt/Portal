@@ -31,8 +31,6 @@ pub const Request = struct {
     path: []const u8,
     query: []const u8,
     host: ?[]const u8 = null,
-    origin: ?[]const u8 = null,
-    content_type: ?[]const u8 = null,
     content_length: ?u64 = null,
     /// Any Transfer-Encoding header at all. Portal never accepts one.
     has_transfer_encoding: bool = false,
@@ -42,29 +40,11 @@ pub const Request = struct {
     upgrade_websocket: bool = false,
     ws_key: ?[]const u8 = null,
     ws_version: ?[]const u8 = null,
-    /// Raw header lines, for cookie lookup (there may be several Cookie headers).
-    headers: [max_headers]Header = undefined,
+    /// Header lines seen (at most max_headers).
     header_count: usize = 0,
-
-    pub fn cookieHeaders(r: *const Request) CookieIterator {
-        return .{ .req = r };
-    }
 };
 
 pub const Header = struct { name: []const u8, value: []const u8 };
-
-pub const CookieIterator = struct {
-    req: *const Request,
-    i: usize = 0,
-    pub fn next(it: *CookieIterator) ?[]const u8 {
-        while (it.i < it.req.header_count) {
-            const h = it.req.headers[it.i];
-            it.i += 1;
-            if (std.ascii.eqlIgnoreCase(h.name, "cookie")) return h.value;
-        }
-        return null;
-    }
-};
 
 /// Returns the length of the head including the terminating CRLFCRLF, or
 /// null if not yet complete.
@@ -116,18 +96,11 @@ pub fn parseHead(head: []const u8) ParseError!Request {
         const value = std.mem.trim(u8, hl[colon + 1 ..], " \t");
         if (!validValue(value)) return error.BadHeader;
         if (req.header_count >= max_headers) return error.TooManyHeaders;
-        req.headers[req.header_count] = .{ .name = name, .value = value };
         req.header_count += 1;
 
         if (std.ascii.eqlIgnoreCase(name, "host")) {
             if (req.host != null) return error.DuplicateHeader;
             req.host = value;
-        } else if (std.ascii.eqlIgnoreCase(name, "origin")) {
-            if (req.origin != null) return error.DuplicateHeader;
-            req.origin = value;
-        } else if (std.ascii.eqlIgnoreCase(name, "content-type")) {
-            if (req.content_type != null) return error.DuplicateHeader;
-            req.content_type = value;
         } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             if (req.content_length != null) return error.DuplicateHeader;
             if (value.len == 0 or value.len > 10) return error.BadContentLength;
@@ -254,15 +227,12 @@ test "findHeadEnd" {
 }
 
 test "parse simple GET" {
-    const r = try parseHead("GET /login?e=1 HTTP/1.1\r\nHost: 10.8.0.1:8420\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n");
+    const r = try parseHead("GET /ws?e=1 HTTP/1.1\r\nHost: 10.8.0.1:8420\r\nX-A: 1\r\nX-A: 2\r\n\r\n");
     try testing.expectEqual(Method.GET, r.method);
-    try testing.expectEqualStrings("/login", r.path);
+    try testing.expectEqualStrings("/ws", r.path);
     try testing.expectEqualStrings("e=1", r.query);
     try testing.expectEqualStrings("10.8.0.1:8420", r.host.?);
-    var it = r.cookieHeaders();
-    try testing.expectEqualStrings("a=1", it.next().?);
-    try testing.expectEqualStrings("b=2", it.next().?);
-    try testing.expect(it.next() == null);
+    try testing.expectEqual(@as(usize, 3), r.header_count);
 }
 
 test "reject the head shape that crashed std.http" {

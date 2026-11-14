@@ -1,15 +1,14 @@
 //! The stream seam: the one place Portal's HTTPS/WSS server and its native
 //! client touch a connection. Everything above it (TLS 1.3, HTTP/1.1,
-//! WebSocket, auth, pairing, sync) is one implementation, whichever
-//! transport carries the bytes:
+//! WebSocket, sync) is one implementation, whichever transport carries the
+//! bytes:
 //!
-//!   os    an OS socket (std.Io.net): loopback, the e2e tests, and anyone
-//!         still on a real WireGuard adapter. Byte-for-byte what Portal
-//!         did before the seam existed: std's own reader/writer, std's own
-//!         cancelation.
-//!   ext   anything else that moves a byte stream: the in-process tunnel's
-//!         userspace TCP/IP stack (client/src/tunnel/netstack.zig) and the
-//!         in-memory network the unit tests use (`MemNet` below).
+//!   ext   what Portal runs on: the in-process tunnel's userspace TCP/IP
+//!         stack (client/src/tunnel) and the in-memory network the unit
+//!         tests use (`MemNet` below). The desk listens only here.
+//!   os    an OS socket (std.Io.net), dialed only: the client's unit tests
+//!         on loopback and the e2e forwarder (tests/e2e/link.zig) into a
+//!         test device's tunnel. Std's own reader/writer and cancelation.
 //!
 //! Contract for an `ext` implementation:
 //!   * `read` blocks until at least one byte, end of stream (0) or an
@@ -20,8 +19,8 @@
 //!     (web.zig) and the client's watchdog does the same (watchdog.zig).
 //!   * `remote` is the peer's address as the transport authenticated it.
 //!     Inside the tunnel that is the device's tunnel address (10.8.0.x,
-//!     enforced by WireGuard's allowed-IPs source check): device
-//!     credentials and session cookies are bound to it (auth.zig, M1).
+//!     enforced by WireGuard's allowed-IPs source check): the desk finds
+//!     the paired device by it (src/devices.zig).
 //!   * `close` releases the stream once nothing is blocked on it.
 //!
 //! No polling anywhere: a waiting call sleeps in an Io wait until the
@@ -230,16 +229,13 @@ pub const ExtWriter = struct {
     }
 };
 
-/// A listener of either kind. The os one is created (and closed) by the
-/// caller: on Windows Portal binds it exclusively (src/netlisten.zig).
+/// A listener: always an `ext` one (the desk has no OS listener).
 pub const Listener = union(enum) {
-    os: net.Server,
     ext: ExtListener,
 
     /// Blocks until a connection arrives (cancelable).
     pub fn accept(l: *Listener, io: Io) AcceptError!Stream {
         return switch (l.*) {
-            .os => |*o| .{ .os = try o.accept(io) },
             .ext => |e| e.vtable.accept(e.ptr, io),
         };
     }

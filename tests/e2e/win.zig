@@ -135,7 +135,6 @@ pub extern "kernel32" fn ExitProcess(code: u32) callconv(.winapi) noreturn;
 
 pub const SOCKET = usize;
 pub const INVALID_SOCKET: SOCKET = ~@as(usize, 0);
-pub const SOCKET_ERROR: c_int = -1;
 pub const AF_INET: c_int = 2;
 pub const SOCK_STREAM: c_int = 1;
 pub const IPPROTO_TCP: c_int = 6;
@@ -145,7 +144,6 @@ pub const SOL_SOCKET: c_int = 0xffff;
 pub const SO_RCVBUF: c_int = 0x1002;
 pub const SO_SNDTIMEO: c_int = 0x1005;
 pub const SO_RCVTIMEO: c_int = 0x1006;
-pub const SO_LINGER: c_int = 0x0080;
 pub const TCP_NODELAY: c_int = 1;
 pub const SD_SEND: c_int = 1;
 pub const WSAETIMEDOUT: c_int = 10060;
@@ -158,8 +156,6 @@ pub const sockaddr_in = extern struct {
     addr: [4]u8,
     zero: [8]u8 = @splat(0),
 };
-
-pub const linger = extern struct { l_onoff: u16, l_linger: u16 };
 
 pub extern "ws2_32" fn WSAStartup(version: WORD, data: *anyopaque) callconv(.winapi) c_int;
 pub extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;

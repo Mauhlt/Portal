@@ -512,10 +512,6 @@ pub const Conn = struct {
         return c;
     }
 
-    pub fn isTls(c: *const Conn) bool {
-        return c.client != null;
-    }
-
     /// The CA the server's certificate was checked against (DER): on a
     /// first connection, the one found by its fingerprint, for the caller
     /// to pin.

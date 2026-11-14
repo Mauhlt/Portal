@@ -226,7 +226,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const secrets = [_][]const u8{ "THINKING-SECRET", "ARG-SECRET", "RESULT-SECRET", "injected", "not JSON", "system-reminder", ".jsonl", "e2e00000", "OUTSIDE-SESSION", "OUTSIDE-LATER", "0dd51de0", "SECRET-CMD", "SUMMARY-SECRET", "bshell00", "bmon0000", "task-notification", "output-file" };
 
     const creds = try client.pair(inst, "convo");
-    const v = try client.Viewer.open(inst, creds.sessionCookie());
+    const v = try client.Viewer.open(inst, creds.device());
     defer v.deinit();
     var dump: [8192]u8 = undefined;
     var cdump: [8192]u8 = undefined;
@@ -332,7 +332,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     {
         const sub = tabs_wire.subscribeFrame(id);
         for (0..3) |_| {
-            const v2 = try client.Viewer.open(inst, creds.sessionCookie());
+            const v2 = try client.Viewer.open(inst, creds.device());
             v2.send(&sub);
             v2.pump(300);
             v2.deinit();

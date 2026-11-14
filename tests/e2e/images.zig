@@ -43,7 +43,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     defer inst.kill();
 
     const creds = try client.pair(inst, "laptop");
-    const sess = creds.sessionCookie();
+    const sess = creds.device();
     var dump_buf: [4096]u8 = undefined;
     const v = try client.Viewer.open(inst, sess);
     defer v.deinit();

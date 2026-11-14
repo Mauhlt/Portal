@@ -22,9 +22,6 @@ pub const Frame = struct {
 
 pub const ConnectOptions = struct {
     host: []const u8,
-    origin: ?[]const u8,
-    /// Full Cookie header value, e.g. "portal_session=...".
-    cookie: ?[]const u8,
     version: []const u8 = "13",
     /// Defaults to a random valid key.
     key: ?[]const u8 = null,
@@ -75,8 +72,6 @@ pub const Client = struct {
         try req.print(gpa, "GET /ws HTTP/1.1\r\nHost: {s}\r\n", .{o.host});
         if (o.upgrade_headers) try req.appendSlice(gpa, "Upgrade: websocket\r\nConnection: Upgrade\r\n");
         try req.print(gpa, "Sec-WebSocket-Key: {s}\r\nSec-WebSocket-Version: {s}\r\n", .{ key, o.version });
-        if (o.origin) |v| try req.print(gpa, "Origin: {s}\r\n", .{v});
-        if (o.cookie) |v| try req.print(gpa, "Cookie: {s}\r\n", .{v});
         try req.appendSlice(gpa, "\r\n");
         try req.appendSlice(gpa, o.trailing);
         try sock.sendAll(req.items);
@@ -151,10 +146,6 @@ pub const Client = struct {
         return c.send(.text, text);
     }
 
-    pub fn sendRaw(c: *Client, bytes: []const u8) !void {
-        return c.sock.sendAll(bytes);
-    }
-
     fn compact(c: *Client) void {
         if (c.pos == 0) return;
         const rest = c.buf.items.len - c.pos;
@@ -195,22 +186,6 @@ pub const Client = struct {
                 c.screens_between_parts += 1;
             }
             return .{ .op = m.opcode, .payload = m.payload };
-        }
-    }
-
-    /// Reads and discards everything until the peer closes; returns whether
-    /// it closed within `timeout_ms`.
-    pub fn waitClosed(c: *Client, timeout_ms: u32) bool {
-        const deadline = net.now() + timeout_ms;
-        var tmp: [64 * 1024]u8 = undefined;
-        while (true) {
-            const t = net.now();
-            if (t >= deadline) return false;
-            const n = c.sock.recvSome(&tmp, @intCast(deadline - t)) catch |err| switch (err) {
-                error.Timeout => return false,
-                else => return true,
-            };
-            if (n == 0) return true;
         }
     }
 };

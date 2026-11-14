@@ -30,7 +30,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const creds = try client.pair(inst, "idle");
     net.sleep(500); // let the pairing's own store changes settle
     {
-        const v = try client.Viewer.open(inst, creds.sessionCookie());
+        const v = try client.Viewer.open(inst, creds.device());
         defer v.deinit();
         _ = r.check("idle session shows its banner", v.waitFor("IDLE-READY", 10_000), "", .{});
         std.debug.print("     (idling {d} s with one viewer connected...)\n", .{idle_ms / 1000});

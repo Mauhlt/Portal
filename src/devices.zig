@@ -46,7 +46,6 @@ const wgkeys = @import("WireGuard").device.keys;
 
 pub const max_devices = 16;
 pub const max_name = 32;
-pub const max_ip = tunnelnet.max_ip_text;
 pub const id_len = 16;
 pub const DeviceId = [id_len]u8;
 pub const Key = wgkeys.Key;

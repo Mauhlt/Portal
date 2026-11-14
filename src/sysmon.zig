@@ -83,12 +83,6 @@ pub const Monitor = struct {
         m.update();
     }
 
-    pub fn isEnabled(m: *Monitor) bool {
-        m.ctl.lock();
-        defer m.ctl.unlock();
-        return m.enabled;
-    }
-
     /// A System panel opened. False (and nothing counted, nothing started)
     /// while the setting is off.
     pub fn subscribe(m: *Monitor) bool {

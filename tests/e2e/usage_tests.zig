@@ -177,7 +177,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const settings_before: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(h.io, user_settings, gpa, .limited(1 << 20)) catch null;
 
     const creds = try client.pair(inst, "usage");
-    const v = try client.Viewer.open(inst, creds.sessionCookie());
+    const v = try client.Viewer.open(inst, creds.device());
     defer v.deinit();
     var dump: [8192]u8 = undefined;
 
@@ -191,7 +191,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         lastUsage(v) != null and lastUsage(v).?.week.?.pct == 40 and lastUsage(v).?.five_hour.?.pct == 12 and lastUsage(v).?.week.?.resets_at != 0, "{?s}", .{v.lastText("\"t\":\"usage\"")});
 
     // ---- on connect: a second device connection gets it right after hello
-    const v2 = try client.Viewer.open(inst, creds.sessionCookie());
+    const v2 = try client.Viewer.open(inst, creds.device());
     defer v2.deinit();
     _ = r.check("on connect: usage follows hello at once", v2.waitText("\"t\":\"usage\"", 1, 3000) and lastUsage(v2).?.week.?.pct == 40, "{?s}", .{v2.lastText("\"t\":\"usage\"")});
 

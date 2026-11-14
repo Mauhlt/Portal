@@ -13,17 +13,14 @@ const proc = @import("proc.zig");
 
 pub const Instance = proc.Instance;
 
-/// A paired device, as the groups use it: `sessionCookie()` names the
+/// A paired device, as the groups use it: `device()` names the
 /// device for Viewer.open (it picks that device's tunnel).
 pub const Creds = struct {
     name_buf: [32]u8 = undefined,
     name_len: usize = 0,
 
-    pub fn sessionCookie(c: *const Creds) []const u8 {
+    pub fn device(c: *const Creds) []const u8 {
         return c.name_buf[0..c.name_len];
-    }
-    pub fn deviceCookie(c: *const Creds) []const u8 {
-        return c.sessionCookie();
     }
 };
 
@@ -71,7 +68,7 @@ pub const Viewer = struct {
     trace: bool = false,
 
     /// Upgrades, reads hello and the first grid frame.
-    /// `device` names a device paired with `inst` (Creds.sessionCookie):
+    /// `device` names a device paired with `inst` (Creds.device):
     /// the viewer connects through that device's tunnel.
     pub fn open(inst: *Instance, device: []const u8) !*Viewer {
         const gpa = inst.h.gpa;
@@ -79,7 +76,7 @@ pub const Viewer = struct {
         const v = try gpa.create(Viewer);
         errdefer gpa.destroy(v);
         v.* = .{
-            .c = try ws.Client.connect(gpa, l.port, .{ .host = inst.host, .origin = null, .cookie = null, .tls = inst.tls }),
+            .c = try ws.Client.connect(gpa, l.port, .{ .host = inst.host, .tls = inst.tls }),
             .g = grid.Grid.init(gpa),
         };
         errdefer v.c.close();

@@ -164,7 +164,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const secrets = [_][]const u8{ "ARG-SECRET", "RESULT-SECRET", "e2esub1", "e2ehook2", "agent-e2e", "toolu_sub1", "subagents", ".jsonl", "meta.json", "general-purpose" };
 
     const creds = try client.pair(inst, "subtabs");
-    const v = try client.Viewer.open(inst, creds.sessionCookie());
+    const v = try client.Viewer.open(inst, creds.device());
     defer v.deinit();
     var dump: [8192]u8 = undefined;
     const id = tabs_wire.idField(v.helloText(), "session") orelse {
