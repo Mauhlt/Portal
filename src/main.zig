@@ -1651,10 +1651,11 @@ fn shortPath(gpa: Allocator, p: []const u8) ?[]const u8 {
 
 /// The agent's transcript folder, read (never written) for each tab's
 /// Conversation view (src/convo/follow.zig): %PORTAL_AGENT_PROJECTS%
-/// (tests point it at a scratch folder), else %CLAUDE_CONFIG_DIR%\projects,
-/// else %USERPROFILE%\.claude\projects. Lives as long as the process.
+/// (tests point it at a scratch folder; honoured only in Debug builds,
+/// build option `test_env`), else %CLAUDE_CONFIG_DIR%\projects, else
+/// %USERPROFILE%\.claude\projects. Lives as long as the process.
 fn convoProjects(gpa: Allocator, env: *const std.process.Environ.Map) ?[]const u8 {
-    if (env.get("PORTAL_AGENT_PROJECTS")) |p| if (p.len > 0) return p;
+    if (@import("build_options").test_env) if (env.get("PORTAL_AGENT_PROJECTS")) |p| if (p.len > 0) return p;
     if (env.get("CLAUDE_CONFIG_DIR")) |d| if (d.len > 0) return std.fs.path.join(gpa, &.{ d, "projects" }) catch null;
     const home = env.get("USERPROFILE") orelse return null;
     return std.fs.path.join(gpa, &.{ home, ".claude", "projects" }) catch null;

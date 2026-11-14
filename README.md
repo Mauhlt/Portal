@@ -557,7 +557,8 @@ zig build release-status   # current, known-good, history, and their zig version
   it is set.
 * For testing only, `PORTAL_AGENT_PROJECTS` points the Conversation view at
   a scratch transcript folder instead of the agent's own (the e2e harness
-  sets it). Like every `PORTAL_*` name, it never reaches a tab's program.
+  sets it). Debug builds only: release (ReleaseSafe) builds ignore it.
+  Like every `PORTAL_*` name, it never reaches a tab's program.
 * `src\win32.zig` declares its own Win32 bindings, and `build.zig` tolerates the
   0.17 to 0.18 build API change, to reduce breakage from std churn.
 * ZVC can vet new compilers against Portal before promoting them: add this
