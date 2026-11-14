@@ -125,6 +125,32 @@ pub const Desk = struct {
     /// Portal's environment (where the agent's settings.json and the
     /// installed portalctl are: Settings, "Claude Code integration").
     env: *const std.process.Environ.Map,
+    /// The device store watcher (main.zig): the desk's own pairing and
+    /// Unpair apply through it at once instead of waiting for the change
+    /// watch. Null: rely on the watch.
+    store: ?StoreHook = null,
+
+    pub const StoreHook = struct {
+        ctx: *anyopaque,
+        /// Re-reads the device store and applies it to the server and the
+        /// tunnel; an error if either failed.
+        reload: *const fn (ctx: *anyopaque) anyerror!void,
+        /// A lasting problem applying store changes (one line, shown on
+        /// the desk's status line), or null.
+        problem: *const fn (ctx: *anyopaque) ?[]const u8,
+    };
+
+    /// Applies the store now; null when done, else why not.
+    fn applyStore(d: *const Desk) ?anyerror {
+        const s = d.store orelse return null;
+        s.reload(s.ctx) catch |err| return err;
+        return null;
+    }
+
+    fn storeProblem(d: *const Desk) ?[]const u8 {
+        const s = d.store orelse return null;
+        return s.problem(s.ctx);
+    }
 };
 
 pub const Ended = enum { window_closed, finished };
@@ -614,6 +640,7 @@ pub const LocalHost = struct {
                 .tools = if (d != null) &desk_tools else &.{},
                 .can_add = h.list.len < tabs.max_tabs,
                 .notes = h.projects.notes[0..h.projects.n_notes],
+                .alert = if (d) |x| x.storeProblem() orelse "" else "",
             },
             .activity = if (h.hub != null) &h.act else null,
             .sys = if (h.sys_sub and h.sys_gen != 0) &h.sys else null,
@@ -710,9 +737,9 @@ pub const LocalHost = struct {
         }
     }
 
-    /// The owner approved the key's check code: record the device and show
-    /// its pairing code. The running tunnel lets the key in as soon as the
-    /// store watcher sees the change.
+    /// The owner approved the key's check code: record the device, apply
+    /// it (the key is let in, and any earlier key of that name is shut
+    /// out), and show its pairing code.
     fn approvePair(h: *LocalHost) void {
         const d = h.desk orelse return;
         const k = tunneldesk.tunnel.keys.parsePublic(h.ui.key_text.text()) orelse return h.ui.pairFailed("The key changed; enter it again.", .{});
@@ -721,6 +748,7 @@ pub const LocalHost = struct {
         const paired = desk.pair(name, k, d.desk_public) catch |err|
             return h.ui.pairFailed("Could not pair '{s}': {s}.", .{ name, devices.describeError(err) });
         for (paired.replaced.items()) |old| d.srv.log.print("pairing '{s}' replaced the earlier record of '{s}'", .{ name, old.name.get() });
+        const failed = d.applyStore();
         var ib: [tunnelnet.max_ip_text]u8 = undefined;
         const ip = paired.device.ipText(&ib);
         d.srv.log.print("device '{s}' paired at the desk as {s} (key check code {s})", .{ name, ip, &tunnelnet.checkCode(&k) });
@@ -728,7 +756,9 @@ pub const LocalHost = struct {
         const info = main.PairingInfo.make(&d.desk_public, endpoint, d.ca_sha256, &paired.device) catch
             return h.ui.pairFailed("The tunnel endpoint in Settings is too long.", .{});
         h.ui.paired(ip, info.code(), info.desk_check);
-        if (d.saved.tunnel_endpoint.get() == null)
+        if (failed) |err| {
+            h.ui.setNote(.bad, "Paired, but Portal could not apply it yet ({t}): the device may not get in until it does; see the log.", .{err});
+        } else if (d.saved.tunnel_endpoint.get() == null)
             h.ui.setNote(.warn, "Set the tunnel endpoint in Settings (where devices reach this desktop's UDP {d}): the code above has a placeholder.", .{d.tunnel_port});
     }
 
@@ -799,7 +829,7 @@ pub const LocalHost = struct {
             fn op(c: Ctx, st: *devices.Store) !bool {
                 for (st.devices) |slot| {
                     const dev = slot orelse continue;
-                    var r: deskui.DevRow = .{ .name = dev.name, .last_seen = dev.last_seen };
+                    var r: deskui.DevRow = .{ .id = dev.id, .name = dev.name, .last_seen = dev.last_seen };
                     var ib: [tunnelnet.max_ip_text]u8 = undefined;
                     r.ip.set(dev.ipText(&ib));
                     r.key.set(&tunnelnet.checkCode(&dev.key));
@@ -829,17 +859,31 @@ pub const LocalHost = struct {
     fn unpair(h: *LocalHost, i: usize) void {
         const d = h.desk orelse return;
         if (i >= h.ui.n_devs) return;
-        const name_t = h.ui.devs[i].name;
-        const name = name_t.get();
+        // A copy: loadDevices replaces the rows.
+        const row = h.ui.devs[i];
+        const name = row.name.get();
         const desk: devices.Desk = .{ .gpa = h.gpa, .io = h.io, .paths = d.paths };
-        const removed = desk.unpair(name) catch |err| {
+        // By record id: a record paired again under this name since the
+        // list was shown stays.
+        const removed = desk.forget(row.id) catch |err| {
             h.ui.setNote(.bad, "Could not update the device list: {s}.", .{devices.describeError(err)});
             return;
         };
-        // The store watcher sees the change: the key leaves the tunnel and
-        // the device's connections end with a logout.
-        if (removed != null) d.srv.log.print("device '{s}' unpaired from the Portal window", .{name});
+        if (!removed) {
+            h.loadDevices();
+            h.ui.setNote(.warn, "'{s}' was already unpaired, or paired again since the list was shown: nothing was removed.", .{name});
+            return;
+        }
+        d.srv.log.print("device '{s}' unpaired from the Portal window", .{name});
+        // Applied now, not when the change watch wakes: the device's
+        // connections end with a logout and its key leaves the tunnel
+        // before this returns.
+        const failed = d.applyStore();
         h.loadDevices();
+        if (failed) |err| {
+            h.ui.setNote(.bad, "'{s}' is removed from the device list, but Portal could not apply it ({t}); see the log. Restart Portal if this stays.", .{ name, err });
+            return;
+        }
         h.ui.setNote(.good, "Unpaired '{s}'. Its key is no longer let in; its viewers are disconnected.", .{name});
     }
 

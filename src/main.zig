@@ -761,11 +761,15 @@ fn setupTls(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, log: *L
 /// Sleeps until a file in the data directory is created, renamed or
 /// deleted (every device-store change ends in one: a pairing or Unpair at
 /// the desk, `portalctl pair/unpair`, a device forgetting this desktop).
-/// On each wake it re-reads the store once and
-///   * hands it to the server, which ends the connections of devices that
-///     are no longer paired (with a `logout` saying why);
-///   * gives the tunnel the new peer table (only paired keys get in, each
-///     only from its own address). A failed read changes nothing.
+/// On each wake it re-reads the store once and applies it to the server
+/// and the tunnel in tunneldesk.Applier's order: addresses whose key
+/// changed or went are refused and their connections end (with a
+/// `logout` saying why) before the tunnel gets the new peer table (only
+/// paired keys get in, each only from its own address), and are let in
+/// again only once it took it. A failed read changes nothing.
+///
+/// The window's own pairing and Unpair do not wait for the watch: they
+/// call `reload` themselves (gui.Desk.store) and report its result.
 const StoreWatch = struct {
     srv: *web.Server,
     tun: *tunneldesk.tunnel.Tunnel,
@@ -776,41 +780,47 @@ const StoreWatch = struct {
     io: Io,
     gpa: Allocator,
 
-    /// The paired devices as last applied (to see which went).
-    last: devices.Store = .{},
+    /// Serializes applies (the watch thread, the window's desk actions).
+    mutex: Io.Mutex = .init,
+    /// What the tunnel's peer table was last made from.
+    applier: tunneldesk.Applier = .{},
+    /// The change watch is gone (could not be re-opened, or its thread
+    /// ended): `portalctl` changes are not seen until Portal restarts.
+    lost: std.atomic.Value(bool) = .init(false),
+    /// The last apply could not update the tunnel's peer table (changed
+    /// addresses stay refused).
+    tunnel_failed: std.atomic.Value(bool) = .init(false),
 
-    /// The server's and the tunnel's view of `st`. Devices that went get
-    /// their `logout` first (the server's writers send it at once); only
-    /// then, or after a few seconds, do their keys leave the tunnel.
-    fn apply(sw: *StoreWatch, st: *const devices.Store) void {
-        var gone: [devices.max_devices]tunnelnet.Ip4 = undefined;
-        var n_gone: usize = 0;
-        for (sw.last.devices) |slot| if (slot) |d| {
-            const still = if (st.findIp(d.ip)) |i| std.mem.eql(u8, &st.devices[i].?.key, &d.key) else false;
-            if (!still) {
-                gone[n_gone] = d.ip;
-                n_gone += 1;
-            }
+    /// Re-reads the store and applies it. An error if the read or the
+    /// tunnel's peer table failed (both logged; the latter also shown on
+    /// the desk until an apply succeeds).
+    fn reload(sw: *StoreWatch) !void {
+        sw.mutex.lockUncancelable(sw.io);
+        defer sw.mutex.unlock(sw.io);
+        const st = devices.read(sw.gpa, sw.io, sw.paths) catch |err| {
+            sw.srv.noteStoreError(err);
+            return err;
         };
-        sw.last = st.*;
-        sw.srv.applyStore(st);
-        if (n_gone > 0) sw.srv.awaitGone(gone[0..n_gone], 3000);
-        var peers: [devices.max_devices]tunneldesk.tunnel.Peer = undefined;
-        sw.tun.setPeers(tunneldesk.peersFrom(st, &peers)) catch |err|
-            sw.srv.log.print("ERROR: the tunnel's peer table could not be updated ({t}); device changes take effect after a restart", .{err});
+        sw.applier.apply(sw.srv, sw.tun, &st) catch |err| {
+            sw.srv.log.print("ERROR: the tunnel's peer table could not be updated ({t}); the addresses of changed devices stay refused until it is", .{err});
+            if (!sw.tunnel_failed.swap(true, .acq_rel)) sw.srv.storeChanged();
+            return err;
+        };
+        if (sw.tunnel_failed.swap(false, .acq_rel)) {
+            sw.srv.log.print("the tunnel's peer table is up to date again", .{});
+            sw.srv.storeChanged();
+        }
     }
 
     /// Re-arms the change watch; if that fails, re-opens it once. Losing
-    /// it is logged as an error: changes made by `portalctl` (pair,
-    /// unpair) are then not seen until Portal restarts, while the
-    /// window's own desk actions still are (gui.zig applies them).
+    /// it ends the watch thread (`watch`, which shows it on the desk).
     fn rearm(sw: *StoreWatch) void {
         var d = sw.dw orelse return;
         d.rearm() catch {
             d.close();
             sw.dw = devices.watchStore(sw.gpa, sw.paths) catch |err| {
                 sw.dw = null;
-                sw.srv.log.print("ERROR: lost the change watch on {s} ({t}): `portalctl pair`/`unpair` changes are not seen until Portal restarts", .{ sw.paths.dir, err });
+                sw.srv.log.print("ERROR: lost the change watch on {s} ({t})", .{ sw.paths.dir, err });
                 return;
             };
             sw.srv.log.print("change watch on {s} was lost and has been re-opened", .{sw.paths.dir});
@@ -819,12 +829,34 @@ const StoreWatch = struct {
 
     fn watch(sw: *StoreWatch) void {
         while (true) {
-            const d = sw.dw orelse return;
-            if (w.WaitForMultipleObjects(1, &[1]w.HANDLE{d.h}, 0, w.INFINITE) != w.WAIT_OBJECT_0) return;
+            const d = sw.dw orelse break;
+            if (w.WaitForMultipleObjects(1, &[1]w.HANDLE{d.h}, 0, w.INFINITE) != w.WAIT_OBJECT_0) break;
             _ = sw.srv.pairwatch_wakes.fetchAdd(1, .monotonic);
             sw.rearm(); // before reading: a change made meanwhile signals again
-            if (devices.read(sw.gpa, sw.io, sw.paths)) |st| sw.apply(&st) else |err| sw.srv.noteStoreError(err);
+            sw.reload() catch {};
         }
+        // `portalctl pair`/`unpair` and devices forgetting this desktop
+        // are not seen any more; the window's own actions still apply.
+        sw.lost.store(true, .release);
+        sw.srv.log.print("ERROR: the device store watcher stopped: `portalctl pair`/`unpair` changes are not applied until Portal restarts", .{});
+        sw.srv.storeChanged();
+    }
+
+    // gui.Desk.StoreHook
+    fn hookReload(ctx: *anyopaque) anyerror!void {
+        const sw: *StoreWatch = @ptrCast(@alignCast(ctx));
+        return sw.reload();
+    }
+
+    fn hookProblem(ctx: *anyopaque) ?[]const u8 {
+        const sw: *StoreWatch = @ptrCast(@alignCast(ctx));
+        if (sw.tunnel_failed.load(.acquire)) return "Tunnel peer table not updated: changed devices are refused (see the log)";
+        if (sw.lost.load(.acquire)) return "Not watching the device list: portalctl pair/unpair need a restart";
+        return null;
+    }
+
+    fn hook(sw: *StoreWatch) gui.Desk.StoreHook {
+        return .{ .ctx = sw, .reload = hookReload, .problem = hookProblem };
     }
 };
 
@@ -1680,11 +1712,11 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         },
         .sysmon = monitor,
     };
-    server.applyStore(&prep.store);
+    server.applyStore(&prep.store, &.{});
     var store_watch: StoreWatch = .{
         .srv = &server,
         .tun = prep.tun,
-        .last = prep.store,
+        .applier = .{ .in_tunnel = prep.store },
         // Unpair from `portalctl` must end connections: no watch, no run.
         .dw = devices.watchStore(gpa, paths) catch |err|
             fatal("cannot watch {s} for changes ({t}); Portal needs it to notice pairing and unpairing", .{ paths.dir, err }),
@@ -1692,6 +1724,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .io = io,
         .gpa = gpa,
     };
+    // A change between prepare's read and the watch opening signalled
+    // nobody: read once more now that the watch is open.
+    store_watch.reload() catch {};
 
     // The window's desk panels (pairing, devices, settings with the
     // tunnel) use the device store directly; store changes wake it.
@@ -1711,6 +1746,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .open_ctx = env,
             .env = env,
             .open_fn = deskOpen,
+            .store = store_watch.hook(),
         });
         server.store_notify_ctx = h;
         server.store_notify_fn = gui.LocalHost.storeNotify;

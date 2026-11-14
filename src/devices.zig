@@ -317,7 +317,7 @@ pub fn withStore(gpa: Allocator, io: Io, paths: Paths, now: i64, ctx: anytype, c
     var lb: [1024]u8 = undefined;
     var pb: [1024]u8 = undefined;
     const Ctx = struct { gpa: Allocator, now: i64, inner: @TypeOf(ctx) };
-    fsutil.update(gpa, io, try paths.join(&lb, &.{"devices.lock"}), try paths.join(&pb, &.{"devices.txt"}), 64 * 1024, Ctx{
+    fsutil.update(gpa, io, try lockPath(paths, &lb), try paths.join(&pb, &.{"devices.txt"}), 64 * 1024, Ctx{
         .gpa = gpa,
         .now = now,
         .inner = ctx,
@@ -339,6 +339,12 @@ pub fn withStore(gpa: Allocator, io: Io, paths: Paths, now: i64, ctx: anytype, c
         error.ReplaceFailed => error.DeviceStoreWriteFailed,
         else => err,
     };
+}
+
+/// The store's lock file (`withStore`). Anything else that must not race
+/// a pairing (the desk's tunnel key, tunneldesk.zig) takes it too.
+pub fn lockPath(paths: Paths, buf: []u8) ![]const u8 {
+    return paths.join(buf, &.{"devices.lock"});
 }
 
 /// The store as it is now (a locked read; changes nothing but expiry).
@@ -397,7 +403,9 @@ pub const Desk = struct {
         return out;
     }
 
-    /// A device forgot this desktop: removes record `id` only.
+    /// Removes record `id` only (a device forgetting this desktop, or
+    /// Unpair at the desk: a record paired again under the same name
+    /// meanwhile stays). True if it was there.
     pub fn forget(d: Desk, id: DeviceId) !bool {
         var removed = false;
         const Ctx = struct { id: DeviceId, out: *bool };

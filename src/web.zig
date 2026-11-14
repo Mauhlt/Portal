@@ -70,6 +70,7 @@ const sysmon = @import("sysmon.zig");
 const frames = @import("shared").frames;
 const foryou_ws = @import("foryou_ws.zig");
 const projects_ws = @import("projects_ws.zig");
+const ratelimit = @import("ratelimit.zig");
 
 /// Hard cap on simultaneous connections (each costs a supervisor thread and
 /// a worker thread, a WebSocket one more).
@@ -79,6 +80,13 @@ const max_connections = 32;
 /// hold open.
 const max_pre_auth = 16;
 const max_pre_auth_per_ip = 8;
+/// Upgraded connections one device may hold per channel. A client keeps
+/// one interactive WebSocket and opens a bulk one per sync request (one
+/// at a time); two leaves room for a reconnect overlapping a dying one,
+/// or a second process of the same device (`portal sync`). A new one
+/// over the cap ends that device's oldest on the same channel, so one
+/// device can never hold every slot.
+pub const max_upgraded_per_device: std.EnumArray(Channel, usize) = .init(.{ .interactive = 2, .bulk = 2 });
 
 const max_requests_per_connection = 16;
 const max_body = 0;
@@ -109,8 +117,9 @@ const revoke_grace_ms = 10_000;
 const no_deadline = std.math.maxInt(i64);
 /// Per-peer log lines: at most `burst` per this interval per kind.
 const peer_log_interval_ms = 10_000;
-/// Per-WebSocket input limits (messages and bytes per second, with bursts
-/// twice that). Answering prompts needs a few per second; more is dropped.
+/// Per-device input limits, shared by all of a device's WebSockets
+/// (messages and bytes per second, with bursts twice that). Answering
+/// prompts needs a few per second; more is dropped.
 pub const input_msgs_per_s = 40;
 pub const input_bytes_per_s = 16 * 1024;
 
@@ -139,7 +148,45 @@ pub const Peer = struct {
     ip: tunnelnet.Ip4,
     id: devices.DeviceId,
     name: devices.Text,
+    /// Its address may still carry an older key in the tunnel (the store
+    /// changed and the tunnel's peer table has not caught up,
+    /// tunneldesk.Applier): nothing is admitted from it and no connection
+    /// counts as this record's.
+    refused: bool = false,
 };
+
+/// The two WebSockets (`GET /ws`, `GET /ws/bulk`).
+pub const Channel = enum { interactive, bulk };
+
+/// `peers` from store `st`, those at `refused` addresses marked refused.
+fn setPeers(peers: *[devices.max_devices]?Peer, st: *const devices.Store, refused: []const tunnelnet.Ip4) void {
+    for (peers, st.devices) |*p, d| p.* = if (d) |dev| .{
+        .ip = dev.ip,
+        .id = dev.id,
+        .name = dev.name,
+        .refused = for (refused) |ip| {
+            if (std.mem.eql(u8, &ip, &dev.ip)) break true;
+        } else false,
+    } else null;
+}
+
+/// The record admitted from address `ip`: none if refused.
+fn peerAt(peers: *const [devices.max_devices]?Peer, ip: tunnelnet.Ip4) ?Peer {
+    for (peers) |slot| if (slot) |p| if (std.mem.eql(u8, &p.ip, &ip)) return if (p.refused) null else p;
+    return null;
+}
+
+/// Null while record `p` is still the one at its address (and not
+/// refused); else why its connections end: `replaced` if its name is
+/// still paired (under another record), `unpaired` if not.
+fn endReasonIn(peers: *const [devices.max_devices]?Peer, p: *const Peer) ?Server.EndReason {
+    var replaced = false;
+    for (peers) |slot| if (slot) |q| {
+        if (std.mem.eql(u8, &q.id, &p.id) and std.mem.eql(u8, &q.ip, &p.ip) and !q.refused) return null;
+        if (std.mem.eql(u8, q.name.get(), p.name.get())) replaced = true;
+    };
+    return if (replaced) .replaced else .unpaired;
+}
 
 // ------------------------------------------------------------ pure helpers
 
@@ -162,7 +209,9 @@ pub fn ipKey(addr: net.IpAddress) IpKey {
 /// Connection slot bookkeeping. Pure: the caller holds a mutex and supplies
 /// time. Pre-auth connections over their limits evict the oldest pre-auth
 /// connection (from the same address first), so idle or slow connections
-/// cannot lock a real user out; signed-in connections are never evicted.
+/// cannot lock a real user out; upgraded connections are never evicted by
+/// a pre-auth one, only by a newer upgrade of the same device and channel
+/// over `max_upgraded_per_device` (`promote`).
 pub const ConnTable = struct {
     pub const Entry = struct {
         used: bool = false,
@@ -170,6 +219,9 @@ pub const ConnTable = struct {
         authed: bool = false,
         evicted: bool = false,
         since_ms: i64 = 0,
+        /// Set by `promote`.
+        device: devices.DeviceId = @splat(0),
+        channel: Channel = .interactive,
     };
 
     pub const Admission = struct {
@@ -182,6 +234,7 @@ pub const ConnTable = struct {
     entries: [max_connections]Entry = @splat(.{}),
     max_pre_auth: usize = max_pre_auth,
     max_pre_auth_per_ip: usize = max_pre_auth_per_ip,
+    max_upgraded: std.EnumArray(Channel, usize) = max_upgraded_per_device,
 
     fn isPreAuth(e: Entry) bool {
         return e.used and !e.authed and !e.evicted;
@@ -227,8 +280,27 @@ pub const ConnTable = struct {
         return .{ .slot = slot, .victim = victim };
     }
 
-    pub fn promote(t: *ConnTable, slot: usize) void {
-        if (slot < t.entries.len) t.entries[slot].authed = true;
+    /// Slot `slot` is now device `id`'s WebSocket on `ch`. Returns the
+    /// connection to tear down if the device is now over its cap on `ch`
+    /// (its oldest there), else null.
+    pub fn promote(t: *ConnTable, slot: usize, id: devices.DeviceId, ch: Channel) ?usize {
+        if (slot >= t.entries.len) return null;
+        var n: usize = 0;
+        var oldest: ?usize = null;
+        for (t.entries, 0..) |e, i| {
+            if (i == slot or !e.used or !e.authed or e.evicted or e.channel != ch) continue;
+            if (!std.mem.eql(u8, &e.device, &id)) continue;
+            n += 1;
+            if (oldest == null or e.since_ms < t.entries[oldest.?].since_ms) oldest = i;
+        }
+        const s = &t.entries[slot];
+        s.authed = true;
+        s.device = id;
+        s.channel = ch;
+        if (n < t.max_upgraded.get(ch)) return null;
+        const v = oldest orelse return null;
+        t.entries[v].evicted = true;
+        return v;
     }
 
     pub fn release(t: *ConnTable, slot: usize) void {
@@ -263,7 +335,8 @@ pub const LogLimiter = struct {
 
 const Bucket = @import("bucket.zig").Bucket;
 
-/// Per-connection input limit: a message must fit both buckets.
+/// A device's input limit (Server.input_limits): a message must fit both
+/// buckets.
 pub const InputLimit = struct {
     msgs: Bucket = .init(input_msgs_per_s, 2 * input_msgs_per_s),
     bytes: Bucket = .init(input_bytes_per_s, 2 * input_bytes_per_s),
@@ -274,6 +347,19 @@ pub const InputLimit = struct {
         const n: i64 = @intCast(len);
         if (!l.msgs.has(1) or !l.bytes.has(n)) return false;
         return l.msgs.take(1) and l.bytes.take(n);
+    }
+};
+
+/// A device's input limits, one per channel (Server.input_limits).
+pub const DeviceInput = struct {
+    interactive: InputLimit = .{},
+    bulk: InputLimit = .{},
+
+    pub fn forChannel(d: *DeviceInput, ch: Channel) *InputLimit {
+        return switch (ch) {
+            .interactive => &d.interactive,
+            .bulk => &d.bulk,
+        };
     }
 };
 
@@ -395,6 +481,11 @@ pub const Server = struct {
     /// Each paired device's `p:start` / `p:stop` rate (projects_ws.zig).
     project_limits: projects_ws.Limits = .{},
 
+    /// Each paired device's message budget per channel, over all its
+    /// WebSockets (more sockets never mean more PTY input).
+    input_mutex: Io.Mutex = .init,
+    input_limits: ratelimit.Table(DeviceInput) = .{},
+
     /// Why a device's connections end (docs/protocol.md, `logout`).
     /// `unpaired`: its record was removed at the desk; the device forgets
     /// this desktop. `replaced`: the name was paired again (a new key); the
@@ -412,7 +503,11 @@ pub const Server = struct {
 
     // ------------------------------------------------------ paired devices
 
-    /// The paired device at tunnel address `addr`, if any.
+    /// The paired device at tunnel address `addr`, if any (and not
+    /// refused). By address only: the stream does not carry the WireGuard
+    /// key, so this relies on the tunnel letting each address in only
+    /// with its record's key, which `refused` covers while the peer table
+    /// catches up with the store.
     pub fn deviceAt(srv: *Server, addr: net.IpAddress) ?Peer {
         const ip: tunnelnet.Ip4 = switch (addr) {
             .ip4 => |a| a.bytes,
@@ -420,31 +515,33 @@ pub const Server = struct {
         };
         srv.peer_mutex.lockUncancelable(srv.io);
         defer srv.peer_mutex.unlock(srv.io);
-        for (srv.peers) |slot| if (slot) |p| if (std.mem.eql(u8, &p.ip, &ip)) return p;
-        return null;
+        return peerAt(&srv.peers, ip);
     }
 
-    /// Null while record `p` is still paired; else why its connections end.
+    /// Null while record `p` is still paired at its address (and not
+    /// refused); else why its connections end.
     pub fn endReason(srv: *Server, p: *const Peer) ?EndReason {
         srv.peer_mutex.lockUncancelable(srv.io);
         defer srv.peer_mutex.unlock(srv.io);
-        var replaced = false;
-        for (srv.peers) |slot| if (slot) |q| {
-            if (std.mem.eql(u8, &q.id, &p.id)) return null;
-            if (std.mem.eql(u8, q.name.get(), p.name.get())) replaced = true;
-        };
-        return if (replaced) .replaced else .unpaired;
+        return endReasonIn(&srv.peers, p);
     }
 
-    /// Called by the store watcher with a freshly read store (only a
-    /// successful read gets here, so a store error never ends anyone):
-    /// refreshes the paired devices, then wakes every connection so those
-    /// of removed records say goodbye.
-    pub fn applyStore(srv: *Server, st: *const devices.Store) void {
+    /// Called by the store watcher (tunneldesk.Applier) with a freshly
+    /// read store (only a successful read gets here, so a store error
+    /// never ends anyone): refreshes the paired devices, marking those at
+    /// `refused` addresses refused, then wakes every connection so those
+    /// of removed, replaced or refused records say goodbye.
+    pub fn applyStore(srv: *Server, st: *const devices.Store, refused: []const tunnelnet.Ip4) void {
         srv.peer_mutex.lockUncancelable(srv.io);
-        for (&srv.peers, st.devices) |*p, d| p.* = if (d) |dev| .{ .ip = dev.ip, .id = dev.id, .name = dev.name } else null;
+        setPeers(&srv.peers, st, refused);
         srv.peer_mutex.unlock(srv.io);
         srv.wakeViewers();
+        srv.storeChanged();
+    }
+
+    /// Calls `store_notify_fn`: the paired devices, or how they are
+    /// applied, may have changed.
+    pub fn storeChanged(srv: *Server) void {
         if (srv.store_notify_fn) |f| if (srv.store_notify_ctx) |c| f(c);
     }
 
@@ -543,10 +640,7 @@ pub const Server = struct {
         };
         srv.conn_mutex.lockUncancelable(io);
         const adm = srv.conns.admit(ipKey(stream.remote()), now);
-        if (adm.victim) |v| {
-            srv.conn_evict[v].store(true, .release);
-            srv.conn_wake[v].set(io);
-        }
+        if (adm.victim) |v| srv.evictLocked(v);
         if (adm.slot) |s| {
             // The previous occupant's supervisor has fully exited.
             srv.conn_evict[s].store(false, .release);
@@ -566,6 +660,12 @@ pub const Server = struct {
             return;
         };
         t.detach();
+    }
+
+    /// Tells slot `v`'s supervisor to end it (conn_mutex held).
+    fn evictLocked(srv: *Server, v: usize) void {
+        srv.conn_evict[v].store(true, .release);
+        srv.conn_wake[v].set(srv.io);
     }
 
     fn releaseSlot(srv: *Server, slot: usize) void {
@@ -595,12 +695,21 @@ pub const Server = struct {
         }
     }
 
-    fn promote(srv: *Server, conn: *Conn) void {
+    fn promote(srv: *Server, conn: *Conn, ch: Channel) void {
         if (conn.authed) return;
         conn.authed = true;
         srv.conn_mutex.lockUncancelable(srv.io);
-        srv.conns.promote(conn.slot);
+        if (srv.conns.promote(conn.slot, conn.device.id, ch)) |v| srv.evictLocked(v);
         srv.conn_mutex.unlock(srv.io);
+    }
+
+    /// Device `id` may send a `len`-byte message on `ch` now (its budget
+    /// over all its WebSockets on that channel).
+    fn inputAllowed(srv: *Server, id: devices.DeviceId, ch: Channel, len: usize) bool {
+        const now = srv.nowMs();
+        srv.input_mutex.lockUncancelable(srv.io);
+        defer srv.input_mutex.unlock(srv.io);
+        return srv.input_limits.get(id, now).forChannel(ch).allow(now, len);
     }
 
     /// Supervisor thread: owns the socket, runs the worker, enforces deadlines.
@@ -648,7 +757,7 @@ pub const Server = struct {
             srv.conn_wake[slot].reset();
             if (conn.done.load(.acquire)) break;
             if (srv.conn_evict[slot].load(.acquire)) {
-                reason = "evicted (too many unauthenticated connections)";
+                reason = "evicted (over the connection limits)";
                 break;
             }
             const now = srv.nowMs();
@@ -664,6 +773,12 @@ pub const Server = struct {
                 } else if (revoked_since == null) {
                     revoked_since = now;
                 }
+            } else if (srv.endReason(&conn.device) != null) {
+                // Not a WebSocket yet: there is no logout to deliver, so a
+                // connection whose record went (or whose address is
+                // refused) ends now, not at its head timeout.
+                reason = "unpaired";
+                break;
             }
             if (revoked_since) |r| {
                 if (now -| r >= revoke_grace_ms) {
@@ -875,8 +990,6 @@ pub const Server = struct {
         return false;
     }
 
-    const Channel = enum { interactive, bulk };
-
     // ---------------------------------------------------------- responses
 
     fn respond(srv: *Server, conn: *Conn, w: *Io.Writer, status: http1.Status, body: []const u8) !void {
@@ -905,8 +1018,6 @@ pub const Server = struct {
         dead: std.atomic.Value(bool) = .init(false),
         /// The paired device on the other end.
         device: Peer,
-        /// Reader only: per-connection input rate limit.
-        limit: InputLimit = .{},
         /// Reader only: the tab this viewer's input goes to, with a
         /// reference (null after asking for a session that is not open:
         /// input is then dropped until it picks an open one).
@@ -972,7 +1083,7 @@ pub const Server = struct {
         conn.setDeadline(no_deadline);
 
         var ws: WsConn = .{ .conn = conn, .w = w, .device = conn.device };
-        srv.promote(conn);
+        srv.promote(conn, channel);
         conn.ws_active.store(true, .release);
         conn.wake.set(srv.io); // the supervisor now also watches the pairing
         // A connection a day marks the device as in use (devices unused for
@@ -1513,7 +1624,7 @@ pub const Server = struct {
     /// Returns false to end the connection.
     fn wsHandleFrame(srv: *Server, ws: *WsConn, opcode: websocket.Opcode, payload: []const u8) bool {
         switch (opcode) {
-            .ping, .text, .binary => if (!ws.limit.allow(srv.nowMs(), payload.len)) {
+            .ping, .text, .binary => if (!srv.inputAllowed(ws.device.id, .interactive, payload.len)) {
                 // A paired device flooding input (or pings): drop the excess
                 // rather than let it queue behind a slow PTY write.
                 srv.notePeer(&srv.input_log, "input from {s} over the rate limit; dropped", .{ws.conn.peer()});
@@ -1701,7 +1812,7 @@ pub const Server = struct {
                 _ = ws.send(srv, logoutMessage(r), .text);
                 return;
             }
-            if (!ws.limit.allow(srv.nowMs(), f.payload.len)) {
+            if (!srv.inputAllowed(ws.device.id, .bulk, f.payload.len)) {
                 srv.notePeer(&srv.input_log, "bulk requests from {s} over the rate limit; dropped", .{ws.conn.peer()});
                 continue;
             }
@@ -1905,7 +2016,7 @@ test "conn table: per-ip pre-auth cap evicts that address's oldest" {
 test "conn table: authenticated connections are never evicted" {
     var t: ConnTable = .{ .max_pre_auth = 10, .max_pre_auth_per_ip = 1 };
     const a = t.admit(testKey(1), 0);
-    t.promote(a.slot.?);
+    _ = t.promote(a.slot.?, @splat(1), .interactive);
     const b = t.admit(testKey(1), 1);
     try testing.expect(b.victim == null);
     const c = t.admit(testKey(1), 2);
@@ -1923,12 +2034,60 @@ test "conn table: global pre-auth cap and full table" {
     var full: ConnTable = .{};
     for (0..max_connections) |i| {
         const s = full.admit(testKey(@intCast(i % 200)), @intCast(i)).slot.?;
-        full.promote(s);
+        // Every connection its own device: no per-device cap applies.
+        var id: devices.DeviceId = @splat(0);
+        id[0] = @intCast(i);
+        try testing.expect(full.promote(s, id, .interactive) == null);
     }
     const r = full.admit(testKey(1), 100);
     try testing.expect(r.slot == null and r.victim == null);
     full.release(5);
     try testing.expectEqual(@as(?usize, 5), full.admit(testKey(1), 101).slot);
+}
+
+test "conn table: a device over its upgraded cap loses its oldest on that channel" {
+    var t: ConnTable = .{};
+    const dev: devices.DeviceId = @splat(1);
+    const other: devices.DeviceId = @splat(2);
+    const cap = max_upgraded_per_device.get(.interactive);
+    var first: ?usize = null;
+    for (0..cap) |i| {
+        const s = t.admit(testKey(1), @intCast(i)).slot.?;
+        if (first == null) first = s;
+        try testing.expect(t.promote(s, dev, .interactive) == null);
+    }
+    // Another device and the other channel count apart.
+    try testing.expect(t.promote(t.admit(testKey(2), 50).slot.?, other, .interactive) == null);
+    try testing.expect(t.promote(t.admit(testKey(1), 51).slot.?, dev, .bulk) == null);
+    // One more interactive from the same device: its oldest goes.
+    const s = t.admit(testKey(1), 100).slot.?;
+    try testing.expectEqual(first, t.promote(s, dev, .interactive));
+    try testing.expect(t.entries[first.?].evicted);
+    // The evicted one no longer counts: the next evicts the second oldest.
+    const s2 = t.admit(testKey(1), 101).slot.?;
+    const v2 = t.promote(s2, dev, .interactive).?;
+    try testing.expect(v2 != first.? and v2 != s);
+    // However many it opens, the device holds at most `cap` live ones.
+    var live: usize = 0;
+    for (t.entries) |e| {
+        if (e.used and e.authed and !e.evicted and e.channel == .interactive and std.mem.eql(u8, &e.device, &dev)) live += 1;
+    }
+    try testing.expectEqual(cap, live);
+}
+
+test "input limit is per device: more sockets do not add budget" {
+    var t: ratelimit.Table(DeviceInput) = .{};
+    const dev: devices.DeviceId = @splat(1);
+    var passed: usize = 0;
+    // Two "sockets" of the same device draw on one budget.
+    for (0..1000) |_| {
+        if (t.get(dev, 0).forChannel(.interactive).allow(0, 1)) passed += 1;
+        if (t.get(dev, 0).forChannel(.interactive).allow(0, 1)) passed += 1;
+    }
+    try testing.expectEqual(@as(usize, 2 * input_msgs_per_s), passed);
+    // The bulk channel and another device have their own.
+    try testing.expect(t.get(dev, 0).forChannel(.bulk).allow(0, 1));
+    try testing.expect(t.get(@splat(2), 0).forChannel(.interactive).allow(0, 1));
 }
 
 test "log limiter" {
@@ -1999,3 +2158,37 @@ test "ip key" {
     try testing.expect(!std.mem.eql(u8, &ipKey(a), &ipKey(c)));
 }
 
+test "peers: a refused address admits nothing, and a record replaced at its address ends" {
+    var st: devices.Store = .{};
+    var k1: devices.Key = @splat(7);
+    k1[0] = 1;
+    var k2: devices.Key = @splat(8);
+    k2[0] = 1;
+    const old = (try st.pair("phone", k1, @splat(9), @splat(1), 0)).device;
+    var peers: [devices.max_devices]?Peer = @splat(null);
+    setPeers(&peers, &st, &.{});
+    const admitted = peerAt(&peers, old.ip).?;
+    try testing.expect(endReasonIn(&peers, &admitted) == null);
+
+    // Re-paired: the same name and address, a new record. While the
+    // tunnel may still have the old key the address is refused.
+    const new = (try st.pair("phone", k2, @splat(9), @splat(2), 0)).device;
+    try testing.expectEqual(old.ip, new.ip);
+    setPeers(&peers, &st, &.{new.ip});
+    try testing.expect(peerAt(&peers, new.ip) == null);
+    try testing.expectEqual(Server.EndReason.replaced, endReasonIn(&peers, &admitted).?);
+    // A connection admitted as the new record during the refusal could
+    // not exist (peerAt refused it); after it, the new record is let in.
+    setPeers(&peers, &st, &.{});
+    const now_admitted = peerAt(&peers, new.ip).?;
+    try testing.expect(endReasonIn(&peers, &now_admitted) == null);
+    try testing.expectEqual(Server.EndReason.replaced, endReasonIn(&peers, &admitted).?);
+    // A record id found at another address is not this connection's.
+    var moved = now_admitted;
+    moved.ip = .{ 10, 8, 0, 99 };
+    try testing.expect(endReasonIn(&peers, &moved) != null);
+    // Unpaired: nothing of that name is left.
+    _ = st.remove("phone");
+    setPeers(&peers, &st, &.{});
+    try testing.expectEqual(Server.EndReason.unpaired, endReasonIn(&peers, &now_admitted).?);
+}

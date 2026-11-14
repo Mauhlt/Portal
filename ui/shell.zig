@@ -207,6 +207,9 @@ pub const Desk = struct {
     /// ("started by iPhone", "stopped by iPhone"; "" for none), shown on
     /// the desk's tab after its name. Never sent to devices.
     notes: []const []const u8 = &.{},
+    /// A lasting problem the owner must know about (device changes not
+    /// applied), shown in the status line until it is resolved; "" none.
+    alert: []const u8 = "",
 };
 
 /// What a device's window shows about its connection.
@@ -1109,8 +1112,8 @@ pub const Shell = struct {
             },
             .selection = if (conversation) null else sh.select.range(),
             .status = .{
-                .tone = .good,
-                .label = "local session",
+                .tone = if (d.alert.len > 0) .bad else .good,
+                .label = if (d.alert.len > 0) d.alert else "local session",
                 .extra = if (line_note) lv.note else remote_input,
                 .extra_tone = if (line_note) noteTone(lv.note_tone) else if (d.policy == .text) .bad else .muted,
                 .right = std.fmt.bufPrint(&sh.bufs.extra, "sharing on {s}", .{d.url}) catch d.url,
