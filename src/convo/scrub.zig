@@ -29,7 +29,11 @@
 //!   5. the user's names (%USERNAME%, the home folder's name and its 8.3
 //!      form, and each space-separated part of those), as whole words in
 //!      any case (simple Unicode case folding), become `[user]` (this also
-//!      catches pieces of a path cut by a line break).
+//!      catches pieces of a path cut by a line break); the user's names
+//!      also include git's `user.name`, the local part of `user.email`
+//!      and the computer's name (%COMPUTERNAME%);
+//!   6. an e-mail address (`local@domain.tld`, at a word boundary)
+//!      becomes `[email]`, whoever's it is.
 //!
 //! Paths of rules 1-3 start at a word boundary, except that drive paths
 //! (and `\\?\`, `\\.\`, `file://`, `%VAR%\`) also match glued to the text
@@ -58,6 +62,7 @@ pub const Context = struct {
 pub const path_mark = "[path]";
 pub const user_mark = "[user]";
 pub const home_mark = "[home]";
+pub const email_mark = "[email]";
 
 /// Longest quoted path followed to its closing quote; a longer one is cut
 /// there (all of it removed) rather than left to leak past a space.
@@ -78,6 +83,11 @@ pub const Identity = struct {
         /// %OneDrive%, %OneDriveConsumer%, %OneDriveCommercial% and their
         /// short forms; nulls are skipped.
         other_homes: []const ?[]const u8 = &.{},
+        /// git's `user.name` and `user.email` (the global config, read
+        /// once at startup: main.zig), and %COMPUTERNAME%.
+        git_name: ?[]const u8 = null,
+        git_email: ?[]const u8 = null,
+        computer_name: ?[]const u8 = null,
     };
 
     /// Builds the lists (deduplicated; names longest first, each also
@@ -85,13 +95,28 @@ pub const Identity = struct {
     pub fn init(arena: Allocator, in: Inputs) Allocator.Error!Identity {
         var users: std.ArrayList([]const u8) = .empty;
         var homes: std.ArrayList([]const u8) = .empty;
-        const named = [_]?[]const u8{ in.user_name, if (in.profile) |p| baseName(p) else null, if (in.profile_short) |p| baseName(p) else null };
+        const named = [_]?[]const u8{
+            in.user_name,
+            if (in.profile) |p| baseName(p) else null,
+            if (in.profile_short) |p| baseName(p) else null,
+            in.git_name,
+            in.computer_name,
+        };
         for (named) |maybe| {
             const n = std.mem.trim(u8, maybe orelse continue, " ");
             try addWord(arena, &users, n);
             var parts = std.mem.tokenizeScalar(u8, n, ' ');
             while (parts.next()) |part| try addWord(arena, &users, part);
         }
+        // The e-mail's local part (`jo.ann+git@x` -> "jo.ann", "jo",
+        // "ann"); the whole address is an e-mail anyway (rule 6).
+        if (in.git_email) |e| if (std.mem.indexOfScalar(u8, e, '@')) |at| {
+            const local = std.mem.trim(u8, e[0..at], " ");
+            const handle = local[0 .. std.mem.indexOfScalar(u8, local, '+') orelse local.len];
+            try addWord(arena, &users, handle);
+            var parts = std.mem.tokenizeAny(u8, handle, "._-");
+            while (parts.next()) |part| try addWord(arena, &users, part);
+        };
         std.mem.sort([]const u8, users.items, {}, struct {
             fn longer(_: void, a: []const u8, b: []const u8) bool {
                 return a.len > b.len;
@@ -120,6 +145,60 @@ pub const Identity = struct {
     }
 };
 
+/// git's `user.name` and `user.email` from a git config file's text (the
+/// `[user]` section; later values win, as in git; `"..."` quotes and
+/// `#` / `;` comments handled, includes not followed). Slices of `text`
+/// (a quoted value without its quotes, escapes kept as written).
+pub const GitUser = struct { name: ?[]const u8 = null, email: ?[]const u8 = null };
+
+pub fn parseGitUser(text: []const u8) GitUser {
+    var out: GitUser = .{};
+    var in_user = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+        if (line[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, line, ']') orelse {
+                in_user = false;
+                continue;
+            };
+            in_user = std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[1..close], " \t"), "user");
+            continue;
+        }
+        if (!in_user) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        var v = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        if (v.len > 0 and v[0] == '"') {
+            const end = std.mem.indexOfScalarPos(u8, v, 1, '"') orelse v.len;
+            v = v[1..end];
+        } else if (std.mem.indexOfAny(u8, v, "#;")) |c| v = std.mem.trim(u8, v[0..c], " \t");
+        if (v.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(key, "name")) out.name = v;
+        if (std.ascii.eqlIgnoreCase(key, "email")) out.email = v;
+    }
+    return out;
+}
+
+test "parseGitUser: the [user] section's name and email" {
+    const u = parseGitUser(
+        \\# comment
+        \\[core]
+        \\    name = not-this
+        \\[User]
+        \\    name = "Ann Example"
+        \\    email = ann@example.com ; mine
+        \\[alias]
+        \\    email = x@y.z
+        \\
+    );
+    try testing.expectEqualStrings("Ann Example", u.name.?);
+    try testing.expectEqualStrings("ann@example.com", u.email.?);
+    const none = parseGitUser("[core]\nautocrlf = true\n");
+    try testing.expect(none.name == null and none.email == null);
+}
+
 /// Appends the scrubbed `in` to `out`.
 pub fn scrub(gpa: Allocator, ctx: Context, in: []const u8, out: *std.ArrayList(u8)) Allocator.Error!void {
     var root = trimSeps(ctx.root);
@@ -132,6 +211,11 @@ pub fn scrub(gpa: Allocator, ctx: Context, in: []const u8, out: *std.ArrayList(u
         const at_boundary = boundaryBefore(in, i);
         // Glued to the text before it: only the unmistakable kinds.
         const glued = !at_boundary and gluedStart(in, i);
+        if (at_boundary) if (emailAt(in, i)) |end| {
+            try out.appendSlice(gpa, email_mark);
+            i = end;
+            continue;
+        };
         if (at_boundary or glued) {
             if (root.len > 0) if (matchRoot(in, i, root)) |end| {
                 try out.appendSlice(gpa, ctx.name);
@@ -161,6 +245,51 @@ pub fn scrub(gpa: Allocator, ctx: Context, in: []const u8, out: *std.ArrayList(u
         try out.append(gpa, in[i]);
         i += 1;
     }
+}
+
+/// Whether `s` holds one of the user's names (rule 5: `ctx.user` and
+/// `ctx.users`, whole words, any case): for short texts that are dropped
+/// whole rather than marked (a tab name, a tool's name).
+pub fn containsUser(s: []const u8, ctx: Context) bool {
+    const user: []const u8 = if (ctx.user) |u| (if (u.len >= 2) u else "") else "";
+    for (0..s.len) |i| if (userAt(s, i, user, ctx.users) != null) return true;
+    return false;
+}
+
+fn emailLocal(c: u8) bool {
+    return isAlnum(c) or c == '.' or c == '_' or c == '%' or c == '+' or c == '-';
+}
+
+/// An e-mail address at `i` (`local@label.label`, ASCII, at least one dot
+/// in the domain): its end (a trailing dot stays, as sentence punctuation).
+/// Bounded like addresses are (64-byte local part, 255-byte domain), so
+/// the scan stays linear in the text.
+fn emailAt(s: []const u8, i: usize) ?usize {
+    var j = i;
+    while (j < s.len and emailLocal(s[j])) : (j += 1) if (j - i == 64) return null;
+    if (j == i or j >= s.len or s[j] != '@') return null;
+    j += 1;
+    const domain = j;
+    var dots: usize = 0;
+    var label_len: usize = 0;
+    var end: usize = j;
+    while (j < s.len) : (j += 1) {
+        if (j - domain == 255) return null;
+        const c = s[j];
+        if (isAlnum(c) or c == '-') {
+            label_len += 1;
+            continue;
+        }
+        if (c == '.' and label_len > 0 and j + 1 < s.len and (isAlnum(s[j + 1]))) {
+            dots += 1;
+            label_len = 0;
+            continue;
+        }
+        break;
+    }
+    end = j;
+    if (dots == 0 or label_len == 0) return null;
+    return end;
 }
 
 fn trimSeps(p: []const u8) []const u8 {
@@ -772,4 +901,26 @@ test "a quoted path longer than 1024 bytes is removed whole" {
     defer out.deinit(testing.allocator);
     try scrub(testing.allocator, .{}, long.items, &out);
     try testing.expect(out.items.len < 64);
+}
+
+test "e-mail addresses become [email]; git's and the computer's names are the user's" {
+    const c: Context = .{ .root = "D:\\work\\proj", .name = "proj" };
+    try check(c, "mail jo.ann+x@example.co.uk now.", "mail [email] now.");
+    try check(c, "<bob@corp.example>", "<[email]>");
+    try check(c, "Ends with a@b.io.", "Ends with [email].");
+    try check(c, "not one: a@b, @x.com, user@localhost, x@y.", "not one: a@b, @x.com, user@localhost, x@y.");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const id = try Identity.init(arena.allocator(), .{
+        .user_name = "u1",
+        .git_name = "Ann Example",
+        .git_email = "annex+git@example.com",
+        .computer_name = "DESKTOP-Q1W2",
+    });
+    const cu: Context = .{ .users = id.users };
+    try check(cu, "Ann Example on desktop-q1w2 as annex", "[user] on [user] as [user]");
+    try testing.expect(containsUser("by-ANN", cu));
+    try testing.expect(!containsUser("annexed", cu));
+    try testing.expect(containsUser("x u1", .{ .user = "u1" }));
+    try testing.expect(!containsUser("u10", .{ .user = "u1" }));
 }

@@ -423,7 +423,7 @@ pub const Convo = struct {
             g.calls +|= 1;
             addFile(g, file);
             const s = c.last().?;
-            const t = try c.gpa.dupe(u8, transcript.oneLiner(&line, cat, tool, g.calls, g.n_files + g.extra_files));
+            const t = try c.gpa.dupe(u8, transcript.oneLiner(&line, cat, c.shownTool(tool), g.calls, g.n_files + g.extra_files));
             c.setText(s, t);
             return;
         }
@@ -432,8 +432,15 @@ pub const Convo = struct {
         @memcpy(g.tool[0..tl], tool[0..tl]);
         g.tool_len = @intCast(tl);
         addFile(g, file);
-        const s = try c.pushStatic(.tool, transcript.oneLiner(&line, cat, tool, 1, g.n_files));
+        const s = try c.pushStatic(.tool, transcript.oneLiner(&line, cat, c.shownTool(tool), 1, g.n_files));
         g.n = s.n;
+    }
+
+    /// A tool's name as the one-liners and permission questions may show
+    /// it (transcript.displayTool): "" ("a tool") if it holds one of the
+    /// user's names (an MCP server named after its owner).
+    fn shownTool(c: *const Convo, tool: []const u8) []const u8 {
+        return if (scrub.containsUser(transcript.displayTool(tool), c.ctx)) "" else tool;
     }
 
     fn addFile(g: *Group, file: u64) void {

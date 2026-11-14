@@ -1348,8 +1348,10 @@ pub fn localDay(t: i64) i64 {
 /// The tab name for a folder: its basename, made printable and cut to 64
 /// bytes. Never the path, and never the user's name: the home folder
 /// itself is "Home" (its basename is the user name), a drive root or
-/// anything with no usable characters is "Project".
-pub fn displayName(path: []const u8, home: ?[]const u8, user: ?[]const u8, buf: *[wire.max_name]u8) []const u8 {
+/// anything with no usable characters is "Project", and so is a name
+/// holding any of the user's names as a word (`users`: scrub.Identity's,
+/// so git's name, the computer's name...; scrub.containsUser).
+pub fn displayName(path: []const u8, home: ?[]const u8, user: ?[]const u8, users: []const []const u8, buf: *[wire.max_name]u8) []const u8 {
     var p = path;
     while (p.len > 1 and (p[p.len - 1] == '\\' or p[p.len - 1] == '/')) p = p[0 .. p.len - 1];
     if (home) |hm| {
@@ -1369,19 +1371,25 @@ pub fn displayName(path: []const u8, home: ?[]const u8, user: ?[]const u8, buf: 
         n += cs.len;
     }
     const out = std.mem.trim(u8, buf[0..n], " ");
-    if (!wire.validName(out)) return "Project";
+    if (!wire.validName(out) or scrub.containsUser(out, .{ .user = user, .users = users })) return "Project";
     return out;
 }
 
 test "displayName: basename only, never a path or the user name" {
     var buf: [wire.max_name]u8 = undefined;
-    try std.testing.expectEqualStrings("acme-api", displayName("C:\\code\\acme-api", null, null, &buf));
-    try std.testing.expectEqualStrings("acme-api", displayName("C:\\code\\acme-api\\", null, null, &buf));
-    try std.testing.expectEqualStrings("Home", displayName("C:\\Users\\bob", "C:\\Users\\bob\\", "bob", &buf));
-    try std.testing.expectEqualStrings("Home", displayName("D:\\backup\\BOB", null, "bob", &buf));
-    try std.testing.expectEqualStrings("Project", displayName("C:\\", null, null, &buf));
-    try std.testing.expectEqualStrings("ab", displayName("C:\\x\\a\u{202e}b", null, null, &buf));
+    try std.testing.expectEqualStrings("acme-api", displayName("C:\\code\\acme-api", null, null, &.{}, &buf));
+    try std.testing.expectEqualStrings("acme-api", displayName("C:\\code\\acme-api\\", null, null, &.{}, &buf));
+    try std.testing.expectEqualStrings("Home", displayName("C:\\Users\\bob", "C:\\Users\\bob\\", "bob", &.{}, &buf));
+    try std.testing.expectEqualStrings("Home", displayName("D:\\backup\\BOB", null, "bob", &.{}, &buf));
+    try std.testing.expectEqualStrings("Project", displayName("C:\\", null, null, &.{}, &buf));
+    try std.testing.expectEqualStrings("ab", displayName("C:\\x\\a\u{202e}b", null, null, &.{}, &buf));
     var long_dir: [3 + 100]u8 = @splat('q');
     long_dir[0..3].* = "C:\\".*;
-    try std.testing.expectEqual(@as(usize, 64), displayName(&long_dir, null, null, &buf).len);
+    try std.testing.expectEqual(@as(usize, 64), displayName(&long_dir, null, null, &.{}, &buf).len);
+    // Any of the user's names as a word (git's, the computer's...).
+    const users = [_][]const u8{ "Ann Example", "Ann", "Example", "DESKTOP-Q1" };
+    try std.testing.expectEqualStrings("Project", displayName("C:\\code\\ann-tools", null, "u1", &users, &buf));
+    try std.testing.expectEqualStrings("Project", displayName("C:\\code\\desktop-q1 backup", null, "u1", &users, &buf));
+    try std.testing.expectEqualStrings("Project", displayName("C:\\code\\U1 stuff", null, "u1", &users, &buf));
+    try std.testing.expectEqualStrings("annex", displayName("C:\\code\\annex", null, "u1", &users, &buf));
 }
