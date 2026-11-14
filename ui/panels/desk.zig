@@ -119,8 +119,8 @@ pub fn Panels(comptime devices: type) type {
         pub const max_pkgs = 16;
 
         pub const PairResult = enum { paired, failed };
-        /// "ABCDE-FGHJK" (shared/tunnelnet.zig checkCode).
-        pub const check_len = 11;
+        /// shared/tunnelnet.zig checkCode.
+        pub const check_len = @import("shared").tunnelnet.check_code_len;
         pub const key_text_len = 44;
 
         pub const Setup = struct {

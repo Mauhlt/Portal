@@ -9,7 +9,7 @@
 //! Pairing happens at the desk only; nothing is exchanged over the
 //! network before the device's key is in the peer table:
 //!   1. the device (`portal connect`) shows its public key and that key's
-//!      check code (shared/tunnelnet.zig checkCode, "ABCDE-FGHJK");
+//!      check code (shared/tunnelnet.zig checkCode, "ABCD-EFGH-JKMN-PQRS");
 //!   2. the owner enters the name and the key at the desk (Pair a device,
 //!      or `portalctl pair <name> <key>`); the desk shows the check code
 //!      of what was entered, and the owner approves only if both screens

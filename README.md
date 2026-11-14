@@ -142,8 +142,8 @@ Details: docs/tabs-design.md, "For you".
    Credential Manager, the macOS Keychain, or a 0600 file on Linux). You
    enter its public key at the desk (**Pair a device…**, or `portalctl
    pair <name> <key>`); the desk shows that key's check code
-   (`ABCDE-FGHJK`, 50 bits) and you approve only if the device shows the
-   same code. The desk then shows a pairing code for the device (its own
+   (`ABCD-EFGH-JKMN-PQRS`, 80 bits) and you approve only if the device
+   shows the same code. The desk then shows a pairing code for the device (its own
    key with its check code, where to reach it, the CA's SHA-256, the
    device's tunnel address). Only paired keys get into the tunnel, each
    only from its own address, so the address names the device: there are

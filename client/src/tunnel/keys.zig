@@ -61,7 +61,7 @@ pub const KeyPair = struct {
         return codec.encode(&k.public);
     }
 
-    /// The check code the desk shows for this key ("ABCDE-FGHJK").
+    /// The check code the desk shows for this key ("ABCD-EFGH-JKMN-PQRS").
     pub fn checkCode(k: *const KeyPair) [tunnelnet.check_code_len]u8 {
         return tunnelnet.checkCode(&k.public);
     }

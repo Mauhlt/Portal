@@ -47,17 +47,17 @@ test "pairing: name and key, check code, approve with y, pairing code shown" {
     try testing.expectEqual(Action.paste, ui.char('v', .{ .ctrl = true }));
     ui.paste("hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=");
     try testing.expectEqual(Action.check_key, ui.key(.enter, .{}));
-    ui.keyChecked("ABCDE-FGHJK".*);
+    ui.keyChecked("ABCD-EFGH-JKMN-PQRS".*);
     try testing.expectEqual(Screen.pair_check, ui.screen);
     var bufs: Ui.Bufs = .{};
     const q = ui.panel(&bufs, .{}).?;
-    try testing.expect(std.mem.indexOf(u8, q.title, "ABCDE-FGHJK") != null);
+    try testing.expect(std.mem.indexOf(u8, q.title, "ABCD-EFGH-JKMN-PQRS") != null);
     // Deny has the focus: Enter denies; y approves.
     try testing.expectEqualStrings("Deny", q.buttons[0].label);
     try testing.expect(q.buttons[0].focused);
     try testing.expectEqual(Action.approve_pair, ui.char('y', .{}));
     const code = "portal-pair 2 10.8.0.1:8420 " ++ "00070E151C232A31383F464D545B626970777E858C939AA1A8AFB6BDC4CBD2D9 home.example.org:51820 hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo= 10.8.0.2";
-    ui.paired("10.8.0.2", code, "KLMNP-QRSTV".*);
+    ui.paired("10.8.0.2", code, "KLMN-PQRS-TVWX-YZ01".*);
     try testing.expectEqual(Screen.pair_result, ui.screen);
     const r = ui.panel(&bufs, .{}).?;
     try testing.expect(std.mem.indexOf(u8, r.title, "10.8.0.2") != null);
@@ -69,11 +69,11 @@ test "pairing: deny goes back with a note; Esc in the question goes back" {
     var ui: Ui = .{};
     ui.openPair();
     typeText(&ui, "iphone");
-    ui.keyChecked("ABCDE-FGHJK".*);
+    ui.keyChecked("ABCD-EFGH-JKMN-PQRS".*);
     _ = ui.key(.enter, .{}); // Deny is focused
     try testing.expectEqual(Screen.pair_name, ui.screen);
     try testing.expect(ui.note().len > 0);
-    ui.keyChecked("ABCDE-FGHJK".*);
+    ui.keyChecked("ABCD-EFGH-JKMN-PQRS".*);
     _ = ui.key(.escape, .{});
     try testing.expectEqual(Screen.pair_name, ui.screen);
     ui.pairFailed("no", .{});

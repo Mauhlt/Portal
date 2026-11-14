@@ -17,8 +17,8 @@ knows which device a connection is from its tunnel address alone.
 
 1. The device generates its WireGuard key pair; the private key never
    leaves it. It shows the public key (44 base64 characters) and that
-   key's **check code** (`shared/tunnelnet.zig checkCode`: 50 bits of a
-   domain-separated SHA-256, as `ABCDE-FGHJK`).
+   key's **check code** (`shared/tunnelnet.zig checkCode`: 80 bits of a
+   domain-separated SHA-256, as `ABCD-EFGH-JKMN-PQRS`).
 2. At the desk the owner enters the device's name and public key (Pair a
    device, or `portalctl pair <name> <key>`). The desk shows the check
    code of what was entered; the owner approves only if both screens show

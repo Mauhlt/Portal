@@ -24,7 +24,7 @@ pub const id_code: u32 = 100;
 pub const id_pair: u32 = 1;
 pub const id_scan: u32 = 2;
 
-pub const check_len = 11;
+pub const check_len = @import("shared").tunnelnet.check_code_len;
 
 /// `submit`: check the code (then `askConfirm`, or a note); `confirmed`:
 /// the owner compared the desk's check code; `scan`: the user asked to scan
@@ -161,15 +161,15 @@ pub const Setup = struct {
 const testing = std.testing;
 
 test "setup: key shown, code entered, checked, confirmed" {
-    var s = Setup.init("hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=".*, "ABCDE-FGHJK".*);
+    var s = Setup.init("hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=".*, @import("shared").tunnelnet.check_code_example.*);
     var b: Setup.Bufs = .{};
     const p = s.panel(&b);
     try testing.expect(std.mem.indexOf(u8, p.lines[1].text, "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=") != null);
-    try testing.expect(std.mem.indexOf(u8, p.lines[2].text, "ABCDE-FGHJK") != null);
+    try testing.expect(std.mem.indexOf(u8, p.lines[2].text, @import("shared").tunnelnet.check_code_example) != null);
     for ("abc") |c| _ = s.char(c, .{});
     try testing.expectEqual(Event.submit, s.key(.enter, .{}));
-    s.askConfirm("KLMNP-QRSTV".*);
-    try testing.expect(std.mem.indexOf(u8, s.panel(&b).lines[4].text, "KLMNP-QRSTV") != null);
+    s.askConfirm("KLMN-PQRS-TVWX-YZ01".*);
+    try testing.expect(std.mem.indexOf(u8, s.panel(&b).lines[4].text, "KLMN-PQRS-TVWX-YZ01") != null);
     try testing.expectEqual(Event.confirmed, s.button(id_pair));
     // Editing the code asks again.
     _ = s.button(id_code);

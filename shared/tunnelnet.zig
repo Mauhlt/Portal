@@ -78,32 +78,39 @@ pub fn assign(used: []const Ip4, prefer: ?Ip4) ?Ip4 {
     return null;
 }
 
-/// "ABCDE-FGHJK": the check code of a WireGuard public key, shown next to
-/// the key wherever the owner carries it between machines (the device's
-/// key typed at the desk; the desk's key in the pairing code entered on the
-/// device) and compared on both screens before approving. 50 bits of
-/// SHA-256 over the key (domain-separated), in Crockford base32 (no I, L,
-/// O, U): grinding a different key with the same code takes about 2^50
-/// tries, so a key swapped in transit (a chat, an email, a synced
-/// clipboard) is caught by the comparison.
-pub const check_code_len = 11;
+/// "ABCD-EFGH-JKMN-PQRS": the check code of a WireGuard public key, shown
+/// next to the key wherever the owner carries it between machines (the
+/// device's key typed at the desk; the desk's key in the pairing code
+/// entered on the device) and compared on both screens before approving.
+/// 80 bits of SHA-256 over the key (domain-separated), in Crockford
+/// base32 (no I, L, O, U), 4 groups of 4: grinding a different key with
+/// the same code takes about 2^80 tries, so a key swapped in transit (a
+/// chat, an email, a synced clipboard) is caught by the comparison.
+pub const check_code_groups = 4;
+pub const check_code_group_len = 4;
+pub const check_code_bits = 5 * check_code_groups * check_code_group_len;
+pub const check_code_len = check_code_groups * check_code_group_len + check_code_groups - 1;
+/// An example of the format, for tests and help texts.
+pub const check_code_example = "ABCD-EFGH-JKMN-PQRS";
+
+const check_code_domain = "portal-wireguard-check-code-v2:";
 
 pub fn checkCode(public_key: *const [32]u8) [check_code_len]u8 {
     const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     var h: [32]u8 = undefined;
     var s = std.crypto.hash.sha2.Sha256.init(.{});
-    s.update("portal-wireguard-check-code-v1:");
+    s.update(check_code_domain);
     s.update(public_key);
     s.final(&h);
-    const bits = std.mem.readInt(u64, h[0..8], .big) >> 14; // the top 50 bits
+    const bits = std.mem.readInt(u128, h[0..16], .big) >> (128 - check_code_bits); // the top 80 bits
     var out: [check_code_len]u8 = undefined;
     var j: usize = 0;
-    for (0..10) |i| {
-        if (i == 5) {
+    for (0..check_code_bits / 5) |i| {
+        if (i != 0 and i % check_code_group_len == 0) {
             out[j] = '-';
             j += 1;
         }
-        const shift: u6 = @intCast(45 - 5 * i);
+        const shift: u7 = @intCast(check_code_bits - 5 - 5 * i);
         out[j] = alphabet[@intCast((bits >> shift) & 31)];
         j += 1;
     }
@@ -112,13 +119,27 @@ pub fn checkCode(public_key: *const [32]u8) [check_code_len]u8 {
 
 const testing = std.testing;
 
-test "check codes: 50 bits, grouped, stable, key-dependent" {
+test "check codes: 80 bits in 4 groups of 4, stable, key-dependent" {
+    try testing.expectEqual(80, check_code_bits);
+    try testing.expectEqual(19, check_code_len);
+    try testing.expectEqual(check_code_len, check_code_example.len);
     const a: [32]u8 = @splat(0);
     var b: [32]u8 = @splat(0);
     b[31] = 1;
     const ca = checkCode(&a);
-    try testing.expectEqual(@as(u8, '-'), ca[5]);
-    for (ca, 0..) |c, i| if (i != 5) try testing.expect(std.mem.indexOfScalar(u8, "0123456789ABCDEFGHJKMNPQRSTVWXYZ", c) != null);
+    for (ca, 0..) |c, i| {
+        if (i % 5 == 4) {
+            try testing.expectEqual(@as(u8, '-'), c);
+        } else try testing.expect(std.mem.indexOfScalar(u8, "0123456789ABCDEFGHJKMNPQRSTVWXYZ", c) != null);
+    }
+    // Every bit of the 80 counts: the last character is the hash's bits 75..79.
+    var h: [32]u8 = undefined;
+    var s = std.crypto.hash.sha2.Sha256.init(.{});
+    s.update(check_code_domain);
+    s.update(&a);
+    s.final(&h);
+    try testing.expectEqual("0123456789ABCDEFGHJKMNPQRSTVWXYZ"[h[9] & 31], ca[check_code_len - 1]);
+    try testing.expectEqual("0123456789ABCDEFGHJKMNPQRSTVWXYZ"[h[0] >> 3], ca[0]);
     try testing.expectEqualSlices(u8, &ca, &checkCode(&a));
     try testing.expect(!std.mem.eql(u8, &ca, &checkCode(&b)));
 }

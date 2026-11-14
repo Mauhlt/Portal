@@ -45,7 +45,9 @@ has `portal.exe`, `portalctl.exe`, `portal-show.exe`, a `README.txt` and
 
 1. Copy `portal-aarch64-windows` to the laptop and run `portal connect`.
    The window shows **this device's tunnel key** and its **check code**
-   (`portal connect --key` prints them too).
+   (`portal connect --key` prints them too). A check code is 16
+   characters in 4 groups, like `ABCD-EFGH-JKMN-PQRS` (80 bits of the
+   key's hash): compare every group, not just the first.
 2. At the desk: **Pair a device…** (Ctrl+Shift+P): name `laptop`, and the
    key as the laptop shows it (type it; it is 44 characters). Click
    **Check key**: the desk shows the check code of what you typed.
