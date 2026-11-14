@@ -76,6 +76,10 @@ pub const Options = struct {
     /// the network, and no firewall prompt).
     loopback_only: bool = false,
     peers: []const Peer = &.{},
+    /// TCP keepalive after this much idle time (null: none). The desk
+    /// sets it so a device that vanished frees its connection slots
+    /// without waiting for an application timeout.
+    tcp_keepalive_idle_ns: ?u64 = null,
 };
 
 pub const StartError = error{ NetstackNotReady, OutOfMemory, SystemResources, InvalidEndpoint, ThreadSpawnFailed } || Device.InitError;
@@ -94,8 +98,12 @@ pub const Tunnel = struct {
     mutex: Io.Mutex = .init,
     device: ?*Device = null,
     device_thread: ?std.Thread = null,
-    /// The peers the running device has (owned copies).
+    /// The peers the running device has (owned copies). Replaced only
+    /// after the device took the new list; `peers_known` is false after a
+    /// failure (the device's table is then unknown, so the next setPeers
+    /// always applies instead of being a "same list" no-op).
     peers: std.ArrayList(OwnedPeer) = .empty,
+    peers_known: bool = false,
     readiness: transport.Readiness = .{},
 
     const StackT = if (@hasDecl(wg, "netstack")) ns.Stack else opaque {};
@@ -120,7 +128,10 @@ pub const Tunnel = struct {
             .stack = undefined,
         };
         errdefer std.crypto.secureZero(u8, &t.private_key);
-        t.stack = ns.Stack.create(gpa, &t.clock, .{ .address = .{ .v4 = o.address } }) catch |err| return switch (err) {
+        t.stack = ns.Stack.create(gpa, &t.clock, .{
+            .address = .{ .v4 = o.address },
+            .keepalive_idle_ns = o.tcp_keepalive_idle_ns,
+        }) catch |err| return switch (err) {
             error.InvalidLimits, error.InvalidMtu, error.AddressFamilyUnsupported => error.SystemResources,
             else => |e| e,
         };
@@ -158,22 +169,37 @@ pub const Tunnel = struct {
     }
 
     /// Replaces the peer list (the desk: whenever the device store
-    /// changes). A no-op if it is the same. zwg's Device.setPeers applies
-    /// it on the running device: peers that stay keep their sessions,
-    /// removed ones are wiped. (A WireGuard without it gets the device
-    /// restarted on the same stack instead; TCP survives either way.)
+    /// changes). A no-op if the device is known to have the same list.
+    /// zwg's Device.setPeers applies it on the running device: peers that
+    /// stay keep their sessions, removed ones are wiped. (A WireGuard
+    /// without it gets the device restarted on the same stack instead; TCP
+    /// survives either way.) On an error the cached list is dropped, so
+    /// calling again with the same list retries.
     pub fn setPeers(t: *Tunnel, peers: []const Peer) !void {
         t.mutex.lockUncancelable(t.io);
         defer t.mutex.unlock(t.io);
-        if (samePeers(t.peers.items, peers) and t.device != null) return;
+        if (t.peers_known and t.device != null and samePeers(t.peers.items, peers)) return;
         if (comptime @hasDecl(Device, "setPeers")) if (t.device) |d| {
+            t.peers_known = false;
+            var list: std.ArrayList(OwnedPeer) = .empty;
+            defer list.deinit(t.gpa);
             var b: PeerConfigs = .{};
             defer b.deinit(t.gpa);
-            try t.ownPeers(peers, &b);
-            return d.setPeers(b.configs);
+            try t.ownPeers(peers, &list, &b);
+            try d.setPeers(b.configs);
+            t.adoptPeers(&list);
+            return;
         };
         t.stopDeviceLocked();
         try t.setPeersLocked(peers);
+    }
+
+    /// The device took `list`: it becomes `t.peers` (the list itself is
+    /// swapped, so the elements the configs pointed into stay where they
+    /// are); `list` gets the old one for the caller to free.
+    fn adoptPeers(t: *Tunnel, list: *std.ArrayList(OwnedPeer)) void {
+        std.mem.swap(std.ArrayList(OwnedPeer), &t.peers, list);
+        t.peers_known = true;
     }
 
     fn samePeers(have: []const OwnedPeer, want: []const Peer) bool {
@@ -199,18 +225,17 @@ pub const Tunnel = struct {
         }
     };
 
-    /// Copies `peers` into `t.peers` and builds their zwg configs.
-    fn ownPeers(t: *Tunnel, peers: []const Peer, b: *PeerConfigs) StartError!void {
-        t.peers.clearRetainingCapacity();
-        try t.peers.ensureTotalCapacity(t.gpa, peers.len);
+    /// Copies `peers` into `list` (empty) and builds their zwg configs.
+    fn ownPeers(t: *Tunnel, peers: []const Peer, list: *std.ArrayList(OwnedPeer), b: *PeerConfigs) StartError!void {
+        try list.ensureTotalCapacity(t.gpa, peers.len);
         b.cidrs = try t.gpa.alloc(wg.device.ip.Cidr, peers.len);
         b.configs = try t.gpa.alloc(wg.device.device.PeerConfig, peers.len);
         const cidrs = b.cidrs;
         const configs = b.configs;
         for (peers, 0..) |p, i| {
-            t.peers.appendAssumeCapacity(.{ .peer = p });
+            list.appendAssumeCapacity(.{ .peer = p });
             // The copy of the endpoint lives in the list's own element.
-            const op = &t.peers.items[t.peers.items.len - 1];
+            const op = &list.items[list.items.len - 1];
             if (p.endpoint) |e| {
                 if (e.len > op.endpoint_buf.len) return error.InvalidEndpoint;
                 @memcpy(op.endpoint_buf[0..e.len], e);
@@ -218,7 +243,7 @@ pub const Tunnel = struct {
             }
             cidrs[i] = .{ .addr = .{ .v4 = p.address }, .prefix = 32 };
         }
-        for (t.peers.items, 0..) |*op, i| {
+        for (list.items, 0..) |*op, i| {
             // zwg's own path from a [Peer] to the device's peer config
             // (literal endpoints as they are, names looked up now and
             // again later while the peer is silent).
@@ -234,9 +259,12 @@ pub const Tunnel = struct {
 
     /// Starts a device with `peers` (the mutex is held, or not yet shared).
     fn setPeersLocked(t: *Tunnel, peers: []const Peer) StartError!void {
+        t.peers_known = false;
+        var list: std.ArrayList(OwnedPeer) = .empty;
+        defer list.deinit(t.gpa);
         var b: PeerConfigs = .{};
         defer b.deinit(t.gpa);
-        try t.ownPeers(peers, &b);
+        try t.ownPeers(peers, &list, &b);
         var dopts: wg.device.device.Options = .{
             .private_key = t.private_key,
             .listen_port = t.udp_port,
@@ -253,6 +281,7 @@ pub const Tunnel = struct {
             t.device = null;
             return error.ThreadSpawnFailed;
         };
+        t.adoptPeers(&list);
     }
 
     fn runDevice(d: *Device) void {

@@ -87,6 +87,11 @@ pub fn peersFrom(st: *const devices.Store, out: []tunnel.Peer) []tunnel.Peer {
     return out[0..n];
 }
 
+/// TCP keepalive on the desk's stack: a device that vanished (sleep,
+/// network gone) frees its connection slots after about this plus the
+/// netstack's probes, not only at the next application timeout.
+pub const keepalive_idle_ns: u64 = 30 * std.time.ns_per_s;
+
 pub const Options = struct {
     udp_port: u16 = tunnelnet.default_udp_port,
     /// Tests: bind the UDP socket to 127.0.0.1 only.
@@ -104,6 +109,7 @@ pub fn start(gpa: Allocator, io: Io, paths: devices.Paths, o: Options, st: *cons
         .udp_port = o.udp_port,
         .loopback_only = o.loopback_only,
         .peers = peersFrom(st, &peers),
+        .tcp_keepalive_idle_ns = keepalive_idle_ns,
     });
 }
 
