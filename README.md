@@ -110,6 +110,25 @@ the same folder did; a transcript no tab printed near (an agent
 session outside Portal) is never shown. Details: docs/protocol.md
 section 3b.
 
+### For you, recap and admin prompts
+
+Under the latest reply each device shows **For you**: what the tab needs
+from you (a permission prompt, amber) and what the agent's reply suggests
+(a command to run, another project to switch to, its closing yes/no
+question). Swipe a row (left = Yes by default) or tap it for the full
+card. Yes on a suggestion only asks the agent ("Please run `zig build
+e2e`."); it still asks its own permission. **↺ Recap** (or the line
+`recap`) asks the agent for a short recap.
+
+Commands that would open an administrator prompt (runas, sudo, msiexec,
+installers, Set-ExecutionPolicy, writes under Program Files or HKLM) are
+caught by a PreToolUse hook: in a session a device started they are
+denied (nobody is at the desk to answer), in a desk session they run and
+the tab shows "needs desk". `block_elevation_desk = on` in settings.txt
+denies them at the desk too. Reinstall the hooks (Settings, "Claude Code
+integration", or `portalctl hooks install`) to add the PreToolUse entry.
+Details: docs/tabs-design.md, "For you".
+
 ## Security layers
 
 1. **One network path: Portal's own WireGuard tunnel, in-process.** Portal

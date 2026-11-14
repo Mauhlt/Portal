@@ -6,7 +6,8 @@
 //! Agent hook input: JSON on stdin with
 //! `hook_event_name`, and per event `tool_name` (PermissionRequest),
 //! `notification_type` (Notification), `agent_id` (SubagentStart,
-//! SubagentStop). Everything else (the prompt, tool
+//! SubagentStop). PreToolUse's `tool_input.command` is read by the hook
+//! process only (elevation.zig) and never sent. Everything else (the prompt, tool
 //! input, messages, paths) is never read past the parser and never sent.
 //!
 //! The message (at most `max_message` bytes, ASCII lines):
@@ -14,9 +15,10 @@
 //!   portal-hook-v1
 //!   tab=<32 lower-case hex: the tab's PORTAL_TAB>
 //!   event=<one of `Event`>
-//!   tool=<tool name>              (PermissionRequest only, optional)
+//!   tool=<tool name>              (PermissionRequest, PreToolUse; optional)
 //!   ntype=<notification type>     (Notification only)
 //!   agent=<subagent id>           (SubagentStart / SubagentStop only)
+//!   guard=marked|denied           (PreToolUse only: the admin-prompt guard)
 //!
 //! Untrusted on both ends: the sender only sends enumerated event names
 //! and `[A-Za-z0-9_-]{1,64}` names; the receiver accepts only those, maps
