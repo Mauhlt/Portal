@@ -530,6 +530,36 @@ pub const Convo = struct {
         return c.openQuestion();
     }
 
+    /// The texts of the reply the conversation ends with (its trailing
+    /// assistant items, oldest first; at most `buf.len`): what For-you
+    /// suggestions are made of (foryou_desk.zig). Scrubbed like every text.
+    pub fn lastReply(c: *Convo, buf: [][]const u8) [][]const u8 {
+        var first = c.len;
+        var n: usize = 0;
+        while (first > 0 and n < buf.len) {
+            const s = c.slotAt(first - 1);
+            if (!s.gone and s.kind != .assistant) break;
+            first -= 1;
+            if (!s.gone) n += 1;
+        }
+        var k: usize = 0;
+        for (first..c.len) |i| {
+            const s = c.slotAt(i);
+            if (s.gone) continue;
+            buf[k] = s.text;
+            k += 1;
+        }
+        return buf[0..k];
+    }
+
+    /// The text of the permission question Portal asked from the
+    /// program's state, while it is open (For you's waiting card).
+    pub fn permissionQuestion(c: *Convo) ?[]const u8 {
+        if (c.wait != .permission or c.synthetic_n == 0) return null;
+        const s = c.find(c.synthetic_n) orelse return null;
+        return if (s.open) s.text else null;
+    }
+
     fn openQuestion(c: *Convo) bool {
         for (0..c.len) |k| {
             const s = c.slotAt(k);

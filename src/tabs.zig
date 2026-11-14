@@ -52,6 +52,7 @@ const childenv = @import("childenv.zig");
 const hookmsg = @import("hookmsg.zig");
 const projects_wire = @import("shared").projects;
 const settings = @import("settings.zig");
+const foryou_desk = @import("foryou_desk.zig");
 
 pub const Id = wire.Id;
 pub const State = wire.State;
@@ -134,6 +135,8 @@ pub const Tab = struct {
     /// how `portalctl hook` names the tab (hookmsg.zig). Desktop-only:
     /// never logged, never sent to devices.
     hook_key: hookmsg.Key = undefined,
+    /// The tab's "For you" cards (foryou_desk.zig). Guarded by hub.mutex.
+    foryou: foryou_desk.State = .{},
 
     child_code: std.atomic.Value(u32) = .init(1),
     child_done: std.atomic.Value(bool) = .init(false),
@@ -359,8 +362,8 @@ pub const Tab = struct {
         if (act) h.activity_gen +%= 1;
         // A state from a hook that the transcript shows is over.
         var moved = false;
+        var result = false;
         if (rec.rtype == .user and !rec.sidechain and !rec.history) {
-            var result = false;
             var interrupted = false;
             for (rec.blockSlice()) |*b| switch (b.kind) {
                 .tool_result => result = true,
@@ -371,9 +374,79 @@ pub const Tab = struct {
             };
             moved = t.session.transcriptMovedOnLocked(result, interrupted);
         }
+        // For you: the reply so far, and a running command's output.
+        const fy_gen = h.foryou_gen;
+        const poke = !rec.sidechain and !rec.history and
+            t.foryou.event(.{ .record = .{ .result = result } }, Io.Clock.awake.now(h.io).toMilliseconds());
+        t.refreshForYouLocked();
+        const fy = h.foryou_gen != fy_gen;
         h.mutex.unlock(h.io);
+        if (poke) h.fy_watch.poke();
         h.cond.broadcast(h.io);
-        if (act or moved) h.notify();
+        if (act or moved or fy) h.notify();
+    }
+
+    /// Caller holds hub.mutex. Rebuilds the tab's For-you cards from its
+    /// conversation's last reply and its program's state; viewers send
+    /// them when they changed (Hub.foryou_gen).
+    pub fn refreshForYouLocked(t: *Tab) void {
+        const h = t.hub;
+        var reply: [16][]const u8 = undefined;
+        var open: [max_tabs][]const u8 = undefined;
+        for (h.tabs[0..h.n], 0..) |o, i| open[i] = o.name();
+        var startable: [settings.max_startable][]const u8 = undefined;
+        var ns: usize = 0;
+        for (h.startable[0..h.n_startable]) |*e| if (e.name.get()) |n| {
+            startable[ns] = n;
+            ns += 1;
+        };
+        t.foryou.setReply(t.convo.lastReply(&reply), .{ .tabs = open[0..h.n], .startable = startable[0..ns], .own = t.name() });
+        const st = t.session.state;
+        t.foryou.setProgram(st == .working or st == .waiting, st == .waiting and t.session.wait == .permission, t.convo.permissionQuestion());
+        if (t.foryou.rebuild(h.io)) {
+            h.foryou_gen +%= 1;
+            t.foryou.gen = h.foryou_gen;
+        }
+    }
+
+    /// The program's state changed (Session.state_fn, hub.mutex held).
+    fn forYouStateThunk(ctx: *anyopaque) void {
+        const t: *Tab = @ptrCast(@alignCast(ctx));
+        t.refreshForYouLocked();
+    }
+
+    /// A For-you event from a hook (foryou_desk.Event): the cards are
+    /// rebuilt, viewers told, the deadline watcher woken if it moved.
+    pub fn forYouEvent(t: *Tab, e: foryou_desk.Event) void {
+        const h = t.hub;
+        h.mutex.lockUncancelable(h.io);
+        const poke = t.foryou.event(e, Io.Clock.awake.now(h.io).toMilliseconds());
+        const before = h.foryou_gen;
+        t.refreshForYouLocked();
+        const changed = h.foryou_gen != before;
+        h.mutex.unlock(h.io);
+        if (poke) h.fy_watch.poke();
+        if (changed) {
+            h.cond.broadcast(h.io);
+            h.notify();
+        }
+    }
+
+    /// Card `sig` was answered or dismissed (foryou_ws.zig): gone for
+    /// every device.
+    pub fn forYouDismiss(t: *Tab, sig: u64) void {
+        const h = t.hub;
+        h.mutex.lockUncancelable(h.io);
+        const changed = t.foryou.dismiss(h.io, sig);
+        if (changed) {
+            h.foryou_gen +%= 1;
+            t.foryou.gen = h.foryou_gen;
+        }
+        h.mutex.unlock(h.io);
+        if (changed) {
+            h.cond.broadcast(h.io);
+            h.notify();
+        }
     }
 
     fn convoReset(ctx: *anyopaque, on: bool) void {
@@ -383,6 +456,7 @@ pub const Tab = struct {
         t.convo.reset(on);
         t.activity.reset();
         h.activity_gen +%= 1;
+        t.refreshForYouLocked();
         h.mutex.unlock(h.io);
         h.cond.broadcast(h.io);
         h.notify();
@@ -538,6 +612,13 @@ pub const Hub = struct {
     /// Guarded by `mutex`.
     hook_unknown_logged_ms: i64 = std.math.minInt(i64),
 
+    /// Bumped whenever any tab's For-you cards change (foryou_desk.zig;
+    /// each tab keeps the value of its last change). Guarded by `mutex`.
+    foryou_gen: u64 = 1,
+    /// The long-running deadlines of every tab (started with the first
+    /// tab; scanForYou).
+    fy_watch: foryou_desk.Watcher = .{},
+
     viewers: u32 = 0,
     /// Viewer sockets not yet closed: a viewer counts here from its
     /// upgrade until its socket is closed (after the exit notice and the
@@ -631,6 +712,9 @@ pub const Hub = struct {
                 .notify_fn = notifyThunk,
             },
         };
+        t.foryou.list.tab = id;
+        t.session.state_ctx = t;
+        t.session.state_fn = Tab.forYouStateThunk;
         const nl = @min(name.len, wire.max_name);
         @memcpy(t.name_buf[0..nl], name[0..nl]);
         t.name_len = @intCast(nl);
@@ -682,7 +766,11 @@ pub const Hub = struct {
             for (hookmsg.env_name ++ "=", 0..) |c, i| tab_var[i] = c;
             for (hex, 0..) |c, i| tab_var[hookmsg.env_name.len + 1 + i] = c;
         }
-        const env_block = childenv.forSessionWith(h.gpa, &.{&tab_var}) catch |err| {
+        // A device start's hook denies elevating commands (the
+        // admin-prompt guard, elevation.zig): PORTAL_GUARD=device.
+        const guard_var = comptime std.unicode.utf8ToUtf16LeStringLiteral(hookmsg.guard_env_name ++ "=device");
+        const extra_env: []const []const u16 = if (opts.device != null) &.{ &tab_var, guard_var } else &.{&tab_var};
+        const env_block = childenv.forSessionWith(h.gpa, extra_env) catch |err| {
             h.log.print("tab '{s}': could not prepare the environment: {t}", .{ t.name(), err });
             t.session.term.deinit();
             h.gpa.destroy(t);
@@ -733,7 +821,11 @@ pub const Hub = struct {
         h.gen +%= 1;
         // A device start leaves the desk on the tab it shows.
         if (opts.device == null or h.desk_active == null) h.desk_active = t;
+        h.fy_watch.io = h.io;
+        h.fy_watch.ctx = h;
+        h.fy_watch.scan = scanForYou;
         h.mutex.unlock(h.io);
+        h.fy_watch.start();
         h.cond.broadcast(h.io);
         h.notify();
         if (t.startedBy()) |by|
@@ -893,6 +985,26 @@ pub const Hub = struct {
         h.notify();
     }
 
+    /// The deadline watcher's scan (foryou_desk.Watcher): long runs that
+    /// passed their deadline get their card; returns the next deadline.
+    fn scanForYou(ctx: *anyopaque, now: i64) ?i64 {
+        const h: *Hub = @ptrCast(@alignCast(ctx));
+        h.mutex.lockUncancelable(h.io);
+        var next: ?i64 = null;
+        const before = h.foryou_gen;
+        for (h.tabs[0..h.n]) |t| {
+            if (t.foryou.fireDue(now, t.session.state == .waiting)) t.refreshForYouLocked();
+            if (t.foryou.long_deadline) |d| next = if (next) |n| @min(n, d) else d;
+        }
+        const changed = h.foryou_gen != before;
+        h.mutex.unlock(h.io);
+        if (changed) {
+            h.cond.broadcast(h.io);
+            h.notify();
+        }
+        return next;
+    }
+
     pub fn count(h: *Hub) usize {
         h.mutex.lockUncancelable(h.io);
         defer h.mutex.unlock(h.io);
@@ -1031,6 +1143,7 @@ pub const Hub = struct {
     pub fn applyHook(h: *Hub, m: *const hookmsg.Message) void {
         switch (m.event) {
             .SubagentStart, .SubagentStop => return h.applySubagentHook(m),
+            .PreToolUse => return h.applyPreToolHook(m),
             else => {},
         }
         const e = hookmsg.effect(m) orelse return;
@@ -1057,22 +1170,49 @@ pub const Hub = struct {
         // Desktop log only: the tab's name (shown on the desk anyway),
         // the event and the new state; never the key or anything else.
         if (t.session.setHookState(e)) h.log.print("hooks: tab '{s}': {t} -> {t}", .{ t.name(), m.event, stateOf(e.state) });
+        // For you: a turn's end (or a new one) ends what ran.
+        switch (m.event) {
+            .Stop, .StopFailure, .SessionEnd, .UserPromptSubmit => t.forYouEvent(.turn_end),
+            else => {},
+        }
+    }
+
+    /// The open tab whose hook key is `key`, with a reference; null for
+    /// anything else.
+    fn acquireByHookKey(h: *Hub, key: hookmsg.Key) ?*Tab {
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        var found: ?*Tab = null;
+        for (h.tabs[0..h.n]) |t| if (std.crypto.timing_safe.eql(hookmsg.Key, t.hook_key, key)) {
+            t.acquire();
+            found = t;
+        };
+        return found;
     }
 
     /// SubagentStart / SubagentStop from `portalctl hook`: only an open
     /// tab's own key counts (like applyHook); its sub-tabs learn it.
     fn applySubagentHook(h: *Hub, m: *const hookmsg.Message) void {
         if (m.agent_len == 0) return;
-        h.mutex.lockUncancelable(h.io);
-        var found: ?*Tab = null;
-        for (h.tabs[0..h.n]) |t| if (std.crypto.timing_safe.eql(hookmsg.Key, t.hook_key, m.key)) {
-            t.acquire();
-            found = t;
-        };
-        h.mutex.unlock(h.io);
-        const t = found orelse return;
+        const t = h.acquireByHookKey(m.key) orelse return;
         defer t.release();
         t.subagentEvent(if (m.event == .SubagentStart) .start else .stop, m.agent());
+    }
+
+    /// PreToolUse from `portalctl hook` (a shell command starts): the
+    /// long-running deadline, and the admin-prompt guard's verdict
+    /// (`guard`: let run with a "needs desk" card, or denied). Logged
+    /// without the command, which never leaves the hook.
+    fn applyPreToolHook(h: *Hub, m: *const hookmsg.Message) void {
+        const t = h.acquireByHookKey(m.key) orelse return;
+        defer t.release();
+        switch (m.guard) {
+            .none => {},
+            .marked => h.log.print("hooks: tab '{s}': a command asks for elevation; it runs, the tab needs the desk", .{t.name()}),
+            .denied => h.log.print("hooks: tab '{s}': a command that asks for elevation was denied ({s})", .{ t.name(), if (t.startedBy() != null) "the session was started by a device" else "block_elevation_desk is on" }),
+        }
+        // A denied command does not run: nothing to wait for.
+        if (m.guard != .denied) t.forYouEvent(.{ .pre_tool = .{ .marked = m.guard == .marked } });
     }
 
     pub fn setDeskActive(h: *Hub, t: *Tab) void {

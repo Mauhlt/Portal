@@ -266,7 +266,7 @@ pub fn main(init: std.process.Init) !void {
     // 0, and does nothing outside a Portal tab (hookpipe.hookCommand).
     if (std.mem.eql(u8, cmd, "hook")) {
         const dir = dataDir(gpa, init.environ_map) catch null;
-        hookpipe.hookCommand(init.environ_map.get(hookmsg.env_name), dir);
+        hookpipe.hookCommand(io, init.environ_map.get(hookmsg.env_name), dir, init.environ_map.get(hookmsg.guard_env_name));
         std.process.exit(0);
     }
     if (std.mem.eql(u8, cmd, "hooks")) std.process.exit(agenthooks.command(gpa, io, init.environ_map, args[1..]));
@@ -1817,6 +1817,10 @@ test {
     _ = @import("openreq.zig");
     _ = @import("hookmsg.zig");
     _ = @import("hookpipe.zig");
+    _ = @import("elevation.zig");
+    _ = @import("foryou_extract.zig");
+    _ = @import("foryou_desk.zig");
+    _ = @import("foryou_ws.zig");
     _ = @import("agenthooks.zig");
     _ = @import("log.zig");
     _ = @import("devices.zig");

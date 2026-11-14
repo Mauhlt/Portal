@@ -39,9 +39,14 @@ pub const env_name = "PORTAL_TAB";
 pub const Key = [16]u8;
 
 /// The hook events Portal listens to (settings.json gets one entry each,
-/// agenthooks.zig). PreToolUse is left out on purpose: it fires for every
-/// tool call.
+/// agenthooks.zig).
 pub const Event = enum {
+    /// Before a shell command runs (its matcher is `pretool_matcher`, so
+    /// it fires only for the Bash and PowerShell tools, not for every tool
+    /// call): the admin-prompt guard and the long-running deadline
+    /// (docs/tabs-design.md). `guard` says what the hook did about an
+    /// elevating command; no state change.
+    PreToolUse,
     UserPromptSubmit,
     PermissionRequest,
     Notification,
@@ -61,6 +66,18 @@ pub const Event = enum {
 /// The Notification types that change a tab (Notification's matcher in
 /// settings.json is exactly these, so others don't even start the hook).
 pub const notification_matcher = "permission_prompt|idle_prompt";
+/// PreToolUse's matcher: the shell tools only.
+pub const pretool_matcher = "Bash|PowerShell";
+
+/// What `portalctl hook` did about a PreToolUse command that asks for
+/// elevation (elevation.zig): nothing to say, let it run and told Portal
+/// (a "needs desk" card), or denied it.
+pub const Guard = enum { none, marked, denied };
+
+/// The environment variable Portal sets for a tab a paired device started
+/// (value `device`): its hook denies elevating commands. Added after
+/// childenv's filter like PORTAL_TAB, so it is never inherited.
+pub const guard_env_name = "PORTAL_GUARD";
 
 /// `[A-Za-z0-9_-]{1,64}`: the only names that travel.
 pub fn validName(s: []const u8) bool {
@@ -90,6 +107,7 @@ pub const Message = struct {
     ntype_len: u8 = 0,
     agent_buf: [max_name]u8 = undefined,
     agent_len: u8 = 0,
+    guard: Guard = .none,
 
     pub fn tool(m: *const Message) []const u8 {
         return m.tool_buf[0..m.tool_len];
@@ -123,6 +141,7 @@ pub const Message = struct {
         if (m.tool_len > 0) wr.print("tool={s}\n", .{m.tool()}) catch unreachable;
         if (m.ntype_len > 0) wr.print("ntype={s}\n", .{m.ntype()}) catch unreachable;
         if (m.agent_len > 0) wr.print("agent={s}\n", .{m.agent()}) catch unreachable;
+        if (m.guard != .none) wr.print("guard={t}\n", .{m.guard}) catch unreachable;
         return wr.buffered();
     }
 };
@@ -137,6 +156,7 @@ pub fn parse(text: []const u8) ?Message {
     var tool: []const u8 = "";
     var ntype: []const u8 = "";
     var agent: []const u8 = "";
+    var guard: Guard = .none;
     while (it.next()) |line| {
         if (line.len == 0) continue;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse return null;
@@ -155,9 +175,11 @@ pub fn parse(text: []const u8) ?Message {
         } else if (std.mem.eql(u8, k, "agent")) {
             if (!validName(v)) return null;
             agent = v;
+        } else if (std.mem.eql(u8, k, "guard")) {
+            guard = std.meta.stringToEnum(Guard, v) orelse return null;
         } // unknown keys: ignored (a newer sender)
     }
-    var m: Message = .{ .key = key orelse return null, .event = event orelse return null };
+    var m: Message = .{ .key = key orelse return null, .event = event orelse return null, .guard = guard };
     m.setTool(tool);
     m.setNtype(ntype);
     m.setAgent(agent);
@@ -168,16 +190,35 @@ pub fn parse(text: []const u8) ?Message {
 /// null when there is nothing worth telling Portal (an event Portal does
 /// not use, a Notification of another type, unparsable input).
 pub fn fromHookJson(scratch: std.mem.Allocator, key: Key, json: []const u8) ?Message {
+    return (parseHook(scratch, key, json) orelse return null).msg;
+}
+
+/// What the hook process reads from the agent's JSON: the message, and
+/// for PreToolUse the shell command (`tool_input.command`, in `scratch`),
+/// which only the hook process looks at (the admin-prompt guard) and
+/// which never travels.
+pub const Parsed = struct { msg: Message, command: ?[]const u8 = null };
+
+pub fn parseHook(scratch: std.mem.Allocator, key: Key, json: []const u8) ?Parsed {
     const In = struct {
         hook_event_name: ?[]const u8 = null,
         tool_name: ?[]const u8 = null,
         notification_type: ?[]const u8 = null,
         agent_id: ?[]const u8 = null,
+        // Any shape (another tool's input may hold anything).
+        tool_input: ?std.json.Value = null,
     };
     const in = std.json.parseFromSliceLeaky(In, scratch, json, .{ .ignore_unknown_fields = true, .duplicate_field_behavior = .use_last }) catch return null;
     const event = Event.fromName(in.hook_event_name orelse return null) orelse return null;
     var m: Message = .{ .key = key, .event = event };
+    var command: ?[]const u8 = null;
     switch (event) {
+        .PreToolUse => {
+            if (in.tool_name) |t| m.setTool(t);
+            if (in.tool_input) |ti| if (ti == .object) if (ti.object.get("command")) |c| if (c == .string) {
+                command = c.string;
+            };
+        },
         .PermissionRequest => if (in.tool_name) |t| m.setTool(t),
         .Notification => {
             const nt = in.notification_type orelse return null;
@@ -191,7 +232,7 @@ pub fn fromHookJson(scratch: std.mem.Allocator, key: Key, json: []const u8) ?Mes
         },
         else => {},
     }
-    return m;
+    return .{ .msg = m, .command = command };
 }
 
 /// What a message does to its tab.
@@ -223,7 +264,7 @@ pub fn effect(m: *const Message) ?Effect {
         .Stop => .{ .state = .done, .wait = .none },
         .StopFailure => .{ .state = .failed, .wait = .none },
         .SessionEnd => .{ .state = .idle, .wait = .none },
-        .SubagentStart, .SubagentStop => null,
+        .SubagentStart, .SubagentStop, .PreToolUse => null,
     };
 }
 
@@ -272,7 +313,7 @@ test "fromHookJson: the documented inputs; unknown fields, other events and type
     ).?;
     try testing.expectEqualStrings("permission_prompt", n.ntype());
     try testing.expect(fromHookJson(a, key, "{\"hook_event_name\":\"Notification\",\"notification_type\":\"auth_success\"}") == null);
-    try testing.expect(fromHookJson(a, key, "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\"}") == null);
+    try testing.expect(fromHookJson(a, key, "{\"hook_event_name\":\"PreTool\",\"tool_name\":\"Bash\"}") == null);
     try testing.expect(fromHookJson(a, key, "{\"hook_event_name\":\"stop\"}") == null);
     try testing.expect(fromHookJson(a, key, "not json") == null);
     try testing.expect(fromHookJson(a, key, "[]") == null);
@@ -297,7 +338,8 @@ test "format and parse round-trip; the parser is strict" {
     try testing.expect(parse("portal-hook-v2\ntab=01010101010101010101010101010101\nevent=Stop\n") == null);
     try testing.expect(parse("portal-hook-v1\ntab=0101\nevent=Stop\n") == null);
     try testing.expect(parse("portal-hook-v1\ntab=0101010101010101010101010101010G\nevent=Stop\n") == null);
-    try testing.expect(parse("portal-hook-v1\ntab=01010101010101010101010101010101\nevent=PreToolUse\n") == null);
+    try testing.expect(parse("portal-hook-v1\ntab=01010101010101010101010101010101\nevent=PreTool\n") == null);
+    try testing.expect(parse("portal-hook-v1\ntab=01010101010101010101010101010101\nevent=PreToolUse\nguard=maybe\n") == null);
     try testing.expect(parse("portal-hook-v1\ntab=01010101010101010101010101010101\n") == null);
     try testing.expect(parse("portal-hook-v1\nevent=Stop\n") == null);
     try testing.expect(parse("portal-hook-v1\ntab=01010101010101010101010101010101\nevent=Stop\ntool=a b\n") == null);
@@ -332,6 +374,31 @@ test "effect: the mapping" {
     try testing.expectEqual(vt.ProgramState.done, E.of(.Stop, "", "").?.state);
     try testing.expectEqual(vt.ProgramState.failed, E.of(.StopFailure, "", "").?.state);
     try testing.expectEqual(vt.ProgramState.idle, E.of(.SessionEnd, "", "").?.state);
+}
+
+test "PreToolUse: the command stays in the hook process; the guard travels" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key: Key = @splat(0x03);
+    const p = parseHook(a, key,
+        \\{"session_id":"s","cwd":"C:\\p","hook_event_name":"PreToolUse","tool_name":"PowerShell","tool_input":{"command":"Start-Process x -Verb RunAs","description":"d"},"tool_use_id":"t"}
+    ).?;
+    try testing.expectEqual(Event.PreToolUse, p.msg.event);
+    try testing.expectEqualStrings("Start-Process x -Verb RunAs", p.command.?);
+    try testing.expect(effect(&p.msg) == null);
+    var m = p.msg;
+    m.guard = .marked;
+    var buf: [max_message]u8 = undefined;
+    const text = m.format(&buf);
+    try testing.expect(std.mem.indexOf(u8, text, "RunAs") == null);
+    try testing.expectEqualStrings("portal-hook-v1\ntab=03030303030303030303030303030303\nevent=PreToolUse\ntool=PowerShell\nguard=marked\n", text);
+    try testing.expectEqual(Guard.marked, parse(text).?.guard);
+    // Another tool's input of any shape: no command, still a message.
+    const q = parseHook(a, key, "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":[1,{\"command\":2}]}").?;
+    try testing.expect(q.command == null);
+    // A PermissionRequest whose input has a non-string command still parses.
+    try testing.expect(fromHookJson(a, key, "{\"hook_event_name\":\"PermissionRequest\",\"tool_name\":\"mcp__x__y\",\"tool_input\":{\"command\":{\"a\":1}}}") != null);
 }
 
 test "pipeName: per user and data directory, case-insensitive directory" {
