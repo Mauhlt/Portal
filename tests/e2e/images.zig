@@ -11,14 +11,17 @@ const proc = @import("proc.zig");
 const client = @import("client.zig");
 const ws = @import("ws.zig");
 const imgcheck = @import("imgcheck");
+const parts = @import("shared").parts;
 const Runner = @import("runner.zig").Runner;
 
-/// 80 x 40 px at `--cols 8`: 8 columns, and rows from the aspect ratio at
-/// the nominal 10 x 20 px cell = 8 * 40 * 10 / (80 * 20) = 2.
+/// 80 x 80 px at `--cols 8`: 8 columns, and rows from the aspect ratio at
+/// the nominal 10 x 20 px cell = 8 * 80 * 10 / (80 * 20) = 4. Stored
+/// (uncompressed), the PNG is over 16 KiB: its 'I' blob goes in parts
+/// (shared/parts.zig).
 const png_w = 80;
-const png_h = 40;
+const png_h = 80;
 const want_cols = 8;
-const want_rows = 2;
+const want_rows = 4;
 
 fn hasPlacement(_: void, v: *client.Viewer) bool {
     return v.g.placements.items.len > 0 and v.g.find("IMG-SHOWN") != null;
@@ -55,6 +58,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     _ = r.check("exactly one blob and one placement", v.g.blob_frames == 1 and v.g.placements.items.len == 1, "blobs {d}, placements {d}", .{ v.g.blob_frames, v.g.placements.items.len });
     const blob = v.g.blob(p.id) orelse &.{};
     _ = r.check("'I' blob is the exact PNG", std.mem.eql(u8, blob, png), "{d} bytes vs {d}", .{ blob.len, png.len });
+    _ = r.check("a blob over 16 KiB arrives in 'M' parts", png.len > parts.max_part and v.c.in_parts > 0, "{d} bytes, {d} messages in parts", .{ png.len, v.c.in_parts });
     _ = r.check("placement size from --cols and the aspect ratio", p.cols == want_cols and p.rows == want_rows and p.col == 0, "col {d} {d}x{d}", .{ p.col, p.cols, p.rows });
     const ready = v.g.find("IMG-READY") orelse 0;
     const shown = v.g.find("IMG-SHOWN") orelse 0;

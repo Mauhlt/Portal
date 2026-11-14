@@ -776,7 +776,7 @@ pub const Client = struct {
         if (c.trust == .fingerprint) c.pinFound(sock.conn.caDer());
         const conn = sock.conn;
         // The buffer holds any frame bytes that followed the upgrade head.
-        var buf = &sock.buf;
+        const buf = &sock.buf;
 
         c.last_rx_ms.store(watchdog.nowMs(c.io), .release);
         c.last_ping_ms.store(0, .release);
@@ -805,15 +805,9 @@ pub const Client = struct {
         c.shared.mutex.unlock(c.io);
 
         while (true) {
-            // Drain complete frames.
-            while (true) {
-                const frame = (ws.parseServerFrame(buf.items, max_frame_payload) catch |err| {
-                    return .{ .failed = @errorName(err) };
-                }) orelse break;
+            // Drain complete messages (parts reassembled: shared/parts.zig).
+            while (sock.buffered(max_frame_payload) catch |err| return .{ .failed = @errorName(err) }) |frame| {
                 if (c.handleFrame(frame, backoff)) |r| return r;
-                const used = frame.len;
-                std.mem.copyForwards(u8, buf.items[0 .. buf.items.len - used], buf.items[used..]);
-                buf.shrinkRetainingCapacity(buf.items.len - used);
             }
             if (buf.items.len > max_frame_payload + 16) return .{ .failed = "frame too large" };
             if (!c.readMore(conn, buf)) return .{ .failed = "connection lost" };

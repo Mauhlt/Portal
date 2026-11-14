@@ -2,13 +2,16 @@
 //! connection (tlsconn.zig, CA pinned), the upgrade to one of the two
 //! channels (http.zig: interactive `/ws` or bulk `/ws/bulk`), then frames.
 //! One implementation for the live stream (net/client.zig) and the sync
-//! transfers (sync/engine.zig over shared/bulk.zig).
+//! transfers (sync/engine.zig over shared/bulk.zig). On the interactive
+//! channel, messages the desk sends in parts (shared/parts.zig) come out
+//! of `next` / `buffered` whole.
 
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 const ws = @import("shared").ws;
 const bulk = @import("shared").bulk;
+const parts = @import("shared").parts;
 const http = @import("http.zig");
 const tlsconn = @import("tlsconn.zig");
 
@@ -36,6 +39,9 @@ pub const Socket = struct {
     used: usize = 0,
     /// A bulk reply's signature, copied out of the frame buffer.
     sig_buf: [bulk.max_header]u8 = undefined,
+    /// Reassembles messages in parts: the interactive channel only (the
+    /// bulk channel has none, and its file chunks may start with 'M').
+    assembler: ?parts.Assembler,
 
     /// Dials through `dialer` (its priority: the bulk channel dials as
     /// bulk), completes TLS and the upgrade to `channel`. `stop` is the
@@ -43,7 +49,7 @@ pub const Socket = struct {
     pub fn open(gpa: std.mem.Allocator, io: Io, dialer: tlsconn.transport.Dialer, addr: net.IpAddress, security: tlsconn.Security, host: []const u8, channel: Channel, stop: ?*const std.atomic.Value(bool)) OpenError!Socket {
         const d = if (channel == .bulk) dialer.bulk() else dialer;
         const conn = try tlsconn.Conn.openWatched(gpa, io, d, addr, security, stop);
-        var s: Socket = .{ .gpa = gpa, .io = io, .conn = conn };
+        var s: Socket = .{ .gpa = gpa, .io = io, .conn = conn, .assembler = if (channel == .interactive) .{ .limit = 0 } else null };
         errdefer s.close();
         var rnd: [16]u8 = undefined;
         io.randomSecure(&rnd) catch return error.NoEntropy;
@@ -71,6 +77,7 @@ pub const Socket = struct {
     }
 
     pub fn close(s: *Socket) void {
+        if (s.assembler) |*a| a.deinit(s.gpa);
         std.crypto.secureZero(u8, s.buf.allocatedSlice());
         s.buf.deinit(s.gpa);
         s.conn.close(s.gpa);
@@ -97,20 +104,34 @@ pub const Socket = struct {
     /// The next server frame (its payload valid until the next call);
     /// null at end of stream.
     pub fn next(s: *Socket, max_payload: usize) !?ws.Frame {
-        if (s.used > 0) {
-            const u = s.used;
-            std.mem.copyForwards(u8, s.buf.items[0 .. s.buf.items.len - u], s.buf.items[u..]);
-            s.buf.shrinkRetainingCapacity(s.buf.items.len - u);
-            s.used = 0;
-        }
         while (true) {
-            if (try ws.parseServerFrame(s.buf.items, max_payload)) |f| {
-                s.used = f.len;
-                return f;
-            }
+            if (try s.buffered(max_payload)) |f| return f;
             if (s.buf.items.len > max_payload + 16) return error.FrameTooLarge;
             if (!try s.readMore()) return null;
         }
+    }
+
+    /// The next message among the bytes already read (its payload valid
+    /// until the next call), or null if more are needed. A message in
+    /// parts is at most `max_payload` bytes in all, like one frame.
+    pub fn buffered(s: *Socket, max_payload: usize) (ws.FrameError || parts.Assembler.Error)!?ws.Frame {
+        s.drop();
+        while (try ws.parseServerFrame(s.buf.items, max_payload)) |f| {
+            s.used = f.len;
+            const a = if (s.assembler) |*a| a else return f;
+            a.limit = max_payload;
+            if (try a.filter(s.gpa, f)) |m| return m;
+            s.drop(); // a part: the message goes on
+        }
+        return null;
+    }
+
+    fn drop(s: *Socket) void {
+        if (s.used == 0) return;
+        const u = s.used;
+        std.mem.copyForwards(u8, s.buf.items[0 .. s.buf.items.len - u], s.buf.items[u..]);
+        s.buf.shrinkRetainingCapacity(s.buf.items.len - u);
+        s.used = 0;
     }
 
     /// One bulk request (shared/bulk.zig): the reply header, then the body

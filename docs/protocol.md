@@ -600,6 +600,39 @@ repeat n_rows:
   other than 0/1) is dropped whole, before anything is applied. Invalid
   UTF-8 and control characters in text are shown as U+FFFD.
 
+### Messages in parts (`'M'` frames)
+
+A message over 16 KiB (a big `convo`, an `'I'` image blob, a long
+`foryou`, ...) does not go out as one frame: the desk sends it as a run of
+binary `'M'` frames of at most 16 KiB each (the bulk channel's chunk), and
+the device puts it back together and handles it exactly as the same
+message in one frame. Between two parts the desk sends the screen (`'G'`)
+when it changed, so a keystroke's echo waits behind one part at most,
+never behind a whole conversation. WebSocket fragmentation cannot do this
+(no other data frame may come between the fragments of a message), and
+Portal uses none.
+
+```
+u8  'M'
+u8  flags   bit 0: the last part; bit 1: the message is binary (else
+            text); the other bits are 0
+... the message's next bytes: exactly 16382 in every part but the last,
+    1 to 16382 in the last
+```
+
+* One message is in parts at a time: whole frames of other messages
+  (`'G'` frames, small text messages, answers) may come between its parts,
+  parts of another message never.
+* A message of at most 16 KiB is always one frame, so a first part is
+  never the last one; `'G'` frames always go whole (they are what a
+  keystroke waits for). A binary message in parts never starts with `'M'`.
+* The reassembled message counts against the same limit as a frame
+  (8 MiB in Portal's clients). Anything else (a short middle part, mixed
+  text and binary parts, unknown flags) is a protocol error: the client
+  reconnects.
+* Only the interactive `/ws` has parts; the bulk channel's replies are
+  16 KiB chunks of their own (section 7). Both ends: `shared/parts.zig`.
+
 ### Inline images (`'I'` and `'P'` frames)
 
 Images appear only because a program running in the session emitted them

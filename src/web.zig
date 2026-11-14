@@ -50,7 +50,9 @@ const websocket = @import("shared").ws;
 const transport = @import("shared").transport;
 const tunnelnet = @import("shared").tunnelnet;
 const bulk = @import("shared").bulk;
+const parts = @import("shared").parts;
 const tabs = @import("tabs.zig");
+const vt = @import("vt.zig");
 const tabs_wire = @import("shared").tabs;
 const planusage = @import("shared").planusage;
 const usage_desk = @import("usage_desk.zig");
@@ -1044,18 +1046,108 @@ pub const Server = struct {
         const Want = union(enum) { none, tab: *tabs.Tab, unknown };
         const SubWant = union(enum) { none, main, sub: tabs.Id };
 
-        /// Returns false if the connection should end. Cancelable: the
-        /// supervisor can always tear down a sender stuck behind another.
+        /// One frame. Returns false if the connection should end.
+        /// Cancelable: the supervisor can always tear down a sender stuck
+        /// behind another. Only the writer task sends messages over
+        /// parts.max_part, with sendMessage (the reader's answers are
+        /// smaller: the assert below).
         fn send(c: *WsConn, srv: *Server, data: []const u8, op: websocket.Opcode) bool {
+            return c.sendFrame(srv, op, &.{data});
+        }
+
+        comptime {
+            std.debug.assert(frames.max_answer <= parts.max_part);
+        }
+
+        fn sendFrame(c: *WsConn, srv: *Server, op: websocket.Opcode, pieces: []const []const u8) bool {
             c.write_mutex.lock(srv.io) catch return false;
             defer c.write_mutex.unlock(srv.io);
             if (c.close_sent) return false;
             if (op == .close) c.close_sent = true;
             c.conn.setDeadline(srv.nowMs() +| send_timeout_ms);
-            websocket.writeServerFrame(c.w, op, data) catch return false;
+            websocket.writeServerFrameOf(c.w, op, pieces) catch return false;
             c.conn.setDeadline(no_deadline);
             return true;
         }
+
+        /// One message from the writer task: one frame if it fits in a
+        /// part, else in 'M' parts (shared/parts.zig) with `screen` (the
+        /// screen update, ScreenOut.Between) run after every part but the
+        /// last, so a screen change waits for one part at most.
+        fn sendMessage(c: *WsConn, srv: *Server, data: []const u8, op: websocket.Opcode, screen: ?*ScreenOut.Between) bool {
+            if (!parts.inParts(data.len)) return c.send(srv, data, op);
+            const Ctx = struct {
+                c: *WsConn,
+                srv: *Server,
+                screen: ?*ScreenOut.Between,
+                pub fn frame(x: @This(), header: []const u8, d: []const u8) bool {
+                    return x.c.sendFrame(x.srv, .binary, &.{ header, d });
+                }
+                pub fn between(x: @This()) bool {
+                    return if (x.screen) |b| b.run() else true;
+                }
+            };
+            return parts.send(data, op, Ctx{ .c = c, .srv = srv, .screen = screen });
+        }
+    };
+
+    /// The screen a viewer was last sent ('G' frames) and the frame being
+    /// built: the writer's encode step, and the updates it sends between
+    /// two parts of a large message. 'G' frames always go whole: they are
+    /// what a keystroke waits for.
+    const ScreenOut = struct {
+        frame: std.ArrayList(u8) = .empty,
+        rows: std.ArrayList(u16) = .empty,
+        /// Generation of the emulator state last encoded; 0 plus `full`
+        /// forces a complete snapshot (docs/protocol.md section 3).
+        sent_gen: u64 = 0,
+        full: bool = true,
+        sent_cols: u16 = 0,
+        sent_rows: u16 = 0,
+
+        fn deinit(so: *ScreenOut, gpa: Allocator) void {
+            so.frame.deinit(gpa);
+            so.rows.deinit(gpa);
+        }
+
+        /// Encodes into `frame` what changed in `t` since the last frame
+        /// (hub lock held: a consistent snapshot). False: nothing did.
+        fn encodeLocked(so: *ScreenOut, gpa: Allocator, t: *const vt.Terminal) Allocator.Error!bool {
+            if (t.cols != so.sent_cols or t.rows != so.sent_rows) so.full = true;
+            if (!so.full and t.gen == so.sent_gen) return false;
+            so.rows.clearRetainingCapacity();
+            so.frame.clearRetainingCapacity();
+            var r: u16 = 0;
+            while (r < t.rows) : (r += 1) {
+                if (so.full or t.rowGen(r) > so.sent_gen) try so.rows.append(gpa, r);
+            }
+            try t.encodeRows(so.rows.items, &so.frame, gpa);
+            so.sent_gen = t.gen;
+            so.sent_cols = t.cols;
+            so.sent_rows = t.rows;
+            so.full = false;
+            return true;
+        }
+
+        /// Between two parts: the shown tab's screen, if it changed.
+        const Between = struct {
+            so: *ScreenOut,
+            srv: *Server,
+            ws: *WsConn,
+            tab: *tabs.Tab,
+
+            fn run(b: *Between) bool {
+                const hub = b.srv.hub;
+                hub.mutex.lockUncancelable(b.srv.io);
+                const changed = b.so.encodeLocked(b.srv.gpa, &b.tab.session.term) catch {
+                    hub.mutex.unlock(b.srv.io);
+                    return false; // out of memory: drop this viewer
+                };
+                hub.mutex.unlock(b.srv.io);
+                if (!changed) return true;
+                return b.ws.send(b.srv, b.so.frame.items, .binary);
+            }
+        };
     };
 
     fn webSocket(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, channel: Channel, leftover: []const u8) !void {
@@ -1244,10 +1336,8 @@ pub const Server = struct {
         var cur: ?*tabs.Tab = initial;
         defer if (cur) |t| t.release();
         var msg: [128]u8 = undefined;
-        var frame: std.ArrayList(u8) = .empty;
-        defer frame.deinit(srv.gpa);
-        var rows: std.ArrayList(u16) = .empty;
-        defer rows.deinit(srv.gpa);
+        var screen: ScreenOut = .{};
+        defer screen.deinit(srv.gpa);
         // Inline images: 'I' blobs and 'P' placements (web_images.zig),
         // of the tab shown (a switch starts over).
         var images: web_images.Sender = .{};
@@ -1273,12 +1363,6 @@ pub const Server = struct {
         var sync_seen = srv.sync_gen.load(.acquire);
         var sync_digest = srv.syncDigestFor(ws_device);
 
-        // Generation of the emulator state last sent; 0 plus `full` forces a
-        // complete snapshot first (docs/protocol.md section 3).
-        var sent_gen: u64 = 0;
-        var full = true;
-        var sent_cols: u16 = 0;
-        var sent_rows: u16 = 0;
         // `ended` was sent for the tab shown (it closed while others run).
         var ended_sent = false;
         // The shown tab's conversation (docs/protocol.md section 3b): the
@@ -1326,16 +1410,15 @@ pub const Server = struct {
             const gone = srv.endReason(&ws.device) != null;
             hub.mutex.lockUncancelable(srv.io);
             const cur_closed = if (cur) |c| c.session.closed else false;
-            const cur_gen = if (cur) |c| c.session.term.gen else sent_gen;
+            const cur_gen = if (cur) |c| c.session.term.gen else screen.sent_gen;
             const convo_changed = if (cur) |c| blk: {
                 const cv = shownConvo(c, sub_shown).convo;
                 break :blk cv.epoch != convo_epoch or cv.rev != convo_rev or c.subs.gen != subs_gen;
             } else false;
             const sys_due = if (srv.sysmon) |m| ws.sys_on.load(.acquire) and m.gen.load(.acquire) != sys_seen else false;
             const usage_next = usage_t.decide(hub.usage.latest, srv.nowMs());
-            if (usage_next != .now and !hub.finished and !full and cur_gen == sent_gen and !(cur_closed and !ended_sent) and !convo_changed and
-                hub.activity_gen == activity_seen and !sys_due and !fy.due(hub) and
-                hub.activity_gen == activity_seen and !sys_due and !proj.dueLocked(hub) and
+            if (usage_next != .now and !hub.finished and !screen.full and cur_gen == screen.sent_gen and !(cur_closed and !ended_sent) and !convo_changed and
+                hub.activity_gen == activity_seen and !sys_due and !fy.due(hub) and !proj.dueLocked(hub) and
                 ws.want == .none and ws.sub_want == .none and hub.gen == seen_gen and !ws.dead.load(.acquire) and !gone and
                 srv.sync_gen.load(.acquire) == sync_seen)
             {
@@ -1366,7 +1449,7 @@ pub const Server = struct {
                 .tab => |t| {
                     if (cur) |c| c.release(); // never takes the hub lock
                     cur = t;
-                    full = true;
+                    screen.full = true;
                     ended_sent = false;
                     convo_epoch = 0;
                     subs_gen = 0;
@@ -1408,30 +1491,10 @@ pub const Server = struct {
             var changed = false;
             if (cur) |c| {
                 const t = &c.session.term;
-                if (t.cols != sent_cols or t.rows != sent_rows) full = true;
-                changed = full or t.gen != sent_gen;
-                if (changed) {
-                    rows.clearRetainingCapacity();
-                    frame.clearRetainingCapacity();
-                    var r: u16 = 0;
-                    while (r < t.rows) : (r += 1) {
-                        if (full or t.rowGen(r) > sent_gen) {
-                            rows.append(srv.gpa, r) catch {
-                                encode_ok = false;
-                                break;
-                            };
-                        }
-                    }
-                    if (encode_ok) t.encodeRows(rows.items, &frame, srv.gpa) catch {
-                        encode_ok = false;
-                    };
-                    if (encode_ok) {
-                        sent_gen = t.gen;
-                        sent_cols = t.cols;
-                        sent_rows = t.rows;
-                        full = false;
-                    }
-                }
+                changed = screen.encodeLocked(srv.gpa, t) catch blk: {
+                    encode_ok = false;
+                    break :blk false;
+                };
                 if (encode_ok) images.collect(srv.gpa, t, srv.nowMs()) catch {
                     encode_ok = false;
                 };
@@ -1519,24 +1582,32 @@ pub const Server = struct {
                 if (!ws.send(srv, m, .text)) return;
             };
             if (changed) {
-                if (!ws.send(srv, frame.items, .binary)) return;
+                if (!ws.send(srv, screen.frame.items, .binary)) return;
             }
+            // From here on a large message goes in parts with the screen
+            // between them (never before the frame above: newer rows would
+            // arrive ahead of older ones).
+            var between_buf: ScreenOut.Between = undefined;
+            const between: ?*ScreenOut.Between = if (cur) |c| blk: {
+                between_buf = .{ .so = &screen, .srv = srv, .ws = ws, .tab = c };
+                break :blk &between_buf;
+            } else null;
             var image_frames = images.frames();
-            while (image_frames.next()) |f| if (!ws.send(srv, f, .binary)) return;
+            while (image_frames.next()) |f| if (!ws.sendMessage(srv, f, .binary, between)) return;
             if (subs_out.written().len > 0) {
-                if (!ws.send(srv, subs_out.written(), .text)) return;
+                if (!ws.sendMessage(srv, subs_out.written(), .text, between)) return;
             }
             if (convo_out.written().len > 0) {
-                if (!ws.send(srv, convo_out.written(), .text)) return;
+                if (!ws.sendMessage(srv, convo_out.written(), .text, between)) return;
             }
             if (act_out.written().len > 0) {
-                if (!ws.send(srv, act_out.written(), .text)) return;
+                if (!ws.sendMessage(srv, act_out.written(), .text, between)) return;
             }
             if (usage_msg.len > 0) {
                 if (!ws.send(srv, usage_msg, .text)) return;
             }
             var fy_msgs = fy.messages();
-            while (fy_msgs.next()) |m| if (!ws.send(srv, m, .text)) return;
+            while (fy_msgs.next()) |m| if (!ws.sendMessage(srv, m, .text, between)) return;
             if (srv.sysmon) |m| if (ws.sys_on.load(.acquire) and m.gen.load(.acquire) != sys_seen) {
                 var snap: sysinfo.Snapshot = undefined;
                 sys_seen = m.latest(&snap);
@@ -2190,4 +2261,21 @@ test "peers: a refused address admits nothing, and a record replaced at its addr
     _ = st.remove("phone");
     setPeers(&peers, &st, &.{});
     try testing.expectEqual(Server.EndReason.unpaired, endReasonIn(&peers, &now_admitted).?);
+}
+
+test "screen out: a full snapshot first, then only what changed, nothing when nothing did" {
+    var t = try vt.Terminal.init(testing.allocator, 10, 5);
+    defer t.deinit();
+    var so: Server.ScreenOut = .{};
+    defer so.deinit(testing.allocator);
+    try testing.expect(try so.encodeLocked(testing.allocator, &t));
+    try testing.expectEqual(@as(usize, 5), so.rows.items.len);
+    try testing.expect(!try so.encodeLocked(testing.allocator, &t));
+    t.feed("x");
+    try testing.expect(try so.encodeLocked(testing.allocator, &t));
+    try testing.expectEqual(@as(usize, 1), so.rows.items.len);
+    // A forced snapshot (a switch to another tab) has every row again.
+    so.full = true;
+    try testing.expect(try so.encodeLocked(testing.allocator, &t));
+    try testing.expectEqual(@as(usize, 5), so.rows.items.len);
 }

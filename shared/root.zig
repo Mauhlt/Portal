@@ -25,6 +25,8 @@
 //!            for tests
 //!   tunnelnet the in-process tunnel's addresses and ports (one definition)
 //!   bulk     the bulk WebSocket's request/reply messages (sync transfers)
+//!   parts    large desk -> device messages on /ws in 'M' parts (split and
+//!            reassembled), so a screen update can go between two parts
 //!   projects projects a device may start (projects / project messages,
 //!            p: frames), their start modes and the request rate window
 //!   frames   the one list of device -> desk frame prefixes, and the answer
@@ -48,6 +50,7 @@ pub const subtabs = @import("subtabs.zig");
 pub const transport = @import("transport.zig");
 pub const tunnelnet = @import("tunnelnet.zig");
 pub const bulk = @import("bulk.zig");
+pub const parts = @import("parts.zig");
 pub const projects = @import("projects.zig");
 pub const frames = @import("frames.zig");
 pub const foryou = @import("foryou.zig");
@@ -70,6 +73,7 @@ test {
     _ = transport;
     _ = tunnelnet;
     _ = bulk;
+    _ = parts;
     _ = projects;
     _ = frames;
     _ = foryou;

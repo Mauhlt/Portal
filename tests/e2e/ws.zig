@@ -1,10 +1,12 @@
 //! WebSocket (RFC 6455) test client. Server frames are parsed with the
-//! shared, strict parser (shared/ws.zig) every Portal program uses; client
-//! frames are encoded here, so tests can also send malformed ones (no FIN,
-//! RSV bits, unmasked, lying lengths) at the server.
+//! shared, strict parser (shared/ws.zig) every Portal program uses, and
+//! messages in parts are reassembled with the shared one (shared/parts.zig);
+//! client frames are encoded here, so tests can also send malformed ones
+//! (no FIN, RSV bits, unmasked, lying lengths) at the server.
 
 const std = @import("std");
 const shared_ws = @import("shared").ws;
+const parts = @import("shared").parts;
 const net = @import("net.zig");
 const http = @import("http.zig");
 const tlsnet = @import("tlsnet.zig");
@@ -50,6 +52,13 @@ pub const Client = struct {
     /// Start of unconsumed bytes in `buf`.
     pos: usize = 0,
     rng: std.Random.DefaultPrng,
+    assembler: parts.Assembler = .{ .limit = max_message },
+    /// Messages that arrived in parts (tests check the desk uses them).
+    in_parts: u32 = 0,
+    /// Screen ('G') frames that arrived between two parts of a message.
+    screens_between_parts: u32 = 0,
+
+    const max_message = 16 * 1024 * 1024;
 
     pub fn connect(gpa: Allocator, port: u16, o: ConnectOptions) !Client {
         var sock = try tlsnet.Stream.connect(gpa, port, .{ .rcvbuf = o.rcvbuf }, o.tls);
@@ -99,6 +108,7 @@ pub const Client = struct {
     pub fn close(c: *Client) void {
         c.sock.close();
         c.buf.deinit(c.gpa);
+        c.assembler.deinit(c.gpa);
     }
 
     /// Encodes a masked client frame (fin and rsv as given) into `out`.
@@ -173,10 +183,19 @@ pub const Client = struct {
     }
 
     fn parseOne(c: *Client) !?Frame {
-        const f = (shared_ws.parseServerFrame(c.buf.items[c.pos..], 16 * 1024 * 1024) catch
-            return error.BadFrame) orelse return null;
-        c.pos += f.len;
-        return .{ .op = f.opcode, .payload = f.payload };
+        while (true) {
+            const f = (shared_ws.parseServerFrame(c.buf.items[c.pos..], max_message) catch
+                return error.BadFrame) orelse return null;
+            c.pos += f.len;
+            const was_active = c.assembler.active;
+            const m = (c.assembler.filter(c.gpa, f) catch return error.BadFrame) orelse continue;
+            if (m.payload.ptr != f.payload.ptr) {
+                c.in_parts += 1;
+            } else if (was_active and m.opcode == .binary and m.payload.len > 0 and m.payload[0] == 'G') {
+                c.screens_between_parts += 1;
+            }
+            return .{ .op = m.opcode, .payload = m.payload };
+        }
     }
 
     /// Reads and discards everything until the peer closes; returns whether

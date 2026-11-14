@@ -8,7 +8,9 @@
 //! no continuation frames), known opcodes only, control frames of at most
 //! 125 bytes, minimal length encodings, a 64-bit length with its top bit
 //! clear, frames from a client masked and frames from a server not.
-//! Anything else is an error, never a panic.
+//! Anything else is an error, never a panic. Large desk messages go in
+//! parts one level up (shared/parts.zig), so a screen update can come
+//! between two of them; fragmentation could not allow that.
 
 const std = @import("std");
 
@@ -158,9 +160,18 @@ pub fn encodeClientFrame(out: []u8, opcode: Opcode, payload: []const u8, mask: [
 
 /// Writes one unmasked server frame and flushes.
 pub fn writeServerFrame(w: *std.Io.Writer, opcode: Opcode, payload: []const u8) !void {
+    return writeServerFrameOf(w, opcode, &.{payload});
+}
+
+/// Writes one unmasked server frame whose payload is the concatenation of
+/// `pieces` (a header and the data after it, shared/parts.zig), and
+/// flushes.
+pub fn writeServerFrameOf(w: *std.Io.Writer, opcode: Opcode, pieces: []const []const u8) !void {
+    var len: usize = 0;
+    for (pieces) |p| len += p.len;
     var hbuf: [max_header_len]u8 = undefined;
-    try w.writeAll(try encodeHeader(&hbuf, opcode, payload.len, null));
-    try w.writeAll(payload);
+    try w.writeAll(try encodeHeader(&hbuf, opcode, len, null));
+    for (pieces) |p| try w.writeAll(p);
     try w.flush();
 }
 
