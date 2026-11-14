@@ -95,7 +95,7 @@ pub const bundle_mib_per_day = 100;
 pub const bundle_max_kib = 5 * 1024;
 /// Desktop-wide, over all devices (gate.zig): devices doing speech
 /// traffic at once (the desk's own mic never counts), and totals.
-pub const concurrent_devices = 3;
+pub const concurrent_devices = 2;
 pub const global_feedback_per_hour = 300;
 pub const global_kept_clips_per_day = 1000;
 pub const global_bundles_per_day = 100;

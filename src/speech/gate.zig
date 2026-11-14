@@ -285,21 +285,21 @@ pub const Gate = struct {
 
 const testing = std.testing;
 
-test "concurrency: 3 devices at once, the 4th is busy (not queued); the budget is shared" {
+test "concurrency: 2 devices at once, the 3rd is busy (not queued); the budget is shared" {
     var g: Gate = .{};
-    const names = [_][]const u8{ "laptop", "iphone", "surface", "tablet" };
-    var t: [3]Ticket = undefined;
-    for (names[0..3], 0..) |n, i| t[i] = g.begin(n, 1024, 0).ok;
-    const b = g.begin(names[3], 1024, 0);
+    const names = [_][]const u8{ "laptop", "iphone", "surface" };
+    var t: [2]Ticket = undefined;
+    for (names[0..2], 0..) |n, i| t[i] = g.begin(n, 1024, 0).ok;
+    const b = g.begin(names[2], 1024, 0);
     try testing.expectEqual(@as(i64, busy_retry_ms), b.busy);
     // A device already in may send another request.
     const again = g.begin("laptop", 1024, 0).ok;
     g.end(again, 0);
     g.end(t[0], 0);
     // The laptop still holds its slot (idle for less than 60 s): busy.
-    try testing.expect(g.begin(names[3], 1024, 1000) == .busy);
-    // 60 s without traffic: released, the tablet gets it.
-    try testing.expect(g.begin(names[3], 1024, 60_000) == .ok);
+    try testing.expect(g.begin(names[2], 1024, 1000) == .busy);
+    // 60 s without traffic: released, the Surface gets it.
+    try testing.expect(g.begin(names[2], 1024, 60_000) == .ok);
     try testing.expect(!g.holdsSlot("laptop"));
     // 16 MiB over all devices: a declared size that doesn't fit next to
     // the others is busy; one over the budget alone is too large.

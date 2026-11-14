@@ -130,7 +130,7 @@ it frees up. Rolling windows are fixed slots (60 x 1 min, 24 x 1 h).
 | bundles_per_day | 50 | 1-10000 | training bundles per device |
 | bundle_mib_per_day | 100 | 1-10240 | bundle MiB per device |
 | bundle_max_kib | 5120 | 64-5120 | one bundle |
-| concurrent_devices | 3 | 1-16 | devices doing speech traffic at once (desk mic not counted) |
+| concurrent_devices | 2 | 1-16 | devices doing speech traffic at once (desk mic not counted) |
 | global_feedback_per_hour | 300 | 1-100000 | all devices together |
 | global_kept_clips_per_day | 1000 | 1-1000000 | all devices together |
 | global_bundles_per_day | 100 | 1-100000 | all devices together |
