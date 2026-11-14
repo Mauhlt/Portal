@@ -191,7 +191,10 @@ pub const DeviceStart = union(enum) {
 };
 
 /// Flags of the agent that make a session less careful than "ask for
-/// every edit and command", or that choose the mode themselves.
+/// every edit and command", that choose the mode themselves, or that
+/// bring in settings, folders, tools or agents Portal did not choose
+/// (another settings layer could replace Portal's guard hook; Portal's
+/// own `--settings` is added by launchArgs, never configured).
 pub const permissive_flags = [_][]const u8{
     "--dangerously-skip-permissions",
     "--allow-dangerously-skip-permissions",
@@ -199,6 +202,12 @@ pub const permissive_flags = [_][]const u8{
     "--allowedTools",
     "--allowed-tools",
     "--permission-prompt-tool",
+    "--settings",
+    "--setting-sources",
+    "--add-dir",
+    "--mcp-config",
+    "--plugin-dir",
+    "--agents",
 };
 
 pub fn deviceStart(argv: []const []const u8) DeviceStart {
@@ -225,7 +234,7 @@ pub fn deviceStartText(d: DeviceStart, buf: []u8) []const u8 {
     return switch (d) {
         .ok => "",
         .not_agent => "the program setting is not Claude Code, so Portal cannot make device starts ask for every edit and command",
-        .permissive => |f| std.fmt.bufPrint(buf, "the program setting contains {s}; device starts never run with permissive permissions", .{f}) catch "the program setting contains a permissive flag",
+        .permissive => |f| std.fmt.bufPrint(buf, "the program setting contains {s}; device starts never run with permissive permissions or settings Portal did not choose", .{f}) catch "the program setting contains a permissive flag",
     };
 }
 
@@ -285,9 +294,11 @@ pub fn uuidV4(random: [16]u8) [36]u8 {
     return out;
 }
 
-/// `line` (a Resolved command line) with `args` appended to the
-/// program's arguments: inside the quotes of a `cmd.exe /d /s /c "..."`
-/// line (a .cmd program), else at the end. Each argument must be letters,
+/// `line` (a Resolved command line) with `args` inserted right after the
+/// program (argv[0]; inside the quotes of a `cmd.exe /d /s /c "..."` line
+/// for a .cmd program), before the configured arguments: a configured
+/// `--` (after which everything is the prompt) can never turn Portal's
+/// flags into prompt text. Each argument must be letters,
 /// digits and dashes only (Portal's own: a mode name, a UUID), so it needs
 /// no quoting and is safe for cmd.exe, or a Windows path of Portal's own
 /// (pathArg: letters, digits, spaces and `\ : . _ - ( )`), which goes in
@@ -304,7 +315,8 @@ pub fn withArgs(gpa: Allocator, line: []const u16, args: []const []const u8) ![:
     }
     const batch_prefix = std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"");
     const batch = std.mem.startsWith(u16, line, batch_prefix) and line.len > batch_prefix.len and line[line.len - 1] == '"';
-    const cut = if (batch) line.len - 1 else line.len;
+    const start = if (batch) batch_prefix.len else 0;
+    const cut = start + programEnd(line[start .. if (batch) line.len - 1 else line.len]);
     const out = try gpa.allocSentinel(u16, line.len + add_len, 0);
     @memcpy(out[0..cut], line[0..cut]);
     var at = cut;
@@ -327,6 +339,18 @@ pub fn withArgs(gpa: Allocator, line: []const u16, args: []const []const u8) ![:
     }
     @memcpy(out[at..], line[cut..]);
     return out;
+}
+
+/// Where the program (the first argument, as `join` quotes it) ends in
+/// `line`: after its closing quote, else at the first space. A Windows
+/// path never holds a `"`, so the first quote after the opening one
+/// closes it.
+fn programEnd(line: []const u16) usize {
+    if (line.len > 0 and line[0] == '"') {
+        const close = std.mem.indexOfScalarPos(u16, line, 1, '"') orelse return line.len;
+        return close + 1;
+    }
+    return std.mem.indexOfScalar(u16, line, ' ') orelse line.len;
 }
 
 fn plainArg(a: []const u8) bool {
@@ -365,6 +389,9 @@ test "deviceStart: the agent only, never with a permissive flag" {
         "--dangerously-skip-permissions",      "--allow-dangerously-skip-permissions", "--permission-mode",
         "--permission-mode=bypassPermissions", "--PERMISSION-MODE",                    "--allowedTools",
         "--allowed-tools=Bash",                "--permission-prompt-tool",             "--dangerously-anything-new",
+        "--settings",                          "--settings={}",                        "--setting-sources=project",
+        "--add-dir",                           "--mcp-config",                         "--plugin-dir",
+        "--agents",
     }) |f| try testing.expect(deviceStart(&.{ "claude", "--model", "x", f, "acceptEdits" }) == .permissive);
     // A prompt after "--" is not a flag.
     try testing.expect(deviceStart(&.{ "claude", "--", "--dangerously-skip-permissions" }) == .ok);
@@ -387,7 +414,17 @@ test "launchArgs + withArgs: the permission mode, then the session id; nothing u
     const plain = std.unicode.utf8ToUtf16LeStringLiteral("C:\\x\\claude.exe --model opus");
     const got = try withArgs(gpa, plain, a);
     defer gpa.free(got);
-    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("C:\\x\\claude.exe --model opus --permission-mode plan --session-id 0123abcd-0000-4000-8000-00000000beef"), got);
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("C:\\x\\claude.exe --permission-mode plan --session-id 0123abcd-0000-4000-8000-00000000beef --model opus"), got);
+    // Right after the program: a configured `--` (the rest is the
+    // prompt) never swallows Portal's flags; a quoted program path too.
+    const dashes = std.unicode.utf8ToUtf16LeStringLiteral("\"C:\\a b\\claude.exe\" --model opus -- hello");
+    const got4 = try withArgs(gpa, dashes, launchArgs(&ab, "plan", null, null));
+    defer gpa.free(got4);
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("\"C:\\a b\\claude.exe\" --permission-mode plan --model opus -- hello"), got4);
+    const bat_dashes = std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"C:\\npm\\claude.cmd -- hi\"");
+    const got5 = try withArgs(gpa, bat_dashes, launchArgs(&ab, "default", null, null));
+    defer gpa.free(got5);
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"C:\\npm\\claude.cmd --permission-mode default -- hi\""), got5);
     const bat = std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"C:\\npm\\claude.cmd\"");
     const got2 = try withArgs(gpa, bat, launchArgs(&ab, "default", null, null));
     defer gpa.free(got2);
@@ -439,18 +476,18 @@ test "uuidV4" {
     try testing.expectEqualStrings("00000000-0000-4000-8000-000000000000", &z);
 }
 
-test "withSessionId: appended to the arguments, inside cmd.exe's quotes for a .cmd" {
+test "withSessionId: right after the program, inside cmd.exe's quotes for a .cmd" {
     const gpa = testing.allocator;
     const id = "0123abcd-0000-4000-8000-00000000beef";
     const plain = std.unicode.utf8ToUtf16LeStringLiteral("C:\\x\\claude.exe --model \"a b\"");
     const got = try withSessionId(gpa, plain, id);
     defer gpa.free(got);
-    const want = std.unicode.utf8ToUtf16LeStringLiteral("C:\\x\\claude.exe --model \"a b\" --session-id 0123abcd-0000-4000-8000-00000000beef");
+    const want = std.unicode.utf8ToUtf16LeStringLiteral("C:\\x\\claude.exe --session-id 0123abcd-0000-4000-8000-00000000beef --model \"a b\"");
     try testing.expectEqualSlices(u16, want, got);
     const bat = std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"C:\\npm\\claude.cmd --verbose\"");
     const got2 = try withSessionId(gpa, bat, id);
     defer gpa.free(got2);
-    const want2 = std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"C:\\npm\\claude.cmd --verbose --session-id 0123abcd-0000-4000-8000-00000000beef\"");
+    const want2 = std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"C:\\npm\\claude.cmd --session-id 0123abcd-0000-4000-8000-00000000beef --verbose\"");
     try testing.expectEqualSlices(u16, want2, got2);
 }
 
