@@ -296,6 +296,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "show")) std.process.exit(@import("show.zig").main(gpa, io, args[1..]));
     if (std.mem.eql(u8, cmd, "sync") or std.mem.eql(u8, cmd, "publish") or std.mem.eql(u8, cmd, "unpublish")) {
         const paths = try devicePaths(gpa, io, init.environ_map);
+        defer gpa.free(paths.dir);
         const sp: sync.Paths = .{ .dir = paths.dir };
         if (cmd[0] == 's') return sync_cli.cmdSync(gpa, io, sp, args[1..]);
         if (cmd[0] == 'p') return sync_cli.cmdPublish(gpa, io, sp, args[1..]);
@@ -1239,6 +1240,7 @@ const SettingsWatch = struct {
 /// place the list is kept); a running Portal follows the file.
 fn cmdStartable(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
     const paths = devicePaths(gpa, io, env) catch |err| fatal("cannot find the data directory: {t}", .{err});
+    defer gpa.free(paths.dir);
     const sub = if (args.len > 0) args[0] else "list";
     var s = settings.loadOrNull(gpa, io, paths.dir) orelse fatal("{s}\\{s} exists but can't be read; nothing changed", .{ paths.dir, settings.file_name });
     if (std.mem.eql(u8, sub, "list")) {
@@ -1273,7 +1275,9 @@ fn cmdStartable(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, arg
             d.close(io);
         }
         var nb: [tabs_wire.max_name]u8 = undefined;
-        const n = name orelse tabs.displayName(folder, env.get("USERPROFILE"), env.get("USERNAME"), scrubIdentity(gpa, io, env).users, &nb);
+        var identity_arena: std.heap.ArenaAllocator = .init(gpa);
+        defer identity_arena.deinit();
+        const n = name orelse tabs.displayName(folder, env.get("USERPROFILE"), env.get("USERNAME"), scrubIdentity(identity_arena.allocator(), io, env).users, &nb);
         s.addStartable(n, mode, folder) catch |err| fatal("not added: {s}", .{switch (err) {
             error.BadName => "the name must be 1-64 bytes of printable text without \\ / : | \" and not start with - or .",
             error.BadFolder => "the folder must be an absolute path",
@@ -1363,20 +1367,22 @@ const HookWatch = struct {
 /// (convo/scrub.zig) and tab names (tabs.displayName): %USERNAME%,
 /// %USERPROFILE% and the OneDrive folders, each also in its 8.3 short
 /// form; git's global `user.name` / `user.email` (read here, once) and
-/// %COMPUTERNAME%. Lives as long as the process.
-fn scrubIdentity(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) ScrubIdentity {
+/// %COMPUTERNAME%. Everything is allocated in `arena` (cmdRun passes the
+/// process allocator: the identity lives as long as the process; a short
+/// command passes an arena it frees).
+fn scrubIdentity(arena: Allocator, io: Io, env: *const std.process.Environ.Map) ScrubIdentity {
     const profile = env.get("USERPROFILE");
     var others: [6]?[]const u8 = @splat(null);
     for ([_][]const u8{ "OneDrive", "OneDriveConsumer", "OneDriveCommercial" }, 0..) |name, i| {
         const d = env.get(name) orelse continue;
         others[2 * i] = d;
-        others[2 * i + 1] = shortPath(gpa, d);
+        others[2 * i + 1] = shortPath(arena, d);
     }
-    const git = gitUser(gpa, io, env);
-    return ScrubIdentity.init(gpa, .{
+    const git = gitUser(arena, io, env);
+    return ScrubIdentity.init(arena, .{
         .user_name = env.get("USERNAME"),
         .profile = profile,
-        .profile_short = if (profile) |p| shortPath(gpa, p) else null,
+        .profile_short = if (profile) |p| shortPath(arena, p) else null,
         .other_homes = &others,
         .git_name = git.name,
         .git_email = git.email,
@@ -1386,19 +1392,19 @@ fn scrubIdentity(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) Sc
 
 /// git's global identity: `%USERPROFILE%\.gitconfig`, else the XDG file
 /// (`%XDG_CONFIG_HOME%\git\config` or `%USERPROFILE%\.config\git\config`)
-/// for what it lacks. Read once at startup; never written. Lives as long
-/// as the process.
-fn gitUser(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) scrub.GitUser {
+/// for what it lacks. Read once at startup; never written. The name and
+/// email point into file text allocated in `arena` (scrubIdentity's).
+fn gitUser(arena: Allocator, io: Io, env: *const std.process.Environ.Map) scrub.GitUser {
     var out: scrub.GitUser = .{};
     const home = env.get("USERPROFILE") orelse return out;
     const xdg: ?[]const u8 = if (env.get("XDG_CONFIG_HOME")) |x|
-        std.fs.path.join(gpa, &.{ x, "git", "config" }) catch null
+        std.fs.path.join(arena, &.{ x, "git", "config" }) catch null
     else
-        std.fs.path.join(gpa, &.{ home, ".config", "git", "config" }) catch null;
-    const global = std.fs.path.join(gpa, &.{ home, ".gitconfig" }) catch null;
+        std.fs.path.join(arena, &.{ home, ".config", "git", "config" }) catch null;
+    const global = std.fs.path.join(arena, &.{ home, ".gitconfig" }) catch null;
     for ([_]?[]const u8{ global, xdg }) |maybe| {
         const path = maybe orelse continue;
-        const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 * 1024)) catch continue;
+        const text = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(256 * 1024)) catch continue;
         const u = scrub.parseGitUser(text);
         if (out.name == null) out.name = u.name;
         if (out.email == null) out.email = u.email;
