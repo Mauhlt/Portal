@@ -46,7 +46,7 @@ pub fn extract(scratch: std.mem.Allocator, json: []const u8) ?planusage.Usage {
             seven_day: ?Win = null,
         } = null,
     };
-    const in = std.json.parseFromSliceLeaky(In, scratch, json, .{
+    const in = std.json.parseFromSliceLeaky(In, scratch, json[hookmsg.bomLen(json)..], .{
         .ignore_unknown_fields = true,
         .duplicate_field_behavior = .use_last,
     }) catch return null;
@@ -220,6 +220,18 @@ test "extract: the two windows only; absent windows, absent fields, garbage" {
         "[]",
         "{\"rate_limits\":{\"five_hour\":{\"used_percentage\":1}}",
     }) |bad| try testing.expect(extract(a, bad) == null);
+}
+
+test "extract: a leading byte order mark (Windows PowerShell 5.1's pipe) is skipped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const u = extract(arena.allocator(), "\xEF\xBB\xBF{\"rate_limits\":{\"five_hour\":{\"used_percentage\":23,\"resets_at\":1738425600}}}").?;
+    try testing.expectEqual(planusage.Window{ .pct = 23, .resets_at = 1738425600 }, u.five_hour.?);
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("5-hour 23%", statusText(u, &buf));
+    // Only one, and only at the start.
+    try testing.expect(extract(arena.allocator(), "\xEF\xBB\xBF\xEF\xBB\xBF{\"rate_limits\":{\"five_hour\":{\"used_percentage\":23}}}") == null);
+    try testing.expect(extract(arena.allocator(), "\xEF\xBB\xBF") == null);
 }
 
 test "extract: a huge input is bounded by the caller's scratch" {

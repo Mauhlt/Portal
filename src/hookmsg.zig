@@ -97,6 +97,12 @@ pub const guard_env_name = "PORTAL_GUARD";
 /// settings layer for a device start (agentsettings.zig, hookpipe.zig).
 pub const device_flag = "--device";
 
+/// Bytes of a UTF-8 byte order mark at the start of `text` (0 or 3): the
+/// agent's JSON piped through Windows PowerShell 5.1 starts with one.
+pub fn bomLen(text: []const u8) usize {
+    return if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) 3 else 0;
+}
+
 /// `[A-Za-z0-9_-]{1,64}`: the only names that travel.
 pub fn validName(s: []const u8) bool {
     if (s.len == 0 or s.len > max_name) return false;
@@ -257,7 +263,7 @@ pub fn parseHook(scratch: std.mem.Allocator, key: Key, json: []const u8) ?Parsed
         // Any shape (another tool's input may hold anything).
         tool_input: ?std.json.Value = null,
     };
-    const in = std.json.parseFromSliceLeaky(In, scratch, json, .{ .ignore_unknown_fields = true, .duplicate_field_behavior = .use_last }) catch return null;
+    const in = std.json.parseFromSliceLeaky(In, scratch, json[bomLen(json)..], .{ .ignore_unknown_fields = true, .duplicate_field_behavior = .use_last }) catch return null;
     const event = Event.fromName(in.hook_event_name orelse return null) orelse return null;
     var m: Message = .{ .key = key, .event = event };
     var command: ?[]const u8 = null;
@@ -386,6 +392,16 @@ test "fromHookJson: the documented inputs; unknown fields, other events and type
     try testing.expect(!fromHookJson(a, key, "{\"hook_event_name\":\"Stop\",\"error\":\"rate_limit\"}").?.rate_limit);
     try testing.expect(!parse("portal-hook-v1\ntab=01010101010101010101010101010101\nevent=Stop\nerror=rate_limit\n").?.rate_limit);
     try testing.expect(parse("portal-hook-v1\ntab=01010101010101010101010101010101\nevent=StopFailure\nerror=a b\n") == null);
+}
+
+test "fromHookJson: a leading byte order mark is skipped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const key: Key = @splat(7);
+    const m = fromHookJson(arena.allocator(), key, "\xEF\xBB\xBF{\"hook_event_name\":\"Stop\"}").?;
+    try std.testing.expectEqual(Event.Stop, m.event);
+    try std.testing.expectEqual(@as(usize, 0), bomLen("{}"));
+    try std.testing.expectEqual(@as(usize, 0), bomLen("\xEF\xBB"));
 }
 
 test "format and parse round-trip; the parser is strict" {

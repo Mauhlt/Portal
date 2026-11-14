@@ -171,9 +171,7 @@ const Parser = struct {
     }
 };
 
-fn bomLen(text: []const u8) usize {
-    return if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) 3 else 0;
-}
+const bomLen = hookmsg.bomLen;
 
 /// Validates and parses; the top level must be an object.
 fn parse(a: Allocator, text: []const u8) Error!Node {
