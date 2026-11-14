@@ -2,7 +2,7 @@
 //! still embeds "app_wasm" and its test checks the module's imports and
 //! exports against src/web/app.js, until feat/inproc-tunnel drops the
 //! browser routes. Then delete this file, `browserStub` in build.zig and
-//! the rest of src/web/ (keeping src/web/fonts). Nothing here runs: the
+//! the rest of src/web/. Nothing here runs: the
 //! externs are referenced only so that the module declares them.
 
 extern "env" fn log() void;

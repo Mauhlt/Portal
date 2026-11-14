@@ -1,8 +1,8 @@
 //! Module "inputrules": what a paired device may send, and how every client
 //! turns a key press or an input line into protocol frames
 //! (docs/protocol.md §4). The one definition, used by the server
-//! (src/keymap.zig), the native client (client/src) and the browser client
-//! (src/wasm), so every device offers the same keys and the same instruction
+//! (src/keymap.zig) and the native clients (client/src, ui/), so every
+//! device offers the same keys and the same instruction
 //! line with the same checks. Pure logic, std only.
 //!
 //!   keys.zig  input policy, the allowed key names (and their bytes, for the
@@ -57,10 +57,8 @@ pub const refusalText = send.refusalText;
 pub const serverRefusal = send.serverRefusal;
 pub const Tone = send.Tone;
 pub const Note = send.Note;
-pub const Device = send.Device;
 pub const preview = send.preview;
 pub const help = send.help;
-pub const placeholder = send.placeholder;
 
 test {
     _ = keys;

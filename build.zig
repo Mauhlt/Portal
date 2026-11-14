@@ -240,7 +240,7 @@ fn addAppIcon(b: *std.Build, exe: *std.Build.Step.Compile) void {
 ///   zig-out/portal-x86_64-windows/   the desktop
 ///   zig-out/portal-aarch64-windows/  the Snapdragon X laptop and the Surface
 /// Each holds portal.exe, portalctl.exe, portal-show.exe, README.txt
-/// (docs/package-readme.txt) and the bundled font's licence. No DLLs: the
+/// (docs/package-readme.txt). No DLLs: the
 /// tunnel is the WireGuard app's own, Vulkan comes with the GPU driver.
 /// src/tools/pecheck.zig checks every exe's PE machine and subsystem and
 /// writes zig-out/portal-<arch>-windows-check.txt.
@@ -272,7 +272,6 @@ fn addPackage(b: *std.Build, test_step: *std.Build.Step) void {
         _ = wf.addCopyFile(ctl.getEmittedBin(), "portalctl.exe");
         _ = wf.addCopyFile(show.getEmittedBin(), "portal-show.exe");
         _ = wf.add("README.txt", b.fmt("Portal for {t} Windows (ReleaseSafe)\r\n\r\n{s}", .{ arch, crlf(b, @embedFile("docs/package-readme.txt")) }));
-        _ = wf.addCopyFile(b.path("src/web/fonts/LICENSE.txt"), "licenses/DejaVu-fonts-LICENSE.txt");
 
         const check = b.addRunArtifact(pecheck);
         check.addArg(@tagName(arch));

@@ -1,8 +1,8 @@
 //! The instruction line (`instruct` mode, the server's
-//! default): a one-line field in the instruct panel, the counterpart of the
-//! browser's input box. What Enter does with the text, the answer words and
-//! the refusal texts are the shared logic (module "inputrules",
-//! src/inputrules/send.zig), so both clients behave the same:
+//! default): a one-line field in the instruct panel. What Enter does with
+//! the text, the answer words and the refusal texts are the shared logic
+//! (module "inputrules", src/inputrules/send.zig), so every client behaves
+//! the same:
 //!
 //!   * Enter: an answer word ("yes", "two", "esc") presses that key; any
 //!     other text is checked with the server's rules and sent as an
@@ -61,7 +61,7 @@ pub const Line = struct {
     /// The note for what Enter would do now (or the help on an empty line).
     fn preview(l: *Line) void {
         var buf: [192]u8 = undefined;
-        const n = rules.preview(l.policy, l.field.text(), .native, &buf);
+        const n = rules.preview(l.policy, l.field.text(), &buf);
         l.setNote(n.text, n.tone);
     }
 
