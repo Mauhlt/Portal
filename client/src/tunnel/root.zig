@@ -208,13 +208,14 @@ pub const Tunnel = struct {
         const cidrs = b.cidrs;
         const configs = b.configs;
         for (peers, 0..) |p, i| {
-            var op: OwnedPeer = .{ .peer = p };
+            t.peers.appendAssumeCapacity(.{ .peer = p });
+            // The copy of the endpoint lives in the list's own element.
+            const op = &t.peers.items[t.peers.items.len - 1];
             if (p.endpoint) |e| {
                 if (e.len > op.endpoint_buf.len) return error.InvalidEndpoint;
                 @memcpy(op.endpoint_buf[0..e.len], e);
                 op.peer.endpoint = op.endpoint_buf[0..e.len];
             }
-            t.peers.appendAssumeCapacity(op);
             cidrs[i] = .{ .addr = .{ .v4 = p.address }, .prefix = 32 };
         }
         for (t.peers.items, 0..) |*op, i| {

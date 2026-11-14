@@ -432,6 +432,10 @@ pub const PairingInfo = struct {
     }
 };
 
+/// In a pairing code while no tunnel endpoint is set (Settings): a valid
+/// name that says what to do, so the device shows it when it fails.
+pub const placeholder_endpoint = "set-the-tunnel-endpoint-in-settings:51820";
+
 /// The CA's SHA-256 (32 bytes), if there is a CA.
 fn caSha256(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) ?[32]u8 {
     const store = tlsStore(gpa, io, env) catch return null;
@@ -447,8 +451,13 @@ fn caSha256(gpa: Allocator, io: Io, env: *const std.process.Environ.Map) ?[32]u8
 /// (its key goes into the running Portal's tunnel at once), and the
 /// pairing code for the device is printed. Nothing crosses the network.
 fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
-    const usage_pair = "usage: portalctl pair <name> <the device's WireGuard public key, as `portal connect` shows it>";
-    if (args.len != 2) fatal(usage_pair, .{});
+    const usage_pair = "usage: portalctl pair <name> <the device's WireGuard public key, as `portal connect` shows it> [--endpoint HOST:PORT]";
+    if (args.len != 2 and args.len != 4) fatal(usage_pair, .{});
+    var endpoint_arg: ?[]const u8 = null;
+    if (args.len == 4) {
+        if (!std.mem.eql(u8, args[2], "--endpoint") or !gui.validEndpoint(args[3])) fatal(usage_pair, .{});
+        endpoint_arg = args[3];
+    }
     const name = args[0];
     if (!devices.validName(name)) fatal("device name must be 1-32 characters of a-z, 0-9 and -", .{});
     const key = tunneldesk.tunnel.keys.parsePublic(args[1]) orelse fatal("'{s}' is not a WireGuard public key (44 characters ending in =, as the device shows it)", .{args[1]});
@@ -479,7 +488,7 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     pairLog(gpa, paths, io, "device '{s}' paired at the desk as {s} (key check code {s})", .{ name, paired.device.ipText(&ib), &check });
 
     const saved = settings.load(gpa, io, paths.dir);
-    const endpoint = saved.tunnel_endpoint.get() orelse "<this desktop's public address or DNS name>:51820";
+    const endpoint = endpoint_arg orelse saved.tunnel_endpoint.get() orelse placeholder_endpoint;
     const info = PairingInfo.make(&desk_public, endpoint, ca, &paired.device) catch fatal("the tunnel endpoint in Settings is too long", .{});
     std.debug.print(
         \\Paired '{s}' as {s}.
@@ -489,7 +498,7 @@ fn cmdPair(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
         \\The device then shows this desktop's key check code: it must be {s}.
         \\
     , .{ name, paired.device.ipText(&ib), info.code(), &info.desk_check });
-    if (saved.tunnel_endpoint.get() == null)
+    if (endpoint_arg == null and saved.tunnel_endpoint.get() == null)
         std.debug.print("Note: set the tunnel endpoint in the Portal window's Settings first (where devices reach this desktop's UDP {d}); the code above has a placeholder.\n", .{saved.tunnelPort()});
 }
 
@@ -718,9 +727,25 @@ const StoreWatch = struct {
     io: Io,
     gpa: Allocator,
 
-    /// The server's and the tunnel's view of `st`.
+    /// The paired devices as last applied (to see which went).
+    last: devices.Store = .{},
+
+    /// The server's and the tunnel's view of `st`. Devices that went get
+    /// their `logout` first (the server's writers send it at once); only
+    /// then, or after a few seconds, do their keys leave the tunnel.
     fn apply(sw: *StoreWatch, st: *const devices.Store) void {
+        var gone: [devices.max_devices]tunnelnet.Ip4 = undefined;
+        var n_gone: usize = 0;
+        for (sw.last.devices) |slot| if (slot) |d| {
+            const still = if (st.findIp(d.ip)) |i| std.mem.eql(u8, &st.devices[i].?.key, &d.key) else false;
+            if (!still) {
+                gone[n_gone] = d.ip;
+                n_gone += 1;
+            }
+        };
+        sw.last = st.*;
         sw.srv.applyStore(st);
+        if (n_gone > 0) sw.srv.awaitGone(gone[0..n_gone], 3000);
         var peers: [devices.max_devices]tunneldesk.tunnel.Peer = undefined;
         sw.tun.setPeers(tunneldesk.peersFrom(st, &peers)) catch |err|
             sw.srv.log.print("ERROR: the tunnel's peer table could not be updated ({t}); device changes take effect after a restart", .{err});
@@ -1503,6 +1528,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     var store_watch: StoreWatch = .{
         .srv = &server,
         .tun = prep.tun,
+        .last = prep.store,
         // Unpair from `portalctl` must end connections: no watch, no run.
         .dw = devices.watchStore(gpa, paths) catch |err|
             fatal("cannot watch {s} for changes ({t}); Portal needs it to notice pairing and unpairing", .{ paths.dir, err }),
@@ -1666,7 +1692,7 @@ test {
     _ = @import("deskui.zig");
     _ = @import("keymap.zig");
     _ = @import("guard.zig");
-    _ = @import("netlisten.zig");
+    _ = @import("tunneldesk.zig");
     _ = @import("cmdline.zig");
     _ = @import("childenv.zig");
     _ = @import("console.zig");

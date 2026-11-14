@@ -34,6 +34,8 @@ pub const Socket = struct {
     buf: std.ArrayList(u8) = .empty,
     /// The frame last returned by `next` (dropped by the next call).
     used: usize = 0,
+    /// A bulk reply's signature, copied out of the frame buffer.
+    sig_buf: [bulk.max_header]u8 = undefined,
 
     /// Dials through `dialer` (its priority: the bulk channel dials as
     /// bulk), completes TLS and the upgrade to `channel`. `stop` is the
@@ -117,7 +119,7 @@ pub const Socket = struct {
     pub fn request(s: *Socket, req: bulk.Request, ctx: anytype, comptime sink: fn (@TypeOf(ctx), []const u8) anyerror!void) !bulk.Reply {
         var rb: [bulk.max_header]u8 = undefined;
         try s.send(.text, try bulk.formatRequest(&rb, req));
-        const header: bulk.Reply = while (true) {
+        var header: bulk.Reply = while (true) {
             const f = (try s.next(bulk.max_header)) orelse return error.ConnectionClosed;
             switch (f.opcode) {
                 .text => break bulk.parseReply(f.payload) orelse return error.BadReply,
@@ -126,6 +128,14 @@ pub const Socket = struct {
                 else => return error.BadReply,
             }
         };
+        // The frame buffer moves on with the body: keep the signature.
+        switch (header) {
+            .ok => |*o| if (o.sig) |sig| {
+                @memcpy(s.sig_buf[0..sig.len], sig);
+                o.sig = s.sig_buf[0..sig.len];
+            },
+            .err => {},
+        }
         const len = switch (header) {
             .ok => |o| o.len,
             .err => return header,

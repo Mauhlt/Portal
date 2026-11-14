@@ -6,8 +6,7 @@
 //!            image blob and placement parsing, client-side image limits
 //!   ws       WebSocket (RFC 6455) framing in both directions, handshake
 //!            key and accept values
-//!   http     HTTP/1.1 syntax checks (head end, tokens, field values) and
-//!            Portal's cookie names
+//!   http     HTTP/1.1 syntax checks (head end, tokens, field values)
 //!   pki      DER reader/writer, X.509 reading, PEM, SHA-256 fingerprints
 //!   tabs     project tabs (protocol v2): session ids, the session list in
 //!            hello/tabs, tab colours, program state

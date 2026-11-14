@@ -31,8 +31,14 @@ pub const Code = struct {
     desk_key: tunnel.Key,
     ca_sha256: [32]u8,
     device_ip: tunnelnet.Ip4,
-    /// "host:port" (in text_buf).
-    endpoint: []const u8,
+    /// "host:port": where in text_buf (the struct is copied by value, so no
+    /// slice into itself).
+    endpoint_at: usize = 0,
+    endpoint_len: usize = 0,
+
+    pub fn endpoint(c: *const Code) []const u8 {
+        return c.text_buf[c.endpoint_at..][0..c.endpoint_len];
+    }
 
     pub fn text(c: *const Code) []const u8 {
         return c.text_buf[0..c.text_len];
@@ -46,7 +52,7 @@ pub const Code = struct {
     /// The endpoint is on this machine (tests): bind the UDP socket to
     /// loopback only.
     pub fn loopback(c: *const Code) bool {
-        const e = wg.device.config.Endpoint.parse(c.endpoint) catch return false;
+        const e = wg.device.config.Endpoint.parse(c.endpoint()) catch return false;
         return std.mem.eql(u8, e.host, "127.0.0.1") or std.mem.eql(u8, e.host, "::1");
     }
 };
@@ -56,7 +62,7 @@ pub const ParseError = error{ NotPortal, UnsupportedVersion, Malformed, NoTunnel
 /// Parses and checks a pairing code as typed, pasted or scanned. The
 /// fixed start ("portal-pair 2 10.8.0.1:8420") may be left out when typing.
 pub fn parse(input: []const u8) ParseError!Code {
-    var c: Code = .{ .desk_key = undefined, .ca_sha256 = undefined, .device_ip = undefined, .endpoint = "" };
+    var c: Code = .{ .desk_key = undefined, .ca_sha256 = undefined, .device_ip = undefined };
     const t = std.mem.trim(u8, input, " \t\r\n");
     const full = if (std.mem.startsWith(u8, t, pairqr.prefix))
         std.fmt.bufPrint(&c.text_buf, "{s}", .{t})
@@ -69,7 +75,8 @@ pub fn parse(input: []const u8) ParseError!Code {
     c.ca_sha256 = pairqr.parseFingerprint(p.ca_sha256) orelse return error.BadFingerprint;
     c.desk_key = wg.device.keys.decode(tn.desk_key) catch return error.BadDeskKey;
     _ = wg.device.config.Endpoint.parse(tn.endpoint) catch return error.BadEndpoint;
-    c.endpoint = tn.endpoint;
+    c.endpoint_at = @intFromPtr(tn.endpoint.ptr) - @intFromPtr(&c.text_buf);
+    c.endpoint_len = tn.endpoint.len;
     c.device_ip = tunnelnet.parseIp(tn.device_ip) orelse return error.BadAddress;
     if (!tunnelnet.isDeviceIp(c.device_ip)) return error.BadAddress;
     return c;
@@ -129,7 +136,7 @@ pub fn startTunnel(gpa: std.mem.Allocator, io: Io, c: *const Code, key: *const t
         .peers = &.{.{
             .public_key = c.desk_key,
             .address = tunnelnet.desk_ip,
-            .endpoint = c.endpoint,
+            .endpoint = c.endpoint(),
             .persistent_keepalive = tunnelnet.persistent_keepalive_s,
         }},
     });
@@ -163,7 +170,7 @@ test "pairing codes: full, typed without the fixed start, and refused ones" {
     const fp = "00070E151C232A31383F464D545B626970777E858C939AA1A8AFB6BDC4CBD2D9";
     const c = try parse("portal-pair 2 10.8.0.1:8420 " ++ fp ++ " home.example.org:51820 " ++ key ++ " 10.8.0.2\r\n");
     try testing.expectEqual(tunnelnet.Ip4{ 10, 8, 0, 2 }, c.device_ip);
-    try testing.expectEqualStrings("home.example.org:51820", c.endpoint);
+    try testing.expectEqualStrings("home.example.org:51820", c.endpoint());
     try testing.expect(!c.loopback());
     const short = try parse(fp ++ " 127.0.0.1:51999 " ++ key ++ " 10.8.0.3");
     try testing.expect(short.loopback());

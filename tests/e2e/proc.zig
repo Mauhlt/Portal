@@ -19,6 +19,9 @@ const w = @import("win.zig");
 const net = @import("net.zig");
 const http = @import("http.zig");
 const tlsnet = @import("tlsnet.zig");
+const Link = @import("link.zig").Link;
+const client_mod = @import("client");
+const tunnelnet = @import("shared").tunnelnet;
 
 pub const Harness = struct {
     gpa: Allocator,
@@ -430,93 +433,117 @@ pub const LiveCli = struct {
 
 pub const Instance = struct {
     h: *Harness,
-    port: u16,
+    /// The desk's tunnel UDP port on 127.0.0.1 (the group's port).
+    udp_port: u16,
+    /// The forwarder port of the device most recently paired (`pair`):
+    /// what http.zig / ws.zig connect to.
+    port: u16 = 0,
     /// LOCALAPPDATA of the instance; Portal keeps its files in <this>\Portal.
     data_dir: []const u8,
     process: ?w.HANDLE = null,
-    host_buf: [32]u8 = undefined,
-    origin_buf: [40]u8 = undefined,
-    host: []const u8 = "",
-    origin: []const u8 = "",
-    /// Set by startTls: HTTPS/WSS trusting only this instance's exported CA.
+    /// The Host every device sends: Portal's address inside the tunnel.
+    host: []const u8 = tunnelnet.desk_server,
+    /// No browser any more: nothing sends an Origin.
+    origin: ?[]const u8 = null,
+    /// TLS trusting only this instance's CA (exported once it exists).
     tls: ?*tlsnet.Trust = null,
-    /// startTls: where `portal ca export` wrote the CA files.
     ca_dir: []const u8 = "",
+    /// The devices paired with this desk, in this process (link.zig).
+    links: std.ArrayList(*Link) = .empty,
 
-    /// Starts `portalctl run --console --listen 127.0.0.1:<port> <run_args...>`
-    /// and waits until it answers HTTP.
+    /// Starts `portalctl run --console` with its tunnel on 127.0.0.1:<port>
+    /// (UDP) and waits until the desk has its key and CA; then trusts that
+    /// CA. Devices are paired with `pair`.
     pub fn start(h: *Harness, data_dir: []const u8, port: u16, run_args: []const []const u8) !*Instance {
         const inst = try h.gpa.create(Instance);
-        inst.* = .{ .h = h, .port = port, .data_dir = data_dir };
-        inst.host = try std.fmt.bufPrint(&inst.host_buf, "127.0.0.1:{d}", .{port});
-        inst.origin = try std.fmt.bufPrint(&inst.origin_buf, "http://127.0.0.1:{d}", .{port});
+        inst.* = .{ .h = h, .udp_port = port, .data_dir = data_dir };
+        var pb: [8]u8 = undefined;
+        const port_text = try std.fmt.bufPrint(&pb, "{d}", .{port});
+        var eb: [32]u8 = undefined;
+        const endpoint = try std.fmt.bufPrint(&eb, "127.0.0.1:{d}", .{port});
 
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(h.gpa);
         // --console: the e2e suite tests the server, not the GUI window.
-        // --no-tls: the harness speaks plain HTTP (TLS has its own tests).
-        try argv.appendSlice(h.gpa, &.{ "run", "--console", "--no-tls", "--listen", inst.host });
+        // --tunnel-loopback: the desk's UDP socket on 127.0.0.1 only.
+        try argv.appendSlice(h.gpa, &.{ "run", "--console", "--tunnel-loopback", "--tunnel-port", port_text, "--tunnel-endpoint", endpoint });
         try argv.appendSlice(h.gpa, run_args);
         const pi = try spawn(h, argv.items, data_dir, .console);
         inst.process = pi.hProcess;
         h.track(inst);
 
-        const deadline = net.now() + 15_000;
-        while (net.now() < deadline) {
-            if (!inst.alive()) return error.PortalExited;
-            if (http.request(h.gpa, port, .{ .path = "/pair", .host = inst.host })) |r| {
-                var resp = r;
-                defer resp.deinit();
-                if (resp.status == 200) return inst;
-            } else |_| {}
-            net.sleep(100);
-        }
-        return error.PortalDidNotStart;
-    }
-
-    /// Like `start`, but with TLS on (Portal's default: no `--no-tls`).
-    /// Once the port listens (the CA exists by then), exports the CA with
-    /// `portal ca export --out <data_dir>\ca-export` and trusts only that
-    /// for every request made through this instance; waits until
-    /// GET /pair answers 200 over HTTPS.
-    pub fn startTls(h: *Harness, data_dir: []const u8, port: u16, run_args: []const []const u8) !*Instance {
-        const inst = try h.gpa.create(Instance);
-        inst.* = .{ .h = h, .port = port, .data_dir = data_dir };
-        inst.host = try std.fmt.bufPrint(&inst.host_buf, "127.0.0.1:{d}", .{port});
-        inst.origin = try std.fmt.bufPrint(&inst.origin_buf, "https://127.0.0.1:{d}", .{port});
-
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(h.gpa);
-        try argv.appendSlice(h.gpa, &.{ "run", "--console", "--listen", inst.host });
-        try argv.appendSlice(h.gpa, run_args);
-        const pi = try spawn(h, argv.items, data_dir, .console);
-        inst.process = pi.hProcess;
-        h.track(inst);
-
+        // The CA exists once the desk serves: export it and trust only it.
+        inst.ca_dir = try std.fmt.allocPrint(h.gpa, "{s}\\ca-export", .{data_dir});
         const deadline = net.now() + 20_000;
         while (true) : (net.sleep(100)) {
             if (!inst.alive()) return error.PortalExited;
             if (net.now() >= deadline) return error.PortalDidNotStart;
-            var s = net.Socket.connect(port, .{}) catch continue;
-            s.close();
-            break;
-        }
-        inst.ca_dir = try std.fmt.allocPrint(h.gpa, "{s}\\ca-export", .{data_dir});
-        const ex = try runCli(h, data_dir, &.{ "ca", "export", "--out", inst.ca_dir });
-        if (ex.code != 0) {
-            std.debug.print("portal ca export failed:\n{s}\n", .{ex.out});
-            return error.CaExportFailed;
+            if (!inst.logHas("start: v")) continue;
+            const ex = runCli(h, data_dir, &.{ "ca", "export", "--out", inst.ca_dir }) catch continue;
+            if (ex.code == 0) break;
         }
         const pem = try std.fmt.allocPrint(h.gpa, "{s}\\portal-ca.pem", .{inst.ca_dir});
         defer h.gpa.free(pem);
         inst.tls = try tlsnet.Trust.load(h.gpa, h.io, pem);
-        while (net.now() < deadline) : (net.sleep(100)) {
-            if (!inst.alive()) return error.PortalExited;
-            var resp = http.request(h.gpa, port, .{ .path = "/pair", .host = inst.host, .tls = inst.tls }) catch continue;
-            defer resp.deinit();
-            if (resp.status == 200) return inst;
+        return inst;
+    }
+
+    /// The same as `start` (TLS is always on).
+    pub const startTls = start;
+
+    /// Pairs a new in-process device called `name`, exactly as the owner
+    /// does: `portalctl pair <name> <its key>`, compare the check code
+    /// (here: the one this device computes), answer y, then bring its
+    /// tunnel up with the pairing code printed. `inst.port` then points at
+    /// it. Returns its link.
+    pub fn pair(inst: *Instance, name: []const u8) !*Link {
+        const h = inst.h;
+        var key = client_mod.tunnel.keys.KeyPair.generate(h.io);
+        defer key.wipe();
+        const key_text = key.publicText();
+        var eb: [32]u8 = undefined;
+        const endpoint = try std.fmt.bufPrint(&eb, "127.0.0.1:{d}", .{inst.udp_port});
+        const c = try LiveCli.start(h, inst.data_dir, &.{ "pair", name, &key_text, "--endpoint", endpoint });
+        defer c.deinit();
+        if (!c.waitFor("Pair it? [y/N]", 15_000)) return error.PairPromptMissing;
+        // The desk shows this key's check code: the device's must match.
+        if (!c.has(&key.checkCode())) return error.CheckCodeMismatch;
+        c.answer("y\r\n");
+        if (!c.waitFor("portal-pair 2 ", 15_000)) {
+            std.debug.print("---- portalctl pair said:\n{s}\n----\n", .{c.output()});
+            return error.NoPairingCode;
         }
-        return error.PortalDidNotStart;
+        _ = c.wait(10_000);
+        const out = c.output();
+        const at = std.mem.indexOf(u8, out, "portal-pair 2 ").?;
+        const end = std.mem.indexOfAnyPos(u8, out, at, "\r\n") orelse out.len;
+        const l = Link.start(h.gpa, h.io, name, &key, out[at..end]) catch |err| {
+            std.debug.print("---- pairing code [{s}]: {t}\n", .{ out[at..end], err });
+            return err;
+        };
+        try inst.links.append(h.gpa, l);
+        inst.port = l.port;
+        return l;
+    }
+
+    /// A device with a key the desk never approved, holding a copy of a
+    /// real device's pairing code (it knows the desk's key and endpoint):
+    /// its tunnel can never complete a handshake.
+    pub fn stranger(inst: *Instance, like: *const Link) !*Link {
+        var key = client_mod.tunnel.keys.KeyPair.generate(inst.h.io);
+        defer key.wipe();
+        const l = try Link.start(inst.h.gpa, inst.h.io, "stranger", &key, like.code.text());
+        try inst.links.append(inst.h.gpa, l);
+        return l;
+    }
+
+    pub fn link(inst: *Instance, name: []const u8) ?*Link {
+        var i = inst.links.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, inst.links.items[i].name, name)) return inst.links.items[i];
+        }
+        return null;
     }
 
     pub fn alive(inst: *const Instance) bool {

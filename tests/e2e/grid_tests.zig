@@ -6,7 +6,7 @@ const std = @import("std");
 const net = @import("net.zig");
 const proc = @import("proc.zig");
 const client = @import("client.zig");
-const pairing = @import("pairing.zig");
+const pairing = @import("privacy.zig");
 const Runner = @import("runner.zig").Runner;
 
 pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {

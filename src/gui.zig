@@ -604,7 +604,7 @@ pub const LocalHost = struct {
         var ib: [tunnelnet.max_ip_text]u8 = undefined;
         const ip = paired.device.ipText(&ib);
         d.srv.log.print("device '{s}' paired at the desk as {s} (key check code {s})", .{ name, ip, &tunnelnet.checkCode(&k) });
-        const endpoint = d.saved.tunnel_endpoint.get() orelse "<this desktop's public address or DNS name>:51820";
+        const endpoint = d.saved.tunnel_endpoint.get() orelse main.placeholder_endpoint;
         const info = main.PairingInfo.make(&d.desk_public, endpoint, d.ca_sha256, &paired.device) catch
             return h.ui.pairFailed("The tunnel endpoint in Settings is too long.", .{});
         h.ui.paired(ip, info.code(), info.desk_check);

@@ -1,140 +1,81 @@
 # Portal client protocol (v2: project tabs)
 
 Used by every client: the native Zig + Vulkan clients for Windows, Linux,
-macOS and the iPhone. Transport is HTTP/1.1 + WebSocket (RFC 6455)
-over the WireGuard tunnel, inside TLS 1.3 (HTTPS / WSS on the same port).
-The server certificate is issued by the desktop's private Portal CA; clients
-must trust that CA (Export certificate in the Portal window, or `portalctl
-ca export`) or pin it, and must offer TLS 1.3
-with x25519 and ecdsa_secp256r1_sha256 (ALPN, if sent, must include
-`http/1.1`). `portal run --no-tls` (or `portalctl run --console --no-tls`) serves plain HTTP for tests; replace
-`https`/`wss` with `http`/`ws` and drop the `__Host-` cookie names below.
+macOS and the iPhone. Everything goes through Portal's own WireGuard
+tunnel (docs/wireguard.md): the device dials `10.8.0.1:8420` inside it,
+then TLS 1.3, then HTTP/1.1 only far enough to upgrade to a WebSocket (RFC
+6455). The server certificate is issued by the desktop's private Portal
+CA, which the server sends in its chain; clients pin it by the SHA-256 in
+their pairing code and must offer TLS 1.3 with x25519 and
+ecdsa_secp256r1_sha256.
 
-## 1. Pairing and sign-in (no passwords)
+## 1. Pairing: a device is its WireGuard key
 
-Every POST needs `Host` on the server's allowlist and `Origin: https://<that
-host>`, sent exactly; native clients must send both. POST bodies are empty
-(`Content-Length: 0`).
+There is no sign-in, cookie or credential. The tunnel lets in only the
+keys of paired devices, each only from its own address, so the desktop
+knows which device a connection is from its tunnel address alone.
 
-**Pair (once per device), approved at the desk.** The owner chooses Pair a
-device in the Portal window (or runs `portalctl pair <name>`), which opens
-a 2-minute window and asks the owner about every device that requests
-pairing. Nothing is typed on the device. The client sends:
+1. The device generates its WireGuard key pair; the private key never
+   leaves it. It shows the public key (44 base64 characters) and that
+   key's **check code** (`shared/tunnelnet.zig checkCode`: 50 bits of a
+   domain-separated SHA-256, as `ABCDE-FGHJK`).
+2. At the desk the owner enters the device's name and public key (Pair a
+   device, or `portalctl pair <name> <key>`). The desk shows the check
+   code of what was entered; the owner approves only if both screens show
+   the same code. The device is recorded (name, key, a tunnel address,
+   a random id) and its key enters the tunnel's peer table at once.
+3. The desk shows the **pairing code** (`shared/pairqr.zig`, version 2),
+   as text and QR:
 
-```
-POST /pair HTTP/1.1
-Host: 10.8.0.1:8420
-Origin: https://10.8.0.1:8420
-Content-Length: 0
-```
+   ```
+   portal-pair 2 10.8.0.1:8420 <CA SHA-256, 64 hex> <endpoint HOST:PORT> <desk public key> <device address>
+   ```
 
-* Request registered: `303`, `Location: /pair/wait`, with
-  `Set-Cookie: __Host-portal_pairreq=<43 chars>; Path=/; HttpOnly; SameSite=Strict; Max-Age=600; Secure`,
-  the request token. No credential yet.
-* No window open, or the window already approved a device: `303` to `/pair?e=closed`.
-* Too many pending requests (8 per window, 2 per address): `303` to `/pair?e=busy`.
-* This address was denied in this window: `303` to `/pair?e=denied`.
+   The device brings its tunnel up (the desk as its only peer, allowed
+   only `10.8.0.1`, keepalive 25 s), shows the desk key's check code for
+   the owner to compare with the desk, and connects. On that first TLS
+   handshake it accepts the CA in the server's chain only if its SHA-256 is
+   the one in the code, then pins it. Then it pins the release key
+   (section 7).
 
-Then wait for the answer, from the same source address and with the
-request cookie. `GET /pair/wait` is a long poll:
+Nothing crosses the network before the device's key is in the peer table.
+Every value in the code is public; its authenticity is the owner carrying
+it from the desk's screen and comparing the check code.
 
-```
-GET /pair/wait HTTP/1.1
-Cookie: __Host-portal_pairreq=<43 chars>
-```
+**Re-pairing** a name, or a key, already in use removes the old record
+outright: its connections end with `logout` (reason `replaced`) and its
+key leaves the tunnel; nothing of it is kept.
 
-* Waiting for the desk: `200`, an HTML page showing the 4-hex-digit
-  request code that the desk also shows. The same code is in the header
-  `X-Portal-Request-Code: 7f3a`, for native clients, which read only the
-  response head. Show the code to the user.
-  The first `GET /pair/wait` for a request token is answered at once.
-  Every later one, while the request is still pending, is **held** by
-  the server until the pairing window changes (a request answered, the
-  window closed, replaced or expired, its `portalctl pair` gone) or 25 s
-  pass, and is then answered exactly as described here (the same waiting
-  page if still pending). Clients re-ask immediately after each answer:
-  there is no poll interval. Allow at least 30 s for the response; back
-  off only on network errors, and give up when the request's 10-minute
-  lifetime is over. Browsers do the same without script: the waiting
-  page has `<meta http-equiv="refresh" content="0">`, and the browser
-  keeps showing it while the held reload is pending.
-* Approved: `303`, `Location: /`, with three `Set-Cookie` headers:
-  * `__Host-portal_device=<name>.<43 chars>; Path=/; HttpOnly; SameSite=Strict; Max-Age=7776000; Secure`
-    is the device credential;
-  * `__Host-portal=<43 chars>; ...; Secure` is a session;
-  * the request cookie, cleared (`Max-Age=0`).
-  This happens once; the request is then used up.
-* Denied: `303` to `/pair?e=denied`. Expired, unknown, used, or asked from
-  another address: `303` to `/pair?e=expired`. Both clear the request cookie.
-* With `--no-tls` the names are `portal_device` / `portal_session` /
-  `portal_pairreq`, without `Secure`.
+**Forget, from the device**: the text message `f:` on the interactive
+WebSocket. The desktop removes that record (only it: a newer pairing under
+the name stays), answers `{"t":"forgotten"}` and closes the connection;
+the device then forgets the desktop (pairing code, CA pin, release-key
+pin, sync folder). If the desktop can't be reached, the device forgets it
+locally and says the desktop still lists it until the owner unpairs it.
 
-**Sign in (every launch or reconnect).** Present the device credential:
-
-* Browsers: `GET /` with the device cookie. Returns `303 /` with a
-  rotated device cookie and a new session.
-* Native clients: `POST /auth/refresh` with the device cookie.
-  Returns `204` with the same two `Set-Cookie` headers, or `401` if the
-  device is unknown or revoked. A `401` that also carries
-  **`X-Portal-Device: gone`** means, unambiguously, that this desktop no
-  longer has the device: it was unpaired at the desk (`portalctl unpair`,
-  the Devices panel), forgot itself (`POST /device/forget`), was replaced
-  by a re-pair, was revoked by theft detection, or presented a credential
-  that matches no record. The device then **forgets this desktop** (its
-  credential, CA pin, release-key pin and sync folder) and says why. Any
-  other answer (a `401` without the header, a `5xx`, no answer) is never
-  a reason to forget anything.
-
-The device secret **rotates on every sign-in**, so clients must replace the
-stored value immediately. Each superseded value stays valid for 10 minutes
-from the sign-in that replaced it (the last 4 are remembered), which
-survives a lost response and several tabs signing in at once; that window
-is never extended. Presenting anything older or wrong revokes the device
-(theft detection), and re-pairing is then required. A removed record's
-secrets are remembered (as hashes, up to 32, for 90 days after its last
-use): presenting one gets `X-Portal-Device: gone` and touches nothing, so
-an old device cannot revoke a newer pairing under its name. Credentials
-are bound to the device's source (WireGuard) address; a known credential
-presented from another address gets `303 /pair`, or a `401` *without*
-the gone header (it is not removed).
-Native clients store the device credential only in the OS credential
-store and keep the session in memory.
-
-**Re-pairing** a name (or an address) already in use removes the old
-record outright and ends every one of its sessions (WebSockets, input,
-`/sync`) before the new credential is issued; nothing of it is kept.
-
-`POST /device/forget` (Origin required, the session cookie; the device
-is taken from the session, never from the request): the device's "Forget
-this desktop". The desktop removes the record, ends all its sessions
-(open WebSockets get `logout` with reason `unpaired`), logs it and
-refreshes the desk's Devices panel. `204` (with `X-Portal-Device: gone`)
-when done; `401` without a live session (sign in first; that answer may
-already be `gone`); `500` if the device store is unavailable (nothing
-was removed). Clients call it first and then forget locally whatever the
-answer; if the desktop can't be reached they say that it still lists the
-device until it next sees it (and answers `gone`) or the owner unpairs it.
-
-`POST /logout` unpairs this device and ends its sessions. It uses the
-session cookie, or, if the session has expired, the device credential
-(checked like a sign-in). Success: `303 /pair?bye`; nothing to unpair:
-`303 /pair`.
+**Unpair, at the desk**: open connections get
+`{"t":"logout","reason":"unpaired"}` (the desk waits for them, a few
+seconds at most, before the key leaves the tunnel); the device then
+forgets the desktop. A device offline at that moment only finds the
+desktop unreachable afterwards.
 
 ## 2. Open the stream
 
 ```
 GET /ws HTTP/1.1
 Host: 10.8.0.1:8420
-Origin: https://10.8.0.1:8420
-Cookie: __Host-portal=<value>
 Upgrade: websocket
 Connection: Upgrade
 Sec-WebSocket-Key: <base64 of 16 random bytes>
 Sec-WebSocket-Version: 13
 ```
 
-`101 Switching Protocols` on success; `401` means sign in again. Client
-frames must be masked; no fragmentation; no extensions.
+`101 Switching Protocols` on success; `403` means this desktop no longer
+has the device (forget it). `GET /ws/bulk` opens the bulk channel
+(section 7) the same way. Every other request is a `404` and the
+connection closes. Client frames must be masked; no fragmentation; no
+extensions. The interactive connection is dialed with the transport's
+`.interactive` priority, the bulk one with `.bulk`.
 
 ## 3. Server → client
 
@@ -149,7 +90,8 @@ frames must be masked; no fragmentation; no extensions.
 | `ended` | `id`, `code` | the tab shown ended (its program exited with `code`) while other tabs go on; it is already gone from the list (`tabs` came first). Input to it is dropped; the client picks another tab |
 | `state` | `state`: `"working"`, `"waiting"` or `"done"` | **not sent**: the per-tab state is the `state` field of each session in `hello` / `tabs` |
 | `exit` | `code` | the last tab's program exited (every tab has ended): Portal stops; stream ends |
-| `logout` | `reason` (optional): `"unpaired"` or `"replaced"` | the session ended. `"unpaired"`: the desktop removed this device (unpaired at the desk, forgotten, revoked): forget this desktop now. `"replaced"`: a re-pair under its name or address replaced it: sign in again, whose answer (`X-Portal-Device: gone` or not) decides. No reason (expired, logged out): sign in again |
+| `logout` | `reason`: `"unpaired"` or `"replaced"` | this desktop no longer lets the device's key in: unpaired at the desk (`"unpaired"`), or its name was paired again under another key (`"replaced"`). Forget this desktop. |
+| `forgotten` | (none) | the answer to `f:` (Forget this desktop): the record is gone |
 | `updates` | | Portal sync: this device's package index changed (a publish, or a subscription changed at the desk). Fetch `GET /sync/index` (section 7). Devices also look on every connect |
 | `rejected` | `reason` | an `l:` instruction line was refused (e.g. `ShellEscape`, `SlashCommand`, `MemoryShortcut`, `ControlCharacter`, `TooLong`, `Empty`), or a `k:up` / `k:down` in `instruct` mode while the program was not waiting for an answer (`NotWaiting`, section 4); nothing was typed |
 | `convo` | `id`, `on`, `items` | the whole Conversation view of the tab watched (section 3b): after `hello` and every `session`, and whenever the server starts the conversation over. Replaces what the client had |
@@ -593,6 +535,7 @@ passed, so the program can't read the pair as Alt+key.
 | `s:<id>` | watch the open tab `id` (32 hex digits; in every input mode, `none` included). Input sent after it goes to that tab. Answered by `session` (and a snapshot) or, for anything that is not an open tab, `nosession`; rejected ids are logged at the desk, rate limited, never echoed |
 | `a:<sub id>`, `a:` | show that sub-tab of the tab watched (read-only), or the tab's own conversation again (section 3e; every input mode). While a sub-tab is shown, `k:`, `t:` and `l:` are dropped |
 | `y:on`, `y:off` | this viewer's System panel opened / closed (section 3d; every input mode: it is read-only). While the desk's "Show system monitor" is off, `y:on` is ignored and logged at the desk. Closing the connection counts as `y:off` |
+| `f:` | Forget this desktop (section 1): the desktop removes this device's record, answers `forgotten` and closes the connection (every input mode) |
 
 `k:`, `t:` and `l:` go to the tab the viewer last chose with `s:` (at
 first, the tab in `hello.session`); while that tab has ended or the last
@@ -669,24 +612,33 @@ Shift+Tab is `shift-tab`.
 
 ## 7. Portal sync (signed packages for paired devices)
 
-The design and the rules are in [sync-design.md](sync-design.md). Every
-route is `GET`, needs the session cookie (`401` without a live one), and
-serves only the session's own device: packages it is not subscribed to,
-and anything unknown, answer `404`. Responses carry `Content-Length`;
-connection timeouts, slot limits and rate limits are the usual ones.
+The design and the rules are in [sync-design.md](sync-design.md). Sync
+runs on the **bulk WebSocket** (`GET /ws/bulk`), its own connection with
+the transport's bulk priority, so a large download never delays a
+keystroke on the interactive one (`shared/bulk.zig`, the one codec for
+both ends). One request at a time; each is answered in full:
 
-| route | body |
+* client: a text message `get key` | `get index` |
+  `get manifest <id> <version>` | `get file <id> <version> <n>`;
+* server: a text message `ok <len> [<signature hex>]`, then the body in
+  binary messages of at most 16 KiB, exactly `<len>` bytes in all; or
+  `err <code>` (`404`: unknown or not subscribed, they look the same;
+  `500`: the store is unavailable; `400`: malformed).
+
+Only the connection's own device is served (the device is its tunnel
+address). The bodies are unchanged:
+
+| request | body |
 |---|---|
-| `GET /sync/key` | `portal-sync-key-v1\n<64 hex>\n`: the desktop's Ed25519 release public key; header `x-portal-sync-key-fingerprint: AB:CD:...` (SHA-256 of the 32-byte key) |
-| `GET /sync/index` | `portal-sync-index-v1\n`, then one line per subscribed package that has a published version, `pkg <id> <version> <sequence> <data\|executable> <total size> <manifest sha256 hex>\n`, then `end\n` |
-| `GET /sync/pkg/<id>/<version>/manifest` | the canonical manifest bytes; header `x-portal-signature: <128 hex>`, Ed25519 over exactly those bytes |
-| `GET /sync/pkg/<id>/<version>/file/<n>` | file `n` (0-based, in manifest order, decimal without leading zeros) as `application/octet-stream`, exactly the manifest's size, streamed |
+| `get key` | `portal-sync-key-v1\n<64 hex>\n`: the desktop's Ed25519 release public key |
+| `get index` | `portal-sync-index-v1\n`, then one line per subscribed package that has a published version, `pkg <id> <version> <sequence> <data\|executable> <total size> <manifest sha256 hex>\n`, then `end\n` |
+| `get manifest <id> <version>` | the canonical manifest bytes; the reply header carries the Ed25519 signature over exactly those bytes |
+| `get file <id> <version> <n>` | file `n` (0-based, in manifest order, decimal without leading zeros), exactly the manifest's size, streamed |
 
-**Pinning.** Right after pairing (the `/pair/wait` that returns the
-credential), the device asks `GET /sync/key` with its new session, over the
-CA-pinned TLS connection, and pins the key for that server next to the CA
-pin (`<host>.sync-key` in the per-user config folder). A different key
-later is refused; only pairing again replaces the pin.
+**Pinning.** On its first connection after pairing (once the CA is pinned
+by the SHA-256 in the pairing code), the device asks `get key` and pins
+the key for that desktop next to the CA pin. A different key later is
+refused; only pairing again replaces the pin.
 
 **Device rules.** The index is advisory. For each line the device fetches
 the manifest, checks its SHA-256 against the line, verifies the signature

@@ -15,20 +15,18 @@ const client = @import("client.zig");
 const Runner = @import("runner.zig").Runner;
 const native = @import("client");
 const nc = native.net_client;
-const nhttp = native.net_http;
 
 const ended_child = [_][]const u8{ "--input", "keys", "--", "choice.exe", "/c", "YN" };
 
 const Native = struct {
     shared: nc.Shared = .{},
     c: nc.Client = undefined,
-    session: ?nhttp.Cookie = null,
-    result: nc.Client.StreamResult = .unauthorized,
+    result: nc.Client.StreamResult = .gone,
     done: std.Io.Event = .unset,
 
     fn stream(n: *Native) void {
         var backoff: i64 = 1000;
-        n.result = n.c.runStream(&n.session.?, &backoff);
+        n.result = n.c.runStream(&backoff);
         n.done.set(n.c.io);
     }
 
@@ -65,11 +63,12 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const n = try h.gpa.create(Native);
     defer h.gpa.destroy(n);
     n.* = .{};
-    n.c = try nc.Client.init(h.gpa, h.io, &n.shared, inst.host, .insecure_plain_http);
+    // Its own tunnel (the laptop's link) and the CA pinned from the export.
+    var ca_buf: [native.x509check_mod.max_cert_len]u8 = undefined;
+    const pem = try std.fmt.allocPrint(h.gpa, "{s}\\portal-ca.pem", .{inst.ca_dir});
+    const der = try native.pin.readCaFile(h.io, pem, &ca_buf);
+    n.c = try nc.Client.init(h.gpa, h.io, &n.shared, inst.host, inst.link("laptop").?.tun.dialer(), .{ .pinned = der });
     n.c.quiet = true;
-    const value = sess[(std.mem.indexOfScalar(u8, sess, '=') orelse 0) + 1 ..];
-    n.session = nhttp.Cookie.fromValue(.session, value, false) orelse return error.BadSessionCookie;
-    defer if (n.session) |*s| s.wipe();
     var task = try h.io.concurrent(Native.stream, .{n});
     defer task.cancel(h.io);
     _ = r.check("native client connected", n.waitStatus(.connected, 10_000), "{t}", .{n.status()});
@@ -93,7 +92,7 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     _ = r.check("native client stream ends with the exit code", got_native and n.result == .exited and n.result.exited == 1, "done={} {s}", .{ got_native, @tagName(std.meta.activeTag(n.result)) });
     if (got_native) {
         var backoff: i64 = 10;
-        n.c.streamEnded(n.result, &n.session, &backoff);
+        n.c.streamEnded(n.result, &backoff);
         _ = r.check("native client shows the ended session", n.status() == .session_ended and
             std.mem.eql(u8, n.shared.detail(), "Session ended on the desktop (exit code 1)"), "{t}: {s}", .{ n.status(), n.shared.detail() });
     }
@@ -115,9 +114,9 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     // "Desktop offline" and keeps the ended session's code.
     {
         var backoff: i64 = 10;
-        const r2 = n.c.runStream(&n.session.?, &backoff);
+        const r2 = n.c.runStream(&backoff);
         const unreachable_ = r2 == .unreachable_err;
-        n.c.streamEnded(r2, &n.session, &backoff);
+        n.c.streamEnded(r2, &backoff);
         _ = r.check("native client: desktop offline after Portal exited", unreachable_ and n.status() == .desktop_offline and
             std.mem.eql(u8, n.shared.detail(), nc.offline_text) and n.shared.exit_code == 1, "{s} {t}: {s}", .{ @tagName(std.meta.activeTag(r2)), n.status(), n.shared.detail() });
     }

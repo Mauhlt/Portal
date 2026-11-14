@@ -111,47 +111,43 @@ section 3b.
 
 ## Security layers
 
-1. **Network**: Portal refuses to listen on `0.0.0.0` or any public address.
-   Bind it to your WireGuard interface address. Only devices holding a
-   WireGuard key can reach it; WireGuard encrypts everything.
-2. **Device pairing, approved at the desk, no passwords**: each device is
-   paired once (**Pair a device…** in the Portal window, or `portalctl
-   pair <name>`, opens a 2-minute window). Pairing on the device only
-   creates a *request*; the desk shows it with the device's address and a
-   request code that the device also shows, and only a request you approve
-   gets a credential. Anyone else who reaches the port during the window
-   (another WireGuard peer, the LAN, a local process) can't take the slot:
-   their request just appears at the desk, and you deny it. Nothing is
-   typed on the device. The device gets its own random 256-bit credential,
-   which you never see:
-   * stored only as a SHA-256 hash on the desktop, and in an HttpOnly cookie
-     or the OS credential store on the device;
-   * bound to the device's WireGuard address;
-   * **rotated on every use**. Credentials issued in the last 10 minutes
-     stay valid until their own expiry (so two tabs signing in at once
-     don't lock the device out); if any older one is ever presented again
-     (a copied cookie), the device is revoked and logged, and must be
-     paired again;
-   * revocable any time (**Devices** in the window, or `portalctl unpair
-     <name>`), which also disconnects its open viewers at once.
-3. **HTTPS (TLS 1.3) inside the tunnel**: Portal serves HTTPS itself (a
-   small TLS 1.3 server built on Zig std's crypto: x25519, AES-128-GCM /
-   ChaCha20-Poly1305, ECDSA P-256). Its certificate comes from a private
-   CA created on this desktop. The CA can only vouch for the WireGuard
-   subnet and loopback (X.509 name constraints), and its key is
-   DPAPI-protected (see [HTTPS certificates](#https-certificates)). Cookies
-   are `Secure` and `__Host-` prefixed. `--no-tls` (plain HTTP) exists for
-   tests only.
-4. **Sessions**: random, HttpOnly, SameSite=Strict, in memory only. A paired
-   device silently starts a new one after a Portal restart.
-5. **Browser hardening**: Host allowlist (blocks DNS rebinding), Origin checks
-   on every POST and on the WebSocket upgrade (blocks CSRF and cross-site
-   WebSocket hijacking), strict Content-Security-Policy, no framing.
-6. **Robustness**: Portal parses HTTP and WebSocket itself, strictly, instead
-   of using `std.http` (which had remotely reachable crashes). Every
-   connection has read/idle/send timeouts, and unauthenticated connections
-   are capped per address, so idle or slow connections can't lock out a
-   real viewer.
+1. **One network path: Portal's own WireGuard tunnel, in-process.** Portal
+   runs the owner's Zig WireGuard and a userspace TCP/IP stack inside its
+   own process (no adapter, no driver, no administrator rights). The desk
+   listens only on its WireGuard UDP port (51820 by default); the session
+   is reachable only at 10.8.0.1:8420 *inside* that tunnel. There is no
+   other listener: no LAN or loopback port, no web page.
+2. **A device is its WireGuard key, approved at the desk.** Each device
+   makes its own key (the private half never leaves it: Windows
+   Credential Manager, the macOS Keychain, or a 0600 file on Linux). You
+   enter its public key at the desk (**Pair a device…**, or `portalctl
+   pair <name> <key>`); the desk shows that key's check code
+   (`ABCDE-FGHJK`, 50 bits) and you approve only if the device shows the
+   same code. The desk then shows a pairing code for the device (its own
+   key with its check code, where to reach it, the CA's SHA-256, the
+   device's tunnel address). Only paired keys get into the tunnel, each
+   only from its own address, so the address names the device: there are
+   no cookies, passwords or sign-in. Unpair (**Devices**, or `portalctl
+   unpair <name>`) ends its connections with a `logout` and removes its
+   key at once; a device that forgets the desktop tells it, and its record
+   goes too.
+3. **TLS 1.3 inside the tunnel**, as defence in depth: Portal's own TLS
+   1.3 server (Zig std's crypto: x25519, AES-128-GCM / ChaCha20-Poly1305,
+   ECDSA P-256) with a certificate from a private CA created on this
+   desktop, name-constrained to the tunnel subnet and loopback, its key
+   DPAPI-protected. Devices pin that CA by the SHA-256 in their pairing
+   code, never on first use.
+4. **WebSocket only**: `/ws` (interactive: screen, input, conversation,
+   status) and `/ws/bulk` (sync packages, in 16 KiB chunks, on its own
+   connection with the stream's bulk priority, so a download never delays
+   a keystroke). Every other request is a 404.
+5. **Robustness**: Portal parses HTTP and WebSocket itself, strictly,
+   instead of using `std.http` (which had remotely reachable crashes).
+   Every connection has read/idle/send timeouts and the number of
+   connections is capped.
+6. **Signed packages** (Portal sync): Ed25519-signed manifests, the
+   release key pinned at pairing, no downgrades or replays, executables
+   only after approval on the device.
 7. **Process hygiene**: the child runs in a Windows job object, so if Portal
    dies, the session program and anything it spawned die too, leaving no
    unobserved session. Programs are resolved to absolute paths from PATH
@@ -195,24 +191,25 @@ ReleaseSafe folders: `zig-out/portal-x86_64-windows` (the desktop) and
 Installing and pairing each device, in order:
 [docs/pairing.md](docs/pairing.md).
 
-### 2. WireGuard (free, open source)
+### 2. Portal's tunnel (nothing to install)
 
-See [docs/wireguard.md](docs/wireguard.md) for the full walk-through. In short:
+Portal carries its own WireGuard (the owner's Zig WireGuard, in-process: no
+WireGuard app, adapter, driver or administrator rights). See
+[docs/wireguard.md](docs/wireguard.md). In short:
 
-1. Install WireGuard for Windows on the desktop and the laptop.
-2. Desktop tunnel: `Address = 10.8.0.1/24`, `ListenPort = 51820`, and a
-   `[Peer]` for the laptop with `AllowedIPs = 10.8.0.2/32`.
-3. Laptop tunnel: `Address = 10.8.0.2/24`, and a `[Peer]` for the desktop with
-   `Endpoint = <your home IP or DDNS name>:51820`, `AllowedIPs = 10.8.0.1/32`.
-4. Router: forward **UDP 51820** to the desktop. Nothing else.
+1. Router: forward **UDP 51820** to the desktop. Nothing else.
+2. Firewall: one inbound rule for UDP 51820 (an administrator adds it once;
+   [docs/wireguard.md](docs/wireguard.md), "Firewall").
+3. Settings: **Tunnel endpoint** = where devices reach that port (your
+   public IP or dynamic-DNS name, e.g. `home.example.org:51820`).
+4. Pair each device ([docs/pairing.md](docs/pairing.md)).
 
 ### 3. Run
 
 Double-click `portal.exe` (or type `portal`). The first time, the window
 asks what it should do, in plain text inside the window:
 
-* **Listen address**: `127.0.0.1:8420` (this desktop only) or your
-  WireGuard address, e.g. `10.8.0.1:8420`;
+* **Tunnel UDP port**: Portal's own WireGuard port (default 51820);
 * **Program to run**: the session program and its arguments. There is no
   built-in default;
 * **Project name** (optional, shown in the title) and **Remote input**
@@ -227,9 +224,9 @@ program is not found), the same screen comes back with the reason.
 Command-line options override the saved settings for one run:
 
 ```powershell
-portal run --listen 10.8.0.1:8420 -- agent --some-flag   # --input instruct is the default
+portal run -- agent --some-flag                         # --input instruct is the default
 portal run --cwd C:\code\proj                           # start somewhere else
-portalctl run --console --listen 10.8.0.1:8420 -- agent  # a session in this console instead
+portalctl run --console -- agent                        # a session in this console instead
 ```
 
 Started from a terminal, `portal` returns the prompt at once (it is a GUI
@@ -280,7 +277,7 @@ reach the session):
 | Ctrl+Shift+P | Pair a device… | open a 2-minute pairing window and approve or deny each request |
 | Ctrl+Shift+D | Devices | paired devices with address and last use; Unpair |
 | Ctrl+Shift+E | Export certificate… | write portal-ca.cer / .pem / .mobileconfig to a folder (default `%USERPROFILE%\Downloads\Portal-CA`) |
-| Ctrl+Shift+S | Settings | listen address, program, project, input mode for the next start; system monitor, background art and the agent integration (these apply at once) |
+| Ctrl+Shift+S | Settings | tunnel port and endpoint (with this desktop's tunnel key and its peers), program, project, input mode for the next start; system monitor, background art and the agent integration (these apply at once) |
 
 Panels are keyboard driven: Tab / arrows move, Enter activates, Esc closes.
 
@@ -377,32 +374,19 @@ key cannot impersonate other web sites to a device that trusts it. To
 choose the subnets yourself, do this before the first start:
 `portalctl ca init --permit 10.8.0.0/24 --permit 127.0.0.1/32 [--permit-dns name]`.
 The private keys (`ca.key`, `leaf.key`) are encrypted with Windows DPAPI for
-your account. The server certificate (397 days, IP SAN of the listen
-address) is renewed automatically at startup.
+your account. The server certificate (397 days, IP SAN 10.8.0.1) is renewed automatically at startup.
 
-Trust the CA once on each device: **Export certificate…** in the window
-(or `portalctl ca export [--out DIR]`) writes `portal-ca.cer`, `.pem` and
-`.mobileconfig` and shows the SHA-256.
-
-* **iPhone / iPad**: while pairing is open, open `http://10.8.0.1:8421/` and
-  tap *install profile*, or AirDrop `portal-ca.mobileconfig`. Then
-  Settings > General > VPN & Device Management > the Portal profile >
-  **Install**. Then Settings > General > About > Certificate Trust Settings
-  > **enable full trust** for "Portal Local CA". Check the fingerprint
-  against the one the desk shows: the download page is plain HTTP, so only
-  that comparison proves it is Portal's.
-* **Windows**: double-click `portal-ca.cer` > Install Certificate > Current
-  User > Trusted Root Certification Authorities.
-* **macOS**: open `portal-ca.mobileconfig` (or add the `.cer` in Keychain
-  Access and set it to Always Trust).
-* **Linux / Android**: import `portal-ca.pem` / `portal-ca.cer` as a CA.
-* **Portal on a laptop** pins the CA per server instead (it never trusts on
-  first use). A wrong or replaced certificate is shown in its window
-  ("Cannot verify this Portal"), with the pinned fingerprint.
+Devices need nothing installed: the desk sends its CA with its
+certificate, and a device accepts it only if its SHA-256 is the one in the
+pairing code it was given at the desk; from then on it pins it (it never
+trusts on first use). A wrong or replaced certificate is shown in its
+window ("Cannot verify this Portal"), with the pinned fingerprint.
+**Export certificate…** (or `portalctl ca export [--out DIR]`) still
+writes the CA files if you want to check them elsewhere.
 
 `portalctl ca` shows the CA, its constraints and the server certificate.
 `portalctl ca init --force` replaces the CA, and every device must then
-trust the new one.
+be paired again.
 
 ## Portal sync: packages for your devices
 

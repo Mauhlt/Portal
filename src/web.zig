@@ -349,6 +349,8 @@ pub const Server = struct {
     peers: [devices.max_devices]?Peer = @splat(null),
 
     conn_mutex: Io.Mutex = .init,
+    /// Broadcast whenever a connection's slot is released (awaitGone).
+    conn_cond: Io.Condition = .init,
     conns: ConnTable = .{},
     conn_wake: [max_connections]Io.Event = @splat(.unset),
     conn_evict: [max_connections]std.atomic.Value(bool) = @splat(.init(false)),
@@ -559,6 +561,27 @@ pub const Server = struct {
         srv.conn_mutex.lockUncancelable(srv.io);
         srv.conns.release(slot);
         srv.conn_mutex.unlock(srv.io);
+        srv.conn_cond.broadcast(srv.io);
+    }
+
+    /// Waits (event-driven, at most `max_ms`) until no connection from
+    /// these tunnel addresses is left: removed devices get their `logout`
+    /// before their keys leave the tunnel (StoreWatch, main.zig).
+    pub fn awaitGone(srv: *Server, ips: []const tunnelnet.Ip4, max_ms: i64) void {
+        const deadline = srv.nowMs() +| max_ms;
+        srv.conn_mutex.lockUncancelable(srv.io);
+        defer srv.conn_mutex.unlock(srv.io);
+        while (true) {
+            var any = false;
+            for (srv.conns.entries) |e| {
+                if (!e.used) continue;
+                for (ips) |ip| any = any or std.mem.eql(u8, e.key[12..16], &ip);
+            }
+            if (!any) return;
+            const left = deadline -| srv.nowMs();
+            if (left <= 0) return;
+            srv.conn_cond.waitTimeout(srv.io, &srv.conn_mutex, .{ .duration = .{ .raw = .fromMilliseconds(left), .clock = .awake } }) catch return;
+        }
     }
 
     fn promote(srv: *Server, conn: *Conn) void {

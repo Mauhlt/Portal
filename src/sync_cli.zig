@@ -215,6 +215,10 @@ pub fn cmdSyncDevice(gpa: Allocator, io: Io, args: []const []const u8, client_ve
             revoke = args[i];
         } else if (std.mem.eql(u8, a, "--key")) {
             show_key = true;
+        } else if (std.mem.eql(u8, a, "--drop-key")) {
+            tunnel.keys.drop() catch |err| fatal("could not delete this device's tunnel key: {t}", .{err});
+            std.debug.print("sync-device: this device's tunnel key is deleted\n", .{});
+            return;
         } else if (std.mem.eql(u8, a, "--forget")) {
             forget = true;
         } else if (std.mem.eql(u8, a, "--status")) {

@@ -1,7 +1,6 @@
 //! HTTP/1.1 pieces both ends of Portal's HTTP share: the syntax checks the
 //! server's request parser (src/http1.zig) and the native client's
-//! response parser (client/src/net/http.zig) both apply, and the names of
-//! Portal's cookies. Requests and responses are still parsed separately;
+//! response parser (client/src/net/http.zig) both apply. Requests and responses are still parsed separately;
 //! they genuinely differ. Pure functions over byte slices.
 
 const std = @import("std");
@@ -38,48 +37,6 @@ pub fn validValue(v: []const u8) bool {
     return true;
 }
 
-// ---------------------------------------------------------------- cookies
-
-pub const CookieKind = enum(u2) {
-    /// The browser / device session.
-    session,
-    /// The long-lived device credential ("<name>.<secret>").
-    device,
-    /// A pending pairing request's token.
-    pairreq,
-};
-
-pub const CookieName = struct { name: []const u8, kind: CookieKind, secure: bool };
-
-/// Every cookie Portal sets, indexed by `cookieIndex`. The `__Host-`
-/// names are used over HTTPS (the server's default); the plain names only
-/// with `portal run --no-tls`.
-pub const cookie_names = [_]CookieName{
-    .{ .name = "portal_session", .kind = .session, .secure = false },
-    .{ .name = "__Host-portal", .kind = .session, .secure = true },
-    .{ .name = "portal_device", .kind = .device, .secure = false },
-    .{ .name = "__Host-portal_device", .kind = .device, .secure = true },
-    .{ .name = "portal_pairreq", .kind = .pairreq, .secure = false },
-    .{ .name = "__Host-portal_pairreq", .kind = .pairreq, .secure = true },
-};
-
-pub fn cookieIndex(kind: CookieKind, secure: bool) u8 {
-    return @as(u8, @intFromEnum(kind)) * 2 + @intFromBool(secure);
-}
-
-/// The cookie name for `kind` over HTTPS (`secure`) or plain HTTP.
-pub fn cookieName(kind: CookieKind, secure: bool) []const u8 {
-    return cookie_names[cookieIndex(kind, secure)].name;
-}
-
-/// The index of a cookie name, if it is one of Portal's.
-pub fn findCookie(name: []const u8) ?u8 {
-    for (cookie_names, 0..) |n, i| if (std.mem.eql(u8, name, n.name)) return @intCast(i);
-    return null;
-}
-
-// ------------------------------------------------------------------ tests
-
 const testing = std.testing;
 
 test "head end, tokens, values" {
@@ -91,14 +48,3 @@ test "head end, tokens, values" {
     try testing.expect(!validValue("a\r\nb") and !validValue("a\x00") and !validValue("\x7f"));
 }
 
-test "cookie names" {
-    for (cookie_names, 0..) |n, i| {
-        try testing.expectEqual(@as(u8, @intCast(i)), cookieIndex(n.kind, n.secure));
-        try testing.expectEqual(@as(?u8, @intCast(i)), findCookie(n.name));
-        try testing.expect(isToken(n.name));
-        try testing.expectEqual(n.secure, std.mem.startsWith(u8, n.name, "__Host-"));
-    }
-    try testing.expectEqualStrings("__Host-portal", cookieName(.session, true));
-    try testing.expectEqualStrings("portal_device", cookieName(.device, false));
-    try testing.expectEqual(@as(?u8, null), findCookie("portal"));
-}

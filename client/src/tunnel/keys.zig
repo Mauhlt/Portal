@@ -18,8 +18,25 @@ const codec = wg.device.keys;
 pub const Key = codec.Key;
 pub const text_len = codec.base64_len;
 
-/// The credential store entry.
+/// The credential store entry: "Portal-tunnel/device-key", or with
+/// PORTAL_DEVICE_KEY_SLOT=<name> set, "Portal-tunnel/device-key-<name>"
+/// (the e2e tests run several devices as one user and must never touch the
+/// owner's real key; it only picks another of this user's own entries).
 pub const store_target = "Portal-tunnel/device-key";
+
+fn target(buf: *[credstore.max_target]u8) []const u8 {
+    var eb: [32]u8 = undefined;
+    const slot = @import("../net/pin.zig").envVar("PORTAL_DEVICE_KEY_SLOT", &eb) orelse return store_target;
+    for (slot) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return store_target;
+    return std.fmt.bufPrint(buf, store_target ++ "-{s}", .{slot}) catch store_target;
+}
+
+/// Deletes this device's key (`portalctl sync-device --drop-key`: a
+/// device reset, and the e2e tests' cleanup).
+pub fn drop() credstore.Error!void {
+    var tb: [credstore.max_target]u8 = undefined;
+    return credstore.delete(target(&tb));
+}
 
 pub const KeyPair = struct {
     private: Key,
@@ -55,7 +72,9 @@ pub const KeyPair = struct {
 pub fn loadOrCreate(io: std.Io) (credstore.Error || error{BadStoredKey})!KeyPair {
     var buf: [credstore.max_secret]u8 = undefined;
     defer std.crypto.secureZero(u8, &buf);
-    if (try credstore.load(store_target, &buf)) |text| {
+    var tb: [credstore.max_target]u8 = undefined;
+    const t = target(&tb);
+    if (try credstore.load(t, &buf)) |text| {
         var k = codec.decode(text) catch return error.BadStoredKey;
         defer std.crypto.secureZero(u8, &k);
         if (codec.isZero(&k)) return error.BadStoredKey;
@@ -65,7 +84,7 @@ pub fn loadOrCreate(io: std.Io) (credstore.Error || error{BadStoredKey})!KeyPair
     errdefer kp.wipe();
     var text = codec.encode(&kp.private);
     defer std.crypto.secureZero(u8, &text);
-    try credstore.save(store_target, &text);
+    try credstore.save(t, &text);
     return kp;
 }
 

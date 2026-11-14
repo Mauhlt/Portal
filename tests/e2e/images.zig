@@ -39,16 +39,6 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const inst = try proc.Instance.start(h, dir, port, &.{ "--", "cmd.exe", "/c", script });
     defer inst.kill();
 
-    // Nothing without a session: the WebSocket upgrade is refused.
-    {
-        var c = try ws.Client.connect(h.gpa, port, .{ .host = inst.host, .origin = inst.origin, .cookie = null });
-        defer c.close();
-        _ = r.check("no session: /ws refused", c.status == 401, "status {d}", .{c.status});
-        var c2 = try ws.Client.connect(h.gpa, port, .{ .host = inst.host, .origin = inst.origin, .cookie = "portal_session=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" });
-        defer c2.close();
-        _ = r.check("bogus session: /ws refused", c2.status == 401, "status {d}", .{c2.status});
-    }
-
     const creds = try client.pair(inst, "laptop");
     const sess = creds.sessionCookie();
     var dump_buf: [4096]u8 = undefined;

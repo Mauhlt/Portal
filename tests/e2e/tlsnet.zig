@@ -77,7 +77,7 @@ pub const TlsSocket = struct {
     pub const Options = struct {
         net: net.Options = .{},
         /// Name checked against the certificate (an IP SAN for Portal).
-        host: []const u8 = "127.0.0.1",
+        host: []const u8 = "10.8.0.1",
     };
 
     pub fn connect(gpa: Allocator, port: u16, trust: *Trust, o: Options) Error!*TlsSocket {
