@@ -36,6 +36,12 @@ pub const WriteError = net.Stream.Writer.Error;
 pub const AcceptError = net.Server.AcceptError;
 pub const DialError = net.IpAddress.ConnectError;
 
+/// How the transport schedules a stream's bytes against the others. The
+/// live WebSocket (keystrokes, screen, conversation) is `interactive`;
+/// sync packages and other large transfers go on their own `bulk`
+/// connection, so a big download never delays a keystroke or its echo.
+pub const Priority = enum { interactive, bulk };
+
 /// A connection from an `ext` transport.
 pub const Ext = struct {
     ptr: *anyopaque,
@@ -46,6 +52,8 @@ pub const Ext = struct {
         read: *const fn (ptr: *anyopaque, io: Io, dest: []u8) ReadError!usize,
         write: *const fn (ptr: *anyopaque, io: Io, data: []const u8) WriteError!usize,
         close: *const fn (ptr: *anyopaque, io: Io) void,
+        /// null: the transport has a single class.
+        set_priority: ?*const fn (ptr: *anyopaque, p: Priority) void = null,
     };
 };
 
@@ -77,6 +85,16 @@ pub const Stream = union(enum) {
         switch (s.*) {
             .os => |*o| o.close(io),
             .ext => |e| e.vtable.close(e.ptr, io),
+        }
+    }
+
+    /// The server marks the bulk WebSocket after the upgrade (the client
+    /// already dialed it as bulk). OS sockets (unit tests only) have one
+    /// class.
+    pub fn setPriority(s: *const Stream, p: Priority) void {
+        switch (s.*) {
+            .os => {},
+            .ext => |e| if (e.vtable.set_priority) |f| f(e.ptr, p),
         }
     }
 
@@ -241,16 +259,36 @@ pub const ExtListener = struct {
     }
 };
 
-/// How a client reaches the server: an OS connect, or a dial through the
-/// in-process tunnel.
-pub const Dialer = union(enum) {
-    os,
-    ext: ExtDialer,
+/// How a client reaches the server: a dial through the in-process tunnel
+/// (`ext`; production) or an OS connect (`os`; in-process unit tests on
+/// loopback only), with the priority its connections get from the first
+/// byte.
+pub const Dialer = struct {
+    kind: Kind,
+    priority: Priority = .interactive,
+
+    pub const Kind = union(enum) {
+        os,
+        ext: ExtDialer,
+    };
+
+    pub const os: Dialer = .{ .kind = .os };
+
+    pub fn ext(e: ExtDialer) Dialer {
+        return .{ .kind = .{ .ext = e } };
+    }
+
+    /// The same dialer for bulk transfers.
+    pub fn bulk(d: Dialer) Dialer {
+        var b = d;
+        b.priority = .bulk;
+        return b;
+    }
 
     pub fn dial(d: Dialer, io: Io, addr: net.IpAddress) DialError!Stream {
-        return switch (d) {
+        return switch (d.kind) {
             .os => .{ .os = try addr.connect(io, .{ .mode = .stream }) },
-            .ext => |e| e.vtable.dial(e.ptr, io, addr),
+            .ext => |e| e.vtable.dial(e.ptr, io, addr, d.priority),
         };
     }
 };
@@ -260,7 +298,7 @@ pub const ExtDialer = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        dial: *const fn (ptr: *anyopaque, io: Io, addr: net.IpAddress) DialError!Stream,
+        dial: *const fn (ptr: *anyopaque, io: Io, addr: net.IpAddress, priority: Priority) DialError!Stream,
     };
 };
 
@@ -358,7 +396,7 @@ pub const MemNet = struct {
     /// picked per connection).
     pub fn dialer(n: *MemNet, source: *Source) Dialer {
         source.net_ = n;
-        return .{ .ext = .{ .ptr = source, .vtable = &dialer_vtable } };
+        return .ext(.{ .ptr = source, .vtable = &dialer_vtable });
     }
 
     pub const Source = struct {
@@ -406,7 +444,8 @@ pub const MemNet = struct {
         n.ready.signal(io);
     }
 
-    fn dial(ptr: *anyopaque, io: Io, addr: net.IpAddress) DialError!Stream {
+    fn dial(ptr: *anyopaque, io: Io, addr: net.IpAddress, priority: Priority) DialError!Stream {
+        _ = priority;
         const src: *Source = @ptrCast(@alignCast(ptr));
         const n = src.net_;
         n.mutex.lockUncancelable(io);

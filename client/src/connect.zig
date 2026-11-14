@@ -55,6 +55,8 @@ pub const net_ws = @import("shared").ws;
 pub const tlsconn = @import("net/tlsconn.zig");
 pub const watchdog = @import("net/watchdog.zig");
 pub const credstore_mod = credstore;
+/// The in-process WireGuard tunnel (the desk uses it too: src/tunneldesk.zig).
+pub const tunnel = @import("tunnel/root.zig");
 pub const pin = pin_mod;
 pub const x509check_mod = x509check;
 
@@ -1171,4 +1173,5 @@ test "classify the certificate field" {
 
 test {
     _ = @import("tests.zig");
+    _ = tunnel;
 }
