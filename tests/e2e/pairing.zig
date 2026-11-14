@@ -564,6 +564,9 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         _ = r.check("logout without a live session still unpairs (device cookie)", std.mem.eql(u8, resp.location(), "/pair?bye"), "{s}", .{resp.location()});
         const d = try inst.cli(&.{"devices"});
         _ = r.check("...and the device is really gone", !d.has("tablet"), "{s}", .{d.out});
+        var gone = try get(inst, "/", c9.deviceCookie());
+        defer gone.deinit();
+        _ = r.check("...and its credential is remembered as unpaired (told it is no longer paired)", std.mem.eql(u8, gone.location(), "/pair?e=gone"), "{s}", .{gone.location()});
         var resp2 = try post(inst, "/logout", null, true);
         defer resp2.deinit();
         _ = r.check("logout with nothing to unpair does not claim it did", std.mem.eql(u8, resp2.location(), "/pair"), "{s}", .{resp2.location()});

@@ -1580,7 +1580,9 @@ pub const Server = struct {
                         c.res.* = .{ .outcome = .ok, .device = st.devices[idx].?.ref() };
                         switch (c.use) {
                             .sign_in => st.rotate(idx, c.hash, c.now),
-                            .unpair => st.devices[idx] = null,
+                            // Its secrets become tombstones, as for any
+                            // other unpair: a later use is told "gone".
+                            .unpair => _ = st.drop(idx),
                         }
                         return true;
                     },
