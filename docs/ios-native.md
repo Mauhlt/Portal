@@ -144,12 +144,16 @@ Rules:
 * **Extension** `PortalTunnel.appex` (client/src/ios/tunnel_ext, Zig, no
   Swift): `PortalPacketTunnelProvider` (an NEPacketTunnelProvider
   subclass registered at runtime, then `NSExtensionMain`). `startTunnel`
-  reads `providerConfiguration["wgQuickConfig"]`, parses it with
+  reads `providerConfiguration["wgQuickConfig"]` (no private key in it),
+  puts back the private key from the Keychain item named in
+  `providerConfiguration["privateKeyRef"]` (tunnel_ext/keyref.zig), parses it with
   WireGuard's config parser, applies NEPacketTunnelNetworkSettings
   (IPv4 addresses, the peers' AllowedIPs as routes, MTU, the desk as
   remote address), starts `WireGuard.device.Device` on
   `tun.PacketFlowTun` (its own event loop thread), and re-arms
-  `packetFlow.readPackets` from each completion (no polling).
+  `packetFlow.readPackets` from each completion (no polling). Packets
+  read after `stopTunnel` began are dropped, and the backend serialises
+  deliver with stop (they arrive on different queues).
 * **One seam:** `TunnelBackend` (tunnel_ext/backend.zig: configure /
   start / deliver / stop). Only `ZigBackend` is compiled in. If the
   security review or live interop of ../WireGuard fails, a fallback
@@ -173,7 +177,17 @@ Rules:
   Apple ID build without it: the app works unchanged over the WireGuard
   app.
 * **Keys:** the phone generates its X25519 pair (wgkey.zig); the private
-  key never leaves it.
+  key never leaves it. `tunnel.configure` takes it out of the wg-quick
+  text before the VPN configuration is saved (that lives in the system's
+  VPN preferences, which can reach backups and diagnostics) and stores it
+  with `credstore.saveUnattended`: Keychain item
+  `Portal-tunnel/packet-tunnel-key`, `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`
+  (never in a backup or iCloud Keychain), no Face ID ACL so the extension
+  can read it without UI, in the app's default Keychain group
+  `<team>.<bundle id>`, which the extension's entitlements also list
+  (ios_sign.zig): no other process can read it. WhenUnlocked, not
+  AfterFirstUnlock: the app brings the tunnel up only while it is on
+  screen, so the extension never needs the key while the phone is locked.
 * **Not done yet (design):**
   1. *Key delivery.* First pairing happens over an already trusted path
      (the home LAN, or the WireGuard app's tunnel): the TLS-pinned,
@@ -191,11 +205,7 @@ Rules:
      `tunnel.configure`; iOS asks once to allow the VPN configuration.
      From then on the app switches to its own tunnel (the WireGuard app's
      on-demand rule for Portal's address can be removed).
-  4. The private key belongs in the Keychain in an access group shared
-     with the extension (`keychain-access-groups`, no Face ID: the
-     extension runs while the phone is locked) instead of the provider
-     configuration; the extension then reads it by reference.
-  5. IPv6 tunnel addresses (NEIPv6Settings).
+  4. IPv6 tunnel addresses (NEIPv6Settings).
 
 ## Implementation: seams
 

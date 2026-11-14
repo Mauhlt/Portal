@@ -18,6 +18,8 @@
 const std = @import("std");
 const build_options = @import("ios_options");
 const view = @import("view");
+const credstore = @import("client").credstore_mod;
+const keyref = @import("tunnel_ext/keyref.zig");
 const ios = view.Window.ios;
 const objc = ios.objc;
 const Object = objc.Object;
@@ -30,10 +32,20 @@ pub const provider_bundle_id = build_options.bundle_id ++ ".tunnel";
 
 /// What the last start/stop asked for (the completion handler applies it).
 var want_up: std.atomic.Value(bool) = .init(false);
-/// A wg-quick configuration to install (configure), or none.
-var config_buf: [4096]u8 = undefined;
-var config_len: usize = 0;
-var config_pending: std.atomic.Value(bool) = .init(false);
+/// A configuration to install (configure -> the main thread), or none.
+/// Handed over whole: configure fills a fresh one and publishes it here;
+/// the main thread takes it (swap) and frees it, so neither thread ever
+/// touches a buffer the other one is using.
+const Pending = struct {
+    buf: [keyref.max_config]u8 = undefined,
+    len: usize = 0,
+
+    fn text(p: *const Pending) []const u8 {
+        return p.buf[0..p.len];
+    }
+};
+var pending: std.atomic.Value(?*Pending) = .init(null);
+const pending_alloc = std.heap.c_allocator;
 
 /// Any thread: Portal is on screen, bring the tunnel up.
 pub fn start() void {
@@ -54,12 +66,20 @@ pub fn stop() void {
 /// AllowedIPs = the desk's tunnel address). iOS asks the user once to
 /// allow the VPN configuration. Called after the desk confirmed this
 /// phone's public key (docs/ios-native.md: not wired yet).
-pub fn configure(wg_quick: []const u8) error{TooLong}!void {
+///
+/// The private key never goes into the VPN configuration (system
+/// preferences, which can reach backups and diagnostics): it goes to the
+/// Keychain, this device only, readable by the extension without Face ID
+/// (keyref.zig), and the configuration names that item.
+pub fn configure(wg_quick: []const u8) (keyref.Error || credstore.Error || error{OutOfMemory})!void {
     if (!enabled) return;
-    if (wg_quick.len > config_buf.len) return error.TooLong;
-    @memcpy(config_buf[0..wg_quick.len], wg_quick);
-    config_len = wg_quick.len;
-    config_pending.store(true, .release);
+    const p = try pending_alloc.create(Pending);
+    p.* = .{};
+    errdefer pending_alloc.destroy(p);
+    const parts = try keyref.split(wg_quick, &p.buf);
+    try credstore.saveUnattended(keyref.keychain_target, parts.key);
+    p.len = parts.public.len;
+    if (pending.swap(p, .acq_rel)) |old| pending_alloc.destroy(old);
     objc.onMainAsync(null, load);
 }
 
@@ -76,7 +96,10 @@ var saved_block: objc.Block = objc.Block.global(@ptrCast(&saved));
 fn loaded(_: *const objc.Block, managers: ?*Object, err: ?*Object) callconv(.c) void {
     if (err != null) return;
     const mgr = find(managers);
-    if (config_pending.swap(false, .acq_rel)) return install(mgr);
+    if (pending.swap(null, .acq_rel)) |p| {
+        defer pending_alloc.destroy(p);
+        return install(mgr, p.text());
+    }
     const m = mgr orelse return; // never configured: nothing to start
     const conn = msgSend(?*Object, m, sel("connection"), .{}) orelse return;
     if (want_up.load(.acquire)) {
@@ -100,9 +123,11 @@ fn find(managers: ?*Object) ?*Object {
     return null;
 }
 
-/// Creates or updates the manager with the pending configuration
-/// (WireGuardKit's convention: providerConfiguration["wgQuickConfig"]).
-fn install(existing: ?*Object) void {
+/// Creates or updates the manager with `config` (the wg-quick text
+/// without its private key) in providerConfiguration["wgQuickConfig"]
+/// (WireGuardKit's convention) and the key's Keychain item name in
+/// providerConfiguration["privateKeyRef"] (keyref.zig).
+fn install(existing: ?*Object, config: []const u8) void {
     const pool = objc.AutoreleasePool.push();
     defer pool.pop();
     const m = existing orelse (msgSend(?*Object, objc.getClass("NETunnelProviderManager"), sel("new"), .{}) orelse return);
@@ -114,11 +139,14 @@ fn install(existing: ?*Object) void {
     const server = objc.newString("Portal desktop");
     defer if (server) |x| objc.release(x);
     msgSend(void, proto, sel("setServerAddress:"), .{server});
-    const cfg = objc.newString(config_buf[0..config_len]);
-    defer if (cfg) |x| objc.release(x);
-    const key = objc.newString("wgQuickConfig");
-    defer if (key) |x| objc.release(x);
-    const dict = msgSend(?*Object, objc.getClass("NSDictionary"), sel("dictionaryWithObject:forKey:"), .{ cfg, key });
+    const dict = msgSend(?*Object, objc.getClass("NSMutableDictionary"), sel("dictionary"), .{}) orelse return;
+    for ([_][2][]const u8{ .{ keyref.config_key, config }, .{ keyref.key_ref_key, keyref.keychain_target } }) |kv| {
+        const k = objc.newString(kv[0]) orelse return;
+        defer objc.release(k);
+        const v = objc.newString(kv[1]) orelse return;
+        defer objc.release(v);
+        msgSend(void, dict, sel("setObject:forKey:"), .{ v, k });
+    }
     msgSend(void, proto, sel("setProviderConfiguration:"), .{dict});
     msgSend(void, m, sel("setProtocolConfiguration:"), .{proto});
     const desc = objc.newString("Portal");

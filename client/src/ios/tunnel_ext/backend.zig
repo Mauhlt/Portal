@@ -21,9 +21,12 @@
 //! Contract: configure() parses the wg-quick text the app stored in the
 //! VPN configuration and returns the network settings iOS must apply
 //! (addresses, routes, MTU, the peer's address); start() brings the device
-//! up; deliver() hands it one packet read from the packet flow (any
-//! thread, serial); packets for the flow come back through `Output`;
-//! stop() tears everything down. IPv4 only for now (Portal's tunnel
+//! up; deliver() hands it one packet read from the packet flow; packets
+//! for the flow come back through `Output`; stop() tears everything down.
+//! The four calls come from different queues (the provider's, the packet
+//! flow's): a backend serialises them itself; deliver() after (or
+//! during) stop() drops the packet, never touches freed state, and a
+//! start() after stop() does nothing until the next configure(). IPv4 only for now (Portal's tunnel
 //! addresses are IPv4; IPv6 settings are a TODO in docs/ios-native.md).
 
 const std = @import("std");
@@ -92,6 +95,12 @@ pub const ZigBackend = struct {
     device: ?*wg.device.Device = null,
     thread: ?std.Thread = null,
     output: Output = undefined,
+    /// Held by every call: deliver (packet flow queue) never runs during
+    /// stop (provider queue), so it never sees a freed tun.
+    mutex: std.Io.Mutex = .init,
+    /// Set by stop, cleared by configure (the next startTunnel): a start
+    /// that lost the race with stop does nothing.
+    stopped: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) ZigBackend {
         return .{ .gpa = gpa, .io = io, .clock = .{ .io = io } };
@@ -109,6 +118,9 @@ pub const ZigBackend = struct {
 
     fn configure(p: *anyopaque, text: []const u8, out: *NetSettings) anyerror!void {
         const z = self(p);
+        z.mutex.lockUncancelable(z.io);
+        defer z.mutex.unlock(z.io);
+        z.stopped = false;
         var diag: wg.device.config.Diagnostic = .{};
         if (z.config) |*c| c.deinit();
         z.config = null;
@@ -122,10 +134,15 @@ pub const ZigBackend = struct {
 
     fn start(p: *anyopaque, output: Output) anyerror!void {
         const z = self(p);
+        z.mutex.lockUncancelable(z.io);
+        defer z.mutex.unlock(z.io);
+        if (z.stopped) return error.Stopped;
+        if (z.device != null) return error.AlreadyStarted;
         const c = &(z.config orelse return error.NotConfigured);
         z.output = output;
         const mtu = c.interface.mtu orelse wg.tun.default_mtu;
         z.tun = try wg.tun.PacketFlowTun.init(z.gpa, .{ .mtu = mtu, .write_fn = writeOut, .write_ctx = z });
+        errdefer z.teardown();
         const peers = try z.gpa.alloc(wg.device.device.PeerConfig, c.peers.len);
         defer z.gpa.free(peers);
         for (c.peers, peers) |*pc_in, *pc| pc.* = .{
@@ -155,11 +172,22 @@ pub const ZigBackend = struct {
 
     fn deliver(p: *anyopaque, packet: []const u8) void {
         const z = self(p);
+        z.mutex.lockUncancelable(z.io);
+        defer z.mutex.unlock(z.io);
         if (z.tun) |*t| t.deliver(packet);
     }
 
     fn stop(p: *anyopaque) void {
         const z = self(p);
+        z.mutex.lockUncancelable(z.io);
+        defer z.mutex.unlock(z.io);
+        z.stopped = true;
+        z.teardown();
+    }
+
+    /// Under `mutex`. The device thread never takes it (it only writes
+    /// packets out), so joining it here cannot deadlock.
+    fn teardown(z: *ZigBackend) void {
         if (z.device) |d| d.stop();
         if (z.thread) |t| t.join();
         z.thread = null;
@@ -207,6 +235,22 @@ pub fn mask(prefix: u8, buf: *[16]u8) []const u8 {
     const p: u6 = @intCast(@min(prefix, 32));
     const m: u32 = if (p == 0) 0 else ~@as(u32, 0) << @intCast(32 - @as(u7, p));
     return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ m >> 24, (m >> 16) & 0xff, (m >> 8) & 0xff, m & 0xff }) catch "255.255.255.255";
+}
+
+test {
+    _ = @import("keyref.zig");
+}
+
+test "deliver before start and after stop drops the packet" {
+    var z = ZigBackend.init(std.testing.allocator, std.testing.io);
+    const b = z.backend();
+    b.deliver(&.{ 0x45, 0x00 });
+    b.stop();
+    b.deliver(&.{ 0x45, 0x00 });
+    b.stop(); // idempotent
+    try std.testing.expect(z.tun == null and z.device == null);
+    // A start that comes after the stop (lost the race) does nothing.
+    try std.testing.expectError(error.Stopped, b.start(.{ .ctx = null, .f = undefined }));
 }
 
 test "settings from a wg-quick config, masks" {

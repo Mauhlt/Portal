@@ -5,13 +5,17 @@
 //!
 //!   main             registers PortalPacketTunnelProvider, NSExtensionMain
 //!   startTunnel      providerConfiguration["wgQuickConfig"] (the app wrote
-//!                    it, tunnel.zig) -> backend.configure -> network
-//!                    settings (addresses, routes, MTU) -> backend.start ->
-//!                    read packets
+//!                    it, tunnel.zig, without the private key) + the key
+//!                    from the Keychain item named in
+//!                    providerConfiguration["privateKeyRef"] (keyref.zig)
+//!                    -> backend.configure -> network settings (addresses,
+//!                    routes, MTU) -> backend.start -> read packets
 //!   packets in       packetFlow.readPackets completion -> backend.deliver,
-//!                    re-armed from the completion (no polling)
+//!                    re-armed from the completion (no polling); nothing
+//!                    once stopTunnel has begun
 //!   packets out      backend Output -> packetFlow.writePackets
-//!   stopTunnel       backend.stop
+//!   stopTunnel       backend.stop (the backend serialises it with
+//!                    deliver: they come from different queues)
 //!
 //! Needs the Network Extension entitlement (packet-tunnel-provider) on both
 //! the app and this extension: a paid Apple Developer account. STATUS:
@@ -20,6 +24,8 @@
 const std = @import("std");
 const objc = @import("IosObjC");
 const backend_mod = @import("backend.zig");
+const keyref = @import("keyref.zig");
+const credstore = @import("credstore");
 const Object = objc.Object;
 const Selector = objc.Selector;
 const msgSend = objc.msgSend;
@@ -59,7 +65,9 @@ const Provider = struct {
         const pool = objc.AutoreleasePool.push();
         defer pool.pop();
         const copied: ?*objc.Block = if (done) |d| @ptrCast(@alignCast(_Block_copy(d))) else null;
-        const text = configText(self) orelse return finish(copied, "no tunnel configuration (pair this iPhone again)");
+        var full: [keyref.max_config + 128]u8 = undefined;
+        defer std.crypto.secureZero(u8, &full);
+        const text = configText(self, &full) orelse return finish(copied, "no tunnel configuration (pair this iPhone again)");
         backend.configure(text, &settings) catch return finish(copied, "the tunnel configuration is invalid");
         const ns = networkSettings(&settings) orelse return finish(copied, "cannot build the network settings");
         start_done = copied;
@@ -92,14 +100,26 @@ fn finish(done: ?*objc.Block, why: ?[]const u8) void {
     f(d, err);
 }
 
-fn configText(self: *Object) ?[]const u8 {
+fn configValue(cfg: *Object, name: []const u8) []const u8 {
+    const key = objc.newString(name) orelse return "";
+    defer objc.release(key);
+    const v = msgSend(?*Object, cfg, sel("objectForKey:"), .{key}) orelse return "";
+    return objc.stringBytes(v);
+}
+
+/// The full wg-quick text in `out`: the stored configuration with the
+/// private key from the Keychain put back (keyref.zig). The item is read
+/// without UI (no Face ID ACL on it); only Portal's own item is accepted.
+fn configText(self: *Object, out: []u8) ?[]const u8 {
     const proto = msgSend(?*Object, self, sel("protocolConfiguration"), .{}) orelse return null;
     const cfg = msgSend(?*Object, proto, sel("providerConfiguration"), .{}) orelse return null;
-    const key = objc.newString("wgQuickConfig") orelse return null;
-    defer objc.release(key);
-    const v = msgSend(?*Object, cfg, sel("objectForKey:"), .{key}) orelse return null;
-    const s = objc.stringBytes(v);
-    return if (s.len == 0) null else s;
+    const public = configValue(cfg, keyref.config_key);
+    if (public.len == 0) return null;
+    if (!std.mem.eql(u8, configValue(cfg, keyref.key_ref_key), keyref.keychain_target)) return null;
+    var kb: [credstore.max_secret]u8 = undefined;
+    defer std.crypto.secureZero(u8, &kb);
+    const key = (credstore.load(keyref.keychain_target, &kb) catch return null) orelse return null;
+    return keyref.join(public, key, out) catch null;
 }
 
 fn nsString(text: []const u8) ?*Object {
@@ -163,6 +183,7 @@ fn readMore() void {
 
 /// readPackets' completion: hand each packet to WireGuard, then re-arm.
 fn readDone(_: *const objc.Block, packets: ?*Object, _: ?*Object) callconv(.c) void {
+    if (stopping.load(.acquire)) return; // stopTunnel has begun: no deliver, no re-arm
     const n = msgSend(objc.NSUInteger, packets, sel("count"), .{});
     var i: objc.NSUInteger = 0;
     while (i < n) : (i += 1) {
@@ -201,4 +222,5 @@ comptime {
 
 test {
     _ = backend_mod;
+    _ = keyref;
 }

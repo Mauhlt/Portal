@@ -793,6 +793,9 @@ fn tunnelExtModule(b: *std.Build, t: std.Build.ResolvedTarget, optimize: std.bui
         .imports = &.{
             .{ .name = "WireGuard", .module = wireguardModule(b, t, optimize) },
             .{ .name = "IosObjC", .module = rendererDep(b, t, optimize).module("IosObjC") },
+            // The Keychain code the app uses, to read the tunnel key the
+            // app stored (tunnel_ext/keyref.zig).
+            .{ .name = "credstore", .module = b.createModule(.{ .root_source_file = b.path("client/src/credstore.zig"), .target = t, .optimize = optimize, .link_libc = true }) },
         },
     });
 }
