@@ -324,7 +324,7 @@ reach the session):
 | Ctrl+Shift+T | + | open a project folder in a new tab |
 | Ctrl+Shift+W | × on the tab | close the tab shown (its program is asked to exit) |
 | Ctrl+Tab / Ctrl+Shift+Tab | click a tab | the next / previous tab |
-| Ctrl+Shift+P | Pair a device… | open a 2-minute pairing window and approve or deny each request |
+| Ctrl+Shift+P | Pair a device… | pair a device by the key it shows (check its check code), then show the pairing code for it |
 | Ctrl+Shift+D | Devices | paired devices with address and last use; Unpair |
 | Ctrl+Shift+E | Export certificate… | write portal-ca.cer / .pem / .mobileconfig to a folder (default `%USERPROFILE%\Downloads\Portal-CA`) |
 | Ctrl+Shift+S | Settings | tunnel port and endpoint (with this desktop's tunnel key and its peers), program, project, input mode for the next start; system monitor, background art and the agent integration (these apply at once) |
@@ -403,38 +403,23 @@ with the owner's `Image.check` before it is stored, sent or decoded (see
 
 ### 4. Pair each device once (at the desk)
 
-With Portal running on your WireGuard address (the default, 127.0.0.1, is
-reachable from this desktop only), click **Pair a device…** (Ctrl+Shift+P),
-name the device (`laptop`, `iphone`) and click **Open pairing**. The panel
-shows the Portal CA's SHA-256 fingerprint and whether the certificate
-download is up. Within 2 minutes, on that device: turn the WireGuard tunnel
-**on**, then
+A device *is* its WireGuard key: there are no passwords, cookies or
+sign-in. Full steps, per device: [docs/pairing.md](docs/pairing.md).
 
-* **Portal on a laptop** (`portal connect`): enter `10.8.0.1:8420` and the
-  certificate (the exported `portal-ca.pem`, or the SHA-256 the desk shows,
-  to download it now), then click **Pair**.
+1. On the device, run `portal connect` (or open the iPhone app). It shows
+   its tunnel key and the key's check code (`ABCD-EFGH-JKMN-PQRS`).
+2. At the desk, **Pair a device…** (Ctrl+Shift+P): a name (`laptop`,
+   `iphone`) and the key as the device shows it. **Check key** shows the
+   check code of what you typed: approve only if it is the device's.
+   (Console: `portalctl pair <name> <key>`, with a `[y/N]` prompt.)
+3. The desk then shows the **pairing code** (text and QR). Enter it on the
+   device (or scan the QR on the iPhone); the device shows the desk key's
+   check code, and you connect only if it is the one Settings shows at the
+   desk. The device brings its tunnel up and pins the Portal CA and the
+   release key from the code.
 
-The device shows a request code, and the Portal window asks:
-
-```
-Pair 'laptop' from 10.8.0.2, code 7f3a?      [Stop pairing] [Deny] [Approve]
-```
-
-Approve only if the address and code match your device (Deny has the
-focus; `y` approves, `n` denies); a denied request keeps the window open for
-the right one. The device then signs in by itself. Pair through the
-WireGuard address even at home, because that's the address the device will
-use when away (devices keep credentials per address). If your router can't
-reach its own public IP from inside the house, put the phone on cellular for
-those 30 seconds.
-
-`portalctl pair <name>` does the same from a terminal (`[y/N]` prompts),
-for scripts. If either reports that the certificate download could not be
-opened, another program may be holding that port: don't install a
-certificate from it; use Export certificate instead.
-
-From then on, the device connects from anywhere with the tunnel on.
-**Devices** (or `portalctl devices`) lists paired devices;
+From then on, the device connects from anywhere it can reach the tunnel
+endpoint. **Devices** (or `portalctl devices`) lists paired devices;
 Unpair (or `portalctl unpair <name>`) revokes one.
 
 ### HTTPS certificates
