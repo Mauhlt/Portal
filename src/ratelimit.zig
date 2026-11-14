@@ -6,6 +6,9 @@
 //!   For you  (foryou_ws.zig)    30 `i:` / `r:` requests a minute per device
 //!   recap    (foryou_desk.zig)  1 a minute per tab, from any device
 //!
+//! `Table` is the per-device slot table under `PerDevice`, also used on
+//! its own for state of another kind (web.zig's keystroke budget).
+//!
 //! A sliding window, not a token bucket (src/bucket.zig, speech's
 //! limits.Bucket): a bucket of burst n refilling over the window lets
 //! nearly 2n through in the first window, so it would not keep these
@@ -36,22 +39,57 @@ pub fn Window(comptime n: usize, comptime window_ms: i64) type {
     };
 }
 
-/// A `Window` per paired device and per `Lane` (an enum: the kinds of
-/// request counted apart), shared by all of a device's connections, so
-/// reconnecting doesn't reset it. A device not seen yet takes a free
-/// slot, or the one unused longest (more devices than slots only happens
-/// after a re-pairing). Any thread.
+/// State `S` (default-initialized) per paired device, shared by all of a
+/// device's connections, so reconnecting doesn't reset it. A device not
+/// seen yet takes a free slot, or the one unused longest (more devices
+/// than slots only happens after a re-pairing). Not locked: the owner
+/// holds its own mutex around `get` and the use of the result.
+pub fn Table(comptime S: type) type {
+    return struct {
+        const Self = @This();
+
+        slots: [devices.max_devices]Slot = @splat(.{}),
+
+        const Slot = struct {
+            id: ?devices.DeviceId = null,
+            last_ms: i64 = 0,
+            s: S = .{},
+        };
+
+        /// Device `id`'s state, marked used at `now_ms`.
+        pub fn get(t: *Self, id: devices.DeviceId, now_ms: i64) *S {
+            const sl = t.slotFor(id);
+            sl.last_ms = now_ms;
+            return &sl.s;
+        }
+
+        fn slotFor(t: *Self, id: devices.DeviceId) *Slot {
+            for (&t.slots) |*s| if (s.id) |sid| if (std.mem.eql(u8, &sid, &id)) return s;
+            var pick: *Slot = &t.slots[0];
+            for (&t.slots) |*s| {
+                if (s.id == null) {
+                    pick = s;
+                    break;
+                }
+                if (s.last_ms < pick.last_ms) pick = s;
+            }
+            pick.* = .{ .id = id };
+            return pick;
+        }
+    };
+}
+
+/// A `Window` per paired device (`Table`) and per `Lane` (an enum: the
+/// kinds of request counted apart). Any thread.
 pub fn PerDevice(comptime Lane: type, comptime n: usize, comptime window_ms: i64) type {
     return struct {
         const Self = @This();
         pub const Win = Window(n, window_ms);
 
         mutex: Io.Mutex = .init,
-        slots: [devices.max_devices]Slot = @splat(.{}),
+        table: Table(State) = .{},
 
-        const Slot = struct {
-            id: ?devices.DeviceId = null,
-            last_ms: i64 = 0,
+        const State = struct {
             wins: std.EnumArray(Lane, Win) = .initFill(.{}),
             /// Requests over the limit (callers log the first few only).
             over: u32 = 0,
@@ -63,25 +101,10 @@ pub fn PerDevice(comptime Lane: type, comptime n: usize, comptime window_ms: i64
         pub fn allow(l: *Self, io: Io, id: devices.DeviceId, lane: Lane, now_ms: i64) Check {
             l.mutex.lockUncancelable(io);
             defer l.mutex.unlock(io);
-            const s = l.slotFor(id);
-            s.last_ms = now_ms;
+            const s = l.table.get(id, now_ms);
             if (s.wins.getPtr(lane).allow(now_ms)) return .{ .ok = true };
             s.over +|= 1;
             return .{ .ok = false, .over = s.over };
-        }
-
-        fn slotFor(l: *Self, id: devices.DeviceId) *Slot {
-            for (&l.slots) |*s| if (s.id) |sid| if (std.mem.eql(u8, &sid, &id)) return s;
-            var pick: *Slot = &l.slots[0];
-            for (&l.slots) |*s| {
-                if (s.id == null) {
-                    pick = s;
-                    break;
-                }
-                if (s.last_ms < pick.last_ms) pick = s;
-            }
-            pick.* = .{ .id = id };
-            return pick;
         }
     };
 }
