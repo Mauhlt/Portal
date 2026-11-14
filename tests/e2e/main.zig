@@ -87,8 +87,12 @@ pub fn main(init: std.process.Init) !void {
     if (args.items.len >= 1 and std.mem.eql(u8, args.items[0], "--inject"))
         @import("win.zig").ExitProcess(console_tests.injectMain(args.items[1..]));
     // The fake session program of the convo group (see fake_agent.zig).
-    if (args.items.len >= 1 and std.mem.eql(u8, args.items[0], "--fake-agent"))
-        @import("win.zig").ExitProcess(@import("fake_agent.zig").main(gpa, io, init.environ_map, args.items[1..]));
+    // Anywhere on the line, as for the real agent: Portal puts its own
+    // flags right after the program (cmdline.withArgs).
+    for (args.items, 0..) |a, i| if (std.mem.eql(u8, a, "--fake-agent")) {
+        _ = args.orderedRemove(i);
+        @import("win.zig").ExitProcess(@import("fake_agent.zig").main(gpa, io, init.environ_map, args.items));
+    };
     if (args.items.len < 1) {
         std.debug.print("usage: e2e <portalctl.exe> [--base-port N] [group...]\n", .{});
         std.process.exit(2);
