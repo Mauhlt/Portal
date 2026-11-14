@@ -251,7 +251,10 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         defer c.deinit();
         _ = r.check("convo is on (a transcript is followed) and every message parses", c.on and c.bad == 0, "{s}", .{c.dump(&cdump)});
         _ = r.check("the owner's prompt, scrubbed of paths and the user name", c.has(.user, prompt), "{s}", .{c.dump(&cdump)});
-        _ = r.check("the reply as text, other paths removed", c.has(.assistant, "I will look at convo-acme\\build.zig and [path]"), "{s}", .{c.dump(&cdump)});
+        // C:\Users\<user>\notes.txt: the home folder reads [home] when it is
+        // %USERPROFILE% (as on most machines); otherwise the path is [path].
+        _ = r.check("the reply as text, other paths removed", c.has(.assistant, "I will look at convo-acme\\build.zig and [home]\\notes.txt") or
+            c.has(.assistant, "I will look at convo-acme\\build.zig and [path]"), "{s}", .{c.dump(&cdump)});
         _ = r.check("edits as one line: Edited 2 files", c.has(.tool, "Edited 2 files"), "{s}", .{c.dump(&cdump)});
         _ = r.check("a command as one line: Ran a command", c.has(.tool, "Ran a command"), "{s}", .{c.dump(&cdump)});
         const q = c.find(.question, "Which fix should I apply in convo-acme?");

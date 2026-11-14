@@ -10,6 +10,12 @@
 //! fixed region. At most one decode per frame keeps the UI responsive; the
 //! view asks for another frame while decodes are pending. Entries for
 //! images no longer placed are dropped every frame.
+//!
+//! Space: slots are packed into shelves and only reclaimed by a wipe. A
+//! wipe is asked for (`full`) only when the region holds stale slots
+//! (images no longer drawn, or drawn at another size); when what is on
+//! screen does not fit even then, the images left over are drawn as
+//! placeholders instead of wiping and decoding again every frame.
 
 const std = @import("std");
 const imgdec = @import("imgdec");
@@ -32,6 +38,9 @@ const Entry = struct {
     dims: [2]u32 = .{ 0, 0 },
     slot: ?Slot = null,
     seen: bool = true,
+    /// Did not fit in a region without stale slots: a placeholder until
+    /// space may have been freed (`Layer.stale`).
+    no_room: bool = false,
 };
 
 pub const Upload = struct { x: u32, y: u32, w: u32, h: u32, px: []u8 };
@@ -51,8 +60,12 @@ pub const Layer = struct {
     shelves: std.ArrayList(Shelf) = .empty,
     next_y: u32 = 0,
     uploads: std.ArrayList(Upload) = .empty,
-    /// The region ran out of space this frame: wipe and rebuild.
+    /// The region ran out of space this frame, and a wipe would free
+    /// some: wipe and rebuild.
     full: bool = false,
+    /// The region holds slots no entry uses any more (since the last
+    /// wipe).
+    stale: bool = false,
     /// A decode was deferred: another frame is needed.
     needs_more: bool = false,
     decodes_left: u32 = 1,
@@ -78,7 +91,11 @@ pub const Layer = struct {
         l.clearUploads();
         l.shelves.clearRetainingCapacity();
         l.next_y = 0;
-        for (l.entries.items) |*e| e.slot = null;
+        l.stale = false;
+        for (l.entries.items) |*e| {
+            e.slot = null;
+            e.no_room = false;
+        }
     }
 
     pub fn begin(l: *Layer) void {
@@ -93,7 +110,12 @@ pub const Layer = struct {
     pub fn end(l: *Layer) void {
         var k: usize = 0;
         while (k < l.entries.items.len) {
-            if (l.entries.items[k].seen) k += 1 else _ = l.entries.swapRemove(k);
+            if (l.entries.items[k].seen) {
+                k += 1;
+            } else {
+                if (l.entries.items[k].slot != null) l.stale = true;
+                _ = l.entries.swapRemove(k);
+            }
         }
     }
 
@@ -136,6 +158,8 @@ pub const Layer = struct {
         }
         const have = if (e.slot) |s| s.w == tw and s.h == th else false;
         if (!have) {
+            // Nothing was freed since it last did not fit.
+            if (e.no_room and !l.stale) return .{ .placeholder = e.dims };
             if (l.decodes_left == 0) {
                 l.needs_more = true;
                 return .none;
@@ -151,9 +175,19 @@ pub const Layer = struct {
             defer src.deinit(l.gpa);
             e.dims = .{ src.w, src.h };
             const slot = l.alloc(tw, th) orelse {
-                l.full = true;
-                return .none;
+                if (l.stale) {
+                    // A wipe frees space: ask for one.
+                    l.full = true;
+                    return .none;
+                }
+                // Does not fit even in a clean region: a box, and no
+                // decoding it again every frame.
+                e.no_room = true;
+                return .{ .placeholder = e.dims };
             };
+            // The old slot (another size) is stale from now on.
+            if (e.slot != null) l.stale = true;
+            e.no_room = false;
             const scaled = imgdec.scale(l.gpa, src, tw, th) catch return .none;
             l.uploads.append(l.gpa, .{ .x = slot.x, .y = slot.y, .w = tw, .h = th, .px = scaled.px }) catch {
                 l.gpa.free(scaled.px);
@@ -233,19 +267,56 @@ test "prepare decodes once per frame, uploads, drops unplaced, placeholders" {
     l.end();
     try testing.expectEqual(@as(usize, 1), l.entries.items.len); // 1 and 2 not drawn: dropped
 
-    // Huge display sizes are capped to the region; filling it sets `full`.
+    // Huge display sizes are capped to the region. Two images that do not
+    // fit together: one is drawn, the other is a placeholder, and nothing
+    // is wiped or decoded again frame after frame.
     l.wipe();
-    var filled = false;
-    for (0..8) |_| {
-        l.begin();
-        _ = l.prepare(&im, 1, 5000, 3000, 2048, 4096);
-        _ = l.prepare(&im, 2, 1500, 1500, 2048, 4096);
-        filled = filled or l.full;
-        l.end();
-        l.clearUploads();
-    }
-    try testing.expect(filled);
+    var f: Frames = .{ .l = &l, .im = &im };
+    for (0..8) |_| try f.frame(5000, 3000);
+    try testing.expectEqual(@as(usize, 0), f.wipes);
+    try testing.expect(f.last2 == .placeholder);
+    try testing.expectEqual([2]u32{ 30, 20 }, f.last2.placeholder);
+    try testing.expect(!l.needs_more);
+    const decodes = f.decodes;
+    try f.frame(5000, 3000);
+    try testing.expectEqual(decodes, f.decodes); // settled: no decoding
+    // The first image drawn at another size leaves its old slot stale:
+    // one wipe, then settled again.
+    for (0..8) |_| try f.frame(1000, 600);
+    try testing.expectEqual(@as(usize, 1), f.wipes);
+    try testing.expect(f.last1 == .image);
+    try testing.expect(f.last2 == .placeholder);
+    try testing.expect(!l.needs_more);
 }
+
+/// Frames as the Presenter builds them: prepare, and on `full` wipe and
+/// prepare again.
+const Frames = struct {
+    l: *Layer,
+    im: *const grid_mod.Images,
+    wipes: usize = 0,
+    decodes: usize = 0,
+    last1: Prepared = .none,
+    last2: Prepared = .none,
+
+    fn frame(f: *Frames, w1: u32, h1: u32) !void {
+        f.pass(w1, h1);
+        if (f.l.full) {
+            f.wipes += 1;
+            f.l.wipe();
+            f.pass(w1, h1);
+        }
+        f.l.clearUploads();
+    }
+
+    fn pass(f: *Frames, w1: u32, h1: u32) void {
+        f.l.begin();
+        f.last1 = f.l.prepare(f.im, 1, w1, h1, 2048, 4096);
+        f.last2 = f.l.prepare(f.im, 2, 1500, 1500, 2048, 4096);
+        f.decodes += 1 - f.l.decodes_left;
+        f.l.end();
+    }
+};
 
 test "clip" {
     const r = clip(-10, 0, 20, 10, .{ 0, 0, 1, 1 }, 0, 0, 100, 5).?;

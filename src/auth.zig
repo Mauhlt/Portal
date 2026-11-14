@@ -10,6 +10,9 @@
 //!     device's random record id (and its name, for display and sync), so
 //!     unpairing or re-pairing a device ends exactly that record's
 //!     sessions: a new device under the same name never inherits them.
+//!   * A session is bound to the client address it was created for: the
+//!     same cookie presented from any other address is refused (but not
+//!     revoked, so a stolen copy cannot end the owner's session either).
 //!   * Sessions live in memory only; restarting Portal ends them, and paired
 //!     devices silently get new ones on their next visit.
 
@@ -68,6 +71,31 @@ pub const Device = struct {
     }
 };
 
+/// The client address (IP only, no port) a session is bound to.
+pub const Addr = struct {
+    pub const max_len = 64;
+
+    buf: [max_len]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn init(ip: []const u8) Addr {
+        var a: Addr = .{};
+        const n = @min(ip.len, max_len);
+        @memcpy(a.buf[0..n], ip[0..n]);
+        a.len = @intCast(n);
+        return a;
+    }
+
+    pub fn get(a: *const Addr) []const u8 {
+        return a.buf[0..a.len];
+    }
+
+    /// Exact match. An address too long to store never matches.
+    fn matches(a: *const Addr, ip: []const u8) bool {
+        return ip.len <= max_len and std.mem.eql(u8, a.get(), ip);
+    }
+};
+
 pub const Sessions = struct {
     pub const max_sessions = 8;
 
@@ -80,20 +108,23 @@ pub const Sessions = struct {
         created_ms: i64,
         last_seen_ms: i64,
         device: ?Device = null,
+        /// The client address the session was issued to.
+        addr: Addr,
     };
 
     /// Register a new session id (the encoded cookie value) that belongs
-    /// to no device. Evicts the least-recently-used session when full.
-    pub fn create(s: *Sessions, cookie_value: []const u8, now_ms: i64) void {
-        s.put(cookie_value, now_ms, null);
+    /// to no device, bound to client address `ip`. Evicts the
+    /// least-recently-used session when full.
+    pub fn create(s: *Sessions, cookie_value: []const u8, ip: []const u8, now_ms: i64) void {
+        s.put(cookie_value, ip, now_ms, null);
     }
 
     /// Like `create`, for a session of paired device `device`.
-    pub fn createFor(s: *Sessions, cookie_value: []const u8, now_ms: i64, device: Device) void {
-        s.put(cookie_value, now_ms, device);
+    pub fn createFor(s: *Sessions, cookie_value: []const u8, ip: []const u8, now_ms: i64, device: Device) void {
+        s.put(cookie_value, ip, now_ms, device);
     }
 
-    fn put(s: *Sessions, cookie_value: []const u8, now_ms: i64, device: ?Device) void {
+    fn put(s: *Sessions, cookie_value: []const u8, ip: []const u8, now_ms: i64, device: ?Device) void {
         s.expire(now_ms);
         var target: usize = 0;
         var oldest: i64 = std.math.maxInt(i64);
@@ -104,22 +135,23 @@ pub const Sessions = struct {
                 target = i;
             }
         }
-        s.slots[target] = .{ .id_hash = hashSecret(cookie_value), .created_ms = now_ms, .last_seen_ms = now_ms, .device = device };
+        s.slots[target] = .{ .id_hash = hashSecret(cookie_value), .created_ms = now_ms, .last_seen_ms = now_ms, .device = device, .addr = .init(ip) };
     }
 
-    /// Returns true and refreshes the idle timer if the cookie is a live session.
-    pub fn validate(s: *Sessions, cookie_value: []const u8, now_ms: i64) bool {
+    /// Returns true and refreshes the idle timer if the cookie is a live
+    /// session of client address `ip`.
+    pub fn validate(s: *Sessions, cookie_value: []const u8, ip: []const u8, now_ms: i64) bool {
         s.expire(now_ms);
-        const idx = s.find(cookie_value) orelse return false;
+        const idx = s.find(cookie_value, ip) orelse return false;
         s.slots[idx].?.last_seen_ms = now_ms;
         return true;
     }
 
     /// Like `validate` but does not refresh the idle timer. Used by long-lived
     /// WebSockets so an open tab alone does not keep a session alive forever.
-    pub fn isLive(s: *Sessions, cookie_value: []const u8, now_ms: i64) bool {
+    pub fn isLive(s: *Sessions, cookie_value: []const u8, ip: []const u8, now_ms: i64) bool {
         s.expire(now_ms);
-        return s.find(cookie_value) != null;
+        return s.find(cookie_value, ip) != null;
     }
 
     pub const Live = union(enum) {
@@ -130,10 +162,11 @@ pub const Sessions = struct {
         device: Device,
     };
 
-    /// Whose session `cookie_value` is, if it is live.
-    pub fn live(s: *Sessions, cookie_value: []const u8, now_ms: i64, refresh: bool) Live {
+    /// Whose session `cookie_value` is, if it is live and was issued to
+    /// client address `ip` (from any other address it is `.none`).
+    pub fn live(s: *Sessions, cookie_value: []const u8, ip: []const u8, now_ms: i64, refresh: bool) Live {
         s.expire(now_ms);
-        const idx = s.find(cookie_value) orelse return .none;
+        const idx = s.find(cookie_value, ip) orelse return .none;
         const slot = &s.slots[idx].?;
         if (refresh) slot.last_seen_ms = now_ms;
         return if (slot.device) |d| .{ .device = d } else .anonymous;
@@ -141,8 +174,8 @@ pub const Sessions = struct {
 
     /// The paired device a live session belongs to; null if not live or
     /// untagged.
-    pub fn liveDevice(s: *Sessions, cookie_value: []const u8, now_ms: i64, refresh: bool) ?Device {
-        return switch (s.live(cookie_value, now_ms, refresh)) {
+    pub fn liveDevice(s: *Sessions, cookie_value: []const u8, ip: []const u8, now_ms: i64, refresh: bool) ?Device {
+        return switch (s.live(cookie_value, ip, now_ms, refresh)) {
             .device => |d| d,
             else => null,
         };
@@ -165,9 +198,9 @@ pub const Sessions = struct {
     /// When the session `cookie_value` will expire if not refreshed (the
     /// earlier of its idle and absolute limits), or null if it is not live.
     /// Lets a viewer sleep until then instead of polling.
-    pub fn expiresAt(s: *Sessions, cookie_value: []const u8, now_ms: i64) ?i64 {
+    pub fn expiresAt(s: *Sessions, cookie_value: []const u8, ip: []const u8, now_ms: i64) ?i64 {
         s.expire(now_ms);
-        const idx = s.find(cookie_value) orelse return null;
+        const idx = s.find(cookie_value, ip) orelse return null;
         const v = s.slots[idx].?;
         return @min(v.last_seen_ms +| s.idle_timeout_ms, v.created_ms +| s.absolute_timeout_ms);
     }
@@ -192,8 +225,10 @@ pub const Sessions = struct {
         return n;
     }
 
-    pub fn revoke(s: *Sessions, cookie_value: []const u8) void {
-        if (s.find(cookie_value)) |idx| s.slots[idx] = null;
+    /// Ends session `cookie_value` if it was issued to client address `ip`
+    /// (a copy presented from elsewhere cannot end it).
+    pub fn revoke(s: *Sessions, cookie_value: []const u8, ip: []const u8) void {
+        if (s.find(cookie_value, ip)) |idx| s.slots[idx] = null;
     }
 
     pub fn revokeAll(s: *Sessions) void {
@@ -208,7 +243,8 @@ pub const Sessions = struct {
         return n;
     }
 
-    fn find(s: *const Sessions, cookie_value: []const u8) ?usize {
+    /// The slot of session `cookie_value` if it is bound to `ip`.
+    fn find(s: *const Sessions, cookie_value: []const u8, ip: []const u8) ?usize {
         if (cookie_value.len != encoded_len) return null;
         const h = hashSecret(cookie_value);
         var found: ?usize = null;
@@ -218,7 +254,9 @@ pub const Sessions = struct {
                 if (std.crypto.timing_safe.eql(Hash, v.id_hash, h)) found = i;
             }
         }
-        return found;
+        const idx = found orelse return null;
+        // The secret matched; the address is not secret, so a plain compare.
+        return if (s.slots[idx].?.addr.matches(ip)) idx else null;
     }
 
     fn expire(s: *Sessions, now_ms: i64) void {
@@ -238,6 +276,7 @@ pub const Sessions = struct {
 // --------------------------------------------------------------------- tests
 
 const testing = std.testing;
+const test_ip = "10.8.0.2";
 
 test "verify accepts right secret, rejects others" {
     const raw: [secret_bytes]u8 = @splat(7);
@@ -264,30 +303,30 @@ test "sessions: create, validate, revoke" {
     var s: Sessions = .{};
     const a = testCookie(1);
     const b = testCookie(2);
-    s.create(&a, 0);
-    try testing.expect(s.validate(&a, 10));
-    try testing.expect(!s.validate(&b, 10));
-    s.revoke(&a);
-    try testing.expect(!s.validate(&a, 20));
+    s.create(&a, test_ip, 0);
+    try testing.expect(s.validate(&a, test_ip, 10));
+    try testing.expect(!s.validate(&b, test_ip, 10));
+    s.revoke(&a, test_ip);
+    try testing.expect(!s.validate(&a, test_ip, 20));
 }
 
 test "sessions: idle and absolute timeouts" {
     var s: Sessions = .{ .idle_timeout_ms = 100, .absolute_timeout_ms = 250 };
     const a = testCookie(1);
-    s.create(&a, 0);
-    try testing.expect(s.validate(&a, 90));
-    try testing.expect(s.validate(&a, 180));
-    try testing.expect(!s.validate(&a, 260)); // absolute limit
-    s.create(&a, 1000);
-    try testing.expect(!s.validate(&a, 1101)); // idle limit
+    s.create(&a, test_ip, 0);
+    try testing.expect(s.validate(&a, test_ip, 90));
+    try testing.expect(s.validate(&a, test_ip, 180));
+    try testing.expect(!s.validate(&a, test_ip, 260)); // absolute limit
+    s.create(&a, test_ip, 1000);
+    try testing.expect(!s.validate(&a, test_ip, 1101)); // idle limit
 }
 
 test "sessions: isLive does not refresh idle timer" {
     var s: Sessions = .{ .idle_timeout_ms = 100 };
     const a = testCookie(1);
-    s.create(&a, 0);
-    try testing.expect(s.isLive(&a, 90));
-    try testing.expect(!s.isLive(&a, 101));
+    s.create(&a, test_ip, 0);
+    try testing.expect(s.isLive(&a, test_ip, 90));
+    try testing.expect(!s.isLive(&a, test_ip, 101));
 }
 
 test "sessions: eviction when full keeps newest" {
@@ -295,11 +334,11 @@ test "sessions: eviction when full keeps newest" {
     var cookies: [Sessions.max_sessions + 1][encoded_len]u8 = undefined;
     for (&cookies, 0..) |*c, i| {
         c.* = testCookie(@intCast(i + 1));
-        s.create(c, @intCast(i));
+        s.create(c, test_ip, @intCast(i));
     }
     try testing.expectEqual(@as(usize, Sessions.max_sessions), s.count());
-    try testing.expect(!s.isLive(&cookies[0], 10));
-    try testing.expect(s.isLive(&cookies[Sessions.max_sessions], 10));
+    try testing.expect(!s.isLive(&cookies[0], test_ip, 10));
+    try testing.expect(s.isLive(&cookies[Sessions.max_sessions], test_ip, 10));
 }
 
 fn testId(fill: u8) DeviceId {
@@ -311,15 +350,15 @@ test "sessions: device tags" {
     const a = testCookie(1);
     const b = testCookie(2);
     const c = testCookie(3);
-    s.createFor(&a, 0, .init(testId(1), "laptop"));
-    s.createFor(&b, 0, .init(testId(2), "phone"));
-    s.create(&c, 0);
-    try testing.expectEqualStrings("laptop", s.liveDevice(&a, 1, false).?.name());
-    try testing.expect(s.live(&c, 1, false) == .anonymous);
-    try testing.expect(s.live(&testCookie(9), 1, false) == .none);
+    s.createFor(&a, test_ip, 0, .init(testId(1), "laptop"));
+    s.createFor(&b, test_ip, 0, .init(testId(2), "phone"));
+    s.create(&c, test_ip, 0);
+    try testing.expectEqualStrings("laptop", s.liveDevice(&a, test_ip, 1, false).?.name());
+    try testing.expect(s.live(&c, test_ip, 1, false) == .anonymous);
+    try testing.expect(s.live(&testCookie(9), test_ip, 1, false) == .none);
     try testing.expectEqual(@as(usize, 1), s.revokeDevice(testId(1)));
-    try testing.expect(s.liveDevice(&a, 2, false) == null);
-    try testing.expectEqualStrings("phone", s.liveDevice(&b, 2, false).?.name());
+    try testing.expect(s.liveDevice(&a, test_ip, 2, false) == null);
+    try testing.expectEqualStrings("phone", s.liveDevice(&b, test_ip, 2, false).?.name());
 }
 
 test "sessions: a re-paired name does not inherit or keep the old record's sessions" {
@@ -328,22 +367,22 @@ test "sessions: a re-paired name does not inherit or keep the old record's sessi
     const old_b = testCookie(2);
     const new = testCookie(3);
     // Two sessions of the old "laptop" record (two tabs).
-    s.createFor(&old_a, 0, .init(testId(1), "laptop"));
-    s.createFor(&old_b, 0, .init(testId(1), "laptop"));
+    s.createFor(&old_a, test_ip, 0, .init(testId(1), "laptop"));
+    s.createFor(&old_b, test_ip, 0, .init(testId(1), "laptop"));
     // Re-paired: the old record's sessions go, then the new one is issued.
     try testing.expectEqual(@as(usize, 2), s.revokeDevice(testId(1)));
-    s.createFor(&new, 1, .init(testId(7), "laptop"));
-    try testing.expect(!s.isLive(&old_a, 2) and !s.isLive(&old_b, 2));
+    s.createFor(&new, test_ip, 1, .init(testId(7), "laptop"));
+    try testing.expect(!s.isLive(&old_a, test_ip, 2) and !s.isLive(&old_b, test_ip, 2));
     // Revoking the old record again (late watcher pass) spares the new one.
     try testing.expectEqual(@as(usize, 0), s.revokeDevice(testId(1)));
-    try testing.expect(std.mem.eql(u8, &s.liveDevice(&new, 2, false).?.id, &testId(7)));
+    try testing.expect(std.mem.eql(u8, &s.liveDevice(&new, test_ip, 2, false).?.id, &testId(7)));
 }
 
 test "sessions: clock going backwards fails closed" {
     var s: Sessions = .{};
     const a = testCookie(1);
-    s.create(&a, 1000);
-    try testing.expect(!s.validate(&a, 500));
+    s.create(&a, test_ip, 1000);
+    try testing.expect(!s.validate(&a, test_ip, 500));
 }
 
 
@@ -351,13 +390,13 @@ test "sessions: clock going backwards fails closed" {
 test "sessions: expiresAt is the earlier limit" {
     var s: Sessions = .{ .idle_timeout_ms = 100, .absolute_timeout_ms = 250 };
     const a = testCookie(1);
-    s.create(&a, 0);
-    try testing.expectEqual(@as(?i64, 100), s.expiresAt(&a, 10));
-    try testing.expect(s.validate(&a, 90));
-    try testing.expectEqual(@as(?i64, 190), s.expiresAt(&a, 95));
-    try testing.expect(s.validate(&a, 180));
-    try testing.expectEqual(@as(?i64, 250), s.expiresAt(&a, 181));
-    try testing.expectEqual(@as(?i64, null), s.expiresAt(&testCookie(2), 181));
+    s.create(&a, test_ip, 0);
+    try testing.expectEqual(@as(?i64, 100), s.expiresAt(&a, test_ip, 10));
+    try testing.expect(s.validate(&a, test_ip, 90));
+    try testing.expectEqual(@as(?i64, 190), s.expiresAt(&a, test_ip, 95));
+    try testing.expect(s.validate(&a, test_ip, 180));
+    try testing.expectEqual(@as(?i64, 250), s.expiresAt(&a, test_ip, 181));
+    try testing.expectEqual(@as(?i64, null), s.expiresAt(&testCookie(2), test_ip, 181));
 }
 
 test "sessions: revokeUnpaired keeps new and untagged sessions" {
@@ -366,10 +405,10 @@ test "sessions: revokeUnpaired keeps new and untagged sessions" {
     const b = testCookie(2);
     const c = testCookie(3);
     const d = testCookie(4);
-    s.createFor(&a, 0, .init(testId(1), "laptop"));
-    s.createFor(&b, 0, .init(testId(2), "laptop")); // same name, the record that is kept
-    s.create(&d, 0);
-    s.createFor(&c, 50, .init(testId(1), "laptop")); // created after the device list was read
+    s.createFor(&a, test_ip, 0, .init(testId(1), "laptop"));
+    s.createFor(&b, test_ip, 0, .init(testId(2), "laptop")); // same name, the record that is kept
+    s.create(&d, test_ip, 0);
+    s.createFor(&c, test_ip, 50, .init(testId(1), "laptop")); // created after the device list was read
     var ended: [Sessions.max_sessions]DeviceId = undefined;
     const n = s.revokeUnpaired(40, {}, struct {
         fn f(_: void, id: DeviceId) bool {
@@ -378,6 +417,26 @@ test "sessions: revokeUnpaired keeps new and untagged sessions" {
     }.f, &ended);
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqual(testId(1), ended[0]);
-    try testing.expect(!s.isLive(&a, 60));
-    try testing.expect(s.isLive(&b, 60) and s.isLive(&c, 60) and s.isLive(&d, 60));
+    try testing.expect(!s.isLive(&a, test_ip, 60));
+    try testing.expect(s.isLive(&b, test_ip, 60) and s.isLive(&c, test_ip, 60) and s.isLive(&d, test_ip, 60));
+}
+
+test "sessions: a cookie from another address is refused, not revoked" {
+    var s: Sessions = .{};
+    const a = testCookie(1);
+    s.createFor(&a, test_ip, 0, .init(testId(1), "laptop"));
+    const other = "10.8.0.3";
+    try testing.expect(!s.validate(&a, other, 1));
+    try testing.expect(!s.isLive(&a, other, 1));
+    try testing.expect(s.live(&a, other, 1, true) == .none);
+    try testing.expectEqual(@as(?i64, null), s.expiresAt(&a, other, 1));
+    s.revoke(&a, other);
+    // Still the owner's, untouched.
+    try testing.expect(s.validate(&a, test_ip, 2));
+    try testing.expectEqualStrings("laptop", s.liveDevice(&a, test_ip, 2, false).?.name());
+    // A prefix or an over-long address is not a match either.
+    try testing.expect(!s.isLive(&a, "10.8.0.", 2));
+    try testing.expect(!s.isLive(&a, &@as([80]u8, @splat('0')), 2));
+    s.revoke(&a, test_ip);
+    try testing.expect(!s.isLive(&a, test_ip, 3));
 }

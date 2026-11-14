@@ -709,6 +709,22 @@ test "publish: hash, sign, store atomically; sequences and names never reused; i
     try testing.expect(try subscribe(gpa, io, paths, "laptop", "stt-model", false));
 }
 
+test "a hand-written publish manifest with no files is not published (no panic)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [512]u8 = undefined;
+    const paths = try tmpPaths(&tmp, &pb);
+    var fb: [1024]u8 = undefined;
+    try Io.Dir.cwd().createDirPath(io, try paths.join(&fb, &.{ "publish", "stt-model", "9" }));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try paths.join(&fb, &.{ "publish", "stt-model", "9", "manifest.txt" }), .data = manifest.header ++
+        "\npackage stt-model\nversion 9\nkind data\nsequence 9\ncreated 1\nmin-client 0.1.0\nfiles 0\nend\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try paths.join(&fb, &.{ "publish", "stt-model", "9", "manifest.sig" }), .data = &@as([128]u8, @splat('a')) });
+    try testing.expectError(error.NotPublished, readVersion(gpa, io, paths, "stt-model", "9"));
+    try testing.expect((try latest(gpa, io, paths, "stt-model")) == null);
+}
+
 test "subscriptions file is strict" {
     try testing.expectError(error.BadSubscriptionFile, Subs.parse("nope\n"));
     try testing.expectError(error.BadSubscriptionFile, Subs.parse(subs_header ++ "\nsub Laptop x\n"));

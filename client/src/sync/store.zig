@@ -307,9 +307,13 @@ pub const Store = struct {
         var it = dir.iterate();
         while (try it.next(s.io)) |e| {
             if (e.kind != .directory or !manifest.validPackageId(e.name)) continue;
-            var vb: [16]Version = undefined;
-            const vs = try s.versions(e.name, &vb);
-            for (vs) |v| total +|= v.size;
+            // Every version, however many there are (not a bounded list).
+            try s.eachVersion(e.name, &total, struct {
+                fn add(t: *u64, v: Version) bool {
+                    t.* +|= v.size;
+                    return true;
+                }
+            }.add);
         }
         return total;
     }
@@ -327,16 +331,30 @@ pub const Store = struct {
     /// Installed version folders of `pkg` that have their manifest (up to
     /// `out.len`).
     pub fn versions(s: *const Store, pkg: []const u8, out: []Version) ![]Version {
+        const Ctx = struct { out: []Version, n: usize = 0 };
+        var c: Ctx = .{ .out = out };
+        try s.eachVersion(pkg, &c, struct {
+            fn put(x: *Ctx, v: Version) bool {
+                if (x.n == x.out.len) return false;
+                x.out[x.n] = v;
+                x.n += 1;
+                return x.n < x.out.len;
+            }
+        }.put);
+        return out[0..c.n];
+    }
+
+    /// Calls `f(ctx, v)` for each installed version folder of `pkg` that
+    /// has its manifest, until `f` returns false.
+    fn eachVersion(s: *const Store, pkg: []const u8, ctx: anytype, comptime f: fn (@TypeOf(ctx), Version) bool) !void {
         var pb: [1024]u8 = undefined;
         var dir = Io.Dir.cwd().openDir(s.io, try s.path(&pb, &.{ "packages", pkg }), .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return out[0..0],
+            error.FileNotFound => return,
             else => return err,
         };
         defer dir.close(s.io);
-        var n: usize = 0;
         var it = dir.iterate();
         while (try it.next(s.io)) |e| {
-            if (n == out.len) break;
             if (e.kind != .directory or !manifest.validVersion(e.name)) continue;
             const m_bytes = s.readInstalledManifest(pkg, e.name) catch continue;
             defer s.gpa.free(m_bytes.text);
@@ -345,10 +363,8 @@ pub const Store = struct {
             var v: Version = .{ .size = m.totalSize(), .sequence = m.sequence };
             @memcpy(v.name_buf[0..e.name.len], e.name);
             v.name_len = @intCast(e.name.len);
-            out[n] = v;
-            n += 1;
+            if (!f(ctx, v)) return;
         }
-        return out[0..n];
     }
 
     pub const InstalledManifest = struct { text: []u8, sig: [manifest.signature_len]u8 };
@@ -1086,6 +1102,41 @@ test "atomic install, read-only files, upgrade, downgrade/replay refused, rollba
     var newer = v3.m;
     newer.min_client = "9.0";
     try testing.expectEqual(Offer.needs_newer_client, try s.checkOffer(&newer, "0.1.0"));
+}
+
+test "quota usage counts every kept version, not only the first 16" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rb: [256]u8 = undefined;
+    var s = try testStore(&tmp, &rb);
+    defer gpa.free(s.root);
+    const kp = try manifest.Ed25519.KeyPair.generateDeterministic(@splat(5));
+    const p = try TestPkg.make(gpa, kp, "stt-model", "1", 1, &.{"0123456789"}, &.{"w.bin"});
+    defer p.destroy(gpa);
+    var src: MemSource = .{ .contents = &.{"0123456789"} };
+    _ = try s.install(&p.m, p.bytes, p.sig, &src);
+    try testing.expectEqual(@as(u64, 10), try s.usage());
+    // 24 more version folders with their manifests (left behind, say, by
+    // versions kept in use).
+    var mb: [1024]u8 = undefined;
+    var tb: [1024]u8 = undefined;
+    for (0..24) |i| {
+        var nb: [16]u8 = undefined;
+        const ver = try std.fmt.bufPrint(&nb, "x{d}", .{i});
+        try Io.Dir.cwd().createDirPath(s.io, try s.path(&tb, &.{ "packages", "stt-model", ver }));
+        for ([_][]const u8{ "txt", "sig" }) |ext| {
+            var fb: [32]u8 = undefined;
+            var ob: [32]u8 = undefined;
+            const from = try s.path(&mb, &.{ "packages", "stt-model", ".manifests", try std.fmt.bufPrint(&ob, "1.{s}", .{ext}) });
+            var data_buf: [4096]u8 = undefined;
+            const data = try Io.Dir.cwd().readFile(s.io, from, &data_buf);
+            try Io.Dir.cwd().writeFile(s.io, .{ .sub_path = try s.path(&tb, &.{ "packages", "stt-model", ".manifests", try std.fmt.bufPrint(&fb, "{s}.{s}", .{ ver, ext }) }), .data = data });
+        }
+    }
+    try testing.expectEqual(@as(u64, 25 * 10), try s.usage());
+    var vb: [4]Store.Version = undefined;
+    try testing.expectEqual(@as(usize, 4), (try s.versions("stt-model", &vb)).len);
 }
 
 test "a corrupted or oversized file is rejected in staging; nothing is installed" {

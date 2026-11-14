@@ -17,6 +17,10 @@ fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     });
     const opts = b.addOptions();
     opts.addOption(bool, "gui", app == .gui);
+    // Test-only environment variables (PORTAL_AGENT_PROJECTS) are honoured
+    // in Debug builds (unit tests, `zig build e2e`) only, never in the
+    // ReleaseSafe builds releases are made of.
+    opts.addOption(bool, "test_env", optimize == @TypeOf(optimize).Debug);
     root.addOptions("build_options", opts);
     root.addAnonymousImport("app_wasm", .{ .root_source_file = wasm_bin });
     root.addImport("shared", sharedModule(b, target, optimize));

@@ -309,15 +309,23 @@ fn parseOption(p: *Parser) ?Option {
     return o;
 }
 
-/// Valid UTF-8 without control characters other than line feed and tab.
+/// Valid UTF-8 without control characters other than line feed and tab,
+/// and none of the other code points tab names refuse (C1 controls, line
+/// separators, bidi controls, BOM: tabs.blocked).
 pub fn printable(s: []const u8) bool {
-    if (!std.unicode.utf8ValidateSlice(s)) return false;
-    for (s) |c| switch (c) {
-        '\n', '\t' => {},
-        0...8, 0x0b...0x1f, 0x7f => return false,
-        else => {},
-    };
+    const v = std.unicode.Utf8View.init(s) catch return false;
+    var it = v.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp == '\n' or cp == '\t') continue;
+        if (tabs.blocked(cp)) return false;
+    }
     return true;
+}
+
+test "printable refuses what tab names refuse, but for line feed and tab" {
+    try std.testing.expect(printable("a\tb\nc é 日本"));
+    for ([_][]const u8{ "a\x00", "a\x1b[31m", "a\x7f", "a\u{85}", "a\u{9b}", "x\u{202e}gnp.exe", "\u{2066}a", "a\u{2069}", "a\u{200f}", "a\u{061c}", "\u{feff}a", "a\u{2028}b", "\xff" }) |bad|
+        try std.testing.expect(!printable(bad));
 }
 
 /// The strict, bounded JSON reader the shared message parsers use
@@ -531,6 +539,9 @@ test "malformed messages are rejected whole" {
         "{\"t\":\"convo\"," ++ id ++ ",\"items\":[{\"n\":-1,\"k\":\"user\",\"text\":\"x\"}]}",
         "{\"t\":\"convo\"," ++ id ++ ",\"items\":[{\"n\":99999999999,\"k\":\"user\",\"text\":\"x\"}]}",
         "{\"t\":\"convo\"," ++ id ++ ",\"items\":[{\"n\":1,\"k\":\"user\",\"text\":\"\xff\"}]}",
+        "{\"t\":\"convo\"," ++ id ++ ",\"items\":[{\"n\":1,\"k\":\"user\",\"text\":\"x\u{202e}y\"}]}", // bidi override, raw
+        "{\"t\":\"convo\"," ++ id ++ ",\"items\":[{\"n\":1,\"k\":\"user\",\"text\":\"x\\u0085y\"}]}", // C1 control, escaped
+        "{\"t\":\"convo\"," ++ id ++ ",\"items\":[{\"n\":1,\"k\":\"question\",\"text\":\"x\",\"options\":[{\"label\":\"a\\u2066b\",\"key\":\"1\"}]}]}", // bidi isolate in a label
         "{\"t\":\"convo\"," ++ id ++ ",\"items\":[{\"n\":1,\"k\":\"user\",\"text\":\"x\",\"open\":true}]}",
         "{\"t\":\"convo\"," ++ id ++ ",\"items\":[{\"n\":1,\"k\":\"question\",\"text\":\"x\",\"options\":[{\"label\":\"a\",\"key\":\"ctrl-c\"}]}]}",
         "{\"t\":\"convo\"," ++ id ++ ",\"items\":[{\"n\":1,\"k\":\"question\",\"text\":\"x\",\"options\":[{\"label\":\"\",\"key\":\"1\"}]}]}",

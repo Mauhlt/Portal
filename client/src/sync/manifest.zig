@@ -279,6 +279,8 @@ pub fn encode(gpa: Allocator, m: *Manifest) Error![]u8 {
     if (!validClientVersion(m.min_client)) return error.BadManifest;
     if (m.sequence == 0 or m.sequence > std.math.maxInt(i63)) return error.BadManifest;
     if (m.created < 0) return error.BadManifest;
+    // A package holds at least one file (publishing refuses an empty folder).
+    if (m.files.len == 0) return error.BadManifest;
     if (m.files.len > max_files) return error.TooManyFiles;
     var total: u64 = 0;
     for (m.files) |f| {
@@ -288,7 +290,7 @@ pub fn encode(gpa: Allocator, m: *Manifest) Error![]u8 {
         if (total > max_package_bytes) return error.TooLarge;
     }
     std.mem.sort(File, m.files, {}, lessPath);
-    for (m.files[1..], 1..) |f, i| if (std.mem.eql(u8, f.path, m.files[i - 1].path)) return error.DuplicatePath;
+    for (1..m.files.len) |i| if (std.mem.eql(u8, m.files[i].path, m.files[i - 1].path)) return error.DuplicatePath;
     try checkUnique(gpa, m.files);
 
     var out: std.ArrayList(u8) = .empty;
@@ -362,6 +364,7 @@ pub fn parse(gpa: Allocator, bytes: []const u8) Error!Manifest {
     const min_client = try l.field("min-client");
     if (!validClientVersion(min_client)) return error.BadManifest;
     const n = try parseUint(try l.field("files"), max_files);
+    if (n == 0) return error.BadManifest;
 
     const files = try gpa.alloc(File, @intCast(n));
     errdefer gpa.free(files);
@@ -758,6 +761,22 @@ test "index round trip and strictness" {
     try testing.expectError(error.BadManifest, parseIndex(index_header ++ "\npkg x 1 1 data 1\nend\n", &buf));
     try testing.expectError(error.BadManifest, parseIndex(index_header ++ "\nend\nextra", &buf));
     try testing.expectError(error.BadPackageId, parseIndex(index_header ++ "\npkg ../x 1 1 data 1 " ++ &@as([64]u8, @splat('0')) ++ "\nend\n", &buf));
+}
+
+test "a manifest without files is refused, not a panic" {
+    const gpa = testing.allocator;
+    var none = [_]File{};
+    var m = sample(&none);
+    try testing.expectError(error.BadManifest, encode(gpa, &m));
+    // The same manifest as bytes ("files 0"): refused by the parser.
+    var one = [_]File{.{ .path = "a.bin", .size = 5, .sha256 = hashOf(1) }};
+    var m1 = sample(&one);
+    const good = try encode(gpa, &m1);
+    defer gpa.free(good);
+    const at = std.mem.indexOf(u8, good, "\nfiles 1\n").?;
+    const empty = try std.mem.concat(gpa, u8, &.{ good[0 .. at + 1], "files 0\nend\n" });
+    defer gpa.free(empty);
+    try testing.expectError(error.BadManifest, parse(gpa, empty));
 }
 
 test "manifest parser fuzz: random, truncated and mutated input never panics" {

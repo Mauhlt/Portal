@@ -254,8 +254,8 @@ These are hard requirements for the tabs and recent-projects work, enforced by
    The Conversation view (protocol section 3b) is the one place program
    text leaves the grid as text, by the owner's decision (2026-11-12): it
    is scrubbed on the desktop first (src/convo/scrub.zig: the tab's
-   folder becomes its name, other absolute paths `[path]`, the user's
-   name `[user]`), and tool arguments, results and thinking are never
+   folder becomes its name, the home folder `[home]`, other absolute
+   paths `[path]`, the user's names `[user]`), and tool arguments, results and thinking are never
    sent. Covered by tests/e2e/convo_tests.zig and privacy.zig.
 5. **Program-controlled strings stay in the grid.** Window titles set by
    programs (OSC 0/2, which the agent uses and which can contain paths) are

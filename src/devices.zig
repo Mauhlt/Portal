@@ -66,8 +66,10 @@ pub const max_requests = 8;
 pub const max_requests_per_ip = 2;
 /// Request code shown on the device and at the desk: 4 hex digits.
 pub const code_len = 4;
-/// Secret hashes of removed records remembered (oldest dropped first).
-pub const max_gone = 32;
+/// Secret hashes of removed records remembered (oldest dropped first):
+/// enough for every record's current secret and full grace ring, so
+/// unpairing all of them at once forgets none.
+pub const max_gone = max_devices * (ring_len + 1);
 
 const header_v1 = "portal-devices-v1";
 const header_v2 = "portal-devices-v2";
@@ -1185,6 +1187,26 @@ test "tombstones are bounded: the oldest go first" {
     for (0..max_gone + 3) |i| s.bury(auth.hashSecret(&[_]u8{@intCast(i)}), @intCast(100 + i));
     try testing.expect(!s.isGone(auth.hashSecret(&[_]u8{0})));
     try testing.expect(s.isGone(auth.hashSecret(&[_]u8{max_gone + 2})));
+}
+
+test "tombstones: unpairing every record with a full ring forgets no secret" {
+    var s: Store = .{};
+    var hashes: [max_devices * (ring_len + 1)]auth.Hash = undefined;
+    var k: usize = 0;
+    for (0..max_devices) |i| {
+        var d: Device = .{ .id = @splat(@intCast(i)), .cur = auth.hashSecret(&[_]u8{ @intCast(i), 0xff }), .created = 1, .last_seen = 1 };
+        hashes[k] = d.cur;
+        k += 1;
+        for (&d.ring, 0..) |*g, j| {
+            const h = auth.hashSecret(&[_]u8{ @intCast(i), @intCast(j) });
+            g.* = .{ .hash = h, .until = 2 };
+            hashes[k] = h;
+            k += 1;
+        }
+        s.devices[i] = d;
+    }
+    for (0..max_devices) |i| _ = s.drop(i);
+    for (hashes) |h| try testing.expect(s.isGone(h));
 }
 
 test "removeId spares a newer record under the same name" {

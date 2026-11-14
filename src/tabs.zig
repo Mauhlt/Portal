@@ -42,6 +42,7 @@ const activity_wire = @import("shared").activity;
 const follow = @import("convo/follow.zig");
 const subagents = @import("convo/subagents.zig");
 const SubTabs = @import("convo/subtabs.zig").SubTabs;
+const scrub = @import("convo/scrub.zig");
 const transcript = @import("convo/transcript.zig");
 const cmdline = @import("cmdline.zig");
 const childenv = @import("childenv.zig");
@@ -448,6 +449,8 @@ pub const Hub = struct {
     convo_projects: ?[]const u8 = null,
     /// The user's name, scrubbed from conversation texts.
     user_name: ?[]const u8 = null,
+    /// The user's other names and home folders, scrubbed likewise.
+    identity: scrub.Identity = .{},
     /// The desk's "Show system monitor" setting, as viewers are told
     /// (`activity.sysmon`). Guarded by `mutex`; set with setSysmon.
     sysmon_on: bool = false,
@@ -579,9 +582,16 @@ pub const Hub = struct {
             t.session_uuid = cmdline.uuidV4(rnd);
         }
         // The hook key, passed to the program (and so to the agent's
-        // hooks) as PORTAL_TAB, added after childenv's filter.
+        // hooks) as PORTAL_TAB, added after childenv's filter. It
+        // authenticates hook messages, so without secure randomness the
+        // tab is not started (no guessable fallback).
         while (true) {
-            h.io.randomSecure(&t.hook_key) catch h.io.random(&t.hook_key);
+            h.io.randomSecure(&t.hook_key) catch |err| {
+                h.log.print("tab '{s}': no secure randomness for its hook key ({t}); not started", .{ t.name(), err });
+                t.session.term.deinit();
+                h.gpa.destroy(t);
+                return error.SpawnFailed;
+            };
             if (!std.mem.allEqual(u8, &t.hook_key, 0)) break;
         }
         const line = (if (t.session_uuid) |*u| cmdline.withSessionId(h.gpa, h.program.cmdline, u) else h.gpa.dupeSentinel(u16, h.program.cmdline, 0)) catch {
@@ -615,11 +625,12 @@ pub const Hub = struct {
         t.session.pty = &t.pty;
         t.local = .{ .gpa = h.gpa, .io = h.io, .session = &t.session };
         t.session.local = &t.local;
-        t.convo = Convo.init(h.gpa, .{ .root = t.cwd, .name = t.name(), .user = h.user_name });
-        t.activity = Activity.init(h.gpa, .{ .root = t.cwd, .name = t.name(), .user = h.user_name });
+        const sctx: scrub.Context = .{ .root = t.cwd, .name = t.name(), .user = h.user_name, .users = h.identity.users, .homes = h.identity.homes };
+        t.convo = Convo.init(h.gpa, sctx);
+        t.activity = Activity.init(h.gpa, sctx);
         t.activity.dayOf = localDay;
         t.session.convo = &t.convo;
-        t.subs = SubTabs.init(h.gpa, h.io, .{ .root = t.cwd, .name = t.name(), .user = h.user_name });
+        t.subs = SubTabs.init(h.gpa, h.io, sctx);
         if (h.convo_projects != null) {
             t.subs_kick = w32.validHandle(w32.CreateEventW(null, 0, 0, null));
             t.convo_stop = w32.validHandle(w32.CreateEventW(null, 1, 0, null));

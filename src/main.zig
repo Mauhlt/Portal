@@ -62,6 +62,7 @@ const settings = @import("settings.zig");
 const sysmon = @import("sysmon.zig");
 const sync = @import("sync.zig");
 const sync_cli = @import("sync_cli.zig");
+const ScrubIdentity = @import("convo/scrub.zig").Identity;
 
 /// True in portal.exe (the window), false in portalctl.exe (build.zig).
 pub const gui_app = @import("build_options").gui;
@@ -1579,6 +1580,11 @@ const HookWatch = struct {
         hub.applyHook(m);
     }
 
+    fn problem(ctx: *anyopaque, what: []const u8) void {
+        const hub: *tabs.Hub = @ptrCast(@alignCast(ctx));
+        hub.log.print("hooks: {s}", .{what});
+    }
+
     /// Starts the pipe server thread; logs (and runs without hooks) if it
     /// can't.
     fn start(gpa: Allocator, hub: *tabs.Hub, log: *Log, data_dir: []const u8) void {
@@ -1592,7 +1598,7 @@ const HookWatch = struct {
             return;
         };
         const srv = gpa.create(hookpipe.Server) catch return;
-        srv.* = .{ .stop = ev[0], .conn_ev = ev[1], .read_ev = ev[2], .ctx = hub, .on_message = message };
+        srv.* = .{ .stop = ev[0], .conn_ev = ev[1], .read_ev = ev[2], .ctx = hub, .on_message = message, .on_problem = problem };
         srv.init(name) catch |err| {
             log.print("hooks: cannot create the hook pipe ({s}); Claude Code hooks are not listened to", .{switch (err) {
                 error.NameTaken => "another process holds its name: another Portal with the same data folder?",
@@ -1608,12 +1614,48 @@ const HookWatch = struct {
     }
 };
 
+/// The user's names and home folders for the conversation scrubber
+/// (convo/scrub.zig): %USERNAME%, %USERPROFILE% and the OneDrive folders,
+/// each also in its 8.3 short form. Lives as long as the process.
+fn scrubIdentity(gpa: Allocator, env: *const std.process.Environ.Map) ScrubIdentity {
+    const profile = env.get("USERPROFILE");
+    var others: [6]?[]const u8 = @splat(null);
+    for ([_][]const u8{ "OneDrive", "OneDriveConsumer", "OneDriveCommercial" }, 0..) |name, i| {
+        const d = env.get(name) orelse continue;
+        others[2 * i] = d;
+        others[2 * i + 1] = shortPath(gpa, d);
+    }
+    return ScrubIdentity.init(gpa, .{
+        .user_name = env.get("USERNAME"),
+        .profile = profile,
+        .profile_short = if (profile) |p| shortPath(gpa, p) else null,
+        .other_homes = &others,
+    }) catch .{};
+}
+
+/// The 8.3 short form of existing path `p` (`C:\Users\JOHNSM~1`), if
+/// it has one that differs.
+fn shortPath(gpa: Allocator, p: []const u8) ?[]const u8 {
+    const wide = std.unicode.wtf8ToWtf16LeAllocZ(gpa, p) catch return null;
+    defer gpa.free(wide);
+    var buf: [1024]u16 = undefined;
+    const n = w.GetShortPathNameW(wide.ptr, &buf, buf.len);
+    if (n == 0 or n >= buf.len) return null;
+    const out = std.unicode.wtf16LeToWtf8Alloc(gpa, buf[0..n]) catch return null;
+    if (std.ascii.eqlIgnoreCase(out, p)) {
+        gpa.free(out);
+        return null;
+    }
+    return out;
+}
+
 /// The agent's transcript folder, read (never written) for each tab's
 /// Conversation view (src/convo/follow.zig): %PORTAL_AGENT_PROJECTS%
-/// (tests point it at a scratch folder), else %CLAUDE_CONFIG_DIR%\projects,
-/// else %USERPROFILE%\.claude\projects. Lives as long as the process.
+/// (tests point it at a scratch folder; honoured only in Debug builds,
+/// build option `test_env`), else %CLAUDE_CONFIG_DIR%\projects, else
+/// %USERPROFILE%\.claude\projects. Lives as long as the process.
 fn convoProjects(gpa: Allocator, env: *const std.process.Environ.Map) ?[]const u8 {
-    if (env.get("PORTAL_AGENT_PROJECTS")) |p| if (p.len > 0) return p;
+    if (@import("build_options").test_env) if (env.get("PORTAL_AGENT_PROJECTS")) |p| if (p.len > 0) return p;
     if (env.get("CLAUDE_CONFIG_DIR")) |d| if (d.len > 0) return std.fs.path.join(gpa, &.{ d, "projects" }) catch null;
     const home = env.get("USERPROFILE") orelse return null;
     return std.fs.path.join(gpa, &.{ home, ".claude", "projects" }) catch null;
@@ -1879,6 +1921,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .colors = saved.colorChoices(&colors_buf),
         .convo_projects = convoProjects(gpa, env),
         .user_name = env.get("USERNAME"),
+        .identity = scrubIdentity(gpa, env),
         .size = initial,
         .sysmon_on = saved.system_monitor orelse false,
     };
