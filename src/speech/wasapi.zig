@@ -286,8 +286,11 @@ pub const Wasapi = struct {
     }
 
     /// UTF-16 (NUL-terminated) -> `out` as UTF-8.
+    /// UTF-16 (NUL-terminated) -> `out` as UTF-8: at most max_id units
+    /// are read, and each can take 3 bytes (a lone surrogate too), so the
+    /// buffer is 3 bytes per unit; `out.set` then cuts at its own size.
     fn utf8(w: [*:0]const u16, out: anytype) void {
-        var buf: [mics.max_id * 2]u8 = undefined;
+        var buf: [mics.max_id * 3]u8 = undefined;
         const s = std.mem.span(w);
         const n = std.unicode.utf16LeToUtf8(&buf, s[0..@min(s.len, mics.max_id)]) catch 0;
         out.set(buf[0..n]);
@@ -443,6 +446,19 @@ pub const Wasapi = struct {
 
     const vt: capture.Backend.VTable = .{ .open = open, .close = close, .list = listFn, .start = startFn, .read = readFn, .stop = stopFn };
 };
+
+test "utf8: a long CJK endpoint name fits (3 bytes per unit), cut at a boundary" {
+    var w: [mics.max_id + 40:0]u16 = undefined;
+    @memset(w[0 .. mics.max_id + 40], 0x4E2D); // 中
+    w[mics.max_id + 40] = 0;
+    var name: mics.NameText = .{};
+    Wasapi.utf8(&w, &name);
+    try std.testing.expect(name.len > 0 and name.len <= mics.max_name);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(name.get()));
+    var id: mics.IdText = .{};
+    Wasapi.utf8(&w, &id);
+    try std.testing.expect(id.len <= mics.max_id and std.unicode.utf8ValidateSlice(id.get()));
+}
 
 test "guids and layouts" {
     const g = guid("BCDE0395-E52F-467C-8E3D-C4579291692E");

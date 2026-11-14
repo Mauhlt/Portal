@@ -29,15 +29,21 @@ pub fn main(init: std.process.Init) !void {
     const model_arg = args.next();
 
     var w: Waker = .{ .ev = try sys.autoEvent() };
+    defer _ = sys.CloseHandle(w.ev);
     var wb: speech.wasapi.Wasapi = .{};
     var mic: capture.Mic = .{ .gpa = gpa, .backend = wb.backend(), .notify_ctx = &w, .notify_fn = Waker.notify };
     try mic.start();
     defer mic.deinit();
     var s: capture.Snapshot = .{};
-    while (s.list_gen == 0) {
-        _ = sys.WaitForSingleObject(w.ev, 2000);
+    // The device list comes with the thread's first notification (10 s
+    // at most, a real deadline).
+    const list_end = std.Io.Clock.awake.now(io).toMilliseconds() + 10_000;
+    while (true) {
         mic.snapshot(&s);
-        if (s.err().len > 0) break;
+        if (s.list_gen > 0 or s.err().len > 0) break;
+        const ms = sys.msUntil(list_end, std.Io.Clock.awake.now(io).toMilliseconds());
+        if (ms == 0) break;
+        _ = sys.WaitForSingleObject(w.ev, ms);
     }
     std.debug.print("capture endpoints ({d}):\n", .{s.list.len});
     for (s.list.slice(), 0..) |*e, i| {
@@ -54,8 +60,7 @@ pub fn main(init: std.process.Init) !void {
     if (s.active == null) return;
 
     std.debug.print("recording {d} s from the endpoint marked * ...\n", .{seconds});
-    mic.startRecording();
-    _ = sys.WaitForSingleObject(w.ev, 0);
+    _ = mic.startRecording();
     // Wait out the seconds (a real deadline), then stop.
     const end = std.Io.Clock.awake.now(io).toMilliseconds() + @as(i64, seconds) * 1000;
     while (true) {
@@ -66,9 +71,12 @@ pub fn main(init: std.process.Init) !void {
     mic.snapshot(&s);
     if (s.err().len > 0) std.debug.print("error: {s}\n", .{s.err()});
     mic.stopRecording();
+    const rec_end = std.Io.Clock.awake.now(io).toMilliseconds() + 5_000;
     const rec = while (true) {
-        if (mic.takeRecording()) |r| break r;
-        _ = sys.WaitForSingleObject(w.ev, 2000);
+        if (mic.takeRecording()) |rr| break rr;
+        const ms = sys.msUntil(rec_end, std.Io.Clock.awake.now(io).toMilliseconds());
+        if (ms == 0) return error.Timeout;
+        _ = sys.WaitForSingleObject(w.ev, ms);
     };
     std.debug.print("recorded {d} samples ({d:.2} s), peak level {d:.2}\n", .{ rec.samples.len, @as(f32, @floatFromInt(rec.samples.len)) / capture.sample_rate, capture.peakLevel(rec.samples) });
     if (!speech.has_home) {

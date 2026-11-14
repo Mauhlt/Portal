@@ -104,7 +104,12 @@ pub const SyncError = error{ Busy, TooLarge, SpeechUnavailable, OutOfMemory };
 pub const FeedbackError = error{ RateLimited, UnknownId, TextTooLong, OutOfMemory };
 
 const Clip = struct { purpose: Purpose, pcm: []i16, seq: u64 };
-const Feedback = struct { id: u64, text: []u8, ok: bool };
+/// Who a queued feedback call is from: the desk's user, a paired device
+/// (the future device routes, after gate.Gate), or Portal itself (its own
+/// discards: canceled, not kept). Device entries never push out the desk's
+/// or Portal's: they get at most half the queue.
+const Source = enum { desk, device, portal };
+const Feedback = struct { id: u64, text: []u8, ok: bool, source: Source = .desk };
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -140,7 +145,11 @@ pub const Engine = struct {
     /// Transcript ids that may still get feedback (newest overwrite the
     /// oldest; 0 = empty slot).
     cfg: limits.Config = .{},
-    /// Dictations kept as training samples (rolling day).
+    /// "Learn from my voice" (default on), and a change waiting for the
+    /// engine's thread to pass to Home.
+    learning: bool = true,
+    learning_job: ?bool = null,
+    /// Dictations kept as training samples (rolling day, boot clock).
     kept: limits.Rolling(24, 3_600_000) = .{},
     pending_ids: [limits.max_pending_ids]u64 = @splat(0),
     pending_at: usize = 0,
@@ -160,17 +169,22 @@ pub const Engine = struct {
     pub fn create(gpa: std.mem.Allocator, io: std.Io, cfg: Config) !*Engine {
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
-        e.* = .{
-            .gpa = gpa,
-            .io = io,
-            .model_path = try gpa.dupe(u8, cfg.model_path),
-            .profile_dir = try gpa.dupe(u8, cfg.profile_dir),
-            .device = try gpa.dupe(u8, cfg.device),
-        };
+        const model_path = try gpa.dupe(u8, cfg.model_path);
+        errdefer gpa.free(model_path);
+        const profile_dir = try gpa.dupe(u8, cfg.profile_dir);
+        errdefer gpa.free(profile_dir);
+        const device = try gpa.dupe(u8, cfg.device);
+        errdefer gpa.free(device);
+        e.* = .{ .gpa = gpa, .io = io, .model_path = model_path, .profile_dir = profile_dir, .device = device };
         try e.feedbacks.ensureTotalCapacityPrecise(gpa, limits.feedback_queue_ceiling);
-        e.stop_ev = try sys.autoEvent();
-        e.job_ev = try sys.autoEvent();
+        errdefer e.feedbacks.deinit(gpa);
+        const stop_ev = try sys.autoEvent();
+        errdefer _ = sys.CloseHandle(stop_ev);
+        const job_ev = try sys.autoEvent();
+        errdefer _ = sys.CloseHandle(job_ev);
         e.rearm_ev = try sys.autoEvent();
+        e.stop_ev = stop_ev;
+        e.job_ev = job_ev;
         return e;
     }
 
@@ -209,6 +223,12 @@ pub const Engine = struct {
         return std.Io.Clock.awake.now(e.io).toMilliseconds();
     }
 
+    /// The rate limits' and day counts' clock: it keeps counting while the
+    /// machine sleeps, so an hour or a day means wall time.
+    fn bootMs(e: *Engine) i64 {
+        return std.Io.Clock.boot.now(e.io).toMilliseconds();
+    }
+
     // ------------------------------------------------------------ window side
 
     /// New limits, live (clamped): rates and caps apply to the next
@@ -235,16 +255,21 @@ pub const Engine = struct {
         var keep = false;
         defer if (!keep) e.gpa.free(pcm);
         const now = e.awakeMs();
+        const boot = e.bootMs();
         e.lock.lock();
         defer e.lock.unlock();
         if (pcm.len < e.cfg.minSamples()) return error.TooShort;
         if (pcm.len > @min(e.cfg.maxSamples(), limits.max_samples)) return error.TooLong;
         if (e.status.state == .failed) return error.SpeechUnavailable;
         if (e.inflight != null) return error.Busy;
-        switch (e.limiter.take(now)) {
+        switch (e.limiter.take(boot)) {
             .ok => {},
             .limited => |l| {
-                e.last_limited = l;
+                e.last_limited = .{ .limit = l.limit, .at = l.at };
+                return error.RateLimited;
+            },
+            .exceeds => |l| {
+                e.last_limited = .{ .limit = l, .at = boot };
                 return error.RateLimited;
             },
         }
@@ -258,12 +283,26 @@ pub const Engine = struct {
         _ = sys.SetEvent(e.job_ev);
     }
 
-    /// The last RateLimited refusal: which limit, and when it frees up
-    /// (awake ms).
-    pub fn lastLimited(e: *Engine) ?@FieldType(limits.Verdict, "limited") {
+    /// The last RateLimited refusal: which limit, and in how many ms it
+    /// frees up.
+    pub fn lastLimited(e: *Engine) ?struct { limit: limits.Limit, in_ms: i64 } {
+        const now = e.bootMs();
         e.lock.lock();
         defer e.lock.unlock();
-        return e.last_limited;
+        const l = e.last_limited orelse return null;
+        return .{ .limit = l.limit, .in_ms = @max(0, l.at -| now) };
+    }
+
+    /// "Learn from my voice" (the desk's switch): off, stt keeps no audio
+    /// and every transcript is discarded at once; transcription goes on.
+    /// Applied on the engine's thread (Home.setLearning), so the window
+    /// never waits on it.
+    pub fn setLearning(e: *Engine, on: bool) void {
+        e.lock.lock();
+        defer e.lock.unlock();
+        e.learning = on;
+        e.learning_job = on;
+        _ = sys.SetEvent(e.job_ev);
     }
 
     /// The in-flight transcription's timeout (awake ms), if one is in
@@ -302,13 +341,17 @@ pub const Engine = struct {
     /// feedback is refused (UnknownId) without reaching stt; text over
     /// 8 KiB is refused.
     pub fn feedback(e: *Engine, id: u64, text: []const u8, ok: bool) FeedbackError!void {
-        const now = e.awakeMs();
+        const now = e.bootMs();
         e.lock.lock();
         defer e.lock.unlock();
         switch (e.fb_limiter.take(now)) {
             .ok => {},
             .limited => |l| {
-                e.last_limited = l;
+                e.last_limited = .{ .limit = l.limit, .at = l.at };
+                return error.RateLimited;
+            },
+            .exceeds => |l| {
+                e.last_limited = .{ .limit = l, .at = now };
                 return error.RateLimited;
             },
         }
@@ -316,6 +359,20 @@ pub const Engine = struct {
         if (!e.takePendingId(id)) return error.UnknownId;
         const t = try e.gpa.dupe(u8, text);
         e.pushFeedback(.{ .id = id, .text = t, .ok = ok });
+        _ = sys.SetEvent(e.job_ev);
+    }
+
+    /// A paired device's correction (the future device routes call it
+    /// after gate.Gate allowed it: rate limits, session, permission). The
+    /// id must be one this engine handed out; its entries can't push the
+    /// desk's corrections out of the queue.
+    pub fn deviceFeedback(e: *Engine, id: u64, text: []const u8, ok: bool) FeedbackError!void {
+        e.lock.lock();
+        defer e.lock.unlock();
+        if (text.len > e.cfg.text_max) return error.TextTooLong;
+        if (!e.takePendingId(id)) return error.UnknownId;
+        const t = try e.gpa.dupe(u8, text);
+        e.pushFeedback(.{ .id = id, .text = t, .ok = ok, .source = .device });
         _ = sys.SetEvent(e.job_ev);
     }
 
@@ -338,7 +395,22 @@ pub const Engine = struct {
 
     /// Caller holds `lock`; capacity is reserved, the oldest goes when full.
     fn pushFeedback(e: *Engine, f: Feedback) void {
-        if (e.feedbacks.items.len >= e.cfg.feedback_queue) {
+        const cap = e.cfg.feedback_queue;
+        var devices: usize = 0;
+        for (e.feedbacks.items) |x| devices += @intFromBool(x.source == .device);
+        // Devices get at most half the queue (at least one entry): their
+        // oldest goes first.
+        const device_cap = @max(1, cap / 2);
+        const evict_device = (f.source == .device and devices >= device_cap) or
+            (e.feedbacks.items.len >= cap and devices > 0);
+        if (evict_device) {
+            for (e.feedbacks.items, 0..) |x, i| if (x.source == .device) {
+                e.gpa.free(e.feedbacks.orderedRemove(i).text);
+                e.dropped += 1;
+                break;
+            };
+        }
+        if (e.feedbacks.items.len >= cap) {
             const old = e.feedbacks.orderedRemove(0);
             e.gpa.free(old.text);
             e.dropped += 1;
@@ -483,7 +555,13 @@ pub const Engine = struct {
                     e.status.training = home.trainingStatus();
                     e.lock.unlock();
                 },
-                else => break,
+                else => {
+                    // The wait itself failed (should not happen): say so
+                    // instead of staying Busy for ever.
+                    e.setFailed("Speech stopped: waiting failed", .{});
+                    e.notify();
+                    break;
+                },
             }
         }
     }
@@ -495,6 +573,8 @@ pub const Engine = struct {
             var clip: ?Clip = null;
             var imp: @TypeOf(e.import_job) = null;
             var exp: ?u32 = null;
+            const learn = e.learning_job;
+            e.learning_job = null;
             // Order: feedback (cheap), the desk's transcription, then
             // device sync work. One at a time.
             if (e.feedbacks.items.len > 0) {
@@ -510,6 +590,10 @@ pub const Engine = struct {
                 e.export_job = null;
             }
             e.lock.unlock();
+            if (learn) |on| {
+                home.setLearning(on) catch {};
+                continue;
+            }
             if (imp) |j| {
                 defer e.gpa.free(j.bytes);
                 const ok = if (home.importBundle(e.gpa, j.bytes)) |_| true else |_| false;
@@ -539,7 +623,7 @@ pub const Engine = struct {
                 // token, it isn't the user's).
                 e.canceled = false;
                 if (res.id != 0) {
-                    if (e.gpa.dupe(u8, "")) |t| e.pushFeedback(.{ .id = res.id, .text = t, .ok = false }) else |_| {}
+                    if (e.gpa.dupe(u8, "")) |t| e.pushFeedback(.{ .id = res.id, .text = t, .ok = false, .source = .portal }) else |_| {}
                 }
                 e.gpa.free(res.text);
                 e.dropped += 1;
@@ -550,17 +634,19 @@ pub const Engine = struct {
             if (e.result) |old| e.gpa.free(old.text);
             res.text = capOwned(e.gpa, res.text, e.cfg.text_max);
             if (res.id != 0) {
-                const now = e.awakeMs();
-                // A Test's clip is never reviewed: not kept. Past the day's
-                // cap, a dictation isn't kept either. Discarding is the one
-                // way stt offers to not keep a transcript's audio.
-                const keep = res.purpose == .dictation and e.kept.sum(now) < e.cfg.kept_clips_per_day;
+                const now = e.bootMs();
+                // A Test's clip is never reviewed: not kept. With learning
+                // off, nothing is. Past the day's cap, a dictation isn't
+                // kept either. Discarding is the one way stt offers to not
+                // keep a transcript's audio.
+                const under_cap = e.kept.sum(now) < e.cfg.kept_clips_per_day;
+                const keep = res.purpose == .dictation and e.learning and under_cap;
                 if (keep) {
                     e.kept.add(now);
                     e.addPendingId(res.id);
                 } else {
-                    if (e.gpa.dupe(u8, "")) |t| e.pushFeedback(.{ .id = res.id, .text = t, .ok = false }) else |_| {}
-                    res.not_kept = res.purpose == .dictation;
+                    if (e.gpa.dupe(u8, "")) |t| e.pushFeedback(.{ .id = res.id, .text = t, .ok = false, .source = .portal }) else |_| {}
+                    res.not_kept = res.purpose == .dictation and e.learning and !under_cap;
                     res.id = 0; // nothing left to give feedback on
                 }
             }
@@ -659,7 +745,7 @@ test "engine limits: 10 transcriptions a minute, then RateLimited until the buck
     try testing.expectError(error.RateLimited, e.transcribe(.dictation, try testClip(limits.min_samples)));
     const l = e.lastLimited().?;
     try testing.expectEqual(limits.Limit.per_minute, l.limit);
-    try testing.expect(l.at > std.Io.Clock.awake.now(testing.io).toMilliseconds() + limits.rate_refill_ms - 1000);
+    try testing.expect(l.in_ms > limits.rate_refill_ms - 1000);
 }
 
 test "engine limits: desk feedback has its own bucket; unknown ids cost a token; text capped; queue bounded" {
@@ -676,7 +762,7 @@ test "engine limits: desk feedback has its own bucket; unknown ids cost a token;
     // The burst is spent: refused, not queued.
     try testing.expectError(error.RateLimited, e.feedback(4, "fix", true));
     try testing.expectEqual(@as(usize, 2), e.feedbacks.items.len);
-    try testing.expect(e.lastLimited().?.at > std.Io.Clock.awake.now(testing.io).toMilliseconds());
+    try testing.expect(e.lastLimited().?.in_ms > 0);
     // The transcription bucket is separate.
     try e.transcribe(.dictation, try testClip(limits.min_samples));
     // The queue keeps the newest 16 (Portal's own discards fill it too).
@@ -708,6 +794,44 @@ test "engine limits apply live (clamped); sync jobs: one each, never training" {
     try testing.expectError(error.TooLarge, e.importBundle("iphone", huge));
     try e.exportUpdate(3);
     try testing.expectError(error.Busy, e.exportUpdate(4));
+}
+
+test "device feedback can't push the desk's corrections out of the queue" {
+    const e = try bare();
+    defer e.destroy();
+    e.setLimits(.{ .feedback_queue = 4 });
+    for (1..20) |i| e.addPendingId(i);
+    try e.feedback(1, "desk fix", true);
+    for (2..12) |i| try e.deviceFeedback(i, "device fix", true);
+    var desk: usize = 0;
+    var dev: usize = 0;
+    for (e.feedbacks.items) |f| switch (f.source) {
+        .desk => desk += 1,
+        .device => dev += 1,
+        .portal => {},
+    };
+    try testing.expectEqual(@as(usize, 1), desk);
+    try testing.expectEqual(@as(usize, 2), dev); // half of 4
+    try testing.expectError(error.UnknownId, e.deviceFeedback(999, "x", true));
+}
+
+test "learning off: queued for the engine thread; the switch is remembered" {
+    const e = try bare();
+    defer e.destroy();
+    try testing.expect(e.learning);
+    e.setLearning(false);
+    try testing.expect(!e.learning);
+    try testing.expectEqual(@as(?bool, false), e.learning_job);
+}
+
+test "create: no leak when the allocator fails part-way" {
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        var fa: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = i });
+        if (Engine.create(fa.allocator(), testing.io, .{ .model_path = "m", .profile_dir = "p" })) |e| {
+            e.destroy();
+        } else |_| {}
+    }
 }
 
 test "capOwned and wavBytes bounds" {

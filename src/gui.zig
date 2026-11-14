@@ -841,7 +841,8 @@ pub const LocalHost = struct {
             return h.ui.setNote(.bad, "Enter the program to run (quotes must be closed).", .{});
         if (project.len > 0 and !validProject(project))
             return h.ui.setNote(.bad, "The project name must be 1-{d} bytes of printable text.", .{max_project_bytes});
-        var s = d.saved;
+        // Merged into settings.txt as it is now (hand edits stay).
+        var s = settings.loadOrNull(h.gpa, h.io, d.paths.dir) orelse d.saved;
         _ = s.listen.set(listen);
         _ = s.program.set(program);
         _ = s.project.set(project);
@@ -908,7 +909,9 @@ pub const LocalHost = struct {
         }
         const saved = s.act(a);
         const d = &(h.desk orelse return);
-        var st = d.saved;
+        // settings.txt as it is now (the desk may have edited it by hand):
+        // only this change is merged in, nothing else is overwritten.
+        var st = settings.loadOrNull(h.gpa, h.io, d.paths.dir) orelse d.saved;
         switch (saved) {
             .none => return,
             .reload => {
@@ -931,6 +934,7 @@ pub const LocalHost = struct {
                 st.instruct_mode = m;
                 h.shell.instruct_mode = m; // live
             },
+            .learning => |on| st.speech_learning = on,
         }
         settings.save(h.gpa, h.io, d.paths.dir, &st) catch |err|
             return s.panel.setNote(.bad, "Could not save the settings: {t}.", .{err});

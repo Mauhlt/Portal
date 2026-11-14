@@ -114,6 +114,8 @@ pub const malformed_window_min = 10;
 pub const slot_max_hold_s = 300;
 pub const slot_idle_s = 60;
 pub const slot_cooldown_s = 30;
+/// Requests one device may have in flight at once.
+pub const device_inflight = 2;
 /// RIFF/fmt/data headers are 44 bytes for what Portal writes; a little room.
 pub const max_wav_bytes = max_samples * 2 + 128;
 
@@ -277,6 +279,7 @@ pub const Config = struct {
     slot_max_hold_s: u32 = slot_max_hold_s,
     slot_idle_s: u32 = slot_idle_s,
     slot_cooldown_s: u32 = slot_cooldown_s,
+    device_inflight: u32 = device_inflight,
 
     pub const Range = struct { name: []const u8, min: u32, max: u32, doc: []const u8 };
 
@@ -311,6 +314,7 @@ pub const Config = struct {
         .{ .name = "slot_max_hold_s", .min = 10, .max = 3600, .doc = "longest hold on a speech slot (s)" },
         .{ .name = "slot_idle_s", .min = 5, .max = 600, .doc = "a slot without speech traffic this long is released (s)" },
         .{ .name = "slot_cooldown_s", .min = 1, .max = 600, .doc = "after an expiry, the same device waits this long if others want a slot (s)" },
+        .{ .name = "device_inflight", .min = 1, .max = 16, .doc = "requests one device may have in flight at once" },
     };
 
     comptime {
@@ -319,12 +323,14 @@ pub const Config = struct {
         for (fs, ranges) |f, r| if (!std.mem.eql(u8, f, r.name)) @compileError("ranges out of order: " ++ f);
     }
 
-    /// Every field within its range.
+    /// Every field within its range, and the shortest clip below the
+    /// longest.
     pub fn clamped(c: Config) Config {
         var out = c;
         inline for (comptime std.meta.fieldNames(Config), ranges) |f, r| {
             @field(out, f) = std.math.clamp(@field(out, f), r.min, r.max);
         }
+        out.clip_min_ms = @min(out.clip_min_ms, out.clip_max_s * 1000 - 1);
         return out;
     }
 
@@ -361,6 +367,9 @@ pub const Verdict = union(enum) {
     ok,
     /// Refused by `limit`; allowed again at `at` (monotonic ms).
     limited: struct { limit: Limit, at: i64 },
+    /// Never allowed as it is (larger than `limit` allows at all): no
+    /// retry time.
+    exceeds: Limit,
 };
 
 /// One source's limits: a token bucket (the per-minute rate) and rolling
@@ -432,6 +441,8 @@ pub const DeviceBuckets = struct {
         /// Over a limit: refused (the caller answers 429 / a WS error
         /// naming the limit, with Retry-After from `at`).
         limited: @FieldType(Verdict, "limited"),
+        /// Too large for that limit ever: 413 / a WS error, no retry.
+        exceeds: Limit,
         /// No room for another device name (or an empty / too long one).
         refused,
     };
@@ -448,6 +459,7 @@ pub const DeviceBuckets = struct {
         return switch (t.limiters[i].take(now)) {
             .ok => .ok,
             .limited => |l| .{ .limited = l },
+            .exceeds => |l| .{ .exceeds = l },
         };
     }
 
@@ -456,31 +468,52 @@ pub const DeviceBuckets = struct {
     pub fn takeBundle(t: *DeviceBuckets, device: []const u8, bytes: u64, now: i64) DeviceVerdict {
         const i = t.slot(device) orelse return .refused;
         const max_one = @as(u64, t.cfg.bundle_max_kib) * 1024;
-        if (bytes > max_one) return .{ .limited = .{ .limit = .bundle_size, .at = std.math.maxInt(i64) } };
+        if (bytes > max_one) return .{ .exceeds = .bundle_size };
         if (t.bundles[i].sum(now) >= t.cfg.bundles_per_day) return .{ .limited = .{ .limit = .per_day, .at = t.bundles[i].freeAt(now, t.cfg.bundles_per_day) } };
         const cap = @as(u64, t.cfg.bundle_mib_per_day) * 1024 * 1024;
-        if (bytes > cap) return .{ .limited = .{ .limit = .bundle_bytes_per_day, .at = std.math.maxInt(i64) } };
+        if (bytes > cap) return .{ .exceeds = .bundle_bytes_per_day };
         if (t.bundle_bytes[i].sum(now) + bytes > cap) return .{ .limited = .{ .limit = .bundle_bytes_per_day, .at = t.bundle_bytes[i].freeAt(now, cap - bytes + 1) } };
         t.bundles[i].add(now);
         t.bundle_bytes[i].addN(now, bytes);
         return .ok;
     }
 
-    /// The device's entry (registered on first use); null: no room or a bad name.
+    /// The device's entry, if it has one (no registering).
+    pub fn find(t: *const DeviceBuckets, device: []const u8) ?usize {
+        if (device.len == 0) return null;
+        for (0..t.n) |k| {
+            if (t.lens[k] > 0 and std.mem.eql(u8, t.names[k][0..t.lens[k]], device)) return k;
+        }
+        return null;
+    }
+
+    /// Frees entry `k` for reuse (its device was unpaired: no longer in
+    /// the device store). A device that pairs again under that name later
+    /// starts fresh; a re-paired device that kept its name never comes
+    /// here (`Gate.retain` keeps every name the store still has).
+    pub fn free(t: *DeviceBuckets, k: usize) void {
+        if (k < t.n) t.lens[k] = 0;
+    }
+
+    /// The device's entry (registered on first use, in a free entry if
+    /// there is one); null: no room or a bad name.
     pub fn slot(t: *DeviceBuckets, device: []const u8) ?usize {
         if (device.len == 0 or device.len > max_device_name) return null;
-        const i = for (0..t.n) |k| {
-            if (std.mem.eql(u8, t.names[k][0..t.lens[k]], device)) break k;
-        } else blk: {
-            if (t.n == max_devices) return null;
-            const k = t.n;
+        if (t.find(device)) |k| return k;
+        const i = blk: {
+            const k = for (0..t.n) |j| {
+                if (t.lens[j] == 0) break j;
+            } else k: {
+                if (t.n == max_devices) return null;
+                t.n += 1;
+                break :k t.n - 1;
+            };
             @memcpy(t.names[k][0..device.len], device);
             t.lens[k] = @intCast(device.len);
             t.limiters[k] = Limiter.feedback();
             t.limiters[k].applyFeedback(t.cfg);
             t.bundles[k] = .{};
             t.bundle_bytes[k] = .{};
-            t.n += 1;
             break :blk k;
         };
         return i;
@@ -632,7 +665,7 @@ test "config: clamping on load, unknown keys, defaults not written" {
 
 test "bundles: size, 50 a day, 100 MiB a day, per device; limits apply live" {
     var t: DeviceBuckets = .{};
-    try testing.expectEqual(Limit.bundle_size, t.takeBundle("laptop", 5 * 1024 * 1024 + 1, 0).limited.limit);
+    try testing.expectEqual(Limit.bundle_size, t.takeBundle("laptop", 5 * 1024 * 1024 + 1, 0).exceeds);
     for (0..bundles_per_day) |_| try testing.expect(t.takeBundle("laptop", 1024, 0) == .ok);
     try testing.expectEqual(Limit.per_day, t.takeBundle("laptop", 1024, 0).limited.limit);
     try testing.expect(t.takeBundle("iphone", 1024, 0) == .ok);
@@ -647,6 +680,22 @@ test "bundles: size, 50 a day, 100 MiB a day, per device; limits apply live" {
     u.setLimits(.{ .feedback_burst = 1 });
     try testing.expect(u.take("laptop", 0) == .ok); // at most 1 token left
     try testing.expect(u.take("laptop", 0) != .ok);
+}
+
+test "config: the shortest clip stays below the longest" {
+    const c = (Config{ .clip_max_s = 1, .clip_min_ms = 5000 }).clamped();
+    try testing.expect(c.clip_min_ms < c.clip_max_s * 1000);
+}
+
+test "device table: an unpaired device's entry is reused" {
+    var t: DeviceBuckets = .{};
+    var names: [max_devices][8]u8 = undefined;
+    for (0..max_devices) |i| _ = t.take(std.fmt.bufPrint(&names[i], "d{d}", .{i}) catch unreachable, 0);
+    try testing.expect(t.take("new", 0) == .refused);
+    t.free(t.find("d3").?);
+    try testing.expect(t.take("new", 0) == .ok);
+    try testing.expectEqual(@as(usize, max_devices), t.n);
+    try testing.expect(t.find("d3") == null);
 }
 
 test "capText cuts at a code point boundary" {

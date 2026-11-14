@@ -44,7 +44,19 @@ const Waker = struct {
         const w: *Waker = @ptrCast(@alignCast(ctx));
         _ = sys.SetEvent(w.ev);
     }
+    /// Sleeps until a notification or the deadline (awake ms); false once
+    /// the deadline has passed.
+    fn wait(w: *Waker, end: i64) bool {
+        const ms = sys.msUntil(end, nowMs());
+        if (ms == 0) return false;
+        _ = sys.WaitForSingleObject(w.ev, ms);
+        return true;
+    }
 };
+
+fn nowMs() i64 {
+    return std.Io.Clock.awake.now(testing.io).toMilliseconds();
+}
 
 test "gpu: a fake microphone's recording of hello.wav, transcribed by stt.Home, with feedback" {
     const gpa = testing.allocator;
@@ -70,23 +82,21 @@ test "gpu: a fake microphone's recording of hello.wav, transcribed by stt.Home, 
     var mic: capture.Mic = .{ .gpa = gpa, .backend = fake.backend(), .notify_ctx = &waker, .notify_fn = Waker.notify };
     try mic.start();
     defer mic.deinit();
-    mic.startRecording();
-    var tries: usize = 0;
-    while (true) : (tries += 1) {
+    _ = mic.startRecording();
+    var end = nowMs() + 5000;
+    while (true) {
         var s: capture.Snapshot = .{};
         mic.snapshot(&s);
         if (s.capturing) break;
-        if (tries > 200) return error.TestTimeout;
-        _ = sys.WaitForSingleObject(waker.ev, 25);
+        if (!waker.wait(end)) return error.TestTimeout;
     }
     var i: usize = 0;
     while (i < samples.len) : (i += 160) fake.feed(samples[i..@min(i + 160, samples.len)]);
     mic.stopRecording();
-    tries = 0;
-    const rec = while (true) : (tries += 1) {
+    end = nowMs() + 5000;
+    const rec = while (true) {
         if (mic.takeRecording()) |r| break r;
-        if (tries > 200) return error.TestTimeout;
-        _ = sys.WaitForSingleObject(waker.ev, 25);
+        if (!waker.wait(end)) return error.TestTimeout;
     };
     try testing.expectEqual(samples.len, rec.samples.len);
 
@@ -97,8 +107,8 @@ test "gpu: a fake microphone's recording of hello.wav, transcribed by stt.Home, 
     e.notify_fn = Waker.notify;
     try e.start();
     try e.transcribe(.dictation, rec.samples);
-    tries = 0;
-    const r = while (true) : (tries += 1) {
+    end = nowMs() + 60_000;
+    const r = while (true) {
         if (e.takeResult()) |r| break r;
         const st = e.getStatus();
         if (st.state == .failed) {
@@ -107,8 +117,7 @@ test "gpu: a fake microphone's recording of hello.wav, transcribed by stt.Home, 
             std.debug.print("speech failed: {s}\n", .{st.why()});
             return error.TestUnexpectedResult;
         }
-        if (tries > 2400) return error.TestTimeout; // 60 s
-        _ = sys.WaitForSingleObject(waker.ev, 25);
+        if (!waker.wait(end)) return error.TestTimeout;
     };
     defer gpa.free(r.text);
     try testing.expect(!r.failed);
@@ -129,16 +138,15 @@ test "gpu: a fake microphone's recording of hello.wav, transcribed by stt.Home, 
 
     // The user corrected it and sent: feedback(id, corrected, true).
     try e.feedback(r.id, "Hello world. This is a test of speech recognition written in pure Zig.", true);
-    tries = 0;
-    while (true) : (tries += 1) {
+    end = nowMs() + 10_000;
+    while (true) {
         e.lock.lock();
         const w = e.wakeups;
         const busy = e.feedbacks.items.len;
         e.lock.unlock();
         // The feedback moved the deadline (nothing pending: null) → a wakeup.
         if (busy == 0 and w >= 3) break;
-        if (tries > 400) return error.TestTimeout;
-        _ = sys.WaitForSingleObject(waker.ev, 25);
+        if (!waker.wait(end)) return error.TestTimeout;
     }
     // A learned fix: the profile has its phrase rule.
     const rules_path = try std.fs.path.join(gpa, &.{ profile, "rules.txt" });

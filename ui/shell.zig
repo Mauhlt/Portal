@@ -262,7 +262,9 @@ pub const Focus = enum { panel, pair_screen, wait_screen, line, terminal, view }
 /// dictation.Tracker turns that into stt feedback).
 pub const Dictation = struct {
     ctx: *anyopaque,
-    start: *const fn (ctx: *anyopaque) void,
+    /// True if recording started (false: the microphone is busy, e.g. the
+    /// Audio panel's Test; the 🎤 stays off).
+    start: *const fn (ctx: *anyopaque) bool,
     stop: *const fn (ctx: *anyopaque) void,
     /// The line was sent (Enter / Send) with this text.
     sent: ?*const fn (ctx: *anyopaque, line: []const u8) void = null,
@@ -273,9 +275,6 @@ pub const Dictation = struct {
     cancel: ?*const fn (ctx: *anyopaque) void = null,
 };
 
-/// Whether a headset with a microphone is attached (the audio work
-/// implements it: ../Audio, IMMDevice form factor). Its media button
-/// toggles dictation only then.
 /// What the desk's Instruct button does (setting `instruct_mode`):
 ///   auto     with a working microphone and speech ready: open the input
 ///            box and start recording (pressed again: stop); otherwise just
@@ -319,6 +318,9 @@ pub const InstructMode = enum {
     }
 };
 
+/// Whether a headset with a microphone is attached (the desk glue
+/// implements it from the microphone thread's device list: form factor
+/// and bus). Its media button toggles dictation only then.
 pub const HeadsetMic = struct {
     ctx: ?*anyopaque = null,
     present: *const fn (ctx: ?*anyopaque) bool,
@@ -553,8 +555,7 @@ pub const Shell = struct {
         // No microphone or no speech: the box only; the 🎤 says why.
         if (!sh.speech_ready) return;
         if (sh.dictation) |d| {
-            d.start(d.ctx);
-            sh.dictating = true;
+            sh.dictating = d.start(d.ctx);
         }
     }
 
@@ -596,10 +597,17 @@ pub const Shell = struct {
 
     /// A transcript for the instruction line (the glue's speech engine):
     /// appended for review; the line takes the keyboard on the desk.
-    pub fn dictated(sh: *Shell, text: []const u8) void {
-        if (text.len == 0) return;
+    /// Returns true only if the line now ends with exactly `text` after
+    /// what it had: the line's limit, a line break, a tab or bad UTF-8 can
+    /// cut or change it, and then the transcript must not be learned from
+    /// as if the user had sent it unchanged (the glue discards it).
+    pub fn dictated(sh: *Shell, text: []const u8) bool {
+        if (text.len == 0) return false;
+        const before = sh.line.text().len;
         _ = sh.line.append(text);
         if (sh.device == .desk and sh.instructing) sh.line_focus = true;
+        const now = sh.line.text();
+        return now.len == before + text.len and std.mem.eql(u8, now[before..], text);
     }
 
     /// Gives up the transcription in progress (nothing lands in the line).
@@ -1818,6 +1826,9 @@ const DictSeen = struct {
         return @ptrCast(@alignCast(p));
     }
     fn nop(_: *anyopaque) void {}
+    fn go(_: *anyopaque) bool {
+        return true;
+    }
     fn sent(p: *anyopaque, line: []const u8) void {
         const d = of(p);
         @memcpy(d.sent_buf[0..line.len], line);
@@ -1833,7 +1844,7 @@ test "desk dictation: the transcript lands in the line; Send and Esc are reporte
     var sh = Shell.init(testing.allocator, .desk, r.host());
     defer sh.deinit();
     var d: DictSeen = .{};
-    sh.dictation = .{ .ctx = &d, .start = DictSeen.nop, .stop = DictSeen.nop, .sent = DictSeen.sent, .cleared = DictSeen.cleared };
+    sh.dictation = .{ .ctx = &d, .start = DictSeen.go, .stop = DictSeen.nop, .sent = DictSeen.sent, .cleared = DictSeen.cleared };
     sh.mic_label = "Jabra Evolve2";
     Shell.onButton(&sh, ids.instruct);
     var o = sh.overlay(.{});
@@ -1843,7 +1854,7 @@ test "desk dictation: the transcript lands in the line; Send and Esc are reporte
     o = sh.overlay(.{});
     try testing.expect(hasLabel(o, "Transcribing"));
     sh.transcribing = false;
-    sh.dictated("Hello world.");
+    try testing.expect(sh.dictated("Hello world."));
     try testing.expectEqualStrings("Hello world.", sh.line.text());
     try testing.expectEqual(Focus.line, sh.focus());
     // Edited, then Send: the line as sent goes to the hook.
@@ -1852,7 +1863,7 @@ test "desk dictation: the transcript lands in the line; Send and Esc are reporte
     try testing.expectEqualStrings("Hello world.!", d.sent_buf[0..d.sent_len]);
     // Esc on a dictated line: cleared, reported once.
     Shell.onButton(&sh, ids.instruct);
-    sh.dictated("wrong words");
+    _ = sh.dictated("wrong words");
     Shell.onKey(&sh, .escape, .{});
     try testing.expectEqual(@as(usize, 1), d.clears);
     try testing.expectEqualStrings("", sh.line.text());
@@ -1868,8 +1879,9 @@ const DictCount = struct {
     fn of(p: *anyopaque) *DictCount {
         return @ptrCast(@alignCast(p));
     }
-    fn start(p: *anyopaque) void {
+    fn start(p: *anyopaque) bool {
         of(p).starts += 1;
+        return true;
     }
     fn stop(_: *anyopaque) void {}
 };
@@ -1885,6 +1897,61 @@ fn instructCase(mode: InstructMode, ready: bool) !struct { starts: usize, notice
     Shell.onButton(&sh, ids.instruct);
     try testing.expect(sh.instructing);
     return .{ .starts = d.starts, .notice = sh.unavailable_notice, .dictating = sh.dictating, .line = sh.focus() == .line };
+}
+
+test "dictated: only an exact append counts (line limit, line break, tab, bad UTF-8)" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    try testing.expect(sh.dictated("Hello world."));
+    // 2.3 KB: the line keeps about 2000 bytes.
+    const long: [2300]u8 = @splat('a');
+    sh.line.field.clear();
+    try testing.expect(!sh.dictated(&long));
+    sh.line.field.clear();
+    try testing.expect(!sh.dictated("first line\nsecond line"));
+    sh.line.field.clear();
+    try testing.expect(!sh.dictated("a\tb"));
+    sh.line.field.clear();
+    try testing.expect(!sh.dictated("bad \xff utf8"));
+    try testing.expect(!sh.dictated(""));
+}
+
+test "a cut transcript is discarded, never learned: 2.3 KB, and one with a line break" {
+    const dict = @import("dictation.zig");
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    var out: [dict.max_text + 2]u8 = undefined;
+    for ([_][]const u8{ "first part\nsecond part", "" }, 0..) |text, round| {
+        var t: dict.Tracker = .{};
+        var long: [2300]u8 = @splat('w');
+        const transcript: []const u8 = if (round == 0) text else &long;
+        sh.line.field.clear();
+        var settled: dict.Decision = .none;
+        const add = t.added(42, transcript, sh.line.text(), &out, &settled);
+        // What the desk glue does: an inexact append is discarded at once.
+        const d: dict.Decision = if (!sh.dictated(add)) t.cleared() else .none;
+        try testing.expectEqual(@as(u64, 42), d.discard);
+        // Sending what is in the line afterwards learns nothing.
+        try testing.expect(t.sent(sh.line.text()) == .none);
+    }
+}
+
+test "dictation: a start the glue refuses leaves the 🎤 off" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    const No = struct {
+        fn start(_: *anyopaque) bool {
+            return false;
+        }
+        fn stop(_: *anyopaque) void {}
+    };
+    var x: u8 = 0;
+    sh.dictation = .{ .ctx = &x, .start = No.start, .stop = No.stop };
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.instructing and !sh.dictating);
 }
 
 test "desk instruct_mode: auto, type and record, with and without a microphone" {
@@ -2151,9 +2218,10 @@ const StubView = struct {
 
 const DictRec = struct {
     started: usize = 0,
-    fn start(p: *anyopaque) void {
+    fn start(p: *anyopaque) bool {
         const d: *DictRec = @ptrCast(@alignCast(p));
         d.started += 1;
+        return true;
     }
     fn stop(_: *anyopaque) void {}
 };
@@ -2267,8 +2335,9 @@ const DictToggle = struct {
     fn of(p: *anyopaque) *DictToggle {
         return @ptrCast(@alignCast(p));
     }
-    fn start(p: *anyopaque) void {
+    fn start(p: *anyopaque) bool {
         of(p).starts += 1;
+        return true;
     }
     fn stop(p: *anyopaque) void {
         of(p).stops += 1;

@@ -100,12 +100,38 @@ pub const Gate = struct {
         return @intCast(k);
     }
 
+    /// Slots in use: held, or still serving a request after its slot
+    /// expired (no overcommit past concurrent_devices meanwhile).
     fn heldSlots(g: *const Gate) u32 {
         var n: u32 = 0;
-        for (g.held_since) |h| if (h != null) {
+        for (g.held_since, g.inflight) |h, f| if (h != null or f > 0) {
             n += 1;
         };
         return n;
+    }
+
+    /// Frees the entries of devices the device store no longer has (call
+    /// when it changes: unpairing). Entries with a request in flight stay
+    /// until it ends; desktop-wide totals are untouched.
+    pub fn retain(g: *Gate, paired: []const []const u8) void {
+        const t = &g.per_device;
+        for (0..t.n) |k| {
+            if (t.lens[k] == 0) continue;
+            const name = t.names[k][0..t.lens[k]];
+            const still = for (paired) |p| {
+                if (std.mem.eql(u8, p, name)) break true;
+            } else false;
+            if (still or g.inflight[k] > 0) continue;
+            t.free(k);
+            g.held_since[k] = null;
+            g.last_traffic[k] = 0;
+            g.expired_notice[k] = false;
+            g.cooldown_until[k] = 0;
+            g.waiting_until[k] = 0;
+            g.kept_dev[k] = .{};
+            g.strikes[k] = .{};
+            g.closed[k] = false;
+        }
     }
 
     fn ms(s: u32) i64 {
@@ -169,10 +195,13 @@ pub const Gate = struct {
             g.expired_notice[i] = false;
             return .expired;
         }
+        if (g.inflight[i] >= g.cfg.device_inflight) return .{ .busy = now + busy_retry_ms };
         if (g.held_since[i] == null) {
             // The same device right after an expiry waits while others want one.
             if (now < g.cooldown_until[i] and g.othersWaiting(i, now)) return .{ .busy = g.cooldown_until[i] };
-            if (g.heldSlots() >= g.cfg.concurrent_devices) {
+            // Its own expired-but-open request isn't someone else's slot.
+            const in_use = g.heldSlots() - @intFromBool(g.inflight[i] > 0);
+            if (in_use >= g.cfg.concurrent_devices) {
                 g.waiting_until[i] = now + ms(g.cfg.slot_cooldown_s);
                 return .{ .busy = @min(now + busy_retry_ms, g.nextDeadline() orelse now + busy_retry_ms) };
             }
@@ -181,7 +210,7 @@ pub const Gate = struct {
         if (g.held_since[i] == null) g.held_since[i] = now;
         g.waiting_until[i] = 0;
         g.last_traffic[i] = now;
-        g.inflight[i] += 1;
+        g.inflight[i] +|= 1;
         g.payload += declared_bytes;
         return .{ .ok = .{ .device = i, .bytes = declared_bytes, .read_deadline = now + @as(i64, g.cfg.read_timeout_s) * 1000 } };
     }
@@ -213,13 +242,14 @@ pub const Gate = struct {
         if (g.bundles_day.sum(now) >= c.global_bundles_per_day)
             return .{ .limited = .{ .limit = .global_per_day, .at = g.bundles_day.freeAt(now, c.global_bundles_per_day) } };
         const gcap = @as(u64, c.global_bundle_mib_per_day) * 1024 * 1024;
-        if (bytes > gcap) return .{ .limited = .{ .limit = .global_bytes_per_day, .at = std.math.maxInt(i64) } };
+        if (bytes > gcap) return .{ .exceeds = .global_bytes_per_day };
         if (g.bytes_day.sum(now) + bytes > gcap)
             return .{ .limited = .{ .limit = .global_bytes_per_day, .at = g.bytes_day.freeAt(now, gcap - bytes + 1) } };
-        if (clips > c.global_kept_clips_per_day or g.kept_day.sum(now) + clips > c.global_kept_clips_per_day)
-            return .{ .limited = .{ .limit = .kept_per_day, .at = g.kept_day.freeAt(now, c.global_kept_clips_per_day -| clips +| 1) } };
-        if (clips > c.kept_clips_per_day or g.kept_dev[i].sum(now) + clips > c.kept_clips_per_day)
-            return .{ .limited = .{ .limit = .kept_per_day, .at = g.kept_dev[i].freeAt(now, c.kept_clips_per_day -| clips +| 1) } };
+        if (clips > c.global_kept_clips_per_day or clips > c.kept_clips_per_day) return .{ .exceeds = .kept_per_day };
+        if (g.kept_day.sum(now) + clips > c.global_kept_clips_per_day)
+            return .{ .limited = .{ .limit = .kept_per_day, .at = g.kept_day.freeAt(now, c.global_kept_clips_per_day - clips + 1) } };
+        if (g.kept_dev[i].sum(now) + clips > c.kept_clips_per_day)
+            return .{ .limited = .{ .limit = .kept_per_day, .at = g.kept_dev[i].freeAt(now, c.kept_clips_per_day - clips + 1) } };
         const v = g.per_device.takeBundle(device, bytes, now);
         if (v == .ok) {
             g.bundles_day.add(now);
@@ -320,10 +350,13 @@ test "slots: idle release after 60 s, one wakeup for the earliest deadline" {
 test "slots: after an expiry the same device waits 30 s if another is waiting" {
     var g: Gate = .{};
     g.setLimits(.{ .concurrent_devices = 1 });
-    _ = g.begin("laptop", 1, 0).ok; // holds the only slot (request open)
+    const t0 = g.begin("laptop", 1, 0).ok; // holds the only slot (request open)
     try testing.expect(g.begin("iphone", 1, 1000) == .busy); // waiting
     try testing.expect(g.begin("iphone", 1, 298_000) == .busy); // still retrying
     _ = g.expire(300_000);
+    // Its open request still uses the slot until it ends.
+    try testing.expect(g.begin("iphone", 1, 300_000) == .busy);
+    g.end(t0, 300_000);
     try testing.expect(g.begin("laptop", 1, 300_000) == .expired);
     // The iPhone waits: the laptop is held off until the cooldown ends.
     try testing.expectEqual(@as(i64, 330_000), g.begin("laptop", 1, 300_001).busy);
@@ -366,6 +399,42 @@ test "global totals override the per-device allowance" {
     try testing.expectEqual(limits.Limit.kept_per_day, k.bundle("a", 1024, 1, 0).limited.limit);
     try testing.expect(k.bundle("b", 1024, 500, 0) == .ok);
     try testing.expectEqual(limits.Limit.kept_per_day, k.bundle("c", 1024, 1, 0).limited.limit);
+}
+
+test "per-device in-flight cap; an expired slot still serving a request counts" {
+    var g: Gate = .{};
+    const a = g.begin("laptop", 1, 0).ok;
+    const b = g.begin("laptop", 1, 0).ok;
+    try testing.expect(g.begin("laptop", 1, 0) == .busy); // 2 at once at most
+    g.end(a, 0);
+    g.end(b, 0);
+    var h: Gate = .{};
+    h.setLimits(.{ .concurrent_devices = 1 });
+    const t = h.begin("laptop", 1, 0).ok;
+    _ = h.expire(300_000); // the slot goes, its request is still open
+    try testing.expect(h.begin("iphone", 1, 300_000) == .busy);
+    h.end(t, 300_100);
+    try testing.expect(h.begin("iphone", 1, 300_100) == .ok);
+}
+
+test "permanent refusals carry no retry time" {
+    var g: Gate = .{};
+    try testing.expectEqual(limits.Limit.kept_per_day, g.bundle("laptop", 1024, 501, 0).exceeds);
+    var z: Gate = .{};
+    z.setLimits(.{ .global_bundle_mib_per_day = 1 });
+    try testing.expectEqual(limits.Limit.global_bytes_per_day, z.bundle("a", 2 * 1024 * 1024, 0, 0).exceeds);
+}
+
+test "retain: unpaired devices' entries are reused, totals stay" {
+    var g: Gate = .{};
+    g.setLimits(.{ .global_feedback_per_hour = 3 });
+    try testing.expect(g.feedback("old", 0) == .ok);
+    try testing.expect(g.feedback("old", 0) == .ok);
+    g.retain(&.{"laptop"});
+    try testing.expect(g.per_device.find("old") == null);
+    // The desktop-wide count still holds the old device's two.
+    try testing.expect(g.feedback("laptop", 0) == .ok);
+    try testing.expectEqual(limits.Limit.global_per_hour, g.feedback("laptop", 0).limited.limit);
 }
 
 test "malformed data: 3 in 10 minutes closes a device until it reconnects" {

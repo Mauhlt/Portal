@@ -18,7 +18,8 @@ pub const id = struct {
     pub const test_clip: u32 = 1701;
     pub const save: u32 = 1702;
     pub const reload: u32 = 1703;
-    /// field0 + index: Automatic (0), speech model (1), Instruct (2).
+    /// field0 + index: Automatic (0), speech model (1), Instruct (2),
+    /// Learn from my voice (3).
     pub const field0: u32 = 1710;
     /// dev0 + row: "Use" this microphone.
     pub const dev0: u32 = 1720;
@@ -35,6 +36,8 @@ pub const Action = union(enum) {
     closed,
     /// Automatic on (true) or off: off pins the active microphone.
     set_auto: bool,
+    /// "Learn from my voice" on / off (applies at once, saved).
+    set_learning: bool,
     /// What the Instruct button does now (applies at once, saved).
     set_instruct_mode: InstructMode,
     /// Use row i's microphone (manual mode).
@@ -84,6 +87,8 @@ pub const Ui = struct {
     auto: bool = true,
     model: form.TextField(max_model) = .{},
     instruct_mode: InstructMode = .auto,
+    /// "Learn from my voice" (default on).
+    learning: bool = true,
     test_state: TestState = .idle,
     test_buf: [600]u8 = undefined,
     test_len: usize = 0,
@@ -97,7 +102,7 @@ pub const Ui = struct {
         row_text: [max_rows][200]u8 = undefined,
         lines: [4]frame.PanelText = undefined,
         line_text: [3][240]u8 = undefined,
-        fields: [3]frame.PanelField = undefined,
+        fields: [4]frame.PanelField = undefined,
         after: [1]frame.PanelText = undefined,
         buttons: [4]frame.PanelButton = undefined,
     };
@@ -150,9 +155,9 @@ pub const Ui = struct {
 
     // ------------------------------------------------------- focus
 
-    /// Focus order: Automatic, the model field, Instruct, the rows, Test,
-    /// Save, Reload limits, Close.
-    const n_fields = 3;
+    /// Focus order: Automatic, the model field, Instruct, Learn, the rows,
+    /// Test, Save, Reload limits, Close.
+    const n_fields = 4;
     fn focusCount(ui: *const Ui) u8 {
         return n_fields + ui.n_rows + 4;
     }
@@ -189,7 +194,7 @@ pub const Ui = struct {
             .tab => if (mods.shift) ui.focus.prev() else ui.focus.next(),
             .up => ui.focus.prev(),
             .down => ui.focus.next(),
-            .left, .right => if (ui.focus.index == 0) return ui.toggleAuto() else if (ui.focus.index == 2) return ui.cycleInstruct(),
+            .left, .right => if (ui.focus.index == 0) return ui.toggleAuto() else if (ui.focus.index == 2) return ui.cycleInstruct() else if (ui.focus.index == 3) return ui.toggleLearning(),
             .backspace => if (ui.focus.index == 1) ui.model.backspace(),
             .enter => return ui.activate(),
             else => {},
@@ -227,6 +232,10 @@ pub const Ui = struct {
                 ui.focus.index = 2;
                 return ui.cycleInstruct();
             },
+            id.field0 + 3 => {
+                ui.focus.index = 3;
+                return ui.toggleLearning();
+            },
             id.dev0...id.dev0 + max_rows - 1 => if (b - id.dev0 < ui.n_rows) {
                 ui.auto = false;
                 return .{ .use = b - id.dev0 };
@@ -239,6 +248,11 @@ pub const Ui = struct {
     fn toggleAuto(ui: *Ui) Action {
         ui.auto = !ui.auto;
         return .{ .set_auto = ui.auto };
+    }
+
+    fn toggleLearning(ui: *Ui) Action {
+        ui.learning = !ui.learning;
+        return .{ .set_learning = ui.learning };
     }
 
     fn cycleInstruct(ui: *Ui) Action {
@@ -257,6 +271,7 @@ pub const Ui = struct {
         if (ui.focus.index == 0) return ui.toggleAuto();
         if (ui.focus.index == 1) return .save_model;
         if (ui.focus.index == 2) return ui.cycleInstruct();
+        if (ui.focus.index == 3) return ui.toggleLearning();
         if (ui.focusedRow()) |r| {
             ui.auto = false;
             return .{ .use = r };
@@ -328,6 +343,13 @@ pub const Ui = struct {
             .value = ui.instruct_mode.label(),
             .id = id.field0 + 2,
             .focused = ui.focus.index == 2,
+            .choice = true,
+        };
+        b.fields[3] = .{
+            .label = "Learn from my voice",
+            .value = if (ui.learning) "On (corrections and clips train your model)" else "Off (transcribe only, nothing kept)",
+            .id = id.field0 + 3,
+            .focused = ui.focus.index == 3,
             .choice = true,
         };
         var na: usize = 0;
@@ -418,6 +440,17 @@ test "audio panel: the Instruct choice cycles auto, type, record" {
     var b: Ui.Bufs = .{};
     const p = ui.panel(&b, .{}).?;
     try testing.expectEqualStrings("Instruct", p.fields[2].label);
+}
+
+test "audio panel: Learn from my voice, on by default, toggles" {
+    var ui: Ui = .{};
+    ui.show(true, "", .auto);
+    try testing.expect(ui.learning);
+    try testing.expect(!ui.button(id.field0 + 3).set_learning);
+    try testing.expect(ui.key(.left, .{}).set_learning);
+    var b: Ui.Bufs = .{};
+    const p = ui.panel(&b, .{}).?;
+    try testing.expectEqualStrings("Learn from my voice", p.fields[3].label);
 }
 
 test "audio panel: the model field takes text and Enter saves" {

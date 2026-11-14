@@ -109,6 +109,9 @@ pub fn peakLevel(samples: []const i16) f32 {
 /// A finished recording, handed to the window (`takeRecording`).
 pub const Recording = struct {
     samples: []i16,
+    /// `startRecording`'s number for it: the window matches it to what it
+    /// asked for (a recording it gave up on is dropped).
+    seq: u32 = 0,
     /// It hit max_seconds and was cut there.
     truncated: bool = false,
 };
@@ -123,7 +126,11 @@ pub const Mic = struct {
     cmd_ev: sys.HANDLE = undefined,
     changed_ev: sys.HANDLE = undefined,
     ready_ev: sys.HANDLE = undefined,
+    /// The four events exist (closed by deinit, thread or not).
+    events_open: bool = false,
     thread: ?std.Thread = null,
+    /// Tests: make `start` fail after its allocations.
+    fail_spawn_for_test: bool = false,
 
     lock: sys.Lock = .{},
     // ---- under `lock`: what the window wants
@@ -157,16 +164,29 @@ pub const Mic = struct {
     capturing_id: mics.IdText = .{},
     capturing: bool = false,
     rec_seen: u32 = 0,
+    /// The seq of the recording in progress (under `lock`).
+    cur_seq: u32 = 0,
 
-    /// Starts the thread. `mode` is the saved choice.
+    /// Starts the thread. On failure nothing is left allocated or open
+    /// (deinit is still safe to call).
     pub fn start(m: *Mic) !void {
         m.rec = try m.gpa.alloc(i16, max_samples);
-        errdefer m.gpa.free(m.rec);
-        m.stop_ev = try sys.autoEvent();
-        m.cmd_ev = try sys.autoEvent();
-        m.changed_ev = try sys.autoEvent();
-        m.ready_ev = try sys.autoEvent();
+        errdefer {
+            m.gpa.free(m.rec);
+            m.rec = &.{};
+        }
+        var evs: [4]?sys.HANDLE = @splat(null);
+        errdefer for (evs) |e| if (e) |h| {
+            _ = sys.CloseHandle(h);
+        };
+        for (&evs) |*e| e.* = try sys.autoEvent();
+        m.stop_ev = evs[0].?;
+        m.cmd_ev = evs[1].?;
+        m.changed_ev = evs[2].?;
+        m.ready_ev = evs[3].?;
+        if (m.fail_spawn_for_test) return error.TestInjected;
         m.thread = try std.Thread.spawn(.{}, run, .{m});
+        m.events_open = true;
     }
 
     /// Stops the thread (and any capture) and frees everything.
@@ -175,9 +195,12 @@ pub const Mic = struct {
             _ = sys.SetEvent(m.stop_ev);
             t.join();
             m.thread = null;
-            for ([_]sys.HANDLE{ m.stop_ev, m.cmd_ev, m.changed_ev, m.ready_ev }) |h| _ = sys.CloseHandle(h);
         }
-        m.gpa.free(m.rec);
+        if (m.events_open) for ([_]sys.HANDLE{ m.stop_ev, m.cmd_ev, m.changed_ev, m.ready_ev }) |h| {
+            _ = sys.CloseHandle(h);
+        };
+        m.events_open = false;
+        if (m.rec.len > 0) m.gpa.free(m.rec);
         m.rec = &.{};
         if (m.done) |d| m.gpa.free(d.samples);
         m.done = null;
@@ -208,13 +231,17 @@ pub const Mic = struct {
         _ = sys.SetEvent(m.changed_ev);
     }
 
-    /// The 🎤 went on: record from the active endpoint.
-    pub fn startRecording(m: *Mic) void {
+    /// The 🎤 went on: record from the active endpoint. Returns the
+    /// recording's number (Recording.seq).
+    pub fn startRecording(m: *Mic) u32 {
         m.lock.lock();
         m.want_record = true;
         m.rec_seq +%= 1;
+        if (m.rec_seq == 0) m.rec_seq = 1;
+        const seq = m.rec_seq;
         m.lock.unlock();
         m.command();
+        return seq;
     }
 
     /// The 🎤 went off: the recording is finished on the thread (what is
@@ -345,6 +372,7 @@ pub const Mic = struct {
         // A new recording starts empty.
         if (m.rec_seq != m.rec_seen) {
             m.rec_seen = m.rec_seq;
+            m.cur_seq = m.rec_seq;
             m.rec_len = 0;
             m.rec_truncated = false;
             m.snap.full = false;
@@ -398,7 +426,7 @@ pub const Mic = struct {
         // one job; the capture buffer stays for the next recording.
         const samples: []i16 = m.gpa.dupe(i16, m.rec[0..m.rec_len]) catch &.{};
         if (m.done) |d| m.gpa.free(d.samples);
-        m.done = .{ .samples = samples, .truncated = m.rec_truncated or m.snap.full };
+        m.done = .{ .samples = samples, .seq = m.cur_seq, .truncated = m.rec_truncated or m.snap.full };
         m.snap.recording = false;
     }
 
@@ -563,13 +591,17 @@ const Waker = struct {
         const w: *Waker = @ptrCast(@alignCast(ctx));
         _ = sys.SetEvent(w.ev);
     }
-    /// Waits for notifications until `cond` holds (5 s at most).
+    /// Waits for notifications until `cond` holds, with a 5 s deadline.
     fn until(w: *Waker, m: *Mic, cond: *const fn (*Mic) bool) !void {
-        var tries: usize = 0;
-        while (!cond(m)) : (tries += 1) {
-            if (tries > 200) return error.TestTimeout;
-            _ = sys.WaitForSingleObject(w.ev, 25);
+        const end = nowMs() + 5000;
+        while (!cond(m)) {
+            const ms = sys.msUntil(end, nowMs());
+            if (ms == 0) return error.TestTimeout;
+            _ = sys.WaitForSingleObject(w.ev, ms);
         }
+    }
+    fn nowMs() i64 {
+        return std.Io.Clock.awake.now(testing.io).toMilliseconds();
     }
 };
 
@@ -623,7 +655,7 @@ test "mic thread: records only while asked, from the chosen endpoint; headset ho
     try testing.expectEqual(@as(u32, 0), fake.starts);
     fake.feed(&.{ 1, 2, 3 });
 
-    m.startRecording();
+    const seq = m.startRecording();
     try waker.until(&m, S.capturing);
     var idb: [mics.max_id]u8 = undefined;
     try testing.expectEqualStrings("{builtin}", fake.capturingId(&idb).?);
@@ -648,6 +680,7 @@ test "mic thread: records only while asked, from the chosen endpoint; headset ho
     defer gpa.free(rec.samples);
     // Every sample from both endpoints, in order, none from before.
     try testing.expectEqualSlices(i16, &.{ 10, 20, 30, 40, 50, 60 }, rec.samples);
+    try testing.expectEqual(seq, rec.seq);
     try testing.expect(!rec.truncated);
     try testing.expectEqual(fake.starts, fake.stops);
 
@@ -744,7 +777,7 @@ test "mic thread: a recording stops at the cap by itself; the buffer is the one 
     defer m.deinit();
     const buf_ptr = m.rec.ptr;
     try testing.expectEqual(@as(usize, max_samples), m.rec.len);
-    m.startRecording();
+    _ = m.startRecording();
     try waker.until(&m, struct {
         fn f(x: *Mic) bool {
             var s: Snapshot = .{};
@@ -777,6 +810,20 @@ test "mic thread: a recording stops at the cap by itself; the buffer is the one 
             return !s.capturing and !s.recording;
         }
     }.f);
+}
+
+test "mic: a start that fails part-way leaves nothing to free twice or leak" {
+    var fake: Fake = .{ .gpa = testing.allocator };
+    defer fake.deinit();
+    var m: Mic = .{ .gpa = testing.allocator, .backend = fake.backend(), .fail_spawn_for_test = true };
+    try testing.expectError(error.TestInjected, m.start());
+    try testing.expectEqual(@as(usize, 0), m.rec.len);
+    m.deinit(); // the testing allocator catches a double free or a leak
+    // Allocation failing first: the same.
+    var fa: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    var m2: Mic = .{ .gpa = fa.allocator(), .backend = fake.backend() };
+    try testing.expectError(error.OutOfMemory, m2.start());
+    m2.deinit();
 }
 
 test "peakLevel" {

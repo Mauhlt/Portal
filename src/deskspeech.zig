@@ -57,8 +57,17 @@ pub const DeskSpeech = struct {
     limits: speech.limits.Config = .{},
     /// "Not kept for training" was said (once, until a clip is kept again).
     told_not_kept: bool = false,
-    /// The panel closed during a Test's recording: drop that recording.
-    discard_test: bool = false,
+    /// The number (capture.Recording.seq) of the recording asked for;
+    /// any other one that arrives (a Test given up on) is dropped.
+    recording_seq: u32 = 0,
+    /// "Learn from my voice" (settings.txt speech_learning, default on).
+    learning: bool = true,
+    /// A model change: the old engine stops on a thread of its own (Home
+    /// closing can take a moment), which wakes the window when done; the
+    /// new one starts then. Meanwhile: "Stopping speech…".
+    retire_thread: ?std.Thread = null,
+    retiring: std.atomic.Value(bool) = .init(false),
+    next_model: ?[]u8 = null,
 
     panel: audio_panel.Ui = .{},
     bufs: audio_panel.Ui.Bufs = .{},
@@ -85,6 +94,7 @@ pub const DeskSpeech = struct {
         s.mic.setLimits(saved.speech);
         s.limits = saved.speech;
         s.instruct_mode = saved.instruct_mode orelse .auto;
+        s.learning = saved.speech_learning orelse true;
         const model = saved.speech_model.get();
         s.startEngine(model);
     }
@@ -99,6 +109,7 @@ pub const DeskSpeech = struct {
         e.notify_ctx = s.notify_ctx;
         e.notify_fn = s.notify_fn;
         e.setLimits(s.limits);
+        if (!s.learning) e.setLearning(false);
         e.start() catch {
             e.destroy();
             return;
@@ -113,9 +124,34 @@ pub const DeskSpeech = struct {
         s.tracker = .{};
     }
 
+    /// Stops the engine off the window's thread; `poll` starts
+    /// `next_model` once it has gone (the reaper wakes the window).
+    fn retireEngine(s: *DeskSpeech) void {
+        if (!speech.has_home) return;
+        const e = s.engine orelse return;
+        s.engine = null;
+        s.tracker = .{};
+        s.retiring.store(true, .release);
+        s.retire_thread = std.Thread.spawn(.{}, reap, .{ s, e }) catch {
+            // No thread: stop it here (the window waits this once).
+            e.destroy();
+            s.retiring.store(false, .release);
+            return;
+        };
+    }
+
+    fn reap(s: *DeskSpeech, e: *Engine) void {
+        e.destroy();
+        s.retiring.store(false, .release);
+        s.notify_fn(s.notify_ctx);
+    }
+
     pub fn deinit(s: *DeskSpeech) void {
         s.mic.deinit();
+        if (s.retire_thread) |t| t.join();
+        s.retire_thread = null;
         s.stopEngine();
+        if (s.next_model) |m| s.gpa.free(m);
         if (s.model_path.len > 0) s.gpa.free(s.model_path);
     }
 
@@ -133,12 +169,15 @@ pub const DeskSpeech = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
-    fn onStart(ctx: *anyopaque) void {
+    /// The 🎤 on: true if recording started (a Test keeps the
+    /// microphone; without one there is nothing to record from).
+    fn onStart(ctx: *anyopaque) bool {
         const s = of(ctx);
-        // A Test in progress keeps the microphone; the 🎤 waits.
-        if (s.recording_for == .test_clip) return;
+        if (s.recording_for == .test_clip) return false;
+        if (s.snap.active == null) return false;
         s.recording_for = .dictation;
-        s.mic.startRecording();
+        s.recording_seq = s.mic.startRecording();
+        return true;
     }
 
     fn onStop(ctx: *anyopaque) void {
@@ -220,14 +259,26 @@ pub const DeskSpeech = struct {
                 changed = true;
             }
         };
+        if (s.retire_thread != null and !s.retiring.load(.acquire)) {
+            s.retire_thread.?.join();
+            s.retire_thread = null;
+            if (s.next_model) |m| {
+                s.next_model = null;
+                defer s.gpa.free(m);
+                s.startEngine(m);
+            }
+            changed = true;
+        }
         if (s.mic.takeRecording()) |rec| {
             changed = true;
+            // Only the recording asked for counts (a Test given up on, or
+            // one overtaken by a newer start, is dropped).
             var purpose = s.recording_for;
-            s.recording_for = .none;
-            // A Test whose panel closed while it recorded: not transcribed.
-            if (s.discard_test) {
-                s.discard_test = false;
+            if (rec.seq != s.recording_seq) {
                 purpose = .none;
+            } else {
+                s.recording_for = .none;
+                s.recording_seq = 0;
             }
             if (purpose == .test_clip) s.panel.testRecorded();
             if (rec.truncated) s.showToast("Dictation stopped at 120 s (the most stt takes at once).");
@@ -251,7 +302,10 @@ pub const DeskSpeech = struct {
                         var d: ui.dictation.Decision = .none;
                         const add = s.tracker.added(r.id, r.text, sh.line.text(), &s.insert_buf, &d);
                         s.perform(d);
-                        sh.dictated(add);
+                        // Cut or changed on the way into the line (its
+                        // limit, a line break, a tab): never learned as
+                        // if sent unchanged; discarded instead.
+                        if (!sh.dictated(add)) s.perform(s.tracker.cleared());
                     },
                 }
             }
@@ -294,9 +348,9 @@ pub const DeskSpeech = struct {
     }
 
     /// "Over the hourly limit for transcriptions: possible again in 4 min."
-    fn limitText(s: *DeskSpeech, e: *Engine, buf: []u8, what: []const u8) []const u8 {
+    fn limitText(_: *DeskSpeech, e: *Engine, buf: []u8, what: []const u8) []const u8 {
         const l = e.lastLimited() orelse return "Too many in a row.";
-        const secs = @max(1, @divFloor(l.at - s.nowMs() + 999, 1000));
+        const secs = @max(1, @divFloor(l.in_ms +| 999, 1000));
         const when = if (secs < 120)
             std.fmt.bufPrint(buf[60..], "{d} s", .{secs}) catch ""
         else if (secs < 7200)
@@ -340,6 +394,7 @@ pub const DeskSpeech = struct {
             bad.* = true;
             return "Speech on this device comes with stt-local (not delivered yet).";
         }
+        if (s.retiring.load(.acquire) or s.next_model != null) return "Stopping speech\u{2026}";
         const e = s.engine orelse {
             bad.* = true;
             return "Speech could not start.";
@@ -374,6 +429,7 @@ pub const DeskSpeech = struct {
 
     pub fn openPanel(s: *DeskSpeech) void {
         s.panel.show(s.snap.automatic, s.model_path, s.instruct_mode);
+        s.panel.learning = s.learning;
         // The meter runs exactly while the panel is open.
         s.mic.setMeter(true);
     }
@@ -402,7 +458,7 @@ pub const DeskSpeech = struct {
 
     /// What an Audio panel action changes in the settings (the window
     /// saves them): the microphone choice or the model path.
-    pub const Saved = union(enum) { none, mic: ?[]const u8, model: []const u8, reload, instruct_mode: ui.shell.InstructMode };
+    pub const Saved = union(enum) { none, mic: ?[]const u8, model: []const u8, reload, instruct_mode: ui.shell.InstructMode, learning: bool };
 
     /// New speech limits (settings.txt reloaded at the desk): applied live.
     pub fn setLimits(s: *DeskSpeech, c: speech.limits.Config) void {
@@ -414,6 +470,11 @@ pub const DeskSpeech = struct {
     pub fn act(s: *DeskSpeech, a: audio_panel.Action) Saved {
         switch (a) {
             .reload_limits => return .reload,
+            .set_learning => |on| {
+                s.learning = on;
+                if (speech.has_home) if (s.engine) |e| e.setLearning(on);
+                return .{ .learning = on };
+            },
             .set_instruct_mode => |m| {
                 s.instruct_mode = m;
                 return .{ .instruct_mode = m };
@@ -426,7 +487,7 @@ pub const DeskSpeech = struct {
                     s.test_until = null;
                     s.mic.stopRecording();
                     s.recording_for = .none;
-                    s.discard_test = true;
+                    s.recording_seq = 0; // its recording is dropped when it comes
                 }
                 if (s.panel.test_state == .transcribing) if (speech.has_home) if (s.engine) |e| {
                     _ = e.cancel();
@@ -456,7 +517,7 @@ pub const DeskSpeech = struct {
                 }
                 s.recording_for = .test_clip;
                 s.test_until = s.nowMs() + audio_panel.test_ms;
-                s.mic.startRecording();
+                s.recording_seq = s.mic.startRecording();
                 return .none;
             },
             .save_model => {
@@ -465,10 +526,16 @@ pub const DeskSpeech = struct {
                     s.panel.setNote(.bad, "Enter the model file's path.", .{});
                     return .none;
                 }
-                s.stopEngine();
-                s.startEngine(path);
-                s.panel.setNote(.good, "Loading {s}\u{2026}", .{std.fs.path.basename(path)});
-                return .{ .model = s.model_path };
+                if (s.next_model) |m| s.gpa.free(m);
+                s.next_model = s.gpa.dupe(u8, path) catch null;
+                if (s.engine != null) s.retireEngine();
+                if (s.retire_thread == null) if (s.next_model) |m| {
+                    s.next_model = null;
+                    defer s.gpa.free(m);
+                    s.startEngine(m);
+                };
+                s.panel.setNote(.good, "Switching to {s}\u{2026}", .{std.fs.path.basename(path)});
+                return .{ .model = path };
             },
         }
     }

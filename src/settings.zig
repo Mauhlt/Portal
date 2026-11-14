@@ -86,6 +86,12 @@ pub const Settings = struct {
     speech_model: Str(max_model) = .{},
     /// The microphone chosen by hand (an endpoint id); null: automatic.
     mic: Str(max_mic) = .{},
+    /// "Learn from my voice" (null: on).
+    speech_learning: ?bool = null,
+    /// `speech.*` lines this Portal doesn't know (a newer one wrote them, or
+    /// a typo): kept as they are and written back, never dropped.
+    speech_extra: [8]Str(160) = @splat(.{}),
+    n_speech_extra: usize = 0,
     /// The desk's Instruct button (null: auto).
     instruct_mode: ?@import("portal_ui").shell.InstructMode = null,
     /// The speech limits (defaults unless set; always clamped).
@@ -130,8 +136,12 @@ pub const Settings = struct {
                 if (!std.ascii.eqlIgnoreCase(val, "auto")) _ = s.mic.set(val);
             } else if (std.mem.eql(u8, key, "instruct_mode")) {
                 s.instruct_mode = @import("portal_ui").shell.InstructMode.parse(val);
+            } else if (std.mem.eql(u8, key, "speech_learning")) {
+                if (std.ascii.eqlIgnoreCase(val, "on")) s.speech_learning = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.speech_learning = false;
             } else if (std.mem.startsWith(u8, key, "speech.")) {
-                _ = s.speech.set(key["speech.".len..], val);
+                if (!s.speech.set(key["speech.".len..], val) and s.n_speech_extra < s.speech_extra.len) {
+                    if (s.speech_extra[s.n_speech_extra].set(line)) s.n_speech_extra += 1;
+                }
             } else if (std.mem.eql(u8, key, "color")) {
                 // NAME #rrggbb: the name may contain spaces.
                 const sp = std.mem.lastIndexOfScalar(u8, val, ' ') orelse continue;
@@ -159,7 +169,9 @@ pub const Settings = struct {
         if (s.speech_model.get()) |v| try out.print("speech_model = {s}\r\n", .{v});
         if (s.mic.get()) |v| try out.print("mic = {s}\r\n", .{v});
         if (s.instruct_mode) |m| try out.print("instruct_mode = {s}\r\n", .{m.text()});
+        if (s.speech_learning) |v| try out.print("speech_learning = {s}\r\n", .{if (v) "on" else "off"});
         try s.speech.format(out);
+        for (s.speech_extra[0..s.n_speech_extra]) |*x| if (x.get()) |l| try out.print("{s}\r\n", .{l});
         for (s.colors[0..s.n_colors]) |*c| {
             const name = c.name.get() orelse continue;
             try out.print("color = {s} {s}\r\n", .{ name, &tabs_wire.colorHex(c.color) });
@@ -172,6 +184,20 @@ pub fn load(gpa: std.mem.Allocator, io: Io, dir: []const u8) Settings {
     const path = std.fs.path.join(gpa, &.{ dir, file_name }) catch return .{};
     defer gpa.free(path);
     const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch return .{};
+    defer gpa.free(text);
+    return Settings.parse(text);
+}
+
+/// Like `load`, but null when the file exists and can't be read (so a
+/// caller merging one change into it doesn't overwrite it with defaults);
+/// a missing file is empty settings.
+pub fn loadOrNull(gpa: std.mem.Allocator, io: Io, dir: []const u8) ?Settings {
+    const path = std.fs.path.join(gpa, &.{ dir, file_name }) catch return null;
+    defer gpa.free(path);
+    const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch |err| return switch (err) {
+        error.FileNotFound => .{},
+        else => null,
+    };
     defer gpa.free(text);
     return Settings.parse(text);
 }
@@ -279,6 +305,18 @@ test "settings: speech model and microphone" {
     const again = Settings.parse(out.buffered());
     try testing.expectEqualStrings(s.mic.get().?, again.mic.get().?);
     try testing.expectEqualStrings(s.speech_model.get().?, again.speech_model.get().?);
+}
+
+test "settings: speech_learning; unknown speech.* lines survive a save" {
+    const s = Settings.parse("speech_learning = off\r\nspeech.from_the_future = 7\r\nspeech.transcribe_per_hour = 9\r\n");
+    try testing.expect(!s.speech_learning.?);
+    var buf: [2048]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    try s.format(&out);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech.from_the_future = 7") != null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech.transcribe_per_hour = 9") != null);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech_learning = off") != null);
+    try testing.expect(Settings.parse("").speech_learning == null);
 }
 
 test "settings: instruct_mode" {

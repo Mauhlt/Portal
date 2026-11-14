@@ -94,6 +94,15 @@ the active input where the platform reports it.
   auto, but says once why it can't record. "A microphone works" is
   re-evaluated on every device change (IMMNotificationClient), no polling.
   Devices are not affected.
+* "Learn from my voice" (owner, 2026-11-14), default ON: off means
+  transcribe only, every clip discarded in stt (no samples) and
+  Home.setLearning(false). Desk: Audio panel and settings.txt
+  `speech_learning = on|off`, applied live. Every device (laptop, Surface,
+  iPhone) gets the same switch, default on, with the device speech work.
+* Future device routes: call `speech.gate.Gate` (begin / feedback /
+  bundle / malformed / end, `retain` with the device store's names when it
+  changes) and `home.Engine.deviceFeedback`, whose entries can take at
+  most half the feedback queue, so they never evict the desk's.
 * `zig build mic-check -- <seconds>` records from the real microphone and
   prints the transcript (manual check, never part of `test`).
 * Not yet: the training banner, the laptop's stt-local client, the
