@@ -183,10 +183,11 @@ pub const Feed = struct {
         var l: projects.List = .{};
         hub.projectsLocked(&l);
         if (f.sent and l.eql(&f.last)) return null;
-        var w: Io.Writer = .fixed(&f.buf);
-        projects.write(&w, l.slice()) catch return null;
+        // Looked at, whatever happens next: the writer never spins on it.
         f.last = l;
         f.sent = true;
+        var w: Io.Writer = .fixed(&f.buf);
+        projects.write(&w, l.slice()) catch return null; // max_message holds any list
         return w.buffered();
     }
 };
