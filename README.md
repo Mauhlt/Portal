@@ -31,9 +31,10 @@ All three are built from the same source (`zig build`); `portal.exe` and
 
 | Can | Cannot |
 |---|---|
-| See the session started at the desk, live, with scrollback | Start a new session, process, or project |
+| See the session started at the desk, live, with scrollback | Start a process, or a project the desk did not allow |
 | Send keystrokes into that session, filtered by the input mode | Choose a directory, read or upload files |
-| Ask the program to repaint | Resize or kill the session |
+| Ask the program to repaint | Resize the session, or end one the desk started |
+| Start a project the desk marked startable, by name, in the mode the desk chose (Projects, below) | Choose the folder, the program or its permission mode |
 
 Input modes (`--input`, or Remote input in the window's Settings):
 
@@ -263,8 +264,38 @@ Ctrl+Shift+Tab or a click switches. When a tab's program exits the tab
 goes; when the last one goes (or the window is closed) Portal ends as
 before. A tab is named after its folder (the home folder is "Home"); paired
 devices see that name and the colour, never a path, and can switch
-between open tabs and answer, but nothing they send can open, close or
-start a project (docs/tabs-design.md).
+between open tabs and answer. The one thing they can open is a project
+the desk marked startable, and the one thing they can close is a session
+a device started (below; docs/tabs-design.md). Every tab finds the
+program on PATH again when it opens, so a project reopened after an
+agent update runs the version installed now, even if the update
+moved it.
+
+**Starting projects from a device.** The desk's **Projects** panel
+(Ctrl+Shift+J) lists the folders a paired device may start, at most 16:
+Add folder… (or Add this tab's folder), Remove, and per project the mode
+a device start runs in: **Ask** (the agent's `--permission-mode
+default`: every edit and command needs approval) or **Plan** (`--permission-mode
+plan`: read-only planning). Never a permissive mode. The same list from a
+terminal:
+
+```
+portalctl startable add <folder> [--name NAME] [--mode ask|plan]
+portalctl startable remove <name>
+portalctl startable list
+```
+
+It is kept in settings.txt (`startable = NAME | MODE | FOLDER`); a
+running Portal follows the file. On a device, **Projects** in the top bar
+opens the list: each project's colour, name, Ask / Plan badge and state,
+with Start, Open (it runs: show it) and Stop (only for a session a device
+started). Devices see names only, never folders. Starts are refused while
+the input mode is `none`, limited to 3 a minute per device (stops too),
+and refused altogether when the program setting is not the agent or
+carries a flag that skips or widens permission prompts
+(`--dangerously-*`, `--permission-mode`, `--allowedTools`,
+`--permission-prompt-tool`). A device-started tab says so on the desk
+("acme · started by iPhone"), and the desk keeps the tab it shows.
 
 The desk's own tools are in the top bar, and on these keys (they never
 reach the session):
@@ -278,6 +309,7 @@ reach the session):
 | Ctrl+Shift+D | Devices | paired devices with address and last use; Unpair |
 | Ctrl+Shift+E | Export certificate… | write portal-ca.cer / .pem / .mobileconfig to a folder (default `%USERPROFILE%\Downloads\Portal-CA`) |
 | Ctrl+Shift+S | Settings | tunnel port and endpoint (with this desktop's tunnel key and its peers), program, project, input mode for the next start; system monitor, background art and the agent integration (these apply at once) |
+| Ctrl+Shift+J | Projects | the projects paired devices may start, Ask or Plan each |
 
 Panels are keyboard driven: Tab / arrows move, Enter activates, Esc closes.
 

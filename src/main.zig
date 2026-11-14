@@ -1508,8 +1508,10 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     const command = cfg.command.?;
     // The listener is never closed (see the end of this function).
     const listener = prep.listener;
+    // prepare's lookup only checked that the program is there now: every
+    // tab finds it again when it opens (tabs.Program, Hub.open).
     var resolved = prep.resolved;
-    defer resolved.deinit(gpa);
+    resolved.deinit(gpa);
     const listen_host = tunnelnet.desk_server;
     const allowed_hosts = [_][]const u8{tunnelnet.desk_server};
 
@@ -1577,8 +1579,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .console = &console,
         .policy = cfg.policy,
         .program = .{
-            .app = resolved.app,
-            .cmdline = resolved.cmdline,
+            .argv = command,
+            .path_env = env.get("PATH"),
+            .system_root = env.get("SystemRoot"),
             .command_name = std.fs.path.basename(command[0]),
             .session_id = cmdline.wantsSessionId(command),
             .device_start = cmdline.deviceStart(command),
@@ -1806,6 +1809,7 @@ test {
     _ = @import("workdir.zig");
     _ = @import("settings.zig");
     _ = @import("deskui.zig");
+    _ = @import("deskprojects.zig");
     _ = @import("keymap.zig");
     _ = @import("guard.zig");
     _ = @import("tunneldesk.zig");
@@ -1814,6 +1818,7 @@ test {
     _ = @import("console.zig");
     _ = @import("session.zig");
     _ = @import("tabs.zig");
+    _ = @import("projects_ws.zig");
     _ = @import("openreq.zig");
     _ = @import("hookmsg.zig");
     _ = @import("hookpipe.zig");

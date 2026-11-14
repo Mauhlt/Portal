@@ -67,6 +67,7 @@ const subtabs_wire = @import("shared").subtabs;
 const sysmon = @import("sysmon.zig");
 const frames = @import("shared").frames;
 const foryou_ws = @import("foryou_ws.zig");
+const projects_ws = @import("projects_ws.zig");
 
 /// Hard cap on simultaneous connections (each costs a supervisor thread and
 /// a worker thread, a WebSocket one more).
@@ -388,6 +389,9 @@ pub const Server = struct {
     sync_digests: [devices.max_devices]SyncDigest = @splat(.{}),
     sync_n: usize = 0,
     sync_gen: std.atomic.Value(u64) = .init(0),
+
+    /// Each paired device's `p:start` / `p:stop` rate (projects_ws.zig).
+    project_limits: projects_ws.Limits = .{},
 
     /// Why a device's connections end (docs/protocol.md, `logout`).
     /// `unpaired`: its record was removed at the desk; the device forgets
@@ -1192,6 +1196,11 @@ pub const Server = struct {
         defer act_out.deinit();
         // The system monitor's sample last sent (section 3d).
         var sys_seen: u64 = 0;
+        // The startable projects (section 3f): after hello, then whenever
+        // the list or a project's running state changes.
+        const proj = srv.gpa.create(projects_ws.Feed) catch return;
+        defer srv.gpa.destroy(proj);
+        proj.* = .{};
         while (true) {
             ws.writer_wakes +|= 1;
             // Event-driven: wakes on output, resize, a tab list change, a
@@ -1208,6 +1217,7 @@ pub const Server = struct {
             const sys_due = if (srv.sysmon) |m| ws.sys_on.load(.acquire) and m.gen.load(.acquire) != sys_seen else false;
             if (!hub.finished and !full and cur_gen == sent_gen and !(cur_closed and !ended_sent) and !convo_changed and
                 hub.activity_gen == activity_seen and !sys_due and !fy.due(hub) and
+                hub.activity_gen == activity_seen and !sys_due and !proj.dueLocked(hub) and
                 ws.want == .none and ws.sub_want == .none and hub.gen == seen_gen and !ws.dead.load(.acquire) and !gone and
                 srv.sync_gen.load(.acquire) == sync_seen)
             {
@@ -1347,6 +1357,7 @@ pub const Server = struct {
             if (encode_ok) fy.fill(hub) catch {
                 encode_ok = false;
             };
+            const proj_msg = proj.collectLocked(hub);
             const cur_id: ?tabs.Id = if (cur) |c| c.id else null;
             hub.mutex.unlock(srv.io);
 
@@ -1367,6 +1378,7 @@ pub const Server = struct {
                 const m = tabsMessage(text, list.slice()) catch return;
                 if (!ws.send(srv, m, .text)) return;
             }
+            if (proj_msg) |m| if (!ws.send(srv, m, .text)) return;
             if (ended) |code| if (cur_id) |id| {
                 const m = std.fmt.bufPrint(&msg, "{{\"t\":\"ended\",\"id\":\"{s}\",\"code\":{d}}}", .{ &tabs_wire.idHex(id), code }) catch return;
                 if (!ws.send(srv, m, .text)) return;
@@ -1498,9 +1510,15 @@ pub const Server = struct {
                 if (payload.len < 2 or payload[1] != ':') return true;
                 // Re-check on every input message, not just on wakes.
                 if (srv.endReason(&ws.device) != null) return false;
+                const known = frames.classify(payload);
                 // "f:" this device forgets this desktop (mutual Forget):
-                // its record goes, which ends all its connections.
-                if (payload[0] == 'f') return srv.forgotten(ws);
+                // its record goes, which ends all its connections. Exactly
+                // "f:" (frames.classify): "f:" with anything after it is
+                // an unknown frame, never Forget.
+                if (known) |k| if (k.prefix == .forget) return srv.forgotten(ws);
+                // A startable project (projects_ws.zig): a request, not
+                // typing, answered in every input mode.
+                if (known) |k| if (k.prefix == .project) return srv.projectRequest(ws, k.rest);
                 // Switching tabs is not input: also in view-only mode.
                 if (payload[0] == 's') {
                     srv.subscribe(ws, payload[2..]);
@@ -1516,11 +1534,10 @@ pub const Server = struct {
                 // shown sub-tab doesn't block them; foryou_ws checks the
                 // input mode per request (dismissing is allowed in every
                 // mode).
-                if (payload[0] == 'i' or payload[0] == 'r') {
-                    const fr = frames.classify(payload) orelse return true;
+                if (known) |fr| if (fr.prefix == .item or fr.prefix == .recap) {
                     var ab: [frames.max_answer]u8 = undefined;
                     return ws.send(srv, foryou_ws.handle(srv.fyCtx(ws), fr, &ab), .text);
-                }
+                };
                 // A sub-tab is read-only: nothing typed while it is shown.
                 if (ws.sub_view) return true;
                 // The System panel (read-only, every mode): "y:on" / "y:off".
@@ -1563,6 +1580,18 @@ pub const Server = struct {
     }
     fn fyCtx(srv: *Server, ws: *const WsConn) foryou_ws.Ctx {
         return .{ .hub = srv.hub, .limits = &srv.fy_limits, .log = srv.log, .device = ws.device.id, .device_name = ws.device.name.get(), .now_ms = srv.nowMs() };
+    }
+
+    /// `p:start <name>` / `p:stop <name>` (projects_ws.handle): the answer,
+    /// and on a start (or an already running one) this viewer then shows
+    /// that tab, exactly as after `s:<id>`.
+    fn projectRequest(srv: *Server, ws: *WsConn, rest: []const u8) bool {
+        var buf: [frames.max_answer]u8 = undefined;
+        const dev: projects_ws.Device = .{ .id = ws.device.id, .name = ws.device.name.get() };
+        const out = projects_ws.handle(srv.hub, &srv.project_limits, dev, srv.nowMs(), rest, &buf) orelse return true;
+        if (!ws.send(srv, out.answer, .text)) return false;
+        if (out.show) |id| srv.subscribe(ws, &tabs_wire.idHex(id));
+        return true;
     }
 
     /// "f:" from the device: remove its record (this one only: a newer

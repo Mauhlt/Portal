@@ -167,7 +167,8 @@ fn inputIs(h: *proc.Harness, folder: []const u8, want: []const u8, settle_ms: u3
     return std.mem.eql(u8, got, want);
 }
 
-fn selfExe(gpa: std.mem.Allocator) ![]u8 {
+/// This program (portal-e2e), to run as the fake agent.
+pub fn selfExe(gpa: std.mem.Allocator) ![]u8 {
     var buf: [1024]u16 = undefined;
     const n = w.GetModuleFileNameW(null, &buf, buf.len);
     if (n == 0 or n >= buf.len) return error.NoSelf;

@@ -32,6 +32,9 @@
 //! --console`, which types its console's keys into the tab by design.
 //! Start such consoles hidden or with SW_SHOWMINNOACTIVE.)
 //!
+//! It prints the `--permission-mode` it was given (FAKE-PERMISSION-MODE=
+//! <mode>, or FAKE-NO-PERMISSION-MODE), for the projects group.
+//!
 //! A tab whose folder's name contains "quiet" writes no transcript at all.
 //! A tab whose folder's name contains "probe" only does OSC 7501 feature
 //! detection (`probe`; the probe group, tests/e2e/probe_tests.zig).
@@ -237,13 +240,22 @@ fn validUuid(s: []const u8) bool {
 
 pub fn main(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, args: []const []const u8) u32 {
     var session_id: ?[]const u8 = null;
-    for (args, 0..) |a, i| if (std.mem.eql(u8, a, "--session-id") and i + 1 < args.len) {
-        session_id = args[i + 1];
+    var permission_mode: ?[]const u8 = null;
+    for (args, 0..) |a, i| if (i + 1 < args.len) {
+        if (std.mem.eql(u8, a, "--session-id")) session_id = args[i + 1];
+        if (std.mem.eql(u8, a, "--permission-mode")) permission_mode = args[i + 1];
     };
     out_h = GetStdHandle(STD_OUTPUT_HANDLE);
     in_h = GetStdHandle(STD_INPUT_HANDLE);
     if (in_h) |h| _ = SetConsoleMode(h, ENABLE_VIRTUAL_TERMINAL_INPUT);
     say("FAKE-START\r\n");
+    // How it was launched (the projects group: a device start passes the
+    // desk's mode, a desk start none).
+    if (permission_mode) |m| {
+        say("FAKE-PERMISSION-MODE=");
+        say(m);
+        say("\r\n");
+    } else say("FAKE-NO-PERMISSION-MODE\r\n");
     const cwd = std.process.currentPathAlloc(io, gpa) catch return 2;
     openInputLog(gpa, cwd);
     if (session_id) |s| say(if (validUuid(s)) "FAKE-SESSION-ID\r\n" else "FAKE-BAD-SESSION-ID\r\n") else say("FAKE-NO-SESSION-ID\r\n");

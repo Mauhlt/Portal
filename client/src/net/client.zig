@@ -40,6 +40,7 @@ const tabs_wire = @import("shared").tabs;
 const convo_wire = @import("shared").convo;
 const subtabs_wire = @import("shared").subtabs;
 const activity_wire = @import("shared").activity;
+const projects_wire = @import("shared").projects;
 const sysinfo = @import("shared").sysinfo;
 const tlsconn = @import("tlsconn.zig");
 const x509check = @import("x509check.zig");
@@ -124,6 +125,8 @@ test "trust errors" {
 }
 
 pub const Activity = activity_wire.Activity;
+pub const ProjectList = projects_wire.List;
+pub const ProjectAnswer = projects_wire.Answer;
 pub const SysSnapshot = sysinfo.Snapshot;
 
 pub const Shared = struct {
@@ -142,6 +145,13 @@ pub const Shared = struct {
     /// Every open tab's For-you cards (`foryou`) and the last answer to an
     /// `i:` / `r:` request (`item`, `recap`): docs/protocol.md 3g, 4b.
     foryou: ui.foryou.Store = .{},
+    /// The projects the desk lets this device start (`projects`, section
+    /// 3f), once known; the desk's latest answer to a `p:` request and a
+    /// count bumped with each one.
+    projects: projects_wire.List = .{},
+    has_projects: bool = false,
+    project_answer: ?projects_wire.Answer = null,
+    project_answer_gen: u64 = 0,
     /// The latest system monitor sample (`sys`), while the System panel
     /// is open.
     sys: sysinfo.Snapshot = .{},
@@ -465,6 +475,25 @@ pub const Client = struct {
         c.shared.mutex.lockUncancelable(c.io);
         c.shared.activity = a.*;
         c.shared.has_activity = true;
+        c.shared.mutex.unlock(c.io);
+        c.notify();
+    }
+
+    /// A `projects` message or a `project` answer (section 3f), parsed
+    /// strictly (malformed: ignored).
+    fn applyProjects(c: *Client, payload: []const u8) void {
+        const list = projects_wire.parse(payload);
+        const answer = if (list == null) projects_wire.parseResult(payload) else null;
+        if (list == null and answer == null) return;
+        c.shared.mutex.lockUncancelable(c.io);
+        if (list) |l| {
+            c.shared.projects = l;
+            c.shared.has_projects = true;
+        }
+        if (answer) |a| {
+            c.shared.project_answer = a;
+            c.shared.project_answer_gen +%= 1;
+        }
         c.shared.mutex.unlock(c.io);
         c.notify();
     }
@@ -867,6 +896,11 @@ pub const Client = struct {
                     c.applyActivity(frame.payload);
                     return null;
                 }
+                // `projects` and `project` (the answer to a p: request).
+                if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"project")) {
+                    c.applyProjects(frame.payload);
+                    return null;
+                }
                 if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"sys\"")) {
                     c.applySys(frame.payload);
                     return null;
@@ -892,6 +926,8 @@ pub const Client = struct {
                     c.shared.current = tabs_wire.idField(frame.payload, "session");
                     c.shared.subs = .{};
                     c.shared.sub_shown = null;
+                    // The desk sends its projects again after hello.
+                    c.shared.has_projects = false;
                     // Reconnected: back to the tab this device was on, if
                     // it is still open.
                     const back = c.shared.chosen;
@@ -1310,6 +1346,28 @@ test "convo: the client keeps the shown tab's items from convo / convo+ (malform
     // A key outside the answer keys: the whole message is refused.
     c.applyConvo("{\"t\":\"convo+\",\"id\":\"" ++ id ++ "\",\"items\":[{\"n\":3,\"k\":\"question\",\"text\":\"x\",\"open\":true,\"options\":[{\"label\":\"rm\",\"key\":\"t:rm -rf\"}]}]}");
     try std.testing.expectEqual(@as(usize, 2), shared.convo.items.items.len);
+}
+
+test "projects: the list and the answers, strictly" {
+    const io = std.testing.io;
+    var shared: Shared = .{};
+    defer shared.convo.deinit(std.testing.allocator);
+    const c = try std.testing.allocator.create(Client);
+    defer std.testing.allocator.destroy(c);
+    c.* = try Client.init(std.testing.allocator, io, &shared, "127.0.0.1:1", .os, .plain_for_tests);
+    c.quiet = true;
+    c.applyProjects("{\"t\":\"projects\",\"list\":[{\"name\":\"acme\",\"color\":\"#112233\",\"mode\":\"plan\",\"running\":false,\"stoppable\":false}]}");
+    try std.testing.expect(shared.has_projects);
+    try std.testing.expectEqualStrings("acme", shared.projects.items[0].name());
+    // A malformed list (a path for a name) changes nothing.
+    c.applyProjects("{\"t\":\"projects\",\"list\":[{\"name\":\"C:\\\\x\",\"mode\":\"ask\"}]}");
+    try std.testing.expectEqual(@as(usize, 1), shared.projects.len);
+    try std.testing.expectEqual(@as(u64, 0), shared.project_answer_gen);
+    c.applyProjects("{\"t\":\"project\",\"op\":\"start\",\"result\":\"started\",\"name\":\"acme\"}");
+    try std.testing.expectEqual(@as(u64, 1), shared.project_answer_gen);
+    try std.testing.expectEqual(projects_wire.Result.started, shared.project_answer.?.result);
+    c.applyProjects("{\"t\":\"project\",\"op\":\"start\",\"result\":\"maybe\"}");
+    try std.testing.expectEqual(@as(u64, 1), shared.project_answer_gen);
 }
 
 test "subtabs: kept for the tab shown only; the sub-tab shown going (or the tab's own snapshot) ends showing it" {

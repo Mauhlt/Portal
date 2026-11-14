@@ -12,7 +12,8 @@
 //!   frame      layout, widgets and draw-list generation (Overlay: the
 //!              description of one frame), hit-testing, cell mapping
 //!   draw       the draw list: rects, glyphs, text runs, images
-//!   panels     desk (setup, pairing, devices, export), setup (a device's
+//!   panels     desk (setup, pairing, devices, export), projects (which
+//!              folders devices may start), setup (a device's
 //!              first run), sync (approvals, packages), status (background
 //!              tasks, usage, system): state machines / builders that
 //!              describe frame.Panels
@@ -21,6 +22,8 @@
 //!              feedback: learn, discard, or nothing)
 //!   dataview   the Data slice's state (model: "datafeed")
 //!   convo      the conversation items a device keeps (shared/convo.zig)
+//!   projects_sheet  a device's Projects sheet (start / open / stop the
+//!              projects the desk allowed)
 //!   convoview  the Conversation view (a frame.ContentView): the items as a
 //!              scrollable list, question cards, Yes/No swipe cards
 //!   foryou     the For-you panel under the latest reply (its rows swipe
@@ -49,6 +52,7 @@ pub const dataview = @import("dataview.zig");
 pub const convo = @import("convo.zig");
 pub const convoview = @import("convoview.zig");
 pub const foryou = @import("foryou.zig");
+pub const projects_sheet = @import("projects_sheet.zig");
 pub const dictation = @import("dictation.zig");
 pub const theme = @import("shared").theme;
 pub const panels = struct {
@@ -57,6 +61,7 @@ pub const panels = struct {
     pub const sync = @import("panels/sync.zig");
     pub const status = @import("panels/status.zig");
     pub const audio = @import("panels/audio.zig");
+    pub const projects = @import("panels/projects.zig");
 };
 
 pub const Shell = shell.Shell;
@@ -76,9 +81,11 @@ test {
     _ = convo;
     _ = convoview;
     _ = foryou;
+    _ = projects_sheet;
     _ = panels.setup;
     _ = panels.desk;
     _ = panels.status;
     _ = panels.audio;
+    _ = panels.projects;
     _ = dictation;
 }
