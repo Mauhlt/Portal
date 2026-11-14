@@ -8,13 +8,13 @@
 //!                                      settings (settings.zig); on first
 //!                                      run the window asks for them
 //!     portal run [options] [-- cmd...] the window, options overriding them
-//!     portal connect [--server IP:PORT] view a remote Portal (client/src)
+//!     portal connect [--pairing-code CODE] view the paired Portal (client/src)
 //!   Errors go to a message box. Pairing, devices and the CA export are
 //!   panels inside the window (gui.zig, deskui.zig).
 //!
 //!   portalctl.exe (console, for scripts and tests)
-//!     portalctl pair <name>            let a device pair (2-minute window,
-//!                                      each request approved at the desk)
+//!     portalctl pair <name> <key>      pair a device by its WireGuard key
+//!                                      (its check code confirmed here)
 //!     portalctl devices                list paired devices
 //!     portalctl unpair <name>          revoke a device
 //!     portalctl run --console [options] [-- cmd...]
