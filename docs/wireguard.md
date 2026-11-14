@@ -91,6 +91,14 @@ adapter (8420 exists only inside the tunnel).
 
 `settings.txt`: `tunnel_port = 51820`, `tunnel_endpoint = home.example.org:51820`.
 
+**Port clash with another WireGuard.** Portal claims its UDP port
+exclusively. If another WireGuard on this desktop (for example the
+official app) also uses 51820, whichever starts second cannot bind it.
+Give one of them a different port: e.g. keep Portal on 51820 and set the
+other tunnel's `ListenPort = 51821`, with its own router forward. (To do
+before go-live: Portal must say this plainly at the desk instead of just
+failing to start the tunnel.)
+
 ## Tests
 
 The e2e suite runs the same tunnel over UDP on `127.0.0.1` only
