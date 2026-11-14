@@ -1181,7 +1181,6 @@ pub const LocalHost = struct {
             .open_tab => h.openTab(),
             .copy => |sel| h.copySelection(sel),
             .paste => h.paste(),
-            .pair, .cancel_pair => {},
             .button => |b| switch (b) {
                 deskui.id.tb_pair => if (h.desk != null) h.ui.openPair(),
                 deskui.id.tb_devices => if (h.desk != null) h.perform(h.ui.openDevices()),

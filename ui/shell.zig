@@ -76,8 +76,6 @@ pub const ids = struct {
     pub const tab_add: u32 = 904;
     pub const view_terminal: u32 = 905;
     pub const view_conversation: u32 = 906;
-    pub const pair: u32 = 907;
-    pub const cancel_pair: u32 = 908;
     /// The interaction bar's on-screen keyboard button (touch).
     pub const keyboard: u32 = 909;
     /// A device's bottom (both views): Instruct opens the instruct panel
@@ -112,18 +110,15 @@ pub const MainView = enum { terminal, conversation };
 /// statuses, mapped by name in the device glue).
 pub const Status = enum {
     starting,
+    /// The desktop no longer has this device (unpaired or paired again
+    /// at the desk): the app forgets it.
     need_pairing,
-    pairing,
-    pair_waiting,
-    pair_closed,
-    refreshing,
     connecting,
     connected,
     retrying,
     session_ended,
     desktop_offline,
     network_error,
-    store_unavailable,
     /// Off screen (iOS background): no connection until it is back.
     paused,
 };
@@ -137,17 +132,13 @@ pub const offline_text = "Desktop offline \u{2014} reconnects automatically";
 pub fn statusWord(st: Status) []const u8 {
     return switch (st) {
         .starting => "starting",
-        .need_pairing, .pair_closed => "not paired",
-        .pairing => "pairing",
-        .pair_waiting => "waiting for the desk",
-        .refreshing => "signing in",
+        .need_pairing => "not paired",
         .connecting => "connecting",
         .connected => "connected",
         .retrying => "reconnecting",
         .session_ended => "session ended",
         .desktop_offline => "desktop offline",
         .network_error => "network error",
-        .store_unavailable => "credential store unavailable",
         .paused => "paused",
     };
 }
@@ -222,8 +213,6 @@ pub const Viewer = struct {
     host: []const u8 = "",
     /// A picture of the terminal exists.
     has_grid: bool = false,
-    /// The request code while waiting for the desk.
-    code: ?[4]u8 = null,
     /// The connection error's description when it is a trust error (not
     /// the Portal we pinned, or not Portal's TLS).
     trust_error: ?[]const u8 = null,
@@ -284,7 +273,7 @@ pub const State = struct {
 /// Who gets the keyboard, decided here only. `view`: the Conversation view
 /// on a device (scrolling and its cards' keys; nothing reaches the
 /// terminal from there).
-pub const Focus = enum { panel, pair_screen, wait_screen, line, terminal, view };
+pub const Focus = enum { panel, line, terminal, view };
 
 /// Where a device's speech-to-text plugs in: the glue's microphone
 /// capture and stt engine (desk: src/speech, stt.Home). Dictation toggles:
@@ -369,9 +358,6 @@ pub const Command = union(enum) {
     /// Copy the selected cells (desk), paste the clipboard into the terminal.
     copy: frame.Selection,
     paste,
-    /// The pairing screen's Pair, and Cancel while waiting (devices).
-    pair,
-    cancel_pair,
     /// A button the shell doesn't own (the desk tools).
     button: u32,
     /// The cells that fit the main slice changed (desk: the PTY's size).
@@ -536,7 +522,6 @@ pub const Shell = struct {
     const Bufs = struct {
         txt: [4][200]u8 = undefined,
         lines: [4][]const u8 = undefined,
-        title: [48]u8 = undefined,
         extra: [256]u8 = undefined,
         right: [128]u8 = undefined,
         panes: [frame.max_panes]frame.Pane = undefined,
@@ -583,11 +568,7 @@ pub const Shell = struct {
         if (sh.sub_at != null and sh.conversation != null) return .view;
         switch (sh.device) {
             .desk => return if (sh.line_focus) .line else sh.deskMain(),
-            .viewer => {
-                if (sh.status == .need_pairing or sh.status == .pair_closed) return .pair_screen;
-                if (sh.status == .pairing or sh.status == .pair_waiting) return .wait_screen;
-                return viewerFocus(sh.main == .conversation and sh.conversation != null, sh.status, sh.mode, sh.instructing);
-            },
+            .viewer => return viewerFocus(sh.main == .conversation and sh.conversation != null, sh.status, sh.mode, sh.instructing),
         }
     }
 
@@ -1123,12 +1104,6 @@ pub const Shell = struct {
         };
     }
 
-    const pair_lines = [_][]const u8{
-        "1. At the desktop, in the Portal window: Pair a device\u{2026} (Ctrl+Shift+P).",
-        "   (In a terminal there: portalctl pair <name>.)",
-        "2. Within 2 minutes, click Pair below (or press P). The desk then approves this device.",
-    };
-
     fn viewerOverlay(sh: *Shell, st: State) frame.Overlay {
         const v = st.viewer;
         const b = &sh.bufs;
@@ -1139,43 +1114,18 @@ pub const Shell = struct {
             .right = v.host,
             .tone = switch (s) {
                 .connected => .good,
-                .need_pairing, .pair_closed, .store_unavailable => .bad,
+                .need_pairing => .bad,
                 else => .warn,
             },
         };
         switch (s) {
-            .need_pairing, .pair_closed => {
+            .need_pairing => {
                 o.screen = .{ .message = .{
-                    .title = "Pair this device",
-                    .lines = &pair_lines,
-                    .button = .{ .label = "Pair", .id = ids.pair },
-                    .detail = v.detail,
-                    .detail_tone = if (s == .pair_closed) .warn else .muted,
-                } };
-                return o;
-            },
-            .pairing, .pair_waiting => {
-                const t = if (v.code) |c| std.fmt.bufPrint(&b.title, "Request code {s}", .{&c}) catch "Waiting for the desk" else "Asking the desk\u{2026}";
-                var n: usize = 0;
-                b.lines[n] = "Waiting for approval in the Portal window on the desktop.";
-                n += 1;
-                if (v.code) |c| {
-                    b.lines[n] = std.fmt.bufPrint(&b.txt[0], "Approve it there only if the desk shows the same code, {s}.", .{&c}) catch "";
-                    n += 1;
-                }
-                b.lines[n] = "Press Esc to stop waiting.";
-                n += 1;
-                o.screen = .{ .message = .{
-                    .title = t,
-                    .title_tone = .warn,
-                    .lines = b.lines[0..n],
-                    .button = .{ .label = "Cancel", .id = ids.cancel_pair },
+                    .title = "This desktop no longer has this device",
+                    .title_tone = .bad,
+                    .lines = &.{"This device forgets it now. To use it again, pair it at the desk once more."},
                     .detail = v.detail,
                 } };
-                return o;
-            },
-            .store_unavailable => {
-                o.screen = .{ .message = .{ .title = "Cannot store the device credential", .title_tone = .bad, .detail = v.detail } };
                 return o;
             },
             // A clear end state instead of the last picture behind a status
@@ -1374,8 +1324,6 @@ pub const Shell = struct {
         }
         switch (f) {
             .panel => {},
-            .pair_screen => if (key == .enter) sh.command(.pair),
-            .wait_screen => if (key == .escape) sh.command(.cancel_pair),
             .view => {},
             .line => {
                 sh.lineKey(key, mods);
@@ -1456,8 +1404,6 @@ pub const Shell = struct {
         }
         switch (f) {
             .panel => if (sh.modalActive()) |m| m.char(m.ctx, cp, mods),
-            .pair_screen => if (!mods.ctrl and (cp == 'p' or cp == 'P')) sh.command(.pair),
-            .wait_screen => {},
             // Space with no text field focused: dictation on / off.
             .view => if (cp == ' ' and !mods.ctrl and !mods.alt and !mods.super) sh.toggleDictation(),
             .line => _ = sh.line.onChar(cp, mods),
@@ -1517,8 +1463,6 @@ pub const Shell = struct {
             ids.view0...ids.view_last => if (sh.conversation) |c| if (c.button) |f| {
                 _ = f(c.ctx, id);
             },
-            ids.pair => sh.command(.pair),
-            ids.cancel_pair => sh.command(.cancel_pair),
             ids.projects => sh.toggleProjects(),
             ids.usage => sh.toggleInfo(.usage, null),
             ids.system => sh.toggleInfo(.system, null),
@@ -1644,14 +1588,15 @@ const Rec = struct {
     }
 };
 
-test "viewer: waiting shows the request code; trust errors are explained" {
+test "viewer: a desktop that dropped the device says so; trust errors are explained" {
     var r: Rec = .{};
     var sh = Shell.init(testing.allocator, .viewer, r.host());
     defer sh.deinit();
     sh.main = .terminal;
-    const w = sh.overlay(.{ .viewer = .{ .status = .pair_waiting, .host = "10.8.0.1:8420", .code = "7f3a".* } });
-    try testing.expectEqualStrings("Request code 7f3a", w.screen.message.title);
-    try testing.expectEqual(ids.cancel_pair, w.screen.message.button.?.id);
+    const g = sh.overlay(.{ .viewer = .{ .status = .need_pairing, .host = "10.8.0.1:8420", .detail = "unpaired at the desk" } });
+    try testing.expectEqualStrings("This desktop no longer has this device", g.screen.message.title);
+    try testing.expect(g.screen.message.button == null);
+    try testing.expectEqualStrings("unpaired at the desk", g.screen.message.detail);
     const t = sh.overlay(.{ .viewer = .{ .status = .retrying, .detail = "retrying in 2 s", .host = "10.8.0.1:8420", .has_grid = true, .trust_error = "not issued by the pinned Portal CA", .pin_fp = "AB:CD" } });
     try testing.expectEqualStrings("Cannot verify this Portal", t.screen.message.title);
     try testing.expect(std.mem.indexOf(u8, t.screen.message.lines[0], "pinned Portal CA") != null);
@@ -1797,15 +1742,10 @@ test "viewer per input mode: answer buttons, line and refusals" {
     Shell.onButton(&sh, ids.instruct);
     Shell.onKey(&sh, .escape, .{});
     try testing.expect(!sh.instructing);
-    // Not connected: the terminal (keys go nowhere useful), pairing screens.
+    // Not connected: the terminal (keys go nowhere useful).
     v.status = .retrying;
     _ = sh.overlay(.{ .viewer = v });
     try testing.expectEqual(Focus.terminal, sh.focus());
-    v.status = .need_pairing;
-    _ = sh.overlay(.{ .viewer = v });
-    try testing.expectEqual(Focus.pair_screen, sh.focus());
-    Shell.onKey(&sh, .enter, .{});
-    try testing.expect(r.cmds[r.n_cmds - 1] == .pair);
 }
 
 test "viewer: the Data slice under the terminal, not on pairing screens" {

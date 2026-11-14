@@ -249,7 +249,6 @@ const Host = struct {
                 .detail = detail,
                 .host = h.client.host(),
                 .has_grid = s.grid.cols > 0,
-                .code = null,
                 .trust_error = trust,
                 .exit_code = s.exit_code,
                 .pin_fp = h.pin_fp_buf[0..h.pin_fp_len],
@@ -338,8 +337,6 @@ const Host = struct {
             .select_sub => |i| if (i) |j| {
                 if (j < h.subs.len) h.client.showSub(h.subs.items[j].id);
             } else h.client.showSub(null),
-            // Pairing happens at the desk and on the first-run screen.
-            .pair, .cancel_pair => {},
             // A device opens and closes no tabs, has no selection yet, and
             // the remote grid size is the server's (the view scales to fit).
             .close_tab, .open_tab, .copy, .paste, .button, .resized => {},
