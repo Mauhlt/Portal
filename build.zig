@@ -580,10 +580,6 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
 ///                            signer for aarch64-macos and README.txt, to
 ///                            build on any host (iOS SDK copied from the
 ///                            Mac) and sign + install on a Mac without Zig
-///
-/// Both build against a copy of Zig's lib dir with one std line fixed
-/// (src/tools/ios_zig_lib.zig: std.Io.Threaded does not compile for iOS
-/// in this Zig).
 fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Build.Step) void {
     const bundle_id = b.option([]const u8, "ios-bundle-id", "iPhone app bundle id (default local.portal.Portal; must match the provisioning profile)") orelse "local.portal.Portal";
     const tunnel = b.option(bool, "ios-tunnel", "iPhone app: control the per-app WireGuard tunnel extension (needs the Network Extension entitlement, paid account)") orelse false;
@@ -600,21 +596,10 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
         .os_version_min = .{ .semver = .{ .major = 16, .minor = 0, .patch = 0 } },
     });
 
-    // The Zig lib dir with the std fix (cached by the build system).
-    const lib_tool = b.addExecutable(.{ .name = "ios-zig-lib", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/tools/ios_zig_lib.zig"),
-        .target = b.graph.host,
-        .optimize = .ReleaseSafe,
-    }) });
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lib_tool.root_module })).step);
-    const lib_run = b.addRunArtifact(lib_tool);
-    lib_run.addDirectoryArg(.zig_lib);
-    const zig_lib = lib_run.addOutputDirectoryArg("zig-lib");
-
     // Compile check (object): the whole iPhone app and its tunnel extension
     // without the SDK.
-    const check = b.addObject(.{ .name = "portal-ios-check", .root_module = iosModule(b, t, .Debug, bundle_id, tunnel), .zig_lib_dir = zig_lib });
-    const ext_check = b.addObject(.{ .name = "portal-tunnel-check", .root_module = tunnelExtModule(b, t, .Debug), .zig_lib_dir = zig_lib });
+    const check = b.addObject(.{ .name = "portal-ios-check", .root_module = iosModule(b, t, .Debug, bundle_id, tunnel) });
+    const ext_check = b.addObject(.{ .name = "portal-tunnel-check", .root_module = tunnelExtModule(b, t, .Debug) });
     const ios_check = b.step("ios-check", "Compile the iPhone app and its tunnel extension for aarch64-ios (objects only, no SDK needed)");
     ios_check.dependOn(&check.step);
     ios_check.dependOn(&ext_check.step);
@@ -685,7 +670,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     // MoltenVK is opened from the bundle at run time (the Vulkan package's
     // loader); the rpath lets a framework build of MoltenVK find itself.
     mod.addRPathSpecial("@executable_path/Frameworks");
-    const exe = b.addExecutable(.{ .name = "Portal", .root_module = mod, .zig_lib_dir = zig_lib });
+    const exe = b.addExecutable(.{ .name = "Portal", .root_module = mod });
     exe.headerpad_max_install_names = true;
     // The packet tunnel extension (with -Dios-tunnel): Foundation +
     // NetworkExtension, no UIKit window.
@@ -695,7 +680,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
         em.linkFramework("Foundation", .{});
         em.linkFramework("NetworkExtension", .{});
         em.linkSystemLibrary("objc", .{});
-        break :blk b.addExecutable(.{ .name = "PortalTunnel", .root_module = em, .zig_lib_dir = zig_lib });
+        break :blk b.addExecutable(.{ .name = "PortalTunnel", .root_module = em });
     } else null;
     // This Zig requires darwin_sdk_dir for Darwin targets; it is also the
     // linker's sysroot (absolute install names of re-exported libraries).
