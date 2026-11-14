@@ -85,6 +85,15 @@ the active input where the platform reports it.
   Audio panel, top bar "Audio", Ctrl+Shift+A); `ui/dictation.zig` (which
   stt feedback a dictated line becomes); the shell's 🎤 shows the active
   microphone; a toast when a headset connects or disconnects.
+* Capture stays in Portal (owner, 2026-11-14): ../Audio does formats
+  only, never capture.
+* Instruct on the desk (setting `instruct_mode`, Audio panel, applied
+  live): `auto` (default) opens the box and records when a microphone works
+  and speech is ready, else just opens the box (the 🎤 says why); `type`
+  only opens the box (record with the 🎤 or the headset key); `record` as
+  auto, but says once why it can't record. "A microphone works" is
+  re-evaluated on every device change (IMMNotificationClient), no polling.
+  Devices are not affected.
 * `zig build mic-check -- <seconds>` records from the real microphone and
   prints the transcript (manual check, never part of `test`).
 * Not yet: the training banner, the laptop's stt-local client, the

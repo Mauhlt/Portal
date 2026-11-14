@@ -276,6 +276,49 @@ pub const Dictation = struct {
 /// Whether a headset with a microphone is attached (the audio work
 /// implements it: ../Audio, IMMDevice form factor). Its media button
 /// toggles dictation only then.
+/// What the desk's Instruct button does (setting `instruct_mode`):
+///   auto     with a working microphone and speech ready: open the input
+///            box and start recording (pressed again: stop); otherwise just
+///            open the box (the 🎤 says why speech is off), no popup;
+///   typing   only open the box; recording only through the 🎤 or the
+///            headset's media key;
+///   record   as auto when speech works; otherwise open the box and say
+///            why once (`unavailable_notice`, until speech works again).
+pub const InstructMode = enum {
+    auto,
+    typing,
+    record,
+
+    /// Settings text: "auto", "type", "record".
+    pub fn parse(s: []const u8) ?InstructMode {
+        if (std.ascii.eqlIgnoreCase(s, "auto")) return .auto;
+        if (std.ascii.eqlIgnoreCase(s, "type")) return .typing;
+        if (std.ascii.eqlIgnoreCase(s, "record")) return .record;
+        return null;
+    }
+    pub fn text(m: InstructMode) []const u8 {
+        return switch (m) {
+            .auto => "auto",
+            .typing => "type",
+            .record => "record",
+        };
+    }
+    pub fn label(m: InstructMode) []const u8 {
+        return switch (m) {
+            .auto => "Record when the microphone works, else type",
+            .typing => "Type (record only with the \u{1F3A4})",
+            .record => "Record (say why when it can't)",
+        };
+    }
+    pub fn next(m: InstructMode) InstructMode {
+        return switch (m) {
+            .auto => .typing,
+            .typing => .record,
+            .record => .auto,
+        };
+    }
+};
+
 pub const HeadsetMic = struct {
     ctx: ?*anyopaque = null,
     present: *const fn (ctx: ?*anyopaque) bool,
@@ -396,6 +439,15 @@ pub const Shell = struct {
     mic_label: []const u8 = "",
     transcribing: bool = false,
     speech_off: []const u8 = "",
+    /// The desk's Instruct behaviour, and whether a microphone is usable
+    /// and speech is ready (the glue re-evaluates it on device changes).
+    instruct_mode: InstructMode = .auto,
+    speech_ready: bool = true,
+    /// `record` mode found speech unusable: the glue shows `speech_off`
+    /// once (a toast) and clears this. `told_unavailable` keeps it to
+    /// once until speech works again.
+    unavailable_notice: bool = false,
+    told_unavailable: bool = false,
     /// Set by the glue from the OS (Touch).
     touch: Touch = .{},
     /// The on-screen keyboard should be up: the glue shows or hides the
@@ -496,17 +548,50 @@ pub const Shell = struct {
     /// the device has it. Esc on an empty line, Send or Close shut it.
     /// On the desk (full control) the line also takes the keyboard.
     pub fn startDictation(sh: *Shell) void {
-        const mode = sh.policy() orelse return;
-        if (!mode.acceptsAnswers()) return;
-        sh.instructing = true;
-        if (!hasLine(mode)) return;
-        if (sh.device == .desk) sh.line_focus = true;
-        if (sh.touch.on_screen_keyboard) sh.keyboard = true;
+        if (!sh.openInstruct()) return;
         if (sh.dictating) return;
+        // No microphone or no speech: the box only; the 🎤 says why.
+        if (!sh.speech_ready) return;
         if (sh.dictation) |d| {
             d.start(d.ctx);
             sh.dictating = true;
         }
+    }
+
+    /// Opens the instruct panel with its line focused; false if this mode
+    /// has no line (or takes no input).
+    fn openInstruct(sh: *Shell) bool {
+        const mode = sh.policy() orelse return false;
+        if (!mode.acceptsAnswers()) return false;
+        sh.instructing = true;
+        if (!hasLine(mode)) return false;
+        if (sh.device == .desk) sh.line_focus = true;
+        if (sh.touch.on_screen_keyboard) sh.keyboard = true;
+        return true;
+    }
+
+    /// The Instruct button (the panel closed): per `instruct_mode` on the
+    /// desk; a device opens and dictates when it can, as before.
+    pub fn instructPressed(sh: *Shell) void {
+        if (sh.device != .desk) return sh.startDictation();
+        switch (sh.instruct_mode) {
+            .typing => _ = sh.openInstruct(),
+            .auto => sh.startDictation(),
+            .record => {
+                if (!sh.speech_ready and sh.dictation != null and !sh.told_unavailable) {
+                    sh.unavailable_notice = true;
+                    sh.told_unavailable = true;
+                }
+                sh.startDictation();
+            },
+        }
+    }
+
+    /// The glue's view of the microphone and speech (each frame, and on
+    /// device changes). Working again re-arms record mode's one notice.
+    pub fn setSpeechReady(sh: *Shell, ready: bool) void {
+        sh.speech_ready = ready;
+        if (ready) sh.told_unavailable = false;
     }
 
     /// A transcript for the instruction line (the glue's speech engine):
@@ -1223,7 +1308,7 @@ pub const Shell = struct {
             ids.view_conversation => sh.main = .conversation,
             ids.instruct => if (sh.instructing and sh.transcribing and !sh.dictating)
                 sh.cancelTranscription()
-            else if (sh.instructing) sh.toggleDictation() else sh.startDictation(),
+            else if (sh.instructing) sh.toggleDictation() else sh.instructPressed(),
             ids.instruct_close => sh.closeInstruct(),
             ids.view0...ids.view_last => if (sh.conversation) |c| if (c.button) |f| {
                 _ = f(c.ctx, id);
@@ -1776,6 +1861,85 @@ test "desk dictation: the transcript lands in the line; Send and Esc are reporte
     Shell.onButton(&sh, ids.instruct); // stops the dictation started above
     o = sh.overlay(.{});
     try testing.expectEqualStrings(sh.speech_off, o.bottom[1].content.field.hint);
+}
+
+const DictCount = struct {
+    starts: usize = 0,
+    fn of(p: *anyopaque) *DictCount {
+        return @ptrCast(@alignCast(p));
+    }
+    fn start(p: *anyopaque) void {
+        of(p).starts += 1;
+    }
+    fn stop(_: *anyopaque) void {}
+};
+
+fn instructCase(mode: InstructMode, ready: bool) !struct { starts: usize, notice: bool, dictating: bool, line: bool } {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    var d: DictCount = .{};
+    sh.dictation = .{ .ctx = &d, .start = DictCount.start, .stop = DictCount.stop };
+    sh.instruct_mode = mode;
+    sh.setSpeechReady(ready);
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.instructing);
+    return .{ .starts = d.starts, .notice = sh.unavailable_notice, .dictating = sh.dictating, .line = sh.focus() == .line };
+}
+
+test "desk instruct_mode: auto, type and record, with and without a microphone" {
+    // auto: records with a microphone; without, the box only, no notice.
+    var c = try instructCase(.auto, true);
+    try testing.expect(c.starts == 1 and c.dictating and c.line and !c.notice);
+    c = try instructCase(.auto, false);
+    try testing.expect(c.starts == 0 and !c.dictating and c.line and !c.notice);
+    // type: the box only, either way.
+    c = try instructCase(.typing, true);
+    try testing.expect(c.starts == 0 and !c.dictating and c.line and !c.notice);
+    c = try instructCase(.typing, false);
+    try testing.expect(c.starts == 0 and c.line and !c.notice);
+    // record: records with a microphone; without, the box and the reason once.
+    c = try instructCase(.record, true);
+    try testing.expect(c.starts == 1 and c.dictating and !c.notice);
+    c = try instructCase(.record, false);
+    try testing.expect(c.starts == 0 and c.line and c.notice);
+}
+
+test "desk instruct_mode: auto stops on the second press; record says why once until the mic is back" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .desk, r.host());
+    defer sh.deinit();
+    var d: DictCount = .{};
+    sh.dictation = .{ .ctx = &d, .start = DictCount.start, .stop = DictCount.stop };
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.dictating);
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(!sh.dictating and sh.instructing);
+    Shell.onButton(&sh, ids.instruct_close);
+    // type mode: the 🎤 in the open panel still records.
+    sh.instruct_mode = .typing;
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(!sh.dictating);
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.dictating);
+    Shell.onButton(&sh, ids.instruct_close);
+    // record mode, the microphone unplugged: one notice, not two.
+    sh.instruct_mode = .record;
+    sh.setSpeechReady(false);
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.unavailable_notice);
+    sh.unavailable_notice = false; // the glue showed it
+    Shell.onButton(&sh, ids.instruct_close);
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(!sh.unavailable_notice);
+    Shell.onButton(&sh, ids.instruct_close);
+    // Plugged in again (a device change), then out: told again.
+    sh.setSpeechReady(true);
+    sh.setSpeechReady(false);
+    Shell.onButton(&sh, ids.instruct);
+    try testing.expect(sh.unavailable_notice);
+    // Recording started twice: auto's press and type mode's 🎤.
+    try testing.expectEqual(@as(usize, 2), d.starts);
 }
 
 test "touch: the keyboard button, the keyboard follows the line's focus" {

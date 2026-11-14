@@ -10,6 +10,7 @@ const std = @import("std");
 const frame = @import("../frame.zig");
 const form = @import("../form.zig");
 const input = @import("../input.zig");
+const InstructMode = @import("../shell.zig").InstructMode;
 
 /// Ids (clear of the other panels' and the shell's ranges).
 pub const id = struct {
@@ -17,7 +18,7 @@ pub const id = struct {
     pub const test_clip: u32 = 1701;
     pub const save: u32 = 1702;
     pub const reload: u32 = 1703;
-    /// field0 + index: Automatic (0), speech model (1).
+    /// field0 + index: Automatic (0), speech model (1), Instruct (2).
     pub const field0: u32 = 1710;
     /// dev0 + row: "Use" this microphone.
     pub const dev0: u32 = 1720;
@@ -34,6 +35,8 @@ pub const Action = union(enum) {
     closed,
     /// Automatic on (true) or off: off pins the active microphone.
     set_auto: bool,
+    /// What the Instruct button does now (applies at once, saved).
+    set_instruct_mode: InstructMode,
     /// Use row i's microphone (manual mode).
     use: usize,
     /// Record test_ms, then transcribe (the glue calls testRecorded /
@@ -80,6 +83,7 @@ pub const Ui = struct {
     focus: form.Focus = .{},
     auto: bool = true,
     model: form.TextField(max_model) = .{},
+    instruct_mode: InstructMode = .auto,
     test_state: TestState = .idle,
     test_buf: [600]u8 = undefined,
     test_len: usize = 0,
@@ -93,7 +97,7 @@ pub const Ui = struct {
         row_text: [max_rows][200]u8 = undefined,
         lines: [4]frame.PanelText = undefined,
         line_text: [3][240]u8 = undefined,
-        fields: [2]frame.PanelField = undefined,
+        fields: [3]frame.PanelField = undefined,
         after: [1]frame.PanelText = undefined,
         buttons: [4]frame.PanelButton = undefined,
     };
@@ -103,9 +107,10 @@ pub const Ui = struct {
     }
 
     /// Opens the panel with the saved mode and model path.
-    pub fn show(ui: *Ui, automatic: bool, model_path: []const u8) void {
+    pub fn show(ui: *Ui, automatic: bool, model_path: []const u8, mode: InstructMode) void {
         ui.open_ = true;
         ui.auto = automatic;
+        ui.instruct_mode = mode;
         ui.model.set(model_path);
         ui.note_len = 0;
         if (ui.test_state != .recording and ui.test_state != .transcribing) {
@@ -145,20 +150,21 @@ pub const Ui = struct {
 
     // ------------------------------------------------------- focus
 
-    /// Focus order: Automatic, the model field, the rows, Test, Save,
-    /// Reload limits, Close.
+    /// Focus order: Automatic, the model field, Instruct, the rows, Test,
+    /// Save, Reload limits, Close.
+    const n_fields = 3;
     fn focusCount(ui: *const Ui) u8 {
-        return 2 + ui.n_rows + 4;
+        return n_fields + ui.n_rows + 4;
     }
 
     fn focusedRow(ui: *const Ui) ?usize {
-        if (ui.focus.index < 2 or ui.focus.index >= 2 + ui.n_rows) return null;
-        return ui.focus.index - 2;
+        if (ui.focus.index < n_fields or ui.focus.index >= n_fields + ui.n_rows) return null;
+        return ui.focus.index - n_fields;
     }
 
     fn focusedButton(ui: *const Ui) ?u32 {
-        const b = ui.focus.index -| (2 + ui.n_rows);
-        if (ui.focus.index < 2 + ui.n_rows) return null;
+        const b = ui.focus.index -| (n_fields + ui.n_rows);
+        if (ui.focus.index < n_fields + ui.n_rows) return null;
         return switch (b) {
             0 => id.test_clip,
             1 => id.save,
@@ -183,7 +189,7 @@ pub const Ui = struct {
             .tab => if (mods.shift) ui.focus.prev() else ui.focus.next(),
             .up => ui.focus.prev(),
             .down => ui.focus.next(),
-            .left, .right => if (ui.focus.index == 0) return ui.toggleAuto(),
+            .left, .right => if (ui.focus.index == 0) return ui.toggleAuto() else if (ui.focus.index == 2) return ui.cycleInstruct(),
             .backspace => if (ui.focus.index == 1) ui.model.backspace(),
             .enter => return ui.activate(),
             else => {},
@@ -217,6 +223,10 @@ pub const Ui = struct {
                 return ui.toggleAuto();
             },
             id.field0 + 1 => ui.focus.index = 1,
+            id.field0 + 2 => {
+                ui.focus.index = 2;
+                return ui.cycleInstruct();
+            },
             id.dev0...id.dev0 + max_rows - 1 => if (b - id.dev0 < ui.n_rows) {
                 ui.auto = false;
                 return .{ .use = b - id.dev0 };
@@ -231,6 +241,11 @@ pub const Ui = struct {
         return .{ .set_auto = ui.auto };
     }
 
+    fn cycleInstruct(ui: *Ui) Action {
+        ui.instruct_mode = ui.instruct_mode.next();
+        return .{ .set_instruct_mode = ui.instruct_mode };
+    }
+
     fn startTest(ui: *Ui) Action {
         if (ui.test_state == .recording or ui.test_state == .transcribing) return .none;
         ui.test_state = .recording;
@@ -241,6 +256,7 @@ pub const Ui = struct {
     fn activate(ui: *Ui) Action {
         if (ui.focus.index == 0) return ui.toggleAuto();
         if (ui.focus.index == 1) return .save_model;
+        if (ui.focus.index == 2) return ui.cycleInstruct();
         if (ui.focusedRow()) |r| {
             ui.auto = false;
             return .{ .use = r };
@@ -307,6 +323,13 @@ pub const Ui = struct {
             .id = id.field0 + 1,
             .focused = ui.focus.index == 1,
         };
+        b.fields[2] = .{
+            .label = "Instruct",
+            .value = ui.instruct_mode.label(),
+            .id = id.field0 + 2,
+            .focused = ui.focus.index == 2,
+            .choice = true,
+        };
         var na: usize = 0;
         switch (ui.test_state) {
             .idle => {},
@@ -350,7 +373,7 @@ const testing = std.testing;
 
 test "audio panel: rows, automatic toggle, use, test, close" {
     var ui: Ui = .{};
-    ui.show(true, "C:\\models\\ggml-base.en.bin");
+    ui.show(true, "C:\\models\\ggml-base.en.bin", .auto);
     var b: Ui.Bufs = .{};
     const rows = [_]Row{
         .{ .name = "Microphone Array", .kind = "Microphone \u{00B7} built-in", .default = true },
@@ -385,9 +408,21 @@ test "audio panel: rows, automatic toggle, use, test, close" {
     try testing.expect(ui.panel(&b, .{}) == null);
 }
 
+test "audio panel: the Instruct choice cycles auto, type, record" {
+    var ui: Ui = .{};
+    ui.show(true, "", .auto);
+    try testing.expectEqual(InstructMode.typing, ui.button(id.field0 + 2).set_instruct_mode);
+    _ = ui.key(.right, .{});
+    try testing.expectEqual(InstructMode.record, ui.instruct_mode);
+    try testing.expectEqual(InstructMode.auto, ui.char(' ', .{}).set_instruct_mode);
+    var b: Ui.Bufs = .{};
+    const p = ui.panel(&b, .{}).?;
+    try testing.expectEqualStrings("Instruct", p.fields[2].label);
+}
+
 test "audio panel: the model field takes text and Enter saves" {
     var ui: Ui = .{};
-    ui.show(true, "");
+    ui.show(true, "", .auto);
     _ = ui.key(.tab, .{});
     for ("D:\\m.bin") |c| _ = ui.char(c, .{});
     try testing.expectEqualStrings("D:\\m.bin", ui.model.text());

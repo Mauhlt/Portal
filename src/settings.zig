@@ -86,6 +86,8 @@ pub const Settings = struct {
     speech_model: Str(max_model) = .{},
     /// The microphone chosen by hand (an endpoint id); null: automatic.
     mic: Str(max_mic) = .{},
+    /// The desk's Instruct button (null: auto).
+    instruct_mode: ?@import("portal_ui").shell.InstructMode = null,
     /// The speech limits (defaults unless set; always clamped).
     speech: speech_limits.Config = .{},
     /// Tab colours overriding the one derived from the name.
@@ -126,6 +128,8 @@ pub const Settings = struct {
                 _ = s.speech_model.set(val);
             } else if (std.mem.eql(u8, key, "mic")) {
                 if (!std.ascii.eqlIgnoreCase(val, "auto")) _ = s.mic.set(val);
+            } else if (std.mem.eql(u8, key, "instruct_mode")) {
+                s.instruct_mode = @import("portal_ui").shell.InstructMode.parse(val);
             } else if (std.mem.startsWith(u8, key, "speech.")) {
                 _ = s.speech.set(key["speech.".len..], val);
             } else if (std.mem.eql(u8, key, "color")) {
@@ -154,6 +158,7 @@ pub const Settings = struct {
         if (s.background_art) |v| try out.print("background_art = {s}\r\n", .{if (v) "on" else "off"});
         if (s.speech_model.get()) |v| try out.print("speech_model = {s}\r\n", .{v});
         if (s.mic.get()) |v| try out.print("mic = {s}\r\n", .{v});
+        if (s.instruct_mode) |m| try out.print("instruct_mode = {s}\r\n", .{m.text()});
         try s.speech.format(out);
         for (s.colors[0..s.n_colors]) |*c| {
             const name = c.name.get() orelse continue;
@@ -274,6 +279,18 @@ test "settings: speech model and microphone" {
     const again = Settings.parse(out.buffered());
     try testing.expectEqualStrings(s.mic.get().?, again.mic.get().?);
     try testing.expectEqualStrings(s.speech_model.get().?, again.speech_model.get().?);
+}
+
+test "settings: instruct_mode" {
+    const ui_shell = @import("portal_ui").shell;
+    try testing.expectEqual(ui_shell.InstructMode.typing, Settings.parse("instruct_mode = type").instruct_mode.?);
+    try testing.expectEqual(ui_shell.InstructMode.record, Settings.parse("instruct_mode=Record").instruct_mode.?);
+    try testing.expect(Settings.parse("instruct_mode = sometimes").instruct_mode == null);
+    var s: Settings = .{ .instruct_mode = .record };
+    var buf: [512]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    try s.format(&out);
+    try testing.expectEqual(ui_shell.InstructMode.record, Settings.parse(out.buffered()).instruct_mode.?);
 }
 
 test "settings: speech limits load clamped and round-trip" {

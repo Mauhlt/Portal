@@ -927,6 +927,10 @@ pub const LocalHost = struct {
                 st.mic = .{};
             },
             .model => |p| _ = st.speech_model.set(p),
+            .instruct_mode => |m| {
+                st.instruct_mode = m;
+                h.shell.instruct_mode = m; // live
+            },
         }
         settings.save(h.gpa, h.io, d.paths.dir, &st) catch |err|
             return s.panel.setNote(.bad, "Could not save the settings: {t}.", .{err});

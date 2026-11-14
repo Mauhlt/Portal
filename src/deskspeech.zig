@@ -51,6 +51,8 @@ pub const DeskSpeech = struct {
     recording_for: enum { none, dictation, test_clip } = .none,
     /// Test: when its 3 s are up (awake-clock ms).
     test_until: ?i64 = null,
+    /// What the desk's Instruct button does (settings.txt `instruct_mode`).
+    instruct_mode: ui.shell.InstructMode = .auto,
     /// The speech limits in force (settings.txt `speech.*`).
     limits: speech.limits.Config = .{},
     /// "Not kept for training" was said (once, until a clip is kept again).
@@ -82,6 +84,7 @@ pub const DeskSpeech = struct {
         s.mic.start() catch {};
         s.mic.setLimits(saved.speech);
         s.limits = saved.speech;
+        s.instruct_mode = saved.instruct_mode orelse .auto;
         const model = saved.speech_model.get();
         s.startEngine(model);
     }
@@ -258,6 +261,12 @@ pub const DeskSpeech = struct {
             s.last_busy = st.busy;
         };
         s.updateShell(sh);
+        // Record mode couldn't record: say why, once.
+        if (sh.unavailable_notice) {
+            sh.unavailable_notice = false;
+            s.showToast(sh.speech_off);
+            changed = true;
+        }
         return changed;
     }
 
@@ -355,12 +364,16 @@ pub const DeskSpeech = struct {
         var bad = false;
         const state = s.speechState(&bad);
         sh.speech_off = if (s.snap.active == null) "No microphone found (Audio in the top bar)." else state;
+        // Re-evaluated on every poll, so a device change (the microphone
+        // thread's IMMNotificationClient wake) updates it at once.
+        sh.setSpeechReady(s.snap.active != null and !bad and state.len == 0);
+        sh.instruct_mode = s.instruct_mode;
     }
 
     // ------------------------------------------------------------ Audio panel
 
     pub fn openPanel(s: *DeskSpeech) void {
-        s.panel.show(s.snap.automatic, s.model_path);
+        s.panel.show(s.snap.automatic, s.model_path, s.instruct_mode);
         // The meter runs exactly while the panel is open.
         s.mic.setMeter(true);
     }
@@ -389,7 +402,7 @@ pub const DeskSpeech = struct {
 
     /// What an Audio panel action changes in the settings (the window
     /// saves them): the microphone choice or the model path.
-    pub const Saved = union(enum) { none, mic: ?[]const u8, model: []const u8, reload };
+    pub const Saved = union(enum) { none, mic: ?[]const u8, model: []const u8, reload, instruct_mode: ui.shell.InstructMode };
 
     /// New speech limits (settings.txt reloaded at the desk): applied live.
     pub fn setLimits(s: *DeskSpeech, c: speech.limits.Config) void {
@@ -401,6 +414,10 @@ pub const DeskSpeech = struct {
     pub fn act(s: *DeskSpeech, a: audio_panel.Action) Saved {
         switch (a) {
             .reload_limits => return .reload,
+            .set_instruct_mode => |m| {
+                s.instruct_mode = m;
+                return .{ .instruct_mode = m };
+            },
             .none, .paste => return .none,
             .closed => {
                 s.mic.setMeter(false);
