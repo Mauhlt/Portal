@@ -40,17 +40,26 @@ folder can replace an older one.
    `Address = 10.8.0.1/24`, `ListenPort = 51820`, one `[Peer]` per device
    with its own key (`AllowedIPs = 10.8.0.2/32`, `10.8.0.3/32`,
    `10.8.0.4/32`). Router: forward UDP 51820 to the desktop, nothing else.
-2. **Firewall**: Portal's ports from the devices' tunnel addresses only:
+2. **Firewall** (Terminal as administrator, with the tunnel up). Windows
+   usually files a new WireGuard adapter under **Public** networks, and a
+   firewall prompt answered with "Private" adds a *Block* rule for Public
+   that beats any Allow rule. So first mark the tunnel Private, then allow
+   Portal's ports from the devices' tunnel addresses only:
 
    ```powershell
+   Set-NetConnectionProfile -InterfaceAlias "<your tunnel name>" -NetworkCategory Private
    New-NetFirewallRule -DisplayName "Portal (WireGuard only)" -Direction Inbound `
      -Protocol TCP -LocalPort 8420,8421 -LocalAddress 10.8.0.1 `
      -RemoteAddress 10.8.0.2,10.8.0.3,10.8.0.4 `
-     -InterfaceAlias "<your tunnel name>" -Action Allow
+     -InterfaceAlias "<your tunnel name>" -Profile Private -Action Allow
    ```
 
-   If Windows asks about `portal.exe`, tick **Private networks** and click
-   Allow; never Cancel (that creates a Block rule).
+   Check with `Get-NetConnectionProfile`: the tunnel must say Private.
+   If Windows asks about `portal.exe` (it can again after each update,
+   since every release runs from its own folder), tick **Private networks**
+   only and click Allow; never Cancel (that blocks Portal on the tunnel
+   too). Leave other networks (Ethernet, Wi-Fi) as they are: Portal
+   listens on 10.8.0.1 only.
 3. **Install**: `zig build release` (the usual way: tests, promotes, and
    installs launchers in `%LOCALAPPDATA%\Portal\bin`), or copy
    `portal-x86_64-windows`.
