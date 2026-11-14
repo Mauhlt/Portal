@@ -1817,6 +1817,7 @@ test {
     _ = @import("console.zig");
     _ = @import("session.zig");
     _ = @import("tabs.zig");
+    _ = @import("projects_ws.zig");
     _ = @import("openreq.zig");
     _ = @import("hookmsg.zig");
     _ = @import("hookpipe.zig");
