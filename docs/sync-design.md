@@ -294,25 +294,23 @@ unless something still runs from it. `data\<pkg>\` is kept.
 
 **Forget this desktop** (Packages, after a confirmation; `portal connect
 --server S --forget`; `sync-device --server S --forget`) is mutual. First
-the device asks the desktop to remove it (`POST /device/forget` with its
-session, or a fresh sign-in; docs/protocol.md section 1): the desktop
-removes the record, ends its sessions and refreshes its Devices panel.
-Then, whatever the answer, it deletes the device's credentials for it,
-the pinned CA and release key, every `desktops\<host>-*` folder (renamed
-to `desktops\.trash-*` first, then deleted; folders a running program
-holds stay and are reported) and the remembered last server if it was
-this one. If the desktop could not be reached, the report says it still
+the device asks the desktop to remove it (the `f:` frame on `/ws`,
+docs/protocol.md section 1): the desktop removes the record, ends its
+connections and refreshes its Devices panel. Then, whatever the answer,
+it deletes its pairing with that desktop, the pinned CA and release key
+and every `desktops\<host>-*` folder (renamed to `desktops\.trash-*`
+first, then deleted; folders a running program holds stay and are
+reported). If the desktop could not be reached, the report says it still
 lists the device until it next sees it or the owner unpairs it there.
 `portal connect` exits afterwards.
 
 **Unpaired at the desk** (Devices panel, `portalctl unpair`; also a
 device the desktop revoked or replaced): the desktop says so explicitly,
-with `logout` reason `unpaired` to a connected device and
-`X-Portal-Device: gone` on its next sign-in. The device then runs the
-same local forget automatically and says why (portal connect shows it
-and exits; sync-device prints it and exits 1). Only that explicit answer
-does this: a refused or failed sign-in without it never deletes pins or
-packages.
+with `logout` reason `unpaired` to a connected device and a `403` to its
+next upgrade. The device then runs the same local forget automatically
+and says why (portal connect shows it and exits; sync-device prints it
+and exits 1). Only that explicit answer does this: a connection that
+fails any other way never deletes pins or packages.
 
 **The shared store of earlier builds** (`sync\packages`, `sync\current`,
 `sync\previous` directly under the sync root, from before per-desktop

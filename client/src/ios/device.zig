@@ -86,13 +86,13 @@ const la_biometry_lockout: objc.NSInteger = -8;
 
 /// What the lock cover says after LocalAuthentication answered `code`.
 /// The credential stays bound to Face ID (credstore.zig,
-/// biometryCurrentSet): without Face ID there is nothing to sign in with,
+/// biometryCurrentSet): without Face ID the device key cannot be read,
 /// so the app stays locked and says how to fix it rather than unlocking
 /// with the passcode and failing later on the Keychain read.
 pub fn lockMessage(code: objc.NSInteger) []const u8 {
     return switch (code) {
-        la_biometry_not_available => "Face ID is off for Portal.\n\nTurn it on in Settings > Portal > Face ID (or Settings > Face ID & Passcode > Other Apps), then come back.\n\nPortal keeps its sign-in key behind Face ID and does not open without it.",
-        la_biometry_not_enrolled => "Face ID is not set up on this iPhone.\n\nSet it up in Settings > Face ID & Passcode, then come back.\n\nPortal keeps its sign-in key behind Face ID and does not open without it.",
+        la_biometry_not_available => "Face ID is off for Portal.\n\nTurn it on in Settings > Portal > Face ID (or Settings > Face ID & Passcode > Other Apps), then come back.\n\nPortal keeps this device's key behind Face ID and does not open without it.",
+        la_biometry_not_enrolled => "Face ID is not set up on this iPhone.\n\nSet it up in Settings > Face ID & Passcode, then come back.\n\nPortal keeps this device's key behind Face ID and does not open without it.",
         la_passcode_not_set => "This iPhone has no passcode.\n\nSet a passcode and Face ID in Settings > Face ID & Passcode, then come back.",
         la_biometry_lockout => "Face ID is locked after too many attempts.\nTap to unlock with your passcode.",
         la_authentication_failed => "Face ID did not recognise you.\nTap to try again.",

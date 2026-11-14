@@ -1,8 +1,7 @@
 .{
     // Protocol and crypto code shared by every Portal program: the server
     // (Portal's root build), the native client (../client, which builds on
-    // its own too), the browser client (wasm32-freestanding) and the e2e
-    // tests. Pure Zig over std; no dependencies.
+    // its own too) and the e2e tests. Pure Zig over std; no dependencies.
     .name = .portal_shared,
     .version = "0.1.0",
     .minimum_zig_version = "0.18.0-dev.1005+75d48dfff",

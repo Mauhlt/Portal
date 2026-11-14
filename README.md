@@ -90,10 +90,10 @@ never send raw bytes, so escape sequences can't come from them either.
 
 The Portal window shows `N REMOTE VIEWER(S) WATCHING` as an amber badge (and
 `— N REMOTE VIEWER(S)` in its title bar) while anyone is watching
-(`portalctl run --console`: the console title), and every login attempt and
+(`portalctl run --console`: the console title), and every pairing and
 viewer connection is written to `%LOCALAPPDATA%\Portal\portal.log` (moved
-to `portal.log.1` when it passes 10 MB; lines that a peer can cause before
-signing in are rate limited, with counts of what was suppressed).
+to `portal.log.1` when it passes 10 MB; lines that a peer can cause are
+rate limited, with counts of what was suppressed).
 
 ## The Conversation view
 

@@ -2,7 +2,7 @@
 //!
 //! Device section only: it wires iOS behaviour into the SAME viewer the
 //! desktops run (`connect.main`, module "client": pairing, CA pinning,
-//! sign-in, the WebSocket stream, the shared view and input line) and then
+//! the tunnel, the WebSocket stream, the shared view and input line) and then
 //! hands the main thread to UIKit. Nothing here draws or speaks the
 //! protocol.
 //!

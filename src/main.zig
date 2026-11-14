@@ -1560,7 +1560,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     const dir = paths.dir;
     const log_path = try std.fs.path.join(gpa, &.{ dir, "portal.log" });
     defer gpa.free(log_path);
-    // Fail closed: logins and viewer connections must be auditable.
+    // Fail closed: pairings and viewer connections must be auditable.
     var log = Log.open(gpa, io, log_path) catch |err|
         fatal("cannot open audit log {s} ({t}); refusing to run without it.", .{ log_path, err });
     defer log.close();

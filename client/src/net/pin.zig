@@ -7,8 +7,9 @@
 //!
 //! `<host>` is the canonical IP:PORT with ':' written as '_' (last one, the
 //! port) and '-' (IPv6), e.g. 10.8.0.1_8420.pem, fd00--1_8420.pem.
-//! A pin is only ever created by an explicit `--ca FILE` or a CA download
-//! checked against `--ca-sha256`; nothing is trusted on first use.
+//! A pin is only ever created from the pairing code's CA fingerprint (the
+//! CA the first connection presents must match it) or an explicit
+//! `--ca FILE`; nothing is trusted on first use.
 
 const std = @import("std");
 const builtin = @import("builtin");

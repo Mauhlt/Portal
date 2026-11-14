@@ -77,7 +77,7 @@ pub const Status = enum {
     session_ended,
     /// The desktop does not answer (refused or timed out): Portal is not
     /// running there, or the machine is off. Retried with backoff; Portal
-    /// starting again resumes the session (re-signing in as needed).
+    /// starting again resumes the session.
     desktop_offline,
     /// This side's network is down (no route to the desktop).
     network_error,
@@ -553,8 +553,7 @@ pub const Client = struct {
 
     /// Any thread. Paused: drop the stream now and make no connection
     /// until resumed (the UI is off screen: iOS background). The session
-    /// stays in memory; resuming reconnects at once (signing in again if
-    /// the desktop asks).
+    /// stays in memory; resuming reconnects at once.
     pub fn setPaused(c: *Client, paused: bool) void {
         if (c.shared.paused.swap(paused, .acq_rel) == paused) return;
         if (paused) c.wd.poke(); // the stream's watchdog aborts on `paused`

@@ -12,7 +12,7 @@
 //!            with kSecAccessControlBiometryCurrentSet, so every read asks
 //!            for Face ID and re-enrolling a face invalidates it. Reads use
 //!            the app's last LAContext (`apple_auth_context`) when it has
-//!            one, so unlocking the app and signing in take one Face ID.
+//!            one, so unlocking the app and reading the key take one Face ID.
 //!            The tunnel extension's key (`saveUnattended`) has no Face
 //!            ID ACL: this device only, readable while unlocked.
 //!   both     saving deletes and re-adds, never updates in place, so an
@@ -268,7 +268,7 @@ const apple = struct {
     /// its own access settings through an update, a fresh item gets ours.
     /// Deleting needs no authentication (an update of a Face ID item would
     /// ask for Face ID). Always this device only (never iCloud Keychain or
-    /// a backup); with `biometry` (the iOS sign-in credential) also Face ID
+    /// a backup); with `biometry` (the iOS app's device key) also Face ID
     /// on every read, else readable while the device is unlocked.
     fn save(target: []const u8, secret: []const u8, biometry: bool) Error!void {
         const a = try get();

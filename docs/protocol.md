@@ -801,9 +801,9 @@ watched; it is a request, not typing, so a shown sub-tab doesn't block it.
 
 ## 5. Behaviour clients should implement
 
-* Reconnect with backoff (1 s doubling to 15 s). After `logout` or a `401`,
-  go back to sign-in; after `logout` with reason `unpaired`, or a sign-in
-  answered `X-Portal-Device: gone`, forget the desktop instead.
+* Reconnect with backoff (1 s doubling to 15 s). After `logout` (either
+  reason), or a `403` to the upgrade, forget the desktop: it no longer has
+  this device.
 * Keep the window independent of the terminal size: scale the font, or scroll
   or pan, to fit `cols × rows`.
 * Show the input mode clearly ("view only", "answer keys", "instructions",

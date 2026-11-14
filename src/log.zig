@@ -1,11 +1,11 @@
-//! Append-only audit log (logins, viewer connects, startup/shutdown).
+//! Append-only audit log (pairings, viewer connects, startup/shutdown).
 //! Opened with FILE_APPEND_DATA only, so writes are atomic appends and the
 //! handle cannot rewrite earlier entries.
 //!
 //! Size is bounded: when portal.log grows past `rotate_bytes` (checked at
 //! startup and while running) it is renamed to portal.log.1, replacing any
 //! older one, and a fresh file is started. Lines that a remote peer can
-//! trigger before signing in are additionally rate limited by the callers
+//! trigger are additionally rate limited by the callers
 //! (web.zig `LogLimiter`), so a flood cannot rotate real entries away
 //! quickly either.
 
