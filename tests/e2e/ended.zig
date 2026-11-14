@@ -111,8 +111,12 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     _ = r.ok("exit logged", inst.logHas("stop: child exited with code 1"));
 
     // Nothing listens any more: the native client's next attempt says
-    // "Desktop offline" and keeps the ended session's code.
-    {
+    // "Desktop offline" and keeps the ended session's code. Only once the
+    // first stream has returned: two streams on one client would share its
+    // watchdog and events.
+    if (!got_native) {
+        _ = r.ok("native client: desktop offline after Portal exited", false);
+    } else {
         var backoff: i64 = 10;
         const r2 = n.c.runStream(&backoff);
         const unreachable_ = r2 == .unreachable_err;

@@ -82,11 +82,12 @@ const max_pre_auth = 16;
 const max_pre_auth_per_ip = 8;
 /// Upgraded connections one device may hold per channel. A client keeps
 /// one interactive WebSocket and opens a bulk one per sync request (one
-/// at a time); two leaves room for a reconnect overlapping a dying one,
-/// or a second process of the same device (`portal sync`). A new one
+/// at a time). Four interactive leave room for a second viewer on the
+/// device and a reconnect overlapping a dying one; two bulk for a second
+/// process of the same device (`portal sync`). A new one
 /// over the cap ends that device's oldest on the same channel, so one
 /// device can never hold every slot.
-pub const max_upgraded_per_device: std.EnumArray(Channel, usize) = .init(.{ .interactive = 2, .bulk = 2 });
+pub const max_upgraded_per_device: std.EnumArray(Channel, usize) = .init(.{ .interactive = 4, .bulk = 2 });
 
 const max_requests_per_connection = 16;
 const max_body = 0;
