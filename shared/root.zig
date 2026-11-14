@@ -27,6 +27,11 @@
 //!   bulk     the bulk WebSocket's request/reply messages (sync transfers)
 //!   projects projects a device may start (projects / project messages,
 //!            p: frames), their start modes and the request rate window
+//!   frames   the one list of device -> desk frame prefixes, and the answer
+//!            codec every request family (p:, i:, r:) shares
+//!   foryou   For-you cards per tab (foryou message, i: frames, item answer)
+//!   recap    asking a tab for a recap (r: frame, recap answer)
+//!   planusage the plan-usage bar (usage message: week / five-hour limits)
 
 pub const screen = @import("screen.zig");
 pub const ws = @import("ws.zig");
@@ -44,6 +49,10 @@ pub const transport = @import("transport.zig");
 pub const tunnelnet = @import("tunnelnet.zig");
 pub const bulk = @import("bulk.zig");
 pub const projects = @import("projects.zig");
+pub const frames = @import("frames.zig");
+pub const foryou = @import("foryou.zig");
+pub const recap = @import("recap.zig");
+pub const planusage = @import("planusage.zig");
 
 test {
     _ = screen;
@@ -62,4 +71,8 @@ test {
     _ = tunnelnet;
     _ = bulk;
     _ = projects;
+    _ = frames;
+    _ = foryou;
+    _ = recap;
+    _ = planusage;
 }

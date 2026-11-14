@@ -99,6 +99,12 @@ extensions. The interactive connection is dialed with the transport's
 | `activity` | `sysmon`, `tabs` | every open tab's background tasks and token usage (section 3c): after `hello`, then whenever any of it, the tab list or the desk's system-monitor setting changes |
 | `subtabs` | `id`, `subs` | the subagent sub-tabs of the tab watched (section 3e): after every `session` (and after hello), and whenever they change |
 | `sys` | `cpu`, `mem`, `gpus`, `tabs` | a system monitor sample (section 3d): only to a viewer whose System panel is open (`y:on`), only while the desk's setting is on, about once a second |
+| `projects` | `list` | the projects this device may start (section 3f): after `hello`, and whenever the list or a project's running state changes |
+| `project` | `op`, `result`, `name` | the answer to `p:start` / `p:stop` (section 3f) |
+| `foryou` | `id`, `items` | the For-you cards of tab `id` (section 3g): for every open tab after `hello`, then whenever that tab's cards change |
+| `item` | `op`, `result`, `id` | the answer to `i:yes` / `i:no` (section 3g) |
+| `recap` | `op`, `result`, `id` | the answer to `r:recap` (section 4b) |
+| `usage` | `week`, `five_hour`, `limit_reached` | the plan-usage bar (section 3h): on connect, at most every 5 minutes, at once on crossing 75 %, 90 % or the limit |
 
 ### 3a. Project tabs (sessions)
 
@@ -420,6 +426,122 @@ SUB = {"id":"<32 hex>","name":"<description>","done":true|false}
   there. Grid frames stay the tab's.
 * Strict parser and writer: `shared/subtabs.zig`.
 
+### 3f. Startable projects (`projects`, `p:`, `project`)
+
+The desk may mark up to 16 projects as startable from a device. The list
+carries names, colours and booleans only; a project's folder never leaves
+the desktop.
+
+```
+{"t":"projects","list":[ENTRY,...]}
+ENTRY = {"name":"<name>","color":"#rrggbb","mode":"ask"|"plan",
+         "running":true|false,"stoppable":true|false}
+{"t":"project","op":"start"|"stop","result":"<result>"[,"name":"<name>"]}
+```
+
+* `name`: a startable name: a tab name (section 3a) without `\`, `/`,
+  `:`, `|` or `"`, not starting with `-`, `.` or a space, so it can never
+  be read as a path, a drive, an option or a settings field.
+* `mode`: how a device-started session runs, chosen at the desk: `ask`
+  (the agent asks before every edit and command) or `plan` (read-only
+  planning). Never a permissive mode; a device can't change it.
+* `stoppable`: running and started from a device (only then may a device
+  stop it; `stoppable` without `running` is malformed).
+* `p:start <name>` / `p:stop <name>` (section 4a). Results: `started`,
+  `stopped`, `switched` (already running: the device now shows it),
+  `unknown` (no such project, or malformed), `refused` (input mode
+  `none`), `rate_limited`, `unsafe_program` (the desk's program setting is
+  not safe to start from a device), `not_device_started`, `not_running`,
+  `too_many_tabs`, `failed`.
+* Strict parser and writer: `shared/projects.zig`.
+
+### 3g. For you (`foryou`, `i:`, `item`)
+
+Cards a device shows in its For-you list: what a tab needs from the owner,
+or what the desk suggests, each answered with yes or no (a swipe or a
+button). The desk builds them (from the agent's hooks and transcript),
+keeps them and decides what an answer does; the device only shows them.
+
+```
+{"t":"foryou","id":"<tab, 32 hex>","items":[ITEM,...]}
+ITEM = {"id":"<32 hex>","k":"<kind>","text":"<summary>"
+        [,"cmd":"<command>"][,"why":"<why>"][,"project":"<name>"]}
+{"t":"item","op":"yes"|"no","result":"<result>"[,"id":"<item id>"]}
+```
+
+* One message per tab, for **every** open tab (not only the one
+  watched): after `hello`, and whenever that tab's cards change. It
+  replaces the device's cards for that tab; `"items":[]` clears them. A
+  tab gone from `tabs` takes its cards with it. A card's tab is the
+  message's `id`.
+* At most 16 cards per tab, in the desk's order (most urgent first).
+* `id`: random, 128 bits, never reused. **The id is the card's
+  version:** the desk gives a card a new id whenever anything in it
+  changes, so an answer to a card that was replaced, answered elsewhere
+  (another device, the desk) or is gone names no current id and is
+  refused `stale`.
+* `text`: a one-line summary, 1..120 bytes. `cmd`: a command (the
+  permission prompt's, a suggested run), at most 1 KiB, printable, line
+  feeds and tabs allowed. `why`: one line, at most 240 bytes. `project`:
+  a project name (tab-name rules); the target of `suggest_goto`. Every
+  text is scrubbed on the desk like conversation texts (paths, the user's
+  name).
+* Kinds and what an answer does (enforced by the desk; `Kind.effect`,
+  `Effect.allowedIn`):
+
+| `k` | yes | no | input mode needed |
+|---|---|---|---|
+| `waiting_permission` | allows the agent's permission prompt | denies it | `keys`, `instruct`, `text` |
+| `suggest_run` (has `cmd`: one line, no backtick) | sends the agent ``Please run `<cmd>`.`` | dismisses | yes: `instruct`, `text`; no: any |
+| `suggest_goto` (has `project`) | sends the agent `Please switch to the <project> project.` | dismisses | yes: `instruct`, `text`; no: any |
+| `answer` (a yes/no question in `text`) | answers yes | answers no | `keys`, `instruct`, `text` |
+| `needs_desk` | dismisses | dismisses | any |
+| `long_running` | dismisses | dismisses | any |
+
+* The messages are fixed templates (`foryou.runMessage`, `gotoMessage`)
+  filled with the desk's own `cmd` / `project`, never the device's text,
+  so a device can show exactly what will be sent. Dismissing removes the
+  card for every device.
+* `i:yes <id>` / `i:no <id>` (section 4a). Results: `sent` (it reached
+  the agent; the card is gone), `dismissed` (the card is gone), `stale`
+  (no current card has that id, or a malformed frame; nothing happened),
+  `refused` (the input mode doesn't allow it), `rate_limited`, `failed`
+  (the desk could not deliver it, e.g. the agent is not at its prompt;
+  the card stays).
+* **Needs desk (the admin-prompt guard).** A tab that waits for something
+  only the desk can give (an administrator prompt, the folder-trust
+  prompt, a sign-in) gets a `needs_desk` card; a command running long
+  gets a `long_running` card. There is no separate "needs desk" flag in
+  the tab list: a tab needs the desk while its `foryou` list holds a
+  `needs_desk` card (`foryou.List.needsDesk`), and clients mark its tab
+  from that. Why: `foryou` already reaches every device for every tab, so
+  it is one source of truth with the reason attached; older clients'
+  tab-entry parser rejects the whole list on a non-string field, so a
+  boolean there would break them; and a new `state` value would mix with
+  `waiting`, which gates Up/Down (section 4). The tab's `state` stays
+  what the program reports.
+* Strict parser and writer: `shared/foryou.zig` (too many cards, an
+  unknown kind, a field out of bounds, a card its kind can't have, an id
+  twice: rejected whole; unknown scalar fields ignored).
+
+### 3h. The plan-usage bar (`usage`)
+
+How much of the owner's plan limits is used, as the desk knows it:
+percentages and reset times only (token counts are `activity`, 3c).
+
+```
+{"t":"usage"[,"week":WINDOW][,"five_hour":WINDOW][,"limit_reached":"week"|"five_hour"]}
+WINDOW = {"pct":<0..100>[,"resets_at":<unix s>]}
+```
+
+* An absent window is unknown; an absent `resets_at` is unknown.
+  `limit_reached` names the window whose limit is reached.
+* The desk sends it to a device on connect, then at most once per 5
+  minutes, and at once when a window crosses 75 %, 90 % or reaches its
+  limit. The throttling is the desk's; each message replaces the last.
+* Strict parser and writer: `shared/planusage.zig` (a percentage over
+  100, a field twice, an unknown window: rejected).
+
 **Binary frames**: grid updates, always starting with `'G'`, little-endian:
 
 ```
@@ -535,7 +657,10 @@ passed, so the program can't read the pair as Alt+key.
 | `s:<id>` | watch the open tab `id` (32 hex digits; in every input mode, `none` included). Input sent after it goes to that tab. Answered by `session` (and a snapshot) or, for anything that is not an open tab, `nosession`; rejected ids are logged at the desk, rate limited, never echoed |
 | `a:<sub id>`, `a:` | show that sub-tab of the tab watched (read-only), or the tab's own conversation again (section 3e; every input mode). While a sub-tab is shown, `k:`, `t:` and `l:` are dropped |
 | `y:on`, `y:off` | this viewer's System panel opened / closed (section 3d; every input mode: it is read-only). While the desk's "Show system monitor" is off, `y:on` is ignored and logged at the desk. Closing the connection counts as `y:off` |
-| `f:` | Forget this desktop (section 1): the desktop removes this device's record, answers `forgotten` and closes the connection (every input mode) |
+| `f:` | Forget this desktop (section 1): the desktop removes this device's record, answers `forgotten` and closes the connection (every input mode). Exactly `f:`: nothing may follow (section 4a) |
+| `p:start <name>`, `p:stop <name>` | start / stop a startable project (section 3f); answered by `project` |
+| `i:yes <id>`, `i:no <id>` | answer a For-you card (section 3g); answered by `item` |
+| `r:recap <tab id>` | ask that tab's agent for a recap (section 4b); answered by `recap` |
 
 `k:`, `t:` and `l:` go to the tab the viewer last chose with `s:` (at
 first, the tab in `hello.session`); while that tab has ended or the last
@@ -583,6 +708,50 @@ clients use; so is the clients' key rule: Ctrl, Alt and Meta combinations
 send nothing (Ctrl+Enter is not Enter), except Ctrl+C in `text` mode;
 Shift+Tab is `shift-tab`.
 
+### 4a. Frame prefixes (the one list)
+
+`shared/frames.zig` (`Prefix`, `classify`) is the one list of the
+prefixes above; the desk's dispatch and every client use it, and a new
+frame takes a new letter there. Rules:
+
+* Every frame is `<letter>:<rest>`; a frame whose letter is not in the
+  list is ignored.
+* **`f:` is exactly those two bytes.** Desks before this list forget the
+  device on *any* frame starting with `f`, so no other frame may ever
+  start with `f` (that is why For-you answers are `i:`, not `f:`). A
+  current desk ignores `f:` followed by anything.
+* Request families are `<letter>:<verb> <argument>`, exactly one space,
+  the verb lower case: `p:start <name>`, `p:stop <name>`, `i:yes <id>`,
+  `i:no <id>`, `r:recap <tab id>` (`frames.verb`).
+* Each request is answered by one message
+  `{"t":"<family>","op":"<verb>","result":"<result>"[,"<ref>":"<value>"]}`
+  (`frames.writeAnswer` / `parseAnswer`): `project` (ref `name`), `item`
+  (ref `id`, the card), `recap` (ref `id`, the tab). `op` is the frame's
+  verb; the reference is the desk's own value for a request it could
+  match, never the device's text echoed back, and absent otherwise.
+  `rate_limited` (too many requests from this device in the last minute)
+  and `refused` (the desk's input mode doesn't allow it) mean the same in
+  every family.
+
+### 4b. Recap (`r:recap`, `recap`)
+
+`r:recap <tab id>` asks that open tab's agent for a short recap. The
+device sends only the tab; the desk types its own fixed instruction
+(`shared/recap.zig` `prompt`) as an instruction line, under the line
+rules of section 4. The recap arrives as the agent's reply in that tab's
+conversation. Answer
+`{"t":"recap","op":"recap","result":"<result>"[,"id":"<tab>"]}`:
+
+| result | meaning |
+|---|---|
+| `ok` | the prompt was sent |
+| `refused` | the desk's input mode is not `instruct` or `text`, or the tab's program is not the agent |
+| `rate_limited` | too many requests from this device in the last minute |
+| `unknown` | not an open tab, or a malformed frame |
+
+The frame names its tab, so it works for any open tab, not only the one
+watched; it is a request, not typing, so a shown sub-tab doesn't block it.
+
 ## 5. Behaviour clients should implement
 
 * Reconnect with backoff (1 s doubling to 15 s). After `logout` or a `401`,
@@ -609,6 +778,13 @@ Shift+Tab is `shift-tab`.
   waiting and the question's number keys while no card shows them
   (`keys` mode: the whole answer set; the desk, not policy-limited:
   1–3, ↑ ↓, Esc, Enter always), docs/layout-design.md.
+
+* **Hidden tabs are device-local.** A device may hide tabs from its own
+  tab bar (and their For-you cards); it keeps that list itself, by tab
+  name, and nothing about it is sent: there is no message for it, the
+  desk doesn't know, and every tab stays open and visible at the desk and
+  on other devices. A hidden tab still gets `activity`, `foryou` and every
+  other message as usual.
 
 ## 7. Portal sync (signed packages for paired devices)
 

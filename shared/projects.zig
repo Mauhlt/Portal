@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const tabs = @import("tabs.zig");
+const frames = @import("frames.zig");
 
 /// Most projects the desk may mark startable.
 pub const max_projects = 16;
@@ -228,15 +229,9 @@ pub fn requestFrame(op: Op, name: []const u8, buf: []u8) ?[]const u8 {
 /// option, a second word that makes the name invalid, control characters,
 /// an empty name) is null: the server answers it like an unknown name.
 pub fn parseRequest(rest: []const u8) ?Request {
-    inline for (.{ Op.start, Op.stop }) |op| {
-        const prefix = @tagName(op) ++ " ";
-        if (std.mem.startsWith(u8, rest, prefix)) {
-            const n = rest[prefix.len..];
-            if (!startableName(n)) return null;
-            return .{ .op = op, .name = n };
-        }
-    }
-    return null;
+    const v = frames.verb(Op, rest) orelse return null;
+    if (!startableName(v.arg)) return null;
+    return .{ .op = v.op, .name = v.arg };
 }
 
 /// What the desk did with a request (the `project` message's `result`).
@@ -249,7 +244,7 @@ pub const Result = enum {
     /// No such startable project (also: a malformed request).
     unknown,
     /// The desk's input mode for devices is `none` (view only).
-    not_allowed,
+    refused,
     /// Too many requests from this device in the last minute.
     rate_limited,
     /// The desk's program setting is not the agent, or allows a permissive
@@ -272,14 +267,14 @@ pub const Result = enum {
         return std.meta.stringToEnum(Result, t);
     }
 
-    /// What a device shows ("The agent" may be said in UI strings).
+    /// What a device shows (UI strings may name the product).
     pub fn text(r: Result) []const u8 {
         return switch (r) {
             .started => "Started.",
             .stopped => "Stopped: Claude was asked to exit.",
             .switched => "Already running: switched to it.",
             .unknown => "The desk does not offer that project.",
-            .not_allowed => "This desk is view-only for devices.",
+            .refused => "This desk is view-only for devices.",
             .rate_limited => "Too many requests: wait a minute.",
             .unsafe_program => "The desk's program setting is not safe to start from a device (fix it at the desk).",
             .not_device_started => "Started at the desk: only the desk can stop it.",
@@ -297,13 +292,7 @@ pub const Result = enum {
 /// The answer to a `p:` frame. `name` (a startableName from the desk's
 /// list, never the device's text) only for a known project.
 pub fn writeResult(w: *std.Io.Writer, op: Op, result: Result, name: ?[]const u8) !void {
-    try w.print("{{\"t\":\"project\",\"op\":\"{s}\",\"result\":\"{s}\"", .{ @tagName(op), result.wire() });
-    if (name) |n| {
-        try w.writeAll(",\"name\":\"");
-        try writeName(w, n);
-        try w.writeByte('"');
-    }
-    try w.writeByte('}');
+    try frames.writeAnswer(w, "project", @tagName(op), result.wire(), "name", name);
 }
 
 pub const Answer = struct {
@@ -319,18 +308,13 @@ pub const Answer = struct {
 
 /// A `project` message, or null.
 pub fn parseResult(text: []const u8) ?Answer {
-    if (!std.mem.startsWith(u8, text, "{\"t\":\"project\"")) return null;
-    var buf: [16]u8 = undefined;
-    var p = tabs.fieldValue(text, "op") orelse return null;
-    const op = std.meta.stringToEnum(Op, tabs.readString(text, &p, &buf) orelse return null) orelse return null;
-    p = tabs.fieldValue(text, "result") orelse return null;
-    var rbuf: [32]u8 = undefined;
-    const result = Result.fromWire(tabs.readString(text, &p, &rbuf) orelse return null) orelse return null;
-    var a: Answer = .{ .op = op, .result = result };
-    if (tabs.fieldValue(text, "name")) |np0| {
-        var np = np0;
-        var nb: [max_name]u8 = undefined;
-        const n = tabs.readString(text, &np, &nb) orelse return null;
+    var s: frames.Scratch = undefined;
+    const raw = frames.parseAnswer(text, "project", "name", &s) orelse return null;
+    var a: Answer = .{
+        .op = std.meta.stringToEnum(Op, raw.op) orelse return null,
+        .result = Result.fromWire(raw.result) orelse return null,
+    };
+    if (raw.ref) |n| {
         if (!startableName(n)) return null;
         @memcpy(a.name_buf[0..n.len], n);
         a.name_len = @intCast(n.len);
@@ -424,10 +408,9 @@ test "requests: exact verb and a startable name, nothing else" {
     try testing.expectEqualStrings("acme api", r.name);
     try testing.expectEqual(Op.stop, parseRequest("stop acme").?.op);
     for ([_][]const u8{
-        "start", "start ", "start  acme", "Start acme", "run acme", "startacme",
-        "start C:\\code\\acme", "start ..\\..\\Windows", "start /etc", "start acme --dangerously-skip-permissions",
-        "start --permission-mode bypassPermissions", "start acme\n", "start acme\x00", "start acme|C:\\x",
-        "start acme \"C:\\x\"", "stop -x",
+        "start",                "start ",                "start  acme",          "Start acme",                                "run acme",                                  "startacme",
+        "start C:\\code\\acme", "start ..\\..\\Windows", "start /etc",           "start acme --dangerously-skip-permissions", "start --permission-mode bypassPermissions", "start acme\n",
+        "start acme\x00",       "start acme|C:\\x",      "start acme \"C:\\x\"", "stop -x",
     }) |bad| {
         // Either malformed, or a name the desk can't have (it still has to
         // match the desk's list exactly, which the desk checks).
@@ -445,11 +428,11 @@ test "requests: exact verb and a startable name, nothing else" {
 test "result messages round trip" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeResult(&w, .start, .switched, "a \"b\"");
+    try writeResult(&w, .start, .switched, "acme api");
     const a = parseResult(w.buffered()).?;
     try testing.expectEqual(Op.start, a.op);
     try testing.expectEqual(Result.switched, a.result);
-    try testing.expectEqualStrings("a \"b\"", a.name().?);
+    try testing.expectEqualStrings("acme api", a.name().?);
     var w2: std.Io.Writer = .fixed(&buf);
     try writeResult(&w2, .stop, .unknown, null);
     const b = parseResult(w2.buffered()).?;
