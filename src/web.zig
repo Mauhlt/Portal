@@ -490,20 +490,23 @@ pub const Server = struct {
         return Io.Timestamp.now(srv.io, .real).toMilliseconds();
     }
 
-    pub fn sessionLive(srv: *Server, cookie: []const u8, refresh: bool) bool {
+    /// Whether `cookie` is a live session presented from the address it was
+    /// issued to (`peer` is the connection's "ip:port").
+    pub fn sessionLive(srv: *Server, cookie: []const u8, peer: []const u8, refresh: bool) bool {
         srv.auth_mutex.lockUncancelable(srv.io);
         defer srv.auth_mutex.unlock(srv.io);
         const now = srv.realMs();
-        return if (refresh) srv.sessions.validate(cookie, now) else srv.sessions.isLive(cookie, now);
+        const ip = devices.ipOnly(peer);
+        return if (refresh) srv.sessions.validate(cookie, ip, now) else srv.sessions.isLive(cookie, ip, now);
     }
 
-    /// Milliseconds until session `cookie` expires unless refreshed, or null
-    /// if it is no longer live.
-    fn sessionExpiresIn(srv: *Server, cookie: []const u8) ?i64 {
+    /// Milliseconds until session `cookie` (presented from `peer`) expires
+    /// unless refreshed, or null if it is no longer live.
+    fn sessionExpiresIn(srv: *Server, cookie: []const u8, peer: []const u8) ?i64 {
         srv.auth_mutex.lockUncancelable(srv.io);
         defer srv.auth_mutex.unlock(srv.io);
         const now = srv.realMs();
-        const at = srv.sessions.expiresAt(cookie, now) orelse return null;
+        const at = srv.sessions.expiresAt(cookie, devices.ipOnly(peer), now) orelse return null;
         return @max(at -| now, 0);
     }
 
@@ -737,7 +740,7 @@ pub const Server = struct {
         if (!std.mem.eql(u8, req.path, "/sync/key") and !std.mem.eql(u8, req.path, "/sync/index") and
             !std.mem.startsWith(u8, req.path, "/sync/pkg/")) return srv.fail(conn, w, .not_found, "not found\n");
         const cookie = h.cookie orelse return srv.fail(conn, w, .unauthorized, "login required\n");
-        const who = srv.sessionOwner(cookie, true);
+        const who = srv.sessionOwner(cookie, conn.peer(), true);
         const owner = switch (who) {
             .none => return srv.fail(conn, w, .unauthorized, "login required\n"),
             .anonymous => return srv.fail(conn, w, .forbidden, "not a paired device\n"),
@@ -941,7 +944,7 @@ pub const Server = struct {
             }
             var until = deadline;
             if (conn.ws_active.load(.acquire)) {
-                if (srv.sessionExpiresIn(&conn.ws_cookie)) |left| {
+                if (srv.sessionExpiresIn(&conn.ws_cookie, conn.peer())) |left| {
                     revoked_since = null;
                     until = @min(until, now +| @max(left, 1));
                 } else if (revoked_since == null) {
@@ -1208,7 +1211,7 @@ pub const Server = struct {
 
         if (!conn.authed) {
             if (h.cookie) |c| {
-                if (srv.sessionLive(c, false)) srv.promote(conn);
+                if (srv.sessionLive(c, peer, false)) srv.promote(conn);
             }
         }
 
@@ -1222,7 +1225,7 @@ pub const Server = struct {
                 if (std.mem.eql(u8, path, "/pair/wait")) return srv.pairWait(conn, w, req, h);
                 if (std.mem.eql(u8, path, "/login")) return srv.redirect(conn, w, req, "/pair", &.{});
                 if (std.mem.eql(u8, path, "/")) {
-                    if (h.cookie) |c| if (srv.sessionLive(c, true)) return srv.asset(conn, w, req, index_html, "text/html; charset=utf-8");
+                    if (h.cookie) |c| if (srv.sessionLive(c, peer, true)) return srv.asset(conn, w, req, index_html, "text/html; charset=utf-8");
                     // No live session (first visit, or Portal restarted): a
                     // paired device signs in silently with its credential.
                     if (h.device) |d| return srv.deviceSignIn(conn, w, req, d, .page);
@@ -1473,13 +1476,13 @@ pub const Server = struct {
     };
 
     /// Builds Set-Cookie values for a device credential and a new session
-    /// of device record `device`.
-    fn issueCookies(srv: *Server, device: auth.Device, device_secret: []const u8, out: *CookiePair) !void {
+    /// of device record `device`, bound to the client address of `peer`.
+    fn issueCookies(srv: *Server, device: auth.Device, device_secret: []const u8, peer: []const u8, out: *CookiePair) !void {
         var session_val: [auth.encoded_len]u8 = undefined;
         try srv.newSecret(&session_val);
         defer std.crypto.secureZero(u8, &session_val);
         srv.auth_mutex.lockUncancelable(srv.io);
-        srv.sessions.createFor(&session_val, srv.realMs(), device);
+        srv.sessions.createFor(&session_val, devices.ipOnly(peer), srv.realMs(), device);
         srv.auth_mutex.unlock(srv.io);
         const secure = if (srv.cfg.secure_cookie) "; Secure" else "";
         out.device = try std.fmt.bufPrint(&out.device_buf, "{s}={s}.{s}; Path=/; HttpOnly; SameSite=Strict; Max-Age={d}{s}", .{
@@ -1507,11 +1510,12 @@ pub const Server = struct {
         srv.notePreAuth(&srv.store_log, "{s} from {s} failed: {t}: {s}", .{ what, peer, err, devices.describeError(err) });
     }
 
-    /// Who session `cookie` belongs to (memory only).
-    fn sessionOwner(srv: *Server, cookie: []const u8, refresh: bool) auth.Sessions.Live {
+    /// Who session `cookie` belongs to (memory only); `.none` unless it is
+    /// presented from the address it was issued to (`peer`).
+    fn sessionOwner(srv: *Server, cookie: []const u8, peer: []const u8, refresh: bool) auth.Sessions.Live {
         srv.auth_mutex.lockUncancelable(srv.io);
         defer srv.auth_mutex.unlock(srv.io);
-        return srv.sessions.live(cookie, srv.realMs(), refresh);
+        return srv.sessions.live(cookie, devices.ipOnly(peer), srv.realMs(), refresh);
     }
 
     /// Ends every session of device record `id` (which the store no longer
@@ -1761,7 +1765,7 @@ pub const Server = struct {
         }
         srv.log.print("PAIRED device '{s}' at {s} (request {s}, approved at the desk)", .{ paired.device.name(), ip, &r.code });
         var cookies: CookiePair = .{};
-        try srv.issueCookies(paired.device, &secret, &cookies);
+        try srv.issueCookies(paired.device, &secret, conn.peer(), &cookies);
         return srv.redirect(conn, w, req, "/", &.{ cookies.device, cookies.session, clear });
     }
 
@@ -1793,7 +1797,7 @@ pub const Server = struct {
         switch (outcome) {
             .ok => {
                 var cookies: CookiePair = .{};
-                try srv.issueCookies(res.device.?, &secret, &cookies);
+                try srv.issueCookies(res.device.?, &secret, peer, &cookies);
                 switch (mode) {
                     .page => return srv.redirect(conn, w, req, "/", &.{ cookies.device, cookies.session }),
                     .api => {
@@ -1844,7 +1848,7 @@ pub const Server = struct {
             try srv.respond(conn, w, .unauthorized, "login required\n", "text/plain; charset=utf-8", &.{}, false);
             return false;
         };
-        const d = switch (srv.sessionOwner(cookie, false)) {
+        const d = switch (srv.sessionOwner(cookie, peer, false)) {
             .device => |d| d,
             .anonymous => return srv.fail(conn, w, .forbidden, "not a paired device\n"),
             .none => {
@@ -1884,8 +1888,8 @@ pub const Server = struct {
         var owner: ?auth.Device = null;
         if (h.cookie) |c| {
             srv.auth_mutex.lockUncancelable(srv.io);
-            owner = srv.sessions.liveDevice(c, srv.realMs(), false);
-            srv.sessions.revoke(c);
+            owner = srv.sessions.liveDevice(c, devices.ipOnly(peer), srv.realMs(), false);
+            srv.sessions.revoke(c, devices.ipOnly(peer));
             srv.auth_mutex.unlock(srv.io);
         }
         var res: CredentialCheck = .{};
@@ -1989,7 +1993,7 @@ pub const Server = struct {
             _ = try srv.fail(conn, w, .unauthorized, "login required\n");
             return;
         };
-        if (!srv.sessionLive(cookie, true)) {
+        if (!srv.sessionLive(cookie, peer, true)) {
             _ = try srv.fail(conn, w, .unauthorized, "login required\n");
             return;
         }
@@ -2013,7 +2017,7 @@ pub const Server = struct {
 
         var ws: WsConn = .{ .conn = conn, .w = w, .cookie = undefined };
         @memcpy(&ws.cookie, cookie);
-        switch (srv.sessionOwner(cookie, false)) {
+        switch (srv.sessionOwner(cookie, peer, false)) {
             .device => |d| ws.device = d,
             else => {},
         }
@@ -2233,7 +2237,7 @@ pub const Server = struct {
             // switch the reader asked for, the reader ending, or a
             // revocation (wakeViewers); otherwise sleeps until the session
             // would expire. No periodic recheck.
-            const expires_in = srv.sessionExpiresIn(&ws.cookie) orelse 0;
+            const expires_in = srv.sessionExpiresIn(&ws.cookie, ws.conn.peer()) orelse 0;
             hub.mutex.lockUncancelable(srv.io);
             const cur_closed = if (cur) |c| c.session.closed else false;
             const cur_gen = if (cur) |c| c.session.term.gen else sent_gen;
@@ -2449,7 +2453,7 @@ pub const Server = struct {
             // `portal unpair` in another process: the pairing watcher then
             // ends its sessions and wakes this loop) ends the stream.
             // Checked on every wake; memory only.
-            if (!srv.sessionLive(&ws.cookie, false)) {
+            if (!srv.sessionLive(&ws.cookie, ws.conn.peer(), false)) {
                 _ = ws.send(srv, srv.logoutMessage(ws.device), .text);
                 return;
             }
@@ -2548,7 +2552,7 @@ pub const Server = struct {
                 // (docs/protocol.md section 4).
                 if (payload.len < 2 or payload[1] != ':') return true;
                 // Re-check on every input message, not just periodically.
-                if (!srv.sessionLive(&ws.cookie, false)) return false;
+                if (!srv.sessionLive(&ws.cookie, ws.conn.peer(), false)) return false;
                 // Switching tabs is not input: also in view-only mode.
                 if (payload[0] == 's') {
                     srv.subscribe(ws, payload[2..]);

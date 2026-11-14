@@ -395,6 +395,18 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         };
         _ = r.ok("device still works from its own address", true);
         _ = r.ok("wrong-address attempt logged (the distinction stays local)", inst.logHas("unexpected address"));
+
+        // A session cookie is bound to the address it was issued to.
+        var s1 = try http.request(gpa, port, .{ .path = "/", .host = inst.host, .cookie = cur.sessionCookie(), .source = other_ip });
+        defer s1.deinit();
+        _ = r.check("session cookie replayed from another address does not open the viewer", s1.status == 303 and
+            std.mem.eql(u8, s1.location(), "/pair"), "{d} {s}", .{ s1.status, s1.location() });
+        var s2 = try http.request(gpa, port, .{ .path = "/sync/index", .host = inst.host, .cookie = cur.sessionCookie(), .source = other_ip });
+        defer s2.deinit();
+        _ = r.check("session cookie replayed from another address gets no /sync", s2.status == 401, "{d}", .{s2.status});
+        var s3 = try get(inst, "/", cur.sessionCookie());
+        defer s3.deinit();
+        _ = r.check("...and the session still works from its own address (refused, not revoked)", s3.status == 200, "{d}", .{s3.status});
     }
 
     // ------------------------ stale credential (out of the grace ring)
