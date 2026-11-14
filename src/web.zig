@@ -1484,12 +1484,18 @@ pub const Server = struct {
         srv.auth_mutex.lockUncancelable(srv.io);
         srv.sessions.createFor(&session_val, devices.ipOnly(peer), srv.realMs(), device);
         srv.auth_mutex.unlock(srv.io);
+        try srv.cookieHeaders(device, device_secret, &session_val, out);
+    }
+
+    /// The Set-Cookie values for a device credential and an already
+    /// created session `session_val`.
+    fn cookieHeaders(srv: *Server, device: auth.Device, device_secret: []const u8, session_val: *const [auth.encoded_len]u8, out: *CookiePair) !void {
         const secure = if (srv.cfg.secure_cookie) "; Secure" else "";
         out.device = try std.fmt.bufPrint(&out.device_buf, "{s}={s}.{s}; Path=/; HttpOnly; SameSite=Strict; Max-Age={d}{s}", .{
             srv.deviceCookieName(), device.name(), device_secret, devices.unused_expiry_s, secure,
         });
         out.session = try std.fmt.bufPrint(&out.session_buf, "{s}={s}; Path=/; HttpOnly; SameSite=Strict; Max-Age={d}{s}", .{
-            srv.cookieName(), &session_val, @divTrunc(srv.sessions.absolute_timeout_ms, 1000), secure,
+            srv.cookieName(), session_val, @divTrunc(srv.sessions.absolute_timeout_ms, 1000), secure,
         });
     }
 
@@ -1549,7 +1555,12 @@ pub const Server = struct {
         srv.log.print("DEVICE REVOKED '{s}': stale or wrong credential presented from {s} (copied credential?); {d} session(s) ended. Re-pair required.", .{ gone.name(), peer, n });
     }
 
-    const CredentialUse = enum { sign_in, unpair };
+    const CredentialUse = union(enum) {
+        /// Rotate to `new_hash` and start session `session` (an encoded
+        /// session id) bound to the presenting address.
+        sign_in: struct { new_hash: auth.Hash, session: *const [auth.encoded_len]u8 },
+        unpair,
+    };
 
     const CredentialCheck = struct {
         outcome: SignInOutcome = .unknown,
@@ -1559,18 +1570,24 @@ pub const Server = struct {
 
     /// One locked store update for a presented `<name>.<secret>` device
     /// credential from `ip`: verified against the record's bound address;
-    /// valid ones rotate to `new_hash` (sign-in) or remove the record
-    /// (unpair); a stale or wrong secret revokes the record (see
+    /// valid ones rotate and start a session (sign-in) or remove the
+    /// record (unpair); a stale or wrong secret revokes the record (see
     /// devices.zig). Callers report `.revoked` with `deviceRevoked`.
-    fn checkCredential(srv: *Server, presented: []const u8, ip: []const u8, use: CredentialUse, new_hash: auth.Hash) !CredentialCheck {
+    ///
+    /// The sign-in's session is created while the store is still locked:
+    /// an unpair at the desk (another process) can then only come after
+    /// it, so the pairing watcher's next pass (`applyStore`, which spares
+    /// sessions created after its read began) ends it. If the store write
+    /// fails afterwards, the session is ended again before returning.
+    fn checkCredential(srv: *Server, presented: []const u8, ip: []const u8, use: CredentialUse) !CredentialCheck {
         var res: CredentialCheck = .{};
         const now = srv.nowUnix();
-        const Ctx = struct { presented: []const u8, ip: []const u8, use: CredentialUse, hash: auth.Hash, now: i64, res: *CredentialCheck };
-        try devices.withStore(srv.gpa, srv.io, srv.cfg.devices, now, Ctx{
+        const Ctx = struct { srv: *Server, presented: []const u8, ip: []const u8, use: CredentialUse, now: i64, res: *CredentialCheck };
+        devices.withStore(srv.gpa, srv.io, srv.cfg.devices, now, Ctx{
+            .srv = srv,
             .presented = presented,
             .ip = ip,
             .use = use,
-            .hash = new_hash,
             .now = now,
             .res = &res,
         }, struct {
@@ -1579,7 +1596,12 @@ pub const Server = struct {
                     .ok => |idx| {
                         c.res.* = .{ .outcome = .ok, .device = st.devices[idx].?.ref() };
                         switch (c.use) {
-                            .sign_in => st.rotate(idx, c.hash, c.now),
+                            .sign_in => |si| {
+                                st.rotate(idx, si.new_hash, c.now);
+                                c.srv.auth_mutex.lockUncancelable(c.srv.io);
+                                c.srv.sessions.createFor(si.session, c.ip, c.srv.realMs(), c.res.device.?);
+                                c.srv.auth_mutex.unlock(c.srv.io);
+                            },
                             // Its secrets become tombstones, as for any
                             // other unpair: a later use is told "gone".
                             .unpair => _ = st.drop(idx),
@@ -1601,7 +1623,17 @@ pub const Server = struct {
                     .unknown => return false,
                 }
             }
-        }.op);
+        }.op) catch |err| {
+            if (res.outcome == .ok) switch (use) {
+                .sign_in => |si| {
+                    srv.auth_mutex.lockUncancelable(srv.io);
+                    srv.sessions.revoke(si.session, ip);
+                    srv.auth_mutex.unlock(srv.io);
+                },
+                .unpair => {},
+            };
+            return err;
+        };
         return res;
     }
 
@@ -1791,15 +1823,20 @@ pub const Server = struct {
         srv.newSecret(&secret) catch return srv.fail(conn, w, .internal_server_error, "no entropy\n");
         defer std.crypto.secureZero(u8, &secret);
 
-        const res = srv.checkCredential(presented, devices.ipOnly(peer), .sign_in, auth.hashSecret(&secret)) catch |err| {
+        var session_val: [auth.encoded_len]u8 = undefined;
+        srv.newSecret(&session_val) catch return srv.fail(conn, w, .internal_server_error, "no entropy\n");
+        defer std.crypto.secureZero(u8, &session_val);
+
+        const res = srv.checkCredential(presented, devices.ipOnly(peer), .{ .sign_in = .{ .new_hash = auth.hashSecret(&secret), .session = &session_val } }) catch |err| {
             srv.noteStoreFailure("device sign-in", peer, err);
             return srv.fail(conn, w, .internal_server_error, "device store unavailable\n");
         };
         const outcome = res.outcome;
         switch (outcome) {
             .ok => {
+                // The session already exists (created under the store lock).
                 var cookies: CookiePair = .{};
-                try srv.issueCookies(res.device.?, &secret, peer, &cookies);
+                try srv.cookieHeaders(res.device.?, &secret, &session_val, &cookies);
                 switch (mode) {
                     .page => return srv.redirect(conn, w, req, "/", &.{ cookies.device, cookies.session }),
                     .api => {
@@ -1908,7 +1945,7 @@ pub const Server = struct {
         } else if (h.device) |presented| {
             // No live session: the device credential identifies it
             // (checked like a sign-in, then removed).
-            res = srv.checkCredential(presented, devices.ipOnly(peer), .unpair, undefined) catch |err| {
+            res = srv.checkCredential(presented, devices.ipOnly(peer), .unpair) catch |err| {
                 srv.noteStoreFailure("unpair", peer, err);
                 return srv.fail(conn, w, .internal_server_error, "device store unavailable: the device was NOT unpaired\n");
             };
