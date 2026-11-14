@@ -420,7 +420,7 @@ pub fn textEdit(old: []const u8, new: []const u8) struct { deletes: usize, inser
     while (p < old.len and p < new.len and old[p] == new[p]) p += 1;
     // Back to a code point boundary in both.
     while (p > 0 and ((p < old.len and (old[p] & 0xC0) == 0x80) or (p < new.len and (new[p] & 0xC0) == 0x80))) p -= 1;
-    const removed = std.unicode.utf8CountCodepoints(old[p..]) catch old.len - p;
+    const removed = std.unicode.utf8CountCodepoints(old[p..]) catch (old.len - p);
     return .{ .deletes = removed, .insert = new[p..] };
 }
 

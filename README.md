@@ -451,7 +451,7 @@ delete it, with the exact source and Zig version that produced it:
 
 ```
 %LOCALAPPDATA%\Portal\releases\
-  20261111-185919_zig-0.18.0-dev.4+5a23bf4b2\  portal.exe  portalctl.exe  portal-show.exe  *.pdb  BUILD-INFO.txt  source\
+  20261114-104043_zig-0.18.0-dev.1005+75d48dfff\  portal.exe  portalctl.exe  portal-show.exe  *.pdb  BUILD-INFO.txt  source\
   current.txt      the release the launchers run
   known-good.txt   the release you confirmed works end to end
   history.txt      every promotion

@@ -5,7 +5,7 @@
     // tests. Pure Zig over std; no dependencies.
     .name = .portal_shared,
     .version = "0.1.0",
-    .minimum_zig_version = "0.18.0-dev.4+5a23bf4b2",
+    .minimum_zig_version = "0.18.0-dev.1005+75d48dfff",
     .fingerprint = 0xd25ebfa7ac0ea9e,
     .dependencies = .{},
     .paths = .{ "build.zig", "build.zig.zon", "root.zig", "screen.zig", "ws.zig", "http.zig", "pki", "tls13.zig" },

@@ -11,7 +11,7 @@
 //!
 //! Releases live OUTSIDE the repo (so `git clean` can't delete the safety copy):
 //!     %LOCALAPPDATA%\Portal\releases\
-//!         20261111-183000_zig-0.18.0-dev.4+5a23bf4b2\
+//!         20261114-104043_zig-0.18.0-dev.1005+75d48dfff\
 //!             portal.exe (the window, GUI subsystem), portalctl.exe (the
 //!             console tool), portal-show.exe (images, runs in sessions),
 //!             their .pdb files, BUILD-INFO.txt, source\

@@ -1,7 +1,7 @@
 .{
     .name = .portal_client,
     .version = "0.1.0",
-    .minimum_zig_version = "0.18.0-dev.4+5a23bf4b2",
+    .minimum_zig_version = "0.18.0-dev.1005+75d48dfff",
     .fingerprint = 0xd9ed1b14d35f6f61,
     .dependencies = .{
         // The owner's Renderer (Font, Window, Instanced2D): the de-facto

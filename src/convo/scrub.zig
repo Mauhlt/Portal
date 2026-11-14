@@ -241,7 +241,7 @@ fn pctAt(s: []const u8, j: usize) ?u8 {
     if (j + 3 > s.len or s[j] != '%') return null;
     const hi = hexVal(s[j + 1]) orelse return null;
     const lo = hexVal(s[j + 2]) orelse return null;
-    return hi << 4 | lo;
+    return (hi << 4) | lo;
 }
 
 /// One character of `s` at `j` (itself, `%XX`-encoded, or encoded twice
@@ -249,7 +249,7 @@ fn pctAt(s: []const u8, j: usize) ?u8 {
 fn charAt(s: []const u8, j: usize) ?struct { c: u8, len: usize } {
     if (j >= s.len) return null;
     if (pctAt(s, j)) |c| {
-        if (c == '%' and j + 5 <= s.len) if (hexVal(s[j + 3])) |hi| if (hexVal(s[j + 4])) |lo| return .{ .c = hi << 4 | lo, .len = 5 };
+        if (c == '%' and j + 5 <= s.len) if (hexVal(s[j + 3])) |hi| if (hexVal(s[j + 4])) |lo| return .{ .c = (hi << 4) | lo, .len = 5 };
         return .{ .c = c, .len = 3 };
     }
     return .{ .c = s[j], .len = 1 };

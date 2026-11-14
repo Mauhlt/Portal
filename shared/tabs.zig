@@ -76,7 +76,7 @@ pub fn parseId(text: []const u8) ?Id {
     for (0..id_len) |i| {
         const hi = hexDigit(text[2 * i]) orelse return null;
         const lo = hexDigit(text[2 * i + 1]) orelse return null;
-        out[i] = hi << 4 | lo;
+        out[i] = (hi << 4) | lo;
     }
     return out;
 }

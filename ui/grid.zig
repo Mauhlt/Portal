@@ -20,7 +20,7 @@ pub const color_default_bg_as_fg = theme.color_default_bg_as_fg;
 /// Default foreground used as a background (inverse video).
 pub const color_default_fg_as_bg = theme.color_default_fg_as_bg;
 
-pub const Attrs = packed struct(u8) {
+pub const Attrs = bitpack struct(u8) {
     bold: bool = false,
     dim: bool = false,
     italic: bool = false,
