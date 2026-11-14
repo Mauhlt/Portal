@@ -278,6 +278,9 @@ pub const Session = struct {
     pub fn writeLocal(s: *Session, data: []const u8) void {
         s.input_mutex.lockUncancelable(s.io);
         defer s.input_mutex.unlock(s.io);
+        // The desk may have pressed Enter (or erased the line): a device's
+        // next `!` counts as first on the line again (TextGuard).
+        if (data.len > 0) s.text_guard.at_line_start = true;
         var rest = data;
         while (rest.len > 0) {
             if (!s.input_open or s.input_closing.load(.acquire)) return;
@@ -713,4 +716,37 @@ test "hook states: same generation and convo paths as OSC 7501; OSC wins only wh
     try std.testing.expect(s.transcriptMovedOnLocked(false, true));
     mu.unlock(std.testing.io);
     try std.testing.expectEqual(vt.ProgramState.idle, s.state);
+}
+
+test "desk input puts the text guard back at the line's start" {
+    const w = @import("win32.zig");
+    var rd: w.HANDLE = undefined;
+    var wr: w.HANDLE = undefined;
+    if (w.CreatePipe(&rd, &wr, null, 1 << 16) == 0) return error.SkipZigTest;
+    defer _ = w.CloseHandle(rd);
+    defer _ = w.CloseHandle(wr);
+    var pty: Pty = .{ .hpc = undefined, .in_write = wr, .out_read = undefined, .process = undefined, .job = undefined };
+    var mu: Io.Mutex = .init;
+    var cv: Io.Condition = .init;
+    var s: Session = .{
+        .io = std.testing.io,
+        .mutex = &mu,
+        .cond = &cv,
+        .pty = &pty,
+        .console = undefined,
+        .policy = .text,
+        .term = try vt.Terminal.init(std.testing.allocator, 10, 5),
+        .size = .{ .cols = 10, .rows = 5 },
+    };
+    defer s.term.deinit();
+    s.writeWebText("ab");
+    try std.testing.expect(!s.text_guard.at_line_start);
+    // The owner presses Enter at the desk: a device's `!` is first again.
+    s.writeLocal("\r");
+    try std.testing.expect(s.text_guard.at_line_start);
+    s.writeWebText("!x");
+    var got: [16]u8 = undefined;
+    var r: w.DWORD = 0;
+    try std.testing.expect(w.ReadFile(rd, &got, got.len, &r, null) != 0);
+    try std.testing.expectEqualStrings("ab\rx", got[0..r]);
 }
