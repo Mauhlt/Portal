@@ -25,6 +25,8 @@
 //!            for tests
 //!   tunnelnet the in-process tunnel's addresses and ports (one definition)
 //!   bulk     the bulk WebSocket's request/reply messages (sync transfers)
+//!   projects projects a device may start (projects / project messages,
+//!            p: frames), their start modes and the request rate window
 
 pub const screen = @import("screen.zig");
 pub const ws = @import("ws.zig");
@@ -41,6 +43,7 @@ pub const subtabs = @import("subtabs.zig");
 pub const transport = @import("transport.zig");
 pub const tunnelnet = @import("tunnelnet.zig");
 pub const bulk = @import("bulk.zig");
+pub const projects = @import("projects.zig");
 
 test {
     _ = screen;
@@ -58,4 +61,5 @@ test {
     _ = transport;
     _ = tunnelnet;
     _ = bulk;
+    _ = projects;
 }

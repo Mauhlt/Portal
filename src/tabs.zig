@@ -2,11 +2,14 @@
 //! each a tab with its own session program in its own pseudo console and
 //! its own emulated screen (session.zig).
 //!
-//! The hub owns the list of open tabs. Only the desk opens tabs (the
-//! window's folder picker, `portal open <dir>` / `portalctl open <dir>`
-//! through the data directory, see OpenWatch in main.zig) and only the
-//! desk closes them; remote viewers can switch between open tabs (web.zig)
-//! but nothing they send can create or end one.
+//! The hub owns the list of open tabs. The desk opens tabs (the window's
+//! folder picker, `portal open <dir>` / `portalctl open <dir>` through
+//! the data directory, see OpenWatch in main.zig) and closes them. Remote
+//! viewers switch between open tabs (web.zig); the one thing they can
+//! start is a project the desk marked startable (`startable`, from
+//! settings.txt), by its exact name, in the desk's folder with the desk's
+//! program and a permission mode the desk chose (deviceStart), and the one
+//! thing they can end is a session a device started (deviceStop).
 //!
 //! Locking: `Hub.mutex` guards the list and, shared through
 //! Session.mutex, every tab's screen, so a viewer waits on one condition
@@ -47,6 +50,8 @@ const transcript = @import("convo/transcript.zig");
 const cmdline = @import("cmdline.zig");
 const childenv = @import("childenv.zig");
 const hookmsg = @import("hookmsg.zig");
+const projects_wire = @import("shared").projects;
+const settings = @import("settings.zig");
 
 pub const Id = wire.Id;
 pub const State = wire.State;
@@ -115,6 +120,16 @@ pub const Tab = struct {
     /// The `--session-id` Portal gave the agent for this launch (its
     /// transcript's name), if it gave one. Desktop-only.
     session_uuid: ?[36]u8 = null,
+    /// The paired device that started this tab (deviceStart), and the
+    /// permission mode it runs in; empty: started at the desk. Shown on
+    /// the desk's tab ("started by <device>") and logged; never sent.
+    started_by_buf: [64]u8 = undefined,
+    started_by_len: u8 = 0,
+    start_mode: ?projects_wire.Mode = null,
+    /// The device that stopped it (deviceStop); empty: none. Guarded by
+    /// hub.mutex.
+    stopped_by_buf: [64]u8 = undefined,
+    stopped_by_len: u8 = 0,
     /// This launch's PORTAL_TAB (random, 128 bits, not the tab's `id`):
     /// how `portalctl hook` names the tab (hookmsg.zig). Desktop-only:
     /// never logged, never sent to devices.
@@ -137,6 +152,24 @@ pub const Tab = struct {
 
     pub fn name(t: *const Tab) []const u8 {
         return t.name_buf[0..t.name_len];
+    }
+
+    /// The device that started this tab, or null (the desk did).
+    pub fn startedBy(t: *const Tab) ?[]const u8 {
+        return if (t.started_by_len == 0) null else t.started_by_buf[0..t.started_by_len];
+    }
+
+    /// Caller holds hub.mutex. The device that stopped it, or null.
+    pub fn stoppedByLocked(t: *const Tab) ?[]const u8 {
+        return if (t.stopped_by_len == 0) null else t.stopped_by_buf[0..t.stopped_by_len];
+    }
+
+    /// The desk's note on its tab ("started by iPhone", "stopping: asked by
+    /// iPhone"), "" for none. Caller holds hub.mutex.
+    pub fn deskNoteLocked(t: *const Tab, buf: []u8) []const u8 {
+        if (t.stoppedByLocked()) |d| return std.fmt.bufPrint(buf, "stopped by {s}", .{d}) catch "stopped by a device";
+        const by = t.startedBy() orelse return "";
+        return std.fmt.bufPrint(buf, "started by {s}{s}", .{ by, if (t.start_mode == .plan) " (plan)" else "" }) catch "started by a device";
     }
 
     pub fn fromSession(s: *Session) *Tab {
@@ -431,7 +464,26 @@ pub const Program = struct {
     /// The agent without a session chosen in its arguments: each tab's
     /// launch gets its own `--session-id <uuid>` (cmdline.wantsSessionId).
     session_id: bool = false,
+    /// Whether devices may start sessions of it (cmdline.deviceStart:
+    /// the agent, without a permissive flag); checked on every start.
+    device_start: cmdline.DeviceStart = .not_agent,
 };
+
+/// How a tab is opened (Hub.open).
+pub const OpenOptions = struct {
+    /// Mirror PTY output to the console (`portalctl run --console`, the
+    /// first tab only).
+    mirror: bool = false,
+    /// Started by a paired device (deviceStart): who, and the permission
+    /// mode the desk chose for the project. Null: the desk.
+    device: ?DeviceLaunch = null,
+};
+
+pub const DeviceLaunch = struct { by: []const u8, mode: projects_wire.Mode };
+
+/// What deviceStart did, and the tab it started or found (with a
+/// reference for the caller), so the viewer can be switched to it.
+pub const StartOutcome = struct { result: projects_wire.Result, tab: ?*Tab = null };
 
 pub const Hub = struct {
     gpa: Allocator,
@@ -443,6 +495,12 @@ pub const Hub = struct {
     program: Program,
     /// Tab colours chosen in settings.txt (`color = NAME #rrggbb`).
     colors: []const ColorChoice = &.{},
+    /// The projects devices may start (settings.txt `startable`, the one
+    /// source: set with setStartable whenever the file changes). Guarded
+    /// by `mutex`; `projects_gen` is bumped on every change.
+    startable: [settings.max_startable]settings.StartableEntry = undefined,
+    n_startable: usize = 0,
+    projects_gen: u64 = 1,
     /// The agent's transcript folder (`...\.claude\projects`), read for
     /// each tab's Conversation view; null: no conversations (the view says
     /// there is no transcript).
@@ -498,7 +556,7 @@ pub const Hub = struct {
 
     pub const ColorChoice = struct { name: []const u8, color: u32 };
 
-    pub const OpenError = error{ TooManyTabs, Finished, OutOfMemory, SpawnFailed };
+    pub const OpenError = error{ TooManyTabs, Finished, OutOfMemory, SpawnFailed, UnsafeProgram };
 
     fn notify(h: *Hub) void {
         if (h.notify_fn) |f| if (h.notify_ctx) |c| f(c);
@@ -520,7 +578,11 @@ pub const Hub = struct {
     /// Starts the configured program in `cwd` (null: Portal's own working
     /// directory) as a new tab named `name` (a display name, see
     /// displayName) and makes it the desk's tab.
-    pub fn open(h: *Hub, cwd: ?[:0]const u16, name: []const u8, mirror: bool) OpenError!*Tab {
+    pub fn open(h: *Hub, cwd: ?[:0]const u16, name: []const u8, opts: OpenOptions) OpenError!*Tab {
+        const mirror = opts.mirror;
+        // A device start never runs a program whose permission mode Portal
+        // can't pin to the desk's choice (cmdline.deviceStart).
+        if (opts.device != null and h.program.device_start != .ok) return error.UnsafeProgram;
         h.mutex.lockUncancelable(h.io);
         const full = h.n >= max_tabs;
         const done = h.finished;
@@ -572,6 +634,12 @@ pub const Hub = struct {
         const nl = @min(name.len, wire.max_name);
         @memcpy(t.name_buf[0..nl], name[0..nl]);
         t.name_len = @intCast(nl);
+        if (opts.device) |d| {
+            const bl = @min(d.by.len, t.started_by_buf.len);
+            @memcpy(t.started_by_buf[0..bl], d.by[0..bl]);
+            t.started_by_len = @intCast(bl);
+            t.start_mode = d.mode;
+        }
 
         // The agent gets this launch's own session id, so the tab's
         // transcript is exactly `<id>.jsonl`. Never logged, never sent:
@@ -594,7 +662,12 @@ pub const Hub = struct {
             };
             if (!std.mem.allEqual(u8, &t.hook_key, 0)) break;
         }
-        const line = (if (t.session_uuid) |*u| cmdline.withSessionId(h.gpa, h.program.cmdline, u) else h.gpa.dupeSentinel(u16, h.program.cmdline, 0)) catch {
+        // The launch's own arguments, decided in one place
+        // (cmdline.launchArgs): a device start's permission mode, the
+        // session id.
+        var arg_buf: [4][]const u8 = undefined;
+        const extra = cmdline.launchArgs(&arg_buf, if (opts.device) |d| d.mode.agentArg() else null, if (t.session_uuid) |*u| u else null);
+        const line = cmdline.withArgs(h.gpa, h.program.cmdline, extra) catch {
             t.session.term.deinit();
             h.gpa.destroy(t);
             return error.OutOfMemory;
@@ -658,12 +731,161 @@ pub const Hub = struct {
         h.tabs[h.n] = t;
         h.n += 1;
         h.gen +%= 1;
-        h.desk_active = t;
+        // A device start leaves the desk on the tab it shows.
+        if (opts.device == null or h.desk_active == null) h.desk_active = t;
         h.mutex.unlock(h.io);
         h.cond.broadcast(h.io);
         h.notify();
-        h.log.print("tab opened: '{s}' ({d} open)", .{ t.name(), h.count() });
+        if (t.startedBy()) |by|
+            h.log.print("tab opened: '{s}' ({d} open), started by device '{s}' (permission mode {s})", .{ t.name(), h.count(), by, t.start_mode.?.agentArg() })
+        else
+            h.log.print("tab opened: '{s}' ({d} open)", .{ t.name(), h.count() });
         return t;
+    }
+
+    // ------------------------------------------------- startable projects
+
+    /// The desk's startable list changed (settings.txt): devices are told.
+    pub fn setStartable(h: *Hub, list: []const settings.StartableEntry) void {
+        h.mutex.lockUncancelable(h.io);
+        const n = @min(list.len, h.startable.len);
+        var same = n == h.n_startable;
+        if (same) for (list[0..n], h.startable[0..n]) |*a, *b| {
+            if (!std.mem.eql(u8, a.name.get() orelse "", b.name.get() orelse "") or a.mode != b.mode or
+                !std.mem.eql(u8, a.path.get() orelse "", b.path.get() orelse "")) same = false;
+        };
+        if (!same) {
+            @memcpy(h.startable[0..n], list[0..n]);
+            h.n_startable = n;
+            h.projects_gen +%= 1;
+        }
+        h.mutex.unlock(h.io);
+        if (same) return;
+        h.cond.broadcast(h.io);
+        h.notify();
+        h.log.print("startable projects: {d} (settings.txt)", .{n});
+    }
+
+    /// Caller holds `mutex`. The open tab running startable entry `e`
+    /// (its folder), if any.
+    fn runningLocked(h: *Hub, e: *const settings.StartableEntry) ?*Tab {
+        const path = e.path.get() orelse return null;
+        for (h.tabs[0..h.n]) |t| if (settings.samePath(t.cwd, path)) return t;
+        return null;
+    }
+
+    /// Caller holds `mutex`. The startable list as devices see it: names,
+    /// colours, modes, whether each runs and may be stopped from a
+    /// device. Never a folder (privacy rule 1).
+    pub fn projectsLocked(h: *Hub, out: *projects_wire.List) void {
+        out.len = 0;
+        for (h.startable[0..h.n_startable]) |*e| {
+            const n = e.name.get() orelse continue;
+            const t = h.runningLocked(e);
+            var x: projects_wire.Entry = .{
+                .color = h.colorFor(n),
+                .mode = e.mode,
+                .running = t != null,
+                .stoppable = if (t) |tt| tt.started_by_len > 0 and tt.stopped_by_len == 0 else false,
+            };
+            x.setName(n);
+            out.items[out.len] = x;
+            out.len += 1;
+        }
+    }
+
+    /// `p:start <name>` from paired device `by` (web.zig has checked its
+    /// input mode and rate limit). Only an exact name of the desk's list
+    /// counts; nothing of the request but the name is used. Running: the
+    /// tab it runs in (switched). Otherwise the desk's program in the
+    /// desk's folder for it, with the desk's permission mode for it
+    /// (never a permissive one: cmdline.deviceStart), named as listed.
+    pub fn deviceStart(h: *Hub, name: []const u8, by: []const u8) StartOutcome {
+        h.mutex.lockUncancelable(h.io);
+        var entry: ?settings.StartableEntry = null;
+        for (h.startable[0..h.n_startable]) |*e| if (std.mem.eql(u8, e.name.get() orelse "", name)) {
+            entry = e.*;
+        };
+        const e = entry orelse {
+            h.mutex.unlock(h.io);
+            return .{ .result = .unknown };
+        };
+        if (h.runningLocked(&e)) |t| {
+            t.acquire();
+            h.mutex.unlock(h.io);
+            return .{ .result = .switched, .tab = t };
+        }
+        h.mutex.unlock(h.io);
+        const n = e.name.get().?;
+        if (h.program.device_start != .ok) {
+            var rb: [200]u8 = undefined;
+            h.log.print("device '{s}' asked to start '{s}': refused, {s}", .{ by, n, cmdline.deviceStartText(h.program.device_start, &rb) });
+            return .{ .result = .unsafe_program };
+        }
+        const path = e.path.get() orelse return .{ .result = .failed };
+        const ok_dir = blk: {
+            var d = Io.Dir.cwd().openDir(h.io, path, .{}) catch break :blk false;
+            d.close(h.io);
+            break :blk true;
+        };
+        if (!ok_dir) {
+            h.log.print("device '{s}' asked to start '{s}': its folder is not there any more", .{ by, n });
+            return .{ .result = .failed };
+        }
+        const cwd_w = std.unicode.wtf8ToWtf16LeAllocZ(h.gpa, path) catch return .{ .result = .failed };
+        defer h.gpa.free(cwd_w);
+        const t = h.open(cwd_w, n, .{ .device = .{ .by = by, .mode = e.mode } }) catch |err| {
+            h.log.print("device '{s}' asked to start '{s}': {t}", .{ by, n, err });
+            return .{ .result = switch (err) {
+                error.TooManyTabs => .too_many_tabs,
+                error.UnsafeProgram => .unsafe_program,
+                else => .failed,
+            } };
+        };
+        // A device start does not take the desk's own view away: the desk
+        // keeps the tab it shows (open made the new tab the desk's).
+        t.acquire();
+        return .{ .result = .started, .tab = t };
+    }
+
+    /// `p:stop <name>` from paired device `by` (input mode and rate limit
+    /// checked by web.zig): ends a session that a device started, the
+    /// same way the desk closes a tab (the program is asked to exit and
+    /// ended after close_timeout_ms). Sessions started at the desk are
+    /// only ever stopped there.
+    pub fn deviceStop(h: *Hub, name: []const u8, by: []const u8) projects_wire.Result {
+        h.mutex.lockUncancelable(h.io);
+        var found = false;
+        var tab: ?*Tab = null;
+        var started_here = false;
+        for (h.startable[0..h.n_startable]) |*e| if (std.mem.eql(u8, e.name.get() orelse "", name)) {
+            found = true;
+            if (h.runningLocked(e)) |t| {
+                if (t.started_by_len == 0) {
+                    started_here = true;
+                } else {
+                    t.acquire();
+                    tab = t;
+                    if (t.stopped_by_len == 0) {
+                        const bl = @min(by.len, t.stopped_by_buf.len);
+                        @memcpy(t.stopped_by_buf[0..bl], by[0..bl]);
+                        t.stopped_by_len = @intCast(bl);
+                        h.gen +%= 1;
+                        h.projects_gen +%= 1;
+                    }
+                }
+            }
+        };
+        h.mutex.unlock(h.io);
+        if (!found) return .unknown;
+        if (started_here) return .not_device_started;
+        const t = tab orelse return .not_running;
+        defer t.release();
+        h.cond.broadcast(h.io);
+        h.notify();
+        h.log.print("tab '{s}' stopped by device '{s}': asking its program to exit (ended after {d} s if it doesn't)", .{ t.name(), by, close_timeout_ms / 1000 });
+        t.requestClose();
+        return .stopped;
     }
 
     fn notifyThunk(ctx: *anyopaque) void {

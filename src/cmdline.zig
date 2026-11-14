@@ -144,20 +144,21 @@ pub fn resolve(
     return .{ .app = app, .cmdline = cmdline };
 }
 
-/// The agent (`claude`, `claude.exe`, `claude.cmd`, any case) whose
-/// configured arguments do not already pick a session (`--session-id`,
-/// `--resume`/`-r`, `--continue`/`-c`, in any `--x=v` form or short-flag
-/// group): Portal then gives each tab's launch its own `--session-id
-/// <uuid>`, so the tab's transcript is known exactly (src/convo/follow.zig).
-pub fn wantsSessionId(argv: []const []const u8) bool {
-    if (argv.len == 0) return false;
-    const base = std.fs.path.basenameWindows(argv[0]);
+/// The agent (`claude`, `claude.exe`, `claude.cmd`, any case, any folder).
+pub fn isAgent(argv0: []const u8) bool {
+    const base = std.fs.path.basenameWindows(argv0);
     const ok_names = [_][]const u8{ "claude", "claude.exe", "claude.cmd" };
-    var is_agent = false;
-    for (ok_names) |n| if (std.ascii.eqlIgnoreCase(base, n)) {
-        is_agent = true;
-    };
-    if (!is_agent) return false;
+    for (ok_names) |n| if (std.ascii.eqlIgnoreCase(base, n)) return true;
+    return false;
+}
+
+/// The agent whose configured arguments do not already pick a session
+/// (`--session-id`, `--resume`/`-r`, `--continue`/`-c`, in any `--x=v`
+/// form or short-flag group): Portal then gives each tab's launch its own
+/// `--session-id <uuid>`, so the tab's transcript is known exactly
+/// (src/convo/follow.zig).
+pub fn wantsSessionId(argv: []const []const u8) bool {
+    if (argv.len == 0 or !isAgent(argv[0])) return false;
     for (argv[1..]) |a| {
         if (std.mem.eql(u8, a, "--")) break;
         for ([_][]const u8{ "--session-id", "--resume", "--continue" }) |long| {
@@ -168,6 +169,71 @@ pub fn wantsSessionId(argv: []const []const u8) bool {
         }
     }
     return true;
+}
+
+/// Whether sessions may be started from a device with the desk's program
+/// setting (docs/tabs-design.md, "Starting projects from a device"): only
+/// the agent, whose permission mode Portal sets at launch
+/// (`--permission-mode default|plan`, launchArgs), and only when its
+/// configured arguments contain nothing that skips, widens or pre-answers
+/// permission prompts, or that picks a mode Portal would then fight with.
+pub const DeviceStart = union(enum) {
+    ok,
+    /// Not the agent: Portal can't fix its permission mode.
+    not_agent,
+    /// The configured arguments hold this flag (one of permissive_flags,
+    /// or anything `--dangerously-*` / `--allow-dangerously-*`).
+    permissive: []const u8,
+};
+
+/// Flags of the agent that make a session less careful than "ask for
+/// every edit and command", or that choose the mode themselves.
+pub const permissive_flags = [_][]const u8{
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+    "--permission-mode",
+    "--allowedTools",
+    "--allowed-tools",
+    "--permission-prompt-tool",
+};
+
+pub fn deviceStart(argv: []const []const u8) DeviceStart {
+    if (argv.len == 0 or !isAgent(argv[0])) return .not_agent;
+    for (argv[1..]) |a| {
+        if (std.mem.eql(u8, a, "--")) break;
+        const flag = if (std.mem.indexOfScalar(u8, a, '=')) |eq| a[0..eq] else a;
+        for (permissive_flags) |p| if (std.ascii.eqlIgnoreCase(flag, p)) return .{ .permissive = p };
+        if (std.ascii.startsWithIgnoreCase(flag, "--dangerously") or std.ascii.startsWithIgnoreCase(flag, "--allow-dangerously")) return .{ .permissive = "--dangerously-*" };
+    }
+    return .ok;
+}
+
+/// Why `deviceStart` refused, for the desk's log and panels.
+pub fn deviceStartText(d: DeviceStart, buf: []u8) []const u8 {
+    return switch (d) {
+        .ok => "",
+        .not_agent => "the program setting is not Claude Code, so Portal cannot make device starts ask for every edit and command",
+        .permissive => |f| std.fmt.bufPrint(buf, "the program setting contains {s}; device starts never run with permissive permissions", .{f}) catch "the program setting contains a permissive flag",
+    };
+}
+
+/// The one place a tab's launch arguments are decided (tabs.Hub.open):
+/// `--permission-mode <mode>` for a device start (the agent's value, from
+/// shared/projects.zig Mode.agentArg), then `--session-id <id>` when
+/// Portal picks the session. For withArgs.
+pub fn launchArgs(buf: *[4][]const u8, permission_mode: ?[]const u8, session_id: ?*const [36]u8) []const []const u8 {
+    var n: usize = 0;
+    if (permission_mode) |m| {
+        buf[n] = "--permission-mode";
+        buf[n + 1] = m;
+        n += 2;
+    }
+    if (session_id) |id| {
+        buf[n] = "--session-id";
+        buf[n + 1] = id;
+        n += 2;
+    }
+    return buf[0..n];
 }
 
 /// A random version 4 UUID, lower-case: `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`.
@@ -189,26 +255,78 @@ pub fn uuidV4(random: [16]u8) [36]u8 {
     return out;
 }
 
-/// `line` (a Resolved command line) with ` --session-id <id>` appended to
-/// the program's arguments: inside the quotes of a `cmd.exe /d /s /c "..."`
-/// line (a .cmd program), else at the end. The id is hex and dashes only,
-/// so it needs no quoting and is safe for cmd.exe.
-pub fn withSessionId(gpa: Allocator, line: []const u16, id: *const [36]u8) ![:0]u16 {
-    var extra: [14 + 36]u16 = undefined;
-    for (" --session-id ", 0..) |c, i| extra[i] = c;
-    for (id, 0..) |c, i| extra[14 + i] = c;
-    const add = extra[0 .. 14 + 36];
+/// `line` (a Resolved command line) with `args` appended to the
+/// program's arguments: inside the quotes of a `cmd.exe /d /s /c "..."`
+/// line (a .cmd program), else at the end. Each argument must be letters,
+/// digits and dashes only (Portal's own: a mode name, a UUID), so it needs
+/// no quoting and is safe for cmd.exe; anything else is refused.
+pub fn withArgs(gpa: Allocator, line: []const u16, args: []const []const u8) ![:0]u16 {
+    var add_len: usize = 0;
+    for (args) |a| {
+        if (a.len == 0) return error.UnsafeArgument;
+        for (a) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return error.UnsafeArgument;
+        add_len += 1 + a.len;
+    }
     const batch_prefix = std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"");
     const batch = std.mem.startsWith(u16, line, batch_prefix) and line.len > batch_prefix.len and line[line.len - 1] == '"';
     const cut = if (batch) line.len - 1 else line.len;
-    const out = try gpa.allocSentinel(u16, line.len + add.len, 0);
+    const out = try gpa.allocSentinel(u16, line.len + add_len, 0);
     @memcpy(out[0..cut], line[0..cut]);
-    @memcpy(out[cut..][0..add.len], add);
-    @memcpy(out[cut + add.len ..], line[cut..]);
+    var at = cut;
+    for (args) |a| {
+        out[at] = ' ';
+        at += 1;
+        for (a) |c| {
+            out[at] = c;
+            at += 1;
+        }
+    }
+    @memcpy(out[at..], line[cut..]);
     return out;
 }
 
+/// `line` with ` --session-id <id>` appended (withArgs).
+pub fn withSessionId(gpa: Allocator, line: []const u16, id: *const [36]u8) ![:0]u16 {
+    return withArgs(gpa, line, &.{ "--session-id", id });
+}
+
 const testing = std.testing;
+
+test "deviceStart: the agent only, never with a permissive flag" {
+    try testing.expect(deviceStart(&.{"claude"}) == .ok);
+    try testing.expect(deviceStart(&.{ "C:\\x\\claude.exe", "--model", "opus", "--verbose" }) == .ok);
+    try testing.expect(deviceStart(&.{"cmd.exe"}) == .not_agent);
+    try testing.expect(deviceStart(&.{}) == .not_agent);
+    try testing.expect(deviceStart(&.{"claude-code"}) == .not_agent);
+    for ([_][]const u8{
+        "--dangerously-skip-permissions",      "--allow-dangerously-skip-permissions", "--permission-mode",
+        "--permission-mode=bypassPermissions", "--PERMISSION-MODE",                    "--allowedTools",
+        "--allowed-tools=Bash",                "--permission-prompt-tool",             "--dangerously-anything-new",
+    }) |f| try testing.expect(deviceStart(&.{ "claude", "--model", "x", f, "acceptEdits" }) == .permissive);
+    // A prompt after "--" is not a flag.
+    try testing.expect(deviceStart(&.{ "claude", "--", "--dangerously-skip-permissions" }) == .ok);
+    var buf: [160]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, deviceStartText(deviceStart(&.{ "claude", "--permission-mode", "acceptEdits" }), &buf), "--permission-mode") != null);
+}
+
+test "launchArgs + withArgs: the permission mode, then the session id; nothing unsafe" {
+    const gpa = testing.allocator;
+    var ab: [4][]const u8 = undefined;
+    const id = "0123abcd-0000-4000-8000-00000000beef";
+    const a = launchArgs(&ab, "plan", id);
+    const plain = std.unicode.utf8ToUtf16LeStringLiteral("C:\\x\\claude.exe --model opus");
+    const got = try withArgs(gpa, plain, a);
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("C:\\x\\claude.exe --model opus --permission-mode plan --session-id 0123abcd-0000-4000-8000-00000000beef"), got);
+    const bat = std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"C:\\npm\\claude.cmd\"");
+    const got2 = try withArgs(gpa, bat, launchArgs(&ab, "default", null));
+    defer gpa.free(got2);
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe /d /s /c \"C:\\npm\\claude.cmd --permission-mode default\""), got2);
+    try testing.expectEqual(@as(usize, 0), launchArgs(&ab, null, null).len);
+    try testing.expectError(error.UnsafeArgument, withArgs(gpa, plain, &.{"a b"}));
+    try testing.expectError(error.UnsafeArgument, withArgs(gpa, plain, &.{"x&calc"}));
+    try testing.expectError(error.UnsafeArgument, withArgs(gpa, plain, &.{""}));
+}
 
 test "wantsSessionId: the agent only, and not when the arguments pick a session" {
     try testing.expect(wantsSessionId(&.{"claude"}));

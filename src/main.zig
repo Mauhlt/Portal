@@ -44,6 +44,7 @@ const Console = console_mod.Console;
 const Session = @import("session.zig").Session;
 const tabs = @import("tabs.zig");
 const tabs_wire = @import("shared").tabs;
+const projects_wire = @import("shared").projects;
 const openreq = @import("openreq.zig");
 const hookmsg = @import("hookmsg.zig");
 const hookpipe = @import("hookpipe.zig");
@@ -208,6 +209,16 @@ const usage =
     \\      approval click in the app. Also --key (print this device's
     \\      key), --status, --rollback PKG and --forget.
     \\
+    \\  portalctl startable add <folder> [--name NAME] [--mode ask|plan]
+    \\  portalctl startable remove <name>
+    \\  portalctl startable list
+    \\      The projects a paired device may start (settings.txt, the one
+    \\      place they are kept; a running Portal follows the file). Devices
+    \\      see the name only, never the folder. --mode is how a device
+    \\      start runs Claude Code: ask (default: every edit and command
+    \\      needs approval) or plan (read-only planning). In the window:
+    \\      Projects (Ctrl+Shift+J).
+    \\
     \\  portalctl version
     \\
 ;
@@ -265,6 +276,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "token")) fatal("access tokens were replaced by device pairing: run `portalctl pair <name>` (see `portalctl`)", .{});
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "open")) return cmdOpen(gpa, io, init.environ_map, args[1..]);
+    if (std.mem.eql(u8, cmd, "startable")) return cmdStartable(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "connect")) fatal("the remote viewer is a window: run `portal connect` (portal.exe)", .{});
     if (std.mem.eql(u8, cmd, "ca")) return cmdCa(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "show")) std.process.exit(@import("show.zig").main(gpa, io, args[1..]));
@@ -1126,6 +1138,90 @@ const Threads = struct {
     }
 };
 
+/// settings.txt, event-driven like StoreWatch: wakes when a file in the
+/// data folder is created, renamed or deleted (settings.save replaces the
+/// file by rename) and hands the startable projects to the hub, which
+/// tells devices if they changed. The file stays the one source; nothing
+/// polls.
+const SettingsWatch = struct {
+    hub: *tabs.Hub,
+    dir: []const u8,
+    io: Io,
+    gpa: Allocator,
+
+    fn watch(sw: *SettingsWatch) void {
+        var dw = fsutil.DirWatch.open(sw.gpa, sw.dir, .{}) catch |err| {
+            sw.hub.log.print("ERROR: cannot watch {s} for settings changes ({t}): startable projects change only when Portal restarts", .{ sw.dir, err });
+            return;
+        };
+        while (true) {
+            if (w.WaitForMultipleObjects(1, &[1]w.HANDLE{dw.h}, 0, w.INFINITE) != w.WAIT_OBJECT_0) return;
+            dw.rearm() catch return; // before reading: a change made meanwhile signals again
+            const s = settings.loadOrNull(sw.gpa, sw.io, sw.dir) orelse continue;
+            sw.hub.setStartable(s.startableSlice());
+        }
+    }
+};
+
+/// `portalctl startable add | remove | list`: edits settings.txt (the one
+/// place the list is kept); a running Portal follows the file.
+fn cmdStartable(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
+    const paths = devicePaths(gpa, io, env) catch |err| fatal("cannot find the data directory: {t}", .{err});
+    const sub = if (args.len > 0) args[0] else "list";
+    var s = settings.loadOrNull(gpa, io, paths.dir) orelse fatal("{s}\\{s} exists but can't be read; nothing changed", .{ paths.dir, settings.file_name });
+    if (std.mem.eql(u8, sub, "list")) {
+        if (s.n_startable == 0) std.debug.print("no projects are startable from devices\n", .{});
+        for (s.startableSlice()) |*e| std.debug.print("{s}  ({s})  {s}\n", .{ e.name.get() orelse "", e.mode.wire(), e.path.get() orelse "" });
+        return;
+    }
+    if (std.mem.eql(u8, sub, "add")) {
+        if (args.len < 2) fatal("usage: portalctl startable add <folder> [--name NAME] [--mode ask|plan]", .{});
+        var name: ?[]const u8 = null;
+        var mode: projects_wire.Mode = .ask;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (i + 1 >= args.len) fatal("{s} needs a value", .{args[i]});
+            if (std.mem.eql(u8, args[i], "--name")) {
+                name = args[i + 1];
+            } else if (std.mem.eql(u8, args[i], "--mode")) {
+                mode = projects_wire.Mode.fromWire(args[i + 1]) orelse fatal("--mode must be ask or plan (device starts never use a permissive mode)", .{});
+            } else fatal("unknown option {s}", .{args[i]});
+            i += 1;
+        }
+        const folder = proc_abs: {
+            const f = args[1];
+            if (std.fs.path.isAbsolute(f)) break :proc_abs try gpa.dupe(u8, f);
+            const here = try std.process.currentPathAlloc(io, gpa);
+            defer gpa.free(here);
+            break :proc_abs try std.fs.path.resolve(gpa, &.{ here, f });
+        };
+        defer gpa.free(folder);
+        {
+            var d = Io.Dir.cwd().openDir(io, folder, .{}) catch fatal("{s} is not an existing folder", .{folder});
+            d.close(io);
+        }
+        var nb: [tabs_wire.max_name]u8 = undefined;
+        const n = name orelse tabs.displayName(folder, env.get("USERPROFILE"), env.get("USERNAME"), &nb);
+        s.addStartable(n, mode, folder) catch |err| fatal("not added: {s}", .{switch (err) {
+            error.BadName => "the name must be 1-64 bytes of printable text without \\ / : | \" and not start with - or .",
+            error.BadFolder => "the folder must be an absolute path",
+            error.Duplicate => "that name or folder is already startable",
+            error.Full => "the list is full",
+        }});
+        try settings.save(gpa, io, paths.dir, &s);
+        std.debug.print("startable from devices: {s} ({s})\n", .{ n, mode.wire() });
+        return;
+    }
+    if (std.mem.eql(u8, sub, "remove")) {
+        if (args.len != 2) fatal("usage: portalctl startable remove <name>", .{});
+        if (!s.removeStartable(args[1])) fatal("no startable project is named {s}", .{args[1]});
+        try settings.save(gpa, io, paths.dir, &s);
+        std.debug.print("removed: {s}\n", .{args[1]});
+        return;
+    }
+    fatal("usage: portalctl startable add <folder> [--name NAME] [--mode ask|plan] | remove <name> | list", .{});
+}
+
 /// `portal open` / `portalctl open` requests (openreq.zig) for the running
 /// Portal: each opens a tab.
 const OpenWatch = struct {
@@ -1248,11 +1344,12 @@ pub fn openFolder(gpa: Allocator, hub: *tabs.Hub, env: *const std.process.Enviro
         tabs.displayName(dir, env.get("USERPROFILE"), env.get("USERNAME"), &nb);
     const cwd_w = std.unicode.wtf8ToWtf16LeAllocZ(gpa, dir) catch return "bad folder name";
     defer gpa.free(cwd_w);
-    _ = hub.open(cwd_w, tab_name, false) catch |err| return switch (err) {
+    _ = hub.open(cwd_w, tab_name, .{}) catch |err| return switch (err) {
         error.TooManyTabs => "too many tabs are open",
         error.Finished => "Portal is shutting down",
         error.OutOfMemory => "out of memory",
         error.SpawnFailed => "the program could not be started there",
+        error.UnsafeProgram => unreachable, // only device starts check it
     };
     return null;
 }
@@ -1479,7 +1576,13 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .log = &log,
         .console = &console,
         .policy = cfg.policy,
-        .program = .{ .app = resolved.app, .cmdline = resolved.cmdline, .command_name = std.fs.path.basename(command[0]), .session_id = cmdline.wantsSessionId(command) },
+        .program = .{
+            .app = resolved.app,
+            .cmdline = resolved.cmdline,
+            .command_name = std.fs.path.basename(command[0]),
+            .session_id = cmdline.wantsSessionId(command),
+            .device_start = cmdline.deviceStart(command),
+        },
         .colors = saved.colorChoices(&colors_buf),
         .convo_projects = convoProjects(gpa, env),
         .user_name = env.get("USERNAME"),
@@ -1487,6 +1590,13 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .size = initial,
         .sysmon_on = saved.system_monitor orelse false,
     };
+    // The projects devices may start (settings.txt; SettingsWatch follows
+    // the file from here on).
+    hub.setStartable(saved.startableSlice());
+    if (hub.program.device_start != .ok) {
+        var rb: [200]u8 = undefined;
+        log.print("start: devices cannot start projects: {s}", .{cmdline.deviceStartText(hub.program.device_start, &rb)});
+    }
     if (host) |h| h.attach(hub);
     // The optional system monitor: samples nothing unless the setting is
     // on and a System panel is open (sysmon.zig).
@@ -1505,7 +1615,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         const d = dir_utf8 orelse break :blk "Project";
         break :blk tabs.displayName(d, env.get("USERPROFILE"), env.get("USERNAME"), &first_name_buf);
     };
-    const first = hub.open(cwd_w, first_name, opts.console) catch |err|
+    const first = hub.open(cwd_w, first_name, .{ .mirror = opts.console }) catch |err|
         fatal("could not start '{s}': {t}", .{ command[0], err });
     // From here on the child is running. Exit only via fatal()/ExitProcess:
     // process exit closes the job handles, which kills every tab's tree.
@@ -1612,6 +1722,12 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         ot.detach();
         // Agent hooks: a current-user-only local pipe.
         HookWatch.start(gpa, hub, &log, dir);
+        // settings.txt: the startable projects follow the file.
+        const setw = gpa.create(SettingsWatch) catch fatal("out of memory", .{});
+        setw.* = .{ .hub = hub, .dir = dir, .io = io, .gpa = gpa };
+        const swt = std.Thread.spawn(.{}, SettingsWatch.watch, .{setw}) catch |err|
+            fatal("cannot start the settings watcher thread: {t}", .{err});
+        swt.detach();
     }
 
     // Two ways Portal ends, kept apart:

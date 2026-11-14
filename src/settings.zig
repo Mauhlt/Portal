@@ -11,6 +11,7 @@
 //!   cwd = C:\code\acme-api
 //!   color = acme-api #3366cc
 //!   system_monitor = on
+//!   startable = acme-api | ask | C:\code\acme-api
 //!
 //! One `key = value` per line; blank lines and lines starting with '#' are
 //! ignored, so are unknown keys and values that are too long. `program` is
@@ -19,6 +20,15 @@
 //! configured, the window asks for one. `system_monitor` (`on` / `off`,
 //! default off) shows the System button and lets the system monitor
 //! sample while a System panel is open (sysmon.zig).
+//!
+//! `startable = NAME | MODE | FOLDER` (one line each, at most
+//! projects.max_projects): the projects a paired device may start
+//! (docs/tabs-design.md, "Starting projects from a device"), keyed by
+//! their display name. MODE is the device start's permission mode, `ask`
+//! (every edit and command needs approval) or `plan` (read-only
+//! planning). The folder never leaves the desktop: devices only ever see
+//! the name. This file is the one place the list is kept; the running
+//! Portal reloads it when the file changes (main.zig, SettingsWatch).
 //!
 //! Speech input (the Audio panel): `speech_model` is the stt model file
 //! (default: speech.defaultModel, models\ggml-base.en.bin in the data
@@ -35,6 +45,7 @@ const keymap = @import("keymap.zig");
 const fsutil = @import("fsutil.zig");
 const tabs_wire = @import("shared").tabs;
 const speech_limits = @import("speech").limits;
+const projects_wire = @import("shared").projects;
 
 pub const file_name = "settings.txt";
 
@@ -48,6 +59,18 @@ pub const max_model = 1024;
 pub const max_mic = 256;
 /// Tab colour choices (`color = NAME #rrggbb`, one line each).
 pub const max_colors = 16;
+
+/// Projects a device may start (`startable = NAME | MODE | FOLDER`).
+pub const max_startable = projects_wire.max_projects;
+
+pub const StartableEntry = struct {
+    name: Str(max_project) = .{},
+    mode: projects_wire.Mode = .ask,
+    /// Absolute folder (desk-side only, never sent).
+    path: Str(max_cwd) = .{},
+};
+
+pub const StartableError = error{ BadName, BadFolder, Duplicate, Full };
 
 pub const ColorEntry = struct {
     name: Str(max_project) = .{},
@@ -105,6 +128,44 @@ pub const Settings = struct {
     /// Tab colours overriding the one derived from the name.
     colors: [max_colors]ColorEntry = undefined,
     n_colors: usize = 0,
+    /// Projects devices may start, in the order added.
+    startable: [max_startable]StartableEntry = undefined,
+    n_startable: usize = 0,
+
+    pub fn startableSlice(s: *const Settings) []const StartableEntry {
+        return s.startable[0..s.n_startable];
+    }
+
+    /// The entry named `name` (exactly: names are what devices send).
+    pub fn findStartable(s: *const Settings, name: []const u8) ?usize {
+        for (s.startable[0..s.n_startable], 0..) |*e, i| if (std.mem.eql(u8, e.name.get() orelse "", name)) return i;
+        return null;
+    }
+
+    /// Marks `folder` (absolute) startable from devices as `name`. A name
+    /// already in the list (any case) or a folder already in it is a
+    /// Duplicate.
+    pub fn addStartable(s: *Settings, name: []const u8, mode: projects_wire.Mode, folder: []const u8) StartableError!void {
+        if (!projects_wire.startableName(name)) return error.BadName;
+        if (!std.fs.path.isAbsoluteWindows(folder) or std.mem.indexOfAny(u8, folder, "|\r\n") != null or folder.len > max_cwd) return error.BadFolder;
+        for (s.startable[0..s.n_startable]) |*e| {
+            if (std.ascii.eqlIgnoreCase(e.name.get() orelse "", name)) return error.Duplicate;
+            if (samePath(e.path.get() orelse "", folder)) return error.Duplicate;
+        }
+        if (s.n_startable == max_startable) return error.Full;
+        var e: StartableEntry = .{ .mode = mode };
+        if (!e.name.set(name) or !e.path.set(folder)) return error.BadFolder;
+        s.startable[s.n_startable] = e;
+        s.n_startable += 1;
+    }
+
+    /// Removes the entry named `name`; false if there was none.
+    pub fn removeStartable(s: *Settings, name: []const u8) bool {
+        const i = s.findStartable(name) orelse return false;
+        std.mem.copyForwards(StartableEntry, s.startable[i .. s.n_startable - 1], s.startable[i + 1 .. s.n_startable]);
+        s.n_startable -= 1;
+        return true;
+    }
 
     /// The colour choices for tabs.Hub (names point into `s`).
     pub fn colorChoices(s: *const Settings, buf: *[max_colors]@import("tabs.zig").Hub.ColorChoice) []const @import("tabs.zig").Hub.ColorChoice {
@@ -156,6 +217,14 @@ pub const Settings = struct {
                 if (!s.speech.set(name, val) and !removedSpeechKey(name) and s.n_speech_extra < s.speech_extra.len) {
                     if (s.speech_extra[s.n_speech_extra].set(line)) s.n_speech_extra += 1;
                 }
+            } else if (std.mem.eql(u8, key, "startable")) {
+                // NAME | MODE | FOLDER; a bad line is ignored (and so
+                // dropped on the next save).
+                var parts = std.mem.splitScalar(u8, val, '|');
+                const name = std.mem.trim(u8, parts.next() orelse continue, " \t");
+                const mode = projects_wire.Mode.fromWire(std.mem.trim(u8, parts.next() orelse continue, " \t")) orelse continue;
+                const folder = std.mem.trim(u8, parts.rest(), " \t");
+                s.addStartable(name, mode, folder) catch continue;
             } else if (std.mem.eql(u8, key, "color")) {
                 // NAME #rrggbb: the name may contain spaces.
                 const sp = std.mem.lastIndexOfScalar(u8, val, ' ') orelse continue;
@@ -190,6 +259,9 @@ pub const Settings = struct {
         for (s.colors[0..s.n_colors]) |*c| {
             const name = c.name.get() orelse continue;
             try out.print("color = {s} {s}\r\n", .{ name, &tabs_wire.colorHex(c.color) });
+        }
+        for (s.startable[0..s.n_startable]) |*e| {
+            try out.print("startable = {s} | {s} | {s}\r\n", .{ e.name.get() orelse continue, e.mode.wire(), e.path.get() orelse continue });
         }
     }
 };
@@ -241,8 +313,9 @@ pub fn loadOrNull(gpa: std.mem.Allocator, io: Io, dir: []const u8) ?Settings {
 
 /// Writes `<dir>\settings.txt` atomically (a temporary file renamed over it).
 pub fn save(gpa: std.mem.Allocator, io: Io, dir: []const u8, s: *const Settings) !void {
-    var buf: [8192]u8 = undefined;
-    var out: Io.Writer = .fixed(&buf);
+    const buf = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(buf);
+    var out: Io.Writer = .fixed(buf);
     try s.format(&out);
     const path = try std.fs.path.join(gpa, &.{ dir, file_name });
     defer gpa.free(path);
@@ -251,6 +324,27 @@ pub fn save(gpa: std.mem.Allocator, io: Io, dir: []const u8, s: *const Settings)
         error.ReplaceFailed => error.SettingsWriteFailed,
         else => err,
     };
+}
+
+/// Two Windows folders are the same: case-insensitive, `/` as `\`,
+/// trailing separators ignored. (Desk-side only: for the startable list
+/// and whether one of its projects runs in a tab.)
+pub fn samePath(a: []const u8, b: []const u8) bool {
+    const x = trimSeps(a);
+    const y = trimSeps(b);
+    if (x.len != y.len or x.len == 0) return false;
+    for (x, y) |c, d| {
+        const cc = if (c == '/') '\\' else std.ascii.toLower(c);
+        const dd = if (d == '/') '\\' else std.ascii.toLower(d);
+        if (cc != dd) return false;
+    }
+    return true;
+}
+
+fn trimSeps(p: []const u8) []const u8 {
+    var q = p;
+    while (q.len > 3 and (q[q.len - 1] == '\\' or q[q.len - 1] == '/')) q = q[0 .. q.len - 1];
+    return q;
 }
 
 pub const SplitError = error{ EmptyCommand, UnterminatedQuote, TooManyArguments, CommandTooLong };
@@ -432,6 +526,52 @@ test "settings save and load" {
     // Missing file: empty settings.
     const none = load(gpa, io, "C:\\definitely\\not\\here");
     try testing.expect(none.program.get() == null);
+}
+
+test "settings: startable projects parse, format and edit" {
+    const text =
+        \\startable = acme api | ask | C:\code\acme api
+        \\startable = Beta|plan|D:\work\beta\
+        \\startable = bad mode | bypassPermissions | C:\x
+        \\startable = C:\code\evil | ask | C:\code\evil
+        \\startable = relative | ask | code\rel
+        \\startable = ACME API | ask | C:\elsewhere
+        \\startable = dup folder | ask | c:/code/ACME API/
+        \\startable = missing
+    ;
+    var s = Settings.parse(text);
+    try testing.expectEqual(@as(usize, 2), s.n_startable);
+    try testing.expectEqualStrings("acme api", s.startable[0].name.get().?);
+    try testing.expectEqual(projects_wire.Mode.ask, s.startable[0].mode);
+    try testing.expectEqualStrings("C:\\code\\acme api", s.startable[0].path.get().?);
+    try testing.expectEqual(projects_wire.Mode.plan, s.startable[1].mode);
+    try testing.expectEqual(@as(?usize, 1), s.findStartable("Beta"));
+    try testing.expect(s.findStartable("beta") == null);
+    var buf: [4096]u8 = undefined;
+    var out: Io.Writer = .fixed(&buf);
+    try s.format(&out);
+    const again = Settings.parse(out.buffered());
+    try testing.expectEqual(@as(usize, 2), again.n_startable);
+    try testing.expectEqualStrings("D:\\work\\beta\\", again.startable[1].path.get().?);
+    try testing.expectError(error.Duplicate, s.addStartable("other", .ask, "d:/WORK/beta"));
+    try testing.expectError(error.BadName, s.addStartable("--dangerously-skip-permissions", .ask, "C:\\y"));
+    try testing.expectError(error.BadName, s.addStartable("C:\\y", .ask, "C:\\y"));
+    try testing.expectError(error.BadFolder, s.addStartable("y", .ask, "y"));
+    try s.addStartable("gamma", .plan, "C:\\g");
+    try testing.expect(s.removeStartable("acme api"));
+    try testing.expect(!s.removeStartable("acme api"));
+    try testing.expectEqualStrings("Beta", s.startable[0].name.get().?);
+    try testing.expectEqualStrings("gamma", s.startable[1].name.get().?);
+    while (s.n_startable < max_startable) {
+        var nb: [16]u8 = undefined;
+        var pb: [16]u8 = undefined;
+        const n = try std.fmt.bufPrint(&nb, "p{d}", .{s.n_startable});
+        try s.addStartable(n, .ask, try std.fmt.bufPrint(&pb, "C:\\p{d}", .{s.n_startable}));
+    }
+    try testing.expectError(error.Full, s.addStartable("one more", .ask, "C:\\more"));
+    try testing.expect(samePath("C:\\A\\b\\", "c:/a/B"));
+    try testing.expect(!samePath("C:\\a", "C:\\ab"));
+    try testing.expect(!samePath("", ""));
 }
 
 test "splitCommand" {
