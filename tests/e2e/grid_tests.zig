@@ -9,29 +9,12 @@ const client = @import("client.zig");
 const pairing = @import("pairing.zig");
 const Runner = @import("runner.zig").Runner;
 
-const get = client.get;
-
 pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
     const dir = try h.dataDir("grid");
     const inst = try proc.Instance.start(h, dir, port, &pairing.ping_child);
     defer inst.kill();
     const creds = try client.pair(inst, "laptop");
     const sess = creds.sessionCookie();
-
-    {
-        var resp = try get(inst, "/", sess);
-        defer resp.deinit();
-        _ = r.check("viewer page served, no xterm", resp.status == 200 and !resp.bodyContains("xterm"), "{d}", .{resp.status});
-        var js = try get(inst, "/static/app.js", sess);
-        defer js.deinit();
-        _ = r.check("app.js served as javascript", js.status == 200 and std.mem.startsWith(u8, js.header("content-type") orelse "", "text/javascript"), "{d}", .{js.status});
-        var css = try get(inst, "/static/app.css", null);
-        defer css.deinit();
-        _ = r.check("app.css served", css.status == 200, "{d}", .{css.status});
-        var x = try get(inst, "/static/xterm.js", sess);
-        defer x.deinit();
-        _ = r.check("xterm.js no longer served", x.status == 404, "{d}", .{x.status});
-    }
 
     var dump_buf: [4096]u8 = undefined;
     const v = try client.Viewer.open(inst, sess);

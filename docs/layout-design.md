@@ -1,8 +1,8 @@
 # Layout: slices on every platform
 
 **Owner decision (2026-11-12, revised the same day):** every device (the
-desktop window, the laptop viewer `portal connect`, the iPhone / browser
-page) uses the same layout: three slices stacked **vertically**, under the
+desktop window, the laptop viewer `portal connect`, the iPhone app) uses
+the same layout: three slices stacked **vertically**, under the
 top bar.
 
 ```
@@ -63,15 +63,12 @@ top bar.
 * Native windows (the desk and the native remote viewers, owner decisions
   2026-11-12): only the **Instruct** button; it opens the **instruct
   panel** (the instruction line with Send, dictation, a compact key row;
-  see "Only Instruct at the bottom" below). The browser keeps its answer
-  buttons (Yes, No, 1–3, Esc, Enter), input box and Send. Typed, Apple
+  see "Only Instruct at the bottom" below). Typed, Apple
   dictation on the iPhone, or the local NPU transcriber later
   (docs/audio-design.md).
 * Large enough to see and tap: native windows draw the buttons and the box
   with a 16 px font (`TermView.action_em`, the rest of the chrome is 13 px),
-  the buttons all the same width; the browser uses 52 px buttons on touch
-  screens (two rows of four on phones narrower than ~400 px), 44 px with a
-  mouse, and 18 px labels.
+  the buttons all the same width.
 * Send behaviour: answer words become keys; anything else is a checked
   instruction line (`l:`), using instruct mode, the default.
 * **The desk matches the devices** (owner decision, 2026-11-12): its
@@ -154,7 +151,7 @@ keeps the terminal. In the Conversation view the window is minimal:
 * **Only Instruct at the bottom, in both views** (owner decision,
   2026-11-12, for the native remote viewers: `portal connect` on a laptop
   or Surface, and the iPhone app; the desk got the same bottom later that
-  day, see "② Interaction"; the browser keeps its button row): no answer
+  day, see "② Interaction"): no answer
   bar, no Yes / No / 1 / 2 / 3 buttons, and the **instruction line is
   hidden**. **Instruct** opens the **instruct panel**
   (`Shell.instructBottom`): a row with Dictate / "● Listening…"
@@ -213,15 +210,13 @@ keeps the terminal. In the Conversation view the window is minimal:
 ## Terminal scaling (viewers)
 
 The remote grid's size is the desk's. A viewer picks its cell size from the
-terminal slice and the grid's dimensions (`TermView.fitEm`,
-`src/wasm/layout.zig` fit):
+terminal slice and the grid's dimensions (`TermView.fitEm`):
 
 * the cell size at which the **columns fill the slice width**;
 * made smaller so every row fits too, but **not below a readable size**
   (12 logical / CSS px);
 * if the rows still do not fit, the view shows the lowest rows with content,
-  keeping the cursor in view (`followTop` / `followPan`); in the browser,
-  panning by hand stops following until Fit;
+  keeping the cursor in view (`followTop` / `followPan`);
 * the grid is top-aligned and centred across: no empty band above it.
 
 It is recomputed on every resize and every grid size change (event-driven).
@@ -235,11 +230,6 @@ The desk itself keeps a fixed font and sizes the PTY to its terminal slice.
   line; a modal panel layer over all of them; a single focus owner per host.
   The feed: `client/src/dataview.zig`, used by `portal connect` and the
   desk window (src/gui.zig).
-* Browser: `src/wasm/slices.zig` computes the four rects (header, terminal,
-  data, interaction) from the visual viewport; on a short screen with the
-  keyboard open it sheds the header and the Data slice first. The page
-  (`src/web/index.html`, `app.css`) only places what wasm decides; `app.js`
-  stays logic-free.
 * Data frames reuse the image path ('I'/'P'), plus later typed data frames
   with explicit size limits.
 * Interaction is one manner on every device: the input policy, the key

@@ -239,8 +239,8 @@ pub const DataItem = struct {
 /// The Data slice (docs/layout-design.md): a strip under the main slice,
 /// full width. Its header line is always there ("Data · nothing yet", the
 /// Hide/Show and Clear buttons); below it the items, newest first, left to
-/// right. Its height follows `dataHeight` (module "datafeed"'s rule, shared
-/// with the browser): just the header while empty or collapsed, growing
+/// right. Its height follows `dataHeight` (module "datafeed"'s rule): just
+/// the header while empty or collapsed, growing
 /// with the items up to datafeed.max_share. Images are looked up by id in
 /// `images` (a store separate from the grid's, so its ids never collide
 /// with the terminal's images).

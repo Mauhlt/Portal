@@ -1,7 +1,7 @@
 //! Module "imgcheck": Portal's inline-image policy on top of the owner's
 //! image checker, `Image.check` (module "ImageCheck": format detection and
 //! strict, allocation-free structural validation for every format Image
-//! knows, std only, also built for wasm32).
+//! knows, std only).
 //!
 //! This file holds only Portal's choices: which format is accepted and the
 //! limits. Inline images are PNG (kitty graphics `f=100`), and every check
@@ -11,7 +11,7 @@
 //!   * src/vt_gfx.zig, when a program in the session finishes transmitting
 //!     an image, so nothing malformed or oversized is stored or forwarded;
 //!   * imgdec.zig, before handing bytes to Image's PNG decoder;
-//!   * the browser client (src/wasm/proto.zig) and the view, for sizes.
+//!   * the view, for sizes.
 //! Also re-exports the checker's PNG test fixtures (`testImage`, ...).
 
 const std = @import("std");

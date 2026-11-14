@@ -27,11 +27,6 @@ const Allocator = std.mem.Allocator;
 const width = @import("Font").wcwidth; // the Renderer's Font module
 /// Inline images (kitty graphics subset): store, placements, wire frames.
 pub const gfx = @import("vt_gfx.zig");
-/// Cell width of a code point (0, 1 or 2). Public so the browser client
-/// (src/wasm), which imports this file as a module, lays out wide
-/// characters with exactly the table the emulator used.
-pub const cellWidth = width.of;
-
 pub const min_dim: u16 = 1;
 pub const max_dim: u16 = 1000;
 pub const max_params = 16;

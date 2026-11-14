@@ -8,9 +8,8 @@
   One renderer (Vulkan, the owner's Renderer), one UI, one network client.
   The iPhone section adds only what iOS needs: MoltenVK, a UIKit window
   backend, the app bundle and signing.
-* The Safari/wasm browser app and the Renderer CPU backend are dropped. The
-  browser app stays only until the native app is installed on the phone, then
-  `src/wasm/` and the web app assets are removed.
+* The Safari/wasm browser app and the Renderer CPU backend are dropped
+  (the browser client is removed).
 
 ## Structure: shared core, thin device sections
 
@@ -363,6 +362,4 @@ account the tunnel extension against the desk.
 1. Run on the iPhone; fix what the list above finds.
 2. WireGuard key delivery + desk confirm step (section 6), then
    `tunnel.configure` from pairing.
-3. Remove `src/wasm/` and the web app assets once the native app is the
-   phone's client (owner decision above).
-4. Flip build.zig.zon back to ../Renderer when `ios-window` is merged.
+3. Flip build.zig.zon back to ../Renderer when `ios-window` is merged.

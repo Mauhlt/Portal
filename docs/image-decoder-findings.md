@@ -80,9 +80,8 @@ Table lookups indexed arrays with the `u64` bit buffer (`d.pre[b.buf &
 mask(pre_bits)]` and 13 more sites), a compile error where `usize` is 32
 bits. image-check indexes through a `low(buf, n)` helper that truncates
 the masked value to `usize` (free on 64-bit). The PNG decoder now
-compiles for wasm32-freestanding, so the browser client decodes inline
-images like the window and `portal connect` do (`src/wasm/proto.zig`,
-`decoder_available`), within its 96 MiB / 1024 px budget.
+compiles for wasm32-freestanding (Portal's browser client used that; it
+has since been removed).
 
 ### 2. A ~50-byte file can make the decoder try to allocate tens of GiB
 
@@ -117,9 +116,6 @@ step.
 
 
 `info.zig` and `root.zig` carry a `vk.Format` field, so decoding a PNG
-pulls in the `Vulkan` module. Natively Portal uses your published
-`Image` module as is. For wasm32 it builds a module from the same
-`src/root.zig` with a stub `Vulkan` that has only `Format`
-(`client/src/image/vk_stub.zig`), so the bindings never enter the browser
-build. A small `Format`-free "codecs" module in Image would remove the
-need for the stub. That is optional.
+pulls in the `Vulkan` module. Portal uses your published `Image` module
+as is (every Portal build has Vulkan anyway, now that the wasm browser
+client and its stub `Vulkan` are gone).

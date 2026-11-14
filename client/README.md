@@ -92,7 +92,7 @@ zig build -Dtarget=aarch64-macos
 | `src/keys.zig` | Protocol key names per `hello.input` mode. |
 | `src/remote.zig` | `RemoteSink` (InputSink → protocol frames) and the overlay (pairing screen, status). |
 | `src/net/` | `http.zig` (requests, strict response/Set-Cookie parsing), `client.zig` (connection thread), `tlsconn.zig` (TCP/TLS connection, certificate gate), `x509check.zig` (bounds-checked certificate checks, PEM, fingerprints), `pin.zig` (per-server pinned CA files), `watchdog.zig` (deadlines). |
-| `../shared/` | **Module `shared`** (a path dependency, also used by Portal's server and browser client): `screen.zig` (the 'G'/'I'/'P' frame decoder), `ws.zig` (WebSocket framing), `http.zig` (header syntax, cookie names), `pki/` (DER, certificate reading, PEM, fingerprints), `tls13.zig` (TLS 1.3 record protection). |
+| `../shared/` | **Module `shared`** (a path dependency, also used by Portal's server and e2e tests): `screen.zig` (the 'G'/'I'/'P' frame decoder), `ws.zig` (WebSocket framing), `http.zig` (header syntax, cookie names), `pki/` (DER, certificate reading, PEM, fingerprints), `tls13.zig` (TLS 1.3 record protection). |
 | `src/credstore.zig` | OS credential store: Windows Credential Manager; macOS Keychain and Linux Secret Service (libsecret) via dlopen. |
 
 `portal run`'s local window (Portal's `src/gui.zig`) uses `view` too: it
