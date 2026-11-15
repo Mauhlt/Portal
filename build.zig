@@ -219,6 +219,18 @@ pub fn build(b: *std.Build) void {
     addBrand(b, test_step);
     addPackage(b, test_step);
     addPin(b);
+    addCheckZig(b);
+}
+
+/// `zig build check-zig`: fails unless the running Zig is exactly
+/// build.zig.zon's minimum_zig_version, the pinned Zig (CI runs it after
+/// installing that Zig with ZVC, so a different zig on PATH stops the job).
+fn addCheckZig(b: *std.Build) void {
+    const want = @import("build.zig.zon").minimum_zig_version;
+    const have = @import("builtin").zig_version_string;
+    const step = b.step("check-zig", "Fail unless the running Zig is exactly build.zig.zon's minimum_zig_version");
+    if (!std.mem.eql(u8, have, want))
+        step.dependOn(&b.addFail(b.fmt("this is Zig {s}; build.zig.zon pins {s} (zvc install --from <this folder>)", .{ have, want })).step);
 }
 
 /// A sibling repo pinned in build.zig.zon (and, with `client`, in

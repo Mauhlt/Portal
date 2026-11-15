@@ -508,10 +508,14 @@ the Windows PC (or any host) and carry a kit to the Mac.
    `ios-kit/signed/Portal.app` (setting the executables' mode bits that a
    copy from Windows loses) and installs it on the connected iPhone.
 
-CI: `.github/workflows/ios.yml` (a hosted macOS runner: `ios-check` and an
-unsigned Portal.app artifact). It is YAML because GitHub Actions only reads
-YAML: configuration, the stated exception to the all-Zig rule; every step
-only runs `zig build`.
+CI: `.github/workflows/ios.yml` (a hosted Apple-silicon macOS runner, on a
+manual run or a push to main that touches the iPhone build): ZVC installs
+build.zig.zon's Zig (`zig build check-zig` confirms it), MoltenVK comes
+from one release tarball checked by SHA-256, then `ios-check` and the
+unsigned release-mode kit with and without `-Dios-tunnel=true`, uploaded
+as one artifact. No secrets, no signing. It is YAML because GitHub Actions
+only reads YAML: configuration, the stated exception to the all-Zig rule;
+every step only fetches a pinned input or runs `zig build`.
 
 ## To verify on the phone
 
