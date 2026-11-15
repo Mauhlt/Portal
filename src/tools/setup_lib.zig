@@ -55,6 +55,24 @@ pub fn modeOf(role: Role) Mode {
     unreachable;
 }
 
+/// %TEMP%\<this><16 hex>: the uninstaller's working copy (setup_win
+/// freshTempDir).
+pub const uninstall_dir_prefix = "portal-uninstall-";
+
+/// Of the folder names in %TEMP%, the uninstall copies left behind (a copy
+/// that could not delete itself): exactly the prefix and 16 hex digits.
+pub fn isUninstallDir(name: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, uninstall_dir_prefix)) return false;
+    const rest = name[uninstall_dir_prefix.len..];
+    if (rest.len != 16) return false;
+    for (rest) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
+}
+
+/// Agent CLI names searched on PATH before the desk installer offers the
+/// hooks (it never creates the agent's settings on a PC without it).
+pub const agent_exes = [_][]const u8{ "claude.exe", "claude.cmd" };
+
 pub const app_name = "Portal";
 pub const setup_exe_name = "portal-setup.exe";
 pub const info_name = "install.txt";
@@ -272,7 +290,8 @@ pub fn uninstallEntry(a: Allocator, in: EntryInput) ![]Named {
         .{ .name = "DisplayName", .value = .{ .sz = if (in.role == .desk) "Portal (desk)" else "Portal (device)" } },
         .{ .name = "DisplayVersion", .value = .{ .sz = in.version } },
         .{ .name = "DisplayIcon", .value = .{ .sz = try std.fmt.allocPrint(a, "{s},0", .{portal}) } },
-        .{ .name = "InstallLocation", .value = .{ .sz = in.layout.root } },
+        // The program (Portal's data lives next to it, in root).
+        .{ .name = "InstallLocation", .value = .{ .sz = in.layout.releases } },
         .{ .name = "UninstallString", .value = .{ .sz = try uninstallCommand(a, in.layout.setup_exe) } },
         .{ .name = "InstallDate", .value = .{ .sz = in.date } },
         .{ .name = "EstimatedSize", .value = .{ .dword = in.size_kib } },
@@ -566,6 +585,9 @@ test "setup: the Apps entry, written and removed on a fake registry" {
     defer testing.allocator.free(icon.sz);
     try testing.expectEqualStrings(lad ++ "\\Portal\\bin\\portal.exe,0", icon.sz);
     try testing.expectEqual(@as(u32, 4096), (try r.get(testing.allocator, uninstall_key, "EstimatedSize")).?.dword);
+    const loc = (try r.get(testing.allocator, uninstall_key, "InstallLocation")).?;
+    defer testing.allocator.free(loc.sz);
+    try testing.expectEqualStrings(lad ++ "\\Portal\\releases", loc.sz);
     try r.deleteKey(uninstall_key);
     try testing.expectEqual(@as(usize, 0), f.count(uninstall_key));
 }
@@ -605,6 +627,15 @@ test "setup: install.txt round trip" {
     try testing.expectEqual(Role.desk, parseInfo("role=desk").?.role);
     try testing.expectEqualStrings("connect", shortcutArgs(.device));
     try testing.expectEqualStrings("", shortcutArgs(.desk));
+}
+
+test "setup: only true uninstall copies count as leftovers" {
+    try testing.expect(isUninstallDir("portal-uninstall-0123456789abcdef"));
+    try testing.expect(!isUninstallDir("portal-uninstall-0123456789abcde"));
+    try testing.expect(!isUninstallDir("portal-uninstall-0123456789abcdeg"));
+    try testing.expect(!isUninstallDir("portal-uninstall-0123456789abcdef0"));
+    try testing.expect(!isUninstallDir("portal-setup"));
+    try testing.expect(!isUninstallDir("other-0123456789abcdef"));
 }
 
 test "setup: the mode table: Windows offers desk and device, the Mac device only (for now)" {

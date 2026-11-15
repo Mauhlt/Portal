@@ -1,32 +1,38 @@
 //! The desk's one Windows Firewall rule (docs/wireguard.md, "Firewall"):
-//! inbound UDP on the tunnel port, any profile, allow, not tied to a
-//! program, named "Portal tunnel (WireGuard)".
+//! inbound UDP on the tunnel port, any profile, any address, any
+//! interface, no edge traversal, allow, not tied to a program, named
+//! "Portal tunnel (WireGuard)".
 //!
 //! Module "firewall", used by portalctl (`portalctl firewall status | add |
 //! remove`), the desk's Settings ("Windows Firewall") and portal-setup (the
 //! installer). Self-contained (std and its own Win32/COM declarations), so
-//! the release tools and the main program can both import it.
+//! the release tools and the main program can both import it; it also
+//! lends them its small COM helpers (`com`).
 //!
 //! * Reading the rule (`status`) needs no administrator: the Windows
 //!   Firewall COM API (INetFwPolicy2) lets any user read rules.
-//! * Changing it (`apply`, `removeAll`) needs one: `portalctl firewall add`
-//!   started without one relaunches itself through ShellExecuteEx "runas"
-//!   (`runElevated`, ONE UAC prompt) with `--no-elevate`, and waits for it.
-//!   Declining the prompt is not an error: the caller shows how to add the
-//!   rule later (`manualAdd`).
-//! * `apply` is idempotent: a rule of that name that already matches the
-//!   spec is left alone; one that differs (another port after a port move,
-//!   disabled, a block rule) is replaced; none is added.
+//! * Changing it runs exactly one program as administrator:
+//!   `<System32>\netsh.exe` (GetSystemDirectoryW, never a path from the
+//!   environment), through ShellExecuteEx "runas", with arguments built
+//!   here from a validated port and nothing else (`netshArgs`). Nothing a
+//!   user can write (no Portal program, nothing from %LOCALAPPDATA%, no
+//!   settings file) ever runs elevated.
+//! * `change` reads the rule first (unelevated) and plans: nothing to do,
+//!   `add rule`, or (a rule of that name that differs) `set rule ... new`,
+//!   which rewrites it in the same one prompt. Only a rule tied to a
+//!   program needs `delete rule` then `add rule`: two prompts, since netsh
+//!   cannot clear a rule's program. Afterwards it waits for netsh, reads
+//!   the rule again (unelevated) and reports what Windows now has.
+//!   Declining the prompt changes nothing; the caller shows how to do it
+//!   by hand (`manualAdd`).
 //!
-//! The spec, the plan and the texts are pure and unit tested; the COM
-//! calls only run for real (a read-only test exercises `status`).
+//! The spec, the port rules, the plan, netsh's arguments and the texts are
+//! pure and unit tested; the COM read has a read-only test.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 pub const rule_name = "Portal tunnel (WireGuard)";
-pub const rule_description = "Portal's own WireGuard (inbound UDP on the tunnel port). Added through Portal with an administrator's approval.";
-pub const rule_grouping = "Portal";
 
 /// NET_FW_IP_PROTOCOL_UDP, NET_FW_RULE_DIR_IN, NET_FW_ACTION_ALLOW,
 /// NET_FW_PROFILE2_ALL (netfw.h).
@@ -35,24 +41,42 @@ pub const direction_in: i32 = 1;
 pub const action_allow: i32 = 1;
 pub const profiles_all: i32 = 0x7fffffff;
 
-/// The rule Portal adds, for `port`.
-pub const Spec = struct {
-    name: []const u8 = rule_name,
-    description: []const u8 = rule_description,
-    grouping: []const u8 = rule_grouping,
-    protocol: i32 = protocol_udp,
-    local_port: u16,
-    direction: i32 = direction_in,
-    action: i32 = action_allow,
-    profiles: i32 = profiles_all,
-    enabled: bool = true,
+// ----------------------------------------------------------------- ports
+
+/// Ports the tunnel may not use: below 1024 (system services), and these
+/// well-known ones a desktop already has open or that its network stack
+/// uses. One list for the firewall rule and the Settings / first-run /
+/// `portalctl tunnel-port` checks.
+pub const reserved_ports = [_]struct { port: u16, what: []const u8 }{
+    .{ .port = 1701, .what = "L2TP" },
+    .{ .port = 1900, .what = "SSDP (UPnP discovery)" },
+    .{ .port = 3389, .what = "Remote Desktop" },
+    .{ .port = 3544, .what = "Teredo" },
+    .{ .port = 3702, .what = "WS-Discovery" },
+    .{ .port = 4500, .what = "IPsec NAT traversal" },
+    .{ .port = 5353, .what = "mDNS" },
+    .{ .port = 5355, .what = "LLMNR" },
 };
 
-pub fn spec(port: u16) Spec {
-    return .{ .local_port = port };
+pub const min_port: u16 = 1024;
+
+/// Why `port` cannot be the tunnel's port, or null if it can.
+pub fn portRefusal(buf: []u8, port: u16) ?[]const u8 {
+    if (port < min_port) return std.fmt.bufPrint(buf, "UDP {d} is a system port: choose 1024-65535.", .{port}) catch "Choose a port of 1024-65535.";
+    for (reserved_ports) |r| if (r.port == port)
+        return std.fmt.bufPrint(buf, "UDP {d} belongs to {s}: choose another port (1024-65535).", .{ port, r.what }) catch "That port belongs to a Windows service.";
+    return null;
 }
 
-/// A rule of that name as Windows reports it.
+pub fn validPort(port: u16) bool {
+    var b: [120]u8 = undefined;
+    return portRefusal(&b, port) == null;
+}
+
+// ------------------------------------------------------------- the rule
+
+/// A rule of that name as Windows reports it (COM strings: "*" is any
+/// address, "All" every interface type).
 pub const Observed = struct {
     protocol: i32,
     /// "51820", or a list / range ("51820,51821", "51820-51830", "*").
@@ -61,48 +85,62 @@ pub const Observed = struct {
     action: i32,
     profiles: i32,
     enabled: bool,
-    /// Tied to a program (ApplicationName set): not Portal's rule shape.
+    local_addresses: []const u8 = "*",
+    remote_addresses: []const u8 = "*",
+    interface_types: []const u8 = "All",
+    edge_traversal: bool = false,
+    /// Tied to a program (ApplicationName set).
     has_application: bool = false,
 };
 
 /// The single port in `local_ports`, or null for a list, range or "*".
 pub fn portOf(o: Observed) ?u16 {
-    const t = std.mem.trim(u8, o.local_ports, " ");
-    return std.fmt.parseInt(u16, t, 10) catch null;
+    return std.fmt.parseInt(u16, std.mem.trim(u8, o.local_ports, " "), 10) catch null;
 }
 
-/// The observed rule is exactly the spec's (the parts that decide what
-/// gets in; the description and grouping do not).
-pub fn matches(s: Spec, o: Observed) bool {
-    return o.protocol == s.protocol and portOf(o) == s.local_port and o.direction == s.direction and
-        o.action == s.action and (o.profiles & s.profiles) == s.profiles and o.enabled == s.enabled and !o.has_application;
+/// The rule is exactly Portal's for `port`: every field that decides
+/// what gets in.
+pub fn matches(o: Observed, port: u16) bool {
+    return o.protocol == protocol_udp and portOf(o) == port and o.direction == direction_in and
+        o.action == action_allow and (o.profiles & profiles_all) == profiles_all and o.enabled and
+        anyAddress(o.local_addresses) and anyAddress(o.remote_addresses) and
+        std.ascii.eqlIgnoreCase(std.mem.trim(u8, o.interface_types, " "), "All") and
+        !o.edge_traversal and !o.has_application;
+}
+
+fn anyAddress(s: []const u8) bool {
+    const t = std.mem.trim(u8, s, " ");
+    return std.mem.eql(u8, t, "*") or std.ascii.eqlIgnoreCase(t, "any");
 }
 
 pub const Plan = enum {
     /// The rule is there and right: nothing to change.
     already,
-    /// No rule of that name: add it.
+    /// No rule of that name: `add rule`.
     add,
-    /// A rule of that name differs (another port, disabled, ...): remove
-    /// every rule of that name and add it.
-    replace,
+    /// A rule of that name differs: `set rule ... new` (one prompt).
+    set,
+    /// It differs and is tied to a program, which netsh cannot clear:
+    /// `delete rule`, then `add rule` (two prompts).
+    delete_add,
 };
 
-/// What `apply` does, given the first rule of that name (null: none).
-pub fn plan(first: ?Observed, s: Spec) Plan {
+/// What `change(.add)` does, given the first rule of that name (null: none).
+pub fn plan(first: ?Observed, port: u16) Plan {
     const o = first orelse return .add;
-    return if (matches(s, o)) .already else .replace;
+    if (matches(o, port)) return .already;
+    return if (o.has_application) .delete_add else .set;
 }
 
 pub const Status = union(enum) {
-    /// The rule allows UDP <port>, inbound, every profile.
+    /// The rule allows UDP <port> as Portal adds it.
     present,
     /// No rule of that name.
     missing,
-    /// The rule is for another single port (the tunnel moved).
+    /// The rule is right but for another single port (the tunnel moved).
     other_port: u16,
-    /// A rule of that name exists but does not allow the port as Portal
-    /// would (disabled, a block rule, another protocol, a range).
+    /// A rule of that name exists but differs in another way (disabled,
+    /// a block rule, another protocol, addresses, edge traversal, ...).
     differs,
     /// The firewall could not be read (service stopped, not Windows).
     unavailable,
@@ -110,26 +148,107 @@ pub const Status = union(enum) {
 
 pub fn statusOf(first: ?Observed, port: u16) Status {
     const o = first orelse return .missing;
-    const s = spec(port);
-    if (matches(s, o)) return .present;
-    // Right in every way but the port: the tunnel moved since.
-    if (portOf(o)) |p| if (p != port and matches(spec(p), o)) return .{ .other_port = p };
+    if (matches(o, port)) return .present;
+    if (portOf(o)) |p| if (p != port and matches(o, p)) return .{ .other_port = p };
     return .differs;
 }
 
-/// One line for the desk's Settings.
+/// One line for the desk's Settings (it names the port).
 pub fn describe(st: Status, port: u16, buf: []u8) []const u8 {
     return switch (st) {
         .present => std.fmt.bufPrint(buf, "Allows UDP {d} (rule \"" ++ rule_name ++ "\")", .{port}) catch "Present",
-        .missing => std.fmt.bufPrint(buf, "No rule for UDP {d}: [Add rule] (one administrator prompt)", .{port}) catch "Missing",
-        .other_port => |p| std.fmt.bufPrint(buf, "The rule allows UDP {d}, the tunnel uses {d}: [Replace rule] (one administrator prompt)", .{ p, port }) catch "Another port",
-        .differs => std.fmt.bufPrint(buf, "A rule named \"" ++ rule_name ++ "\" does not allow UDP {d}: [Replace rule] (one administrator prompt)", .{port}) catch "Differs",
+        .missing => std.fmt.bufPrint(buf, "No rule for UDP {d}: [Add rule for UDP {d}] (one administrator prompt)", .{ port, port }) catch "Missing",
+        .other_port => |p| std.fmt.bufPrint(buf, "The rule allows UDP {d}, the tunnel uses {d}: [Replace it with UDP {d}] (one administrator prompt)", .{ p, port, port }) catch "Another port",
+        .differs => std.fmt.bufPrint(buf, "A rule named \"" ++ rule_name ++ "\" does not allow UDP {d} as Portal needs: [Replace it] (one administrator prompt)", .{port}) catch "Differs",
         .unavailable => "Windows Firewall could not be read",
     };
 }
 
-/// Exit codes of `portalctl firewall ...` (the installer and Settings read
-/// them).
+/// The administrator PowerShell line that adds the rule by hand (the
+/// fallback when the prompt was declined; README, docs/wireguard.md).
+pub fn manualAdd(buf: []u8, port: u16) []const u8 {
+    return std.fmt.bufPrint(buf, "New-NetFirewallRule -DisplayName \"" ++ rule_name ++ "\" -Direction Inbound -Protocol UDP -LocalPort {d} -Profile Any -Action Allow", .{port}) catch "";
+}
+
+pub const manual_remove = "Remove-NetFirewallRule -DisplayName \"" ++ rule_name ++ "\"";
+
+// -------------------------------------------------------------- netsh
+
+pub const NetshStep = enum { add, set, delete };
+
+/// netsh's whole command line after `netsh.exe`: fixed text, the rule name
+/// and a validated port, nothing else. error.BadPort for a port Portal
+/// refuses.
+pub fn netshArgs(buf: []u8, step: NetshStep, port: u16) ![]const u8 {
+    const name = "name=\"" ++ rule_name ++ "\"";
+    if (step != .delete and !validPort(port)) return error.BadPort;
+    return switch (step) {
+        .add => std.fmt.bufPrint(buf, "advfirewall firewall add rule " ++ name ++ " dir=in action=allow protocol=UDP localport={d} profile=any", .{port}),
+        .set => std.fmt.bufPrint(buf, "advfirewall firewall set rule " ++ name ++ " new dir=in action=allow protocol=UDP localport={d} profile=any localip=any remoteip=any interfacetype=any edge=no enable=yes", .{port}),
+        .delete => std.fmt.bufPrint(buf, "advfirewall firewall delete rule " ++ name, .{}),
+    };
+}
+
+/// `<dir>\netsh.exe` for the System32 folder `dir`.
+pub fn netshIn(buf: []u8, system_dir: []const u8) ?[]const u8 {
+    if (!std.fs.path.isAbsolute(system_dir)) return null;
+    return std.fmt.bufPrint(buf, "{s}\\netsh.exe", .{std.mem.trimEnd(u8, system_dir, "\\")}) catch null;
+}
+
+pub const Op = enum { add, remove };
+
+pub const Outcome = union(enum) {
+    /// Nothing needed changing (the rule was right, or already gone).
+    nothing,
+    /// netsh ran; Windows' rule as read afterwards.
+    changed: Status,
+    /// The administrator prompt was declined: nothing changed.
+    declined,
+    /// netsh failed (its exit code) or could not be started (a Win32
+    /// error, flagged by `started == false`).
+    failed: struct { code: u32, started: bool },
+    /// The port is not one Portal uses (portRefusal).
+    bad_port,
+    /// The firewall could not be read.
+    unavailable,
+};
+
+/// Adds (or rewrites) the rule for `port`, or removes it: reads it,
+/// runs netsh as administrator only if something must change (one prompt;
+/// two only for a program-bound rule), waits, and reads it again. Blocks
+/// (on the prompt and netsh's process, no polling): call it off the UI
+/// thread. `hwnd` (optional) owns the prompt.
+pub fn change(op: Op, port: u16, hwnd: ?*anyopaque) Outcome {
+    if (!windows) return .unavailable;
+    if (op == .add and !validPort(port)) return .bad_port;
+    var r: Reading = .{};
+    const first = r.read() catch return .unavailable;
+    const steps: []const NetshStep = switch (op) {
+        .remove => if (first == null) return .nothing else &.{.delete},
+        .add => switch (plan(first, port)) {
+            .already => return .nothing,
+            .add => &.{.add},
+            .set => &.{.set},
+            .delete_add => &.{ .delete, .add },
+        },
+    };
+    var sys: [600]u8 = undefined;
+    var nb: [640]u8 = undefined;
+    const netsh = netshIn(&nb, systemDir(&sys) orelse return .{ .failed = .{ .code = 0, .started = false } }) orelse
+        return .{ .failed = .{ .code = 0, .started = false } };
+    for (steps) |step| {
+        var ab: [400]u8 = undefined;
+        const args = netshArgs(&ab, step, port) catch return .bad_port;
+        switch (runElevated(netsh, args, hwnd)) {
+            .exited => |code| if (code != 0) return .{ .failed = .{ .code = code, .started = true } },
+            .declined => return .declined,
+            .failed => |e| return .{ .failed = .{ .code = e, .started = false } },
+        }
+    }
+    return .{ .changed = status(port) };
+}
+
+/// Exit codes of `portalctl firewall ...` (the installer reads them).
 pub const exit = struct {
     pub const ok: u8 = 0;
     pub const failed: u8 = 1;
@@ -140,53 +259,23 @@ pub const exit = struct {
     pub const declined: u8 = 5;
     /// status: the firewall could not be read.
     pub const unavailable: u8 = 6;
+    /// add: the port is one Portal refuses.
+    pub const bad_port: u8 = 7;
 };
-
-/// The administrator PowerShell line that adds the rule by hand (the
-/// fallback when the prompt was declined; README, docs/wireguard.md).
-pub fn manualAdd(buf: []u8, port: u16) []const u8 {
-    return std.fmt.bufPrint(buf, "New-NetFirewallRule -DisplayName \"" ++ rule_name ++ "\" -Direction Inbound -Protocol UDP -LocalPort {d} -Profile Any -Action Allow", .{port}) catch "";
-}
-
-pub const manual_remove = "Remove-NetFirewallRule -DisplayName \"" ++ rule_name ++ "\"";
-
-pub const Op = enum { add, remove };
-
-/// The elevated child's command line after `portalctl`:
-/// `firewall add --port 51820 --no-elevate` (`--no-elevate`: it never asks
-/// again; without the rights it fails).
-pub fn elevatedParams(buf: []u8, op: Op, port: u16) []const u8 {
-    return switch (op) {
-        .add => std.fmt.bufPrint(buf, "firewall add --port {d} --no-elevate", .{port}) catch "",
-        .remove => "firewall remove --no-elevate",
-    };
-}
 
 pub const Args = struct {
     sub: enum { status, add, remove },
     port: ?u16 = null,
-    no_elevate: bool = false,
 };
 
 pub fn parseArgs(args: []const []const u8) ?Args {
     if (args.len == 0) return null;
-    var a: Args = .{ .sub = if (std.mem.eql(u8, args[0], "status"))
-        .status
-    else if (std.mem.eql(u8, args[0], "add"))
-        .add
-    else if (std.mem.eql(u8, args[0], "remove"))
-        .remove
-    else
-        return null };
+    var a: Args = .{ .sub = std.meta.stringToEnum(@FieldType(Args, "sub"), args[0]) orelse return null };
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
             i += 1;
-            const p = std.fmt.parseInt(u16, args[i], 10) catch return null;
-            if (p == 0) return null;
-            a.port = p;
-        } else if (std.mem.eql(u8, args[i], "--no-elevate")) {
-            a.no_elevate = true;
+            a.port = std.fmt.parseInt(u16, args[i], 10) catch return null;
         } else return null;
     }
     return a;
@@ -196,14 +285,14 @@ pub const usage_text =
     \\usage: portalctl firewall status | add | remove [--port N]
     \\  status   whether the rule "Portal tunnel (WireGuard)" allows the tunnel's
     \\           UDP port (default: the saved one); no administrator needed
-    \\  add      add the rule, or replace it after a port move (idempotent);
-    \\           asks for an administrator once (UAC)
-    \\  remove   remove it; asks for an administrator once (UAC)
+    \\  add      add the rule, or rewrite it after a port move (idempotent);
+    \\           Windows' netsh asks for an administrator once (UAC)
+    \\  remove   remove it; netsh asks for an administrator once (UAC)
     \\
 ;
 
-/// `portalctl firewall ...`: `saved_port` is settings.txt's tunnel port.
-/// Prints to stderr; returns the exit code (`exit`).
+/// `portalctl firewall ...` (never elevated itself): `saved_port` is
+/// settings.txt's tunnel port. Prints to stderr; returns the exit code.
 pub fn command(args: []const []const u8, saved_port: u16) u8 {
     const a = parseArgs(args) orelse {
         std.debug.print("{s}", .{usage_text});
@@ -223,111 +312,118 @@ pub fn command(args: []const []const u8, saved_port: u16) u8 {
         },
         .add, .remove => {
             const op: Op = if (a.sub == .add) .add else .remove;
-            if (!isElevated()) {
-                if (a.no_elevate) {
-                    std.debug.print("firewall: this needs an administrator\n", .{});
-                    return exit.failed;
-                }
-                var pb: [64]u8 = undefined;
-                var self_buf: [1024]u8 = undefined;
-                const self = selfExe(&self_buf) orelse {
-                    std.debug.print("firewall: cannot find portalctl.exe itself\n", .{});
-                    return exit.failed;
-                };
-                return switch (runElevated(self, elevatedParams(&pb, op, port), null)) {
-                    .exited => |code| blk: {
-                        const c: u8 = if (code > 255) exit.failed else @intCast(code);
-                        if (c == exit.ok) {
-                            std.debug.print("firewall: {s}\n", .{if (op == .add) describe(status(port), port, &mb) else "rule removed"});
-                        } else std.debug.print("firewall: the administrator step failed (exit code {d})\n", .{code});
-                        break :blk c;
-                    },
-                    .declined => blk: {
-                        std.debug.print("firewall: the administrator prompt was declined; nothing changed. To do it later, in an administrator PowerShell:\n  {s}\n", .{if (op == .add) manualAdd(&mb, port) else manual_remove});
-                        break :blk exit.declined;
-                    },
-                    .failed => |e| blk: {
-                        std.debug.print("firewall: could not ask for an administrator (error {d})\n", .{e});
-                        break :blk exit.failed;
-                    },
-                };
-            }
-            switch (op) {
-                .add => {
-                    const p = apply(port) catch |err| {
-                        std.debug.print("firewall: could not add the rule: {t}\n", .{err});
-                        return exit.failed;
-                    };
-                    std.debug.print("firewall: {s}\n", .{switch (p) {
-                        .already => "the rule was already there",
-                        .add => "rule added",
-                        .replace => "rule replaced",
-                    }});
-                },
-                .remove => {
-                    const n = removeAll() catch |err| {
-                        std.debug.print("firewall: could not remove the rule: {t}\n", .{err});
-                        return exit.failed;
-                    };
-                    std.debug.print("firewall: {d} rule(s) removed\n", .{n});
-                },
-            }
-            return exit.ok;
+            const o = change(op, port, null);
+            std.debug.print("firewall: {s}\n", .{outcomeText(o, op, port, &mb)});
+            return switch (o) {
+                .nothing => exit.ok,
+                .changed => |st| if ((op == .add and st == .present) or (op == .remove and st == .missing)) exit.ok else exit.failed,
+                .declined => exit.declined,
+                .bad_port => exit.bad_port,
+                .failed, .unavailable => exit.failed,
+            };
         },
     }
+}
+
+/// What happened, in a line (portalctl, Settings).
+pub fn outcomeText(o: Outcome, op: Op, port: u16, buf: []u8) []const u8 {
+    var pb: [200]u8 = undefined;
+    return switch (o) {
+        .nothing => if (op == .add) std.fmt.bufPrint(buf, "the rule already allows UDP {d}", .{port}) catch "" else "there is no rule to remove",
+        .changed => |st| if (op == .remove)
+            (if (st == .missing) "rule removed" else "netsh ran, but the rule is still there")
+        else if (st == .present)
+            std.fmt.bufPrint(buf, "Windows Firewall now allows UDP {d}", .{port}) catch ""
+        else
+            std.fmt.bufPrint(buf, "netsh ran, but the rule does not allow UDP {d} as expected", .{port}) catch "",
+        .declined => std.fmt.bufPrint(buf, "the administrator prompt was declined; nothing changed. By hand, in an administrator PowerShell: {s}", .{if (op == .add) manualAdd(&pb, port) else manual_remove}) catch "",
+        .failed => |f| if (f.started)
+            std.fmt.bufPrint(buf, "netsh failed (exit code {d}); nothing may have changed", .{f.code}) catch ""
+        else
+            std.fmt.bufPrint(buf, "could not start netsh as administrator (error {d})", .{f.code}) catch "",
+        .bad_port => portRefusal(buf, port) orelse "bad port",
+        .unavailable => "Windows Firewall could not be read",
+    };
 }
 
 // =================================================================== Windows
 
 const windows = builtin.os.tag == .windows;
 
-const HRESULT = i32;
-const GUID = extern struct { a: u32, b: u16, c: u16, d: [8]u8 };
-const BSTR = ?[*:0]u16;
+/// Small COM helpers, shared with portal-setup (setup_win.zig).
+pub const com = struct {
+    pub const HRESULT = i32;
+    pub const GUID = extern struct { a: u32, b: u16, c: u16, d: [8]u8 };
 
-fn guid(comptime s: []const u8) GUID {
-    // "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-    @setEvalBranchQuota(10_000);
-    const hex = struct {
-        fn n(t: []const u8) u64 {
-            return std.fmt.parseInt(u64, t, 16) catch unreachable;
+    pub fn guid(comptime s: []const u8) GUID {
+        // "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+        @setEvalBranchQuota(10_000);
+        const hex = struct {
+            fn n(t: []const u8) u64 {
+                return std.fmt.parseInt(u64, t, 16) catch unreachable;
+            }
+        }.n;
+        var g: GUID = .{ .a = @intCast(hex(s[0..8])), .b = @intCast(hex(s[9..13])), .c = @intCast(hex(s[14..18])), .d = undefined };
+        g.d[0] = @intCast(hex(s[19..21]));
+        g.d[1] = @intCast(hex(s[21..23]));
+        inline for (0..6) |i| g.d[2 + i] = @intCast(hex(s[24 + 2 * i .. 26 + 2 * i]));
+        return g;
+    }
+
+    /// The method at vtable `index` of COM object `obj`, as `F`.
+    pub fn method(comptime F: type, obj: *anyopaque, index: usize) F {
+        const vtbl: *const [*]const *const anyopaque = @ptrCast(@alignCast(obj));
+        return @ptrCast(@alignCast(vtbl.*[index]));
+    }
+
+    pub fn release(obj: *anyopaque) void {
+        _ = method(*const fn (*anyopaque) callconv(.winapi) u32, obj, 2)(obj);
+    }
+
+    /// COM on this thread (apartment threaded), undone by `deinit` only if
+    /// this call started it.
+    pub const Scope = struct {
+        owned: bool,
+
+        pub fn init() ?Scope {
+            const hr = w.CoInitializeEx(null, 0x2);
+            if (hr == @as(HRESULT, @bitCast(@as(u32, 0x80010106)))) return .{ .owned = false }; // RPC_E_CHANGED_MODE
+            if (hr < 0) return null;
+            return .{ .owned = true };
         }
-    }.n;
-    var g: GUID = .{ .a = @intCast(hex(s[0..8])), .b = @intCast(hex(s[9..13])), .c = @intCast(hex(s[14..18])), .d = undefined };
-    g.d[0] = @intCast(hex(s[19..21]));
-    g.d[1] = @intCast(hex(s[21..23]));
-    inline for (0..6) |i| g.d[2 + i] = @intCast(hex(s[24 + 2 * i .. 26 + 2 * i]));
-    return g;
-}
 
-const CLSID_NetFwPolicy2 = guid("e2b3c97f-6ae1-41ac-817a-f6f92166d7dd");
-const IID_INetFwPolicy2 = guid("98325047-c671-4174-8d81-defcd3f03186");
-const CLSID_NetFwRule = guid("2c5bc43e-3369-4c33-ab0c-be9469677af4");
-const IID_INetFwRule = guid("af230d27-baba-4e42-aced-f524f22cfce2");
+        pub fn deinit(s: Scope) void {
+            if (s.owned) w.CoUninitialize();
+        }
+    };
 
-const CLSCTX_INPROC_SERVER: u32 = 0x1;
-const COINIT_APARTMENTTHREADED: u32 = 0x2;
-const RPC_E_CHANGED_MODE: HRESULT = @bitCast(@as(u32, 0x80010106));
+    pub extern "ole32" fn CoCreateInstance(clsid: *const GUID, outer: ?*anyopaque, ctx: u32, iid: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT;
+};
+
+const Hr = com.HRESULT;
+const BSTR = ?[*:0]u16;
+const comMethod = com.method;
+const comRelease = com.release;
+
+const CLSID_NetFwPolicy2 = com.guid("e2b3c97f-6ae1-41ac-817a-f6f92166d7dd");
+const IID_INetFwPolicy2 = com.guid("98325047-c671-4174-8d81-defcd3f03186");
 
 const w = if (windows) struct {
-    extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: u32) callconv(.winapi) HRESULT;
+    extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: u32) callconv(.winapi) Hr;
     extern "ole32" fn CoUninitialize() callconv(.winapi) void;
-    extern "ole32" fn CoCreateInstance(clsid: *const GUID, outer: ?*anyopaque, ctx: u32, iid: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT;
     extern "oleaut32" fn SysAllocStringLen(s: ?[*]const u16, len: u32) callconv(.winapi) BSTR;
     extern "oleaut32" fn SysFreeString(s: BSTR) callconv(.winapi) void;
     extern "oleaut32" fn SysStringLen(s: BSTR) callconv(.winapi) u32;
-    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) *anyopaque;
     extern "kernel32" fn CloseHandle(h: *anyopaque) callconv(.winapi) i32;
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
     extern "kernel32" fn WaitForSingleObject(h: *anyopaque, ms: u32) callconv(.winapi) u32;
     extern "kernel32" fn GetExitCodeProcess(h: *anyopaque, code: *u32) callconv(.winapi) i32;
     extern "kernel32" fn GetModuleFileNameW(module: ?*anyopaque, buf: [*]u16, size: u32) callconv(.winapi) u32;
-    extern "advapi32" fn OpenProcessToken(process: *anyopaque, access: u32, token: *?*anyopaque) callconv(.winapi) i32;
-    extern "advapi32" fn GetTokenInformation(token: *anyopaque, class: u32, info: *anyopaque, len: u32, ret: *u32) callconv(.winapi) i32;
+    extern "kernel32" fn GetSystemDirectoryW(buf: [*]u16, size: u32) callconv(.winapi) u32;
     extern "shell32" fn ShellExecuteExW(info: *SHELLEXECUTEINFOW) callconv(.winapi) i32;
 } else struct {};
 
-pub const SHELLEXECUTEINFOW = extern struct {
+const SHELLEXECUTEINFOW = extern struct {
     cbSize: u32 = @sizeOf(SHELLEXECUTEINFOW),
     fMask: u32 = 0,
     hwnd: ?*anyopaque = null,
@@ -349,266 +445,128 @@ comptime {
     if (@sizeOf(usize) == 8 and @sizeOf(SHELLEXECUTEINFOW) != 112) @compileError("SHELLEXECUTEINFOW layout");
 }
 
-const SEE_MASK_NOCLOSEPROCESS: u32 = 0x40;
-const SEE_MASK_NOASYNC: u32 = 0x100;
-const SEE_MASK_FLAG_NO_UI: u32 = 0x400;
-const ERROR_CANCELLED: u32 = 1223;
-const INFINITE: u32 = 0xFFFFFFFF;
-
-/// COM for this thread, undone by `deinit` only if this call started it.
-const ComScope = struct {
-    owned: bool,
-
-    fn init() ?ComScope {
-        const hr = w.CoInitializeEx(null, COINIT_APARTMENTTHREADED);
-        if (hr == RPC_E_CHANGED_MODE) return .{ .owned = false }; // the thread has COM already
-        if (hr < 0) return null;
-        return .{ .owned = true };
-    }
-
-    fn deinit(s: ComScope) void {
-        if (s.owned) w.CoUninitialize();
-    }
-};
-
-/// The method at vtable `index` of COM object `obj`, as `F`.
-fn method(comptime F: type, obj: *anyopaque, index: usize) F {
-    const vtbl: *const [*]const *const anyopaque = @ptrCast(@alignCast(obj));
-    return @ptrCast(@alignCast(vtbl.*[index]));
-}
-
-fn release(obj: *anyopaque) void {
-    _ = method(*const fn (*anyopaque) callconv(.winapi) u32, obj, 2)(obj);
+/// The System32 folder (WTF-8), from GetSystemDirectoryW.
+pub fn systemDir(buf: []u8) ?[]const u8 {
+    if (!windows) return null;
+    var wb: [300]u16 = undefined;
+    const n = w.GetSystemDirectoryW(&wb, wb.len);
+    if (n == 0 or n >= wb.len) return null;
+    if (std.unicode.calcWtf8Len(wb[0..n]) > buf.len) return null;
+    return buf[0..std.unicode.wtf16LeToWtf8(buf, wb[0..n])];
 }
 
 // INetFwPolicy2 (IDispatch: 7 methods first).
 const policy_get_rules = 18;
 // INetFwRules.
-const rules_add = 8;
-const rules_remove = 9;
 const rules_item = 10;
-// INetFwRule.
-const rule_put_name = 8;
-const rule_put_description = 10;
+// INetFwRule getters.
 const rule_get_application = 11;
 const rule_get_protocol = 15;
-const rule_put_protocol = 16;
 const rule_get_local_ports = 17;
-const rule_put_local_ports = 18;
+const rule_get_local_addresses = 21;
+const rule_get_remote_addresses = 23;
 const rule_get_direction = 27;
-const rule_put_direction = 28;
+const rule_get_interface_types = 31;
 const rule_get_enabled = 33;
-const rule_put_enabled = 34;
-const rule_put_grouping = 36;
 const rule_get_profiles = 37;
-const rule_put_profiles = 38;
+const rule_get_edge_traversal = 39;
 const rule_get_action = 41;
-const rule_put_action = 42;
 
-const GetI32 = *const fn (*anyopaque, *i32) callconv(.winapi) HRESULT;
-const PutI32 = *const fn (*anyopaque, i32) callconv(.winapi) HRESULT;
-const GetBool = *const fn (*anyopaque, *i16) callconv(.winapi) HRESULT;
-const PutBool = *const fn (*anyopaque, i16) callconv(.winapi) HRESULT;
-const GetStr = *const fn (*anyopaque, *BSTR) callconv(.winapi) HRESULT;
-const PutStr = *const fn (*anyopaque, BSTR) callconv(.winapi) HRESULT;
-const GetObj = *const fn (*anyopaque, *?*anyopaque) callconv(.winapi) HRESULT;
+const GetI32 = *const fn (*anyopaque, *i32) callconv(.winapi) Hr;
+const GetBool = *const fn (*anyopaque, *i16) callconv(.winapi) Hr;
+const GetStr = *const fn (*anyopaque, *BSTR) callconv(.winapi) Hr;
+const GetObj = *const fn (*anyopaque, *?*anyopaque) callconv(.winapi) Hr;
 
-fn bstr(comptime s: []const u8) BSTR {
-    const lit = std.unicode.utf8ToUtf16LeStringLiteral(s);
-    return w.SysAllocStringLen(lit, lit.len);
-}
+/// One read of the first rule named `rule_name`; its strings live here.
+const Reading = struct {
+    bufs: [4][160]u8 = undefined,
 
-fn bstrFmt(comptime fmt: []const u8, args: anytype) BSTR {
-    var b: [64]u8 = undefined;
-    const s = std.fmt.bufPrint(&b, fmt, args) catch return null;
-    var u: [64]u16 = undefined;
-    const n = std.unicode.utf8ToUtf16Le(&u, s) catch return null;
-    return w.SysAllocStringLen(&u, @intCast(n));
-}
+    /// The rule, null if there is none. error.Unavailable if the firewall
+    /// cannot be read.
+    fn read(r: *Reading) error{Unavailable}!?Observed {
+        const scope = com.Scope.init() orelse return error.Unavailable;
+        defer scope.deinit();
+        var pol: ?*anyopaque = null;
+        if (com.CoCreateInstance(&CLSID_NetFwPolicy2, null, 1, &IID_INetFwPolicy2, &pol) < 0) return error.Unavailable;
+        const p = pol orelse return error.Unavailable;
+        defer comRelease(p);
+        var rules_opt: ?*anyopaque = null;
+        if (comMethod(GetObj, p, policy_get_rules)(p, &rules_opt) < 0) return error.Unavailable;
+        const rules = rules_opt orelse return error.Unavailable;
+        defer comRelease(rules);
 
-/// INetFwPolicy2.Rules (released by the caller).
-fn openRules() ?*anyopaque {
-    var pol: ?*anyopaque = null;
-    if (w.CoCreateInstance(&CLSID_NetFwPolicy2, null, CLSCTX_INPROC_SERVER, &IID_INetFwPolicy2, &pol) < 0) return null;
-    const p = pol orelse return null;
-    defer release(p);
-    var rules: ?*anyopaque = null;
-    if (method(GetObj, p, policy_get_rules)(p, &rules) < 0) return null;
-    return rules;
-}
+        const lit = std.unicode.utf8ToUtf16LeStringLiteral(rule_name);
+        const name = w.SysAllocStringLen(lit, lit.len);
+        defer w.SysFreeString(name);
+        var rule_opt: ?*anyopaque = null;
+        const hr = comMethod(*const fn (*anyopaque, BSTR, *?*anyopaque) callconv(.winapi) Hr, rules, rules_item)(rules, name, &rule_opt);
+        // HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND): no such rule.
+        if (hr == @as(Hr, @bitCast(@as(u32, 0x80070002)))) return null;
+        if (hr < 0) return error.Unavailable;
+        const rule = rule_opt orelse return null;
+        defer comRelease(rule);
 
-const ItemError = error{ NotFound, Failed };
-
-/// INetFwRules.Item(rule_name) (released by the caller).
-fn item(rules: *anyopaque) ItemError!*anyopaque {
-    const name = bstr(rule_name);
-    defer w.SysFreeString(name);
-    var r: ?*anyopaque = null;
-    const hr = method(*const fn (*anyopaque, BSTR, *?*anyopaque) callconv(.winapi) HRESULT, rules, rules_item)(rules, name, &r);
-    // HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
-    if (hr == @as(HRESULT, @bitCast(@as(u32, 0x80070002)))) return error.NotFound;
-    if (hr < 0) return error.Failed;
-    return r orelse error.NotFound;
-}
-
-/// Reads a rule into `o`; `ports_buf` holds its local ports text.
-fn observe(rule: *anyopaque, ports_buf: []u8) ?Observed {
-    var o: Observed = .{ .protocol = 0, .local_ports = "", .direction = 0, .action = 0, .profiles = 0, .enabled = false };
-    if (method(GetI32, rule, rule_get_protocol)(rule, &o.protocol) < 0) return null;
-    if (method(GetI32, rule, rule_get_direction)(rule, &o.direction) < 0) return null;
-    if (method(GetI32, rule, rule_get_action)(rule, &o.action) < 0) return null;
-    if (method(GetI32, rule, rule_get_profiles)(rule, &o.profiles) < 0) return null;
-    var en: i16 = 0;
-    if (method(GetBool, rule, rule_get_enabled)(rule, &en) < 0) return null;
-    o.enabled = en != 0;
-    var ports: BSTR = null;
-    if (method(GetStr, rule, rule_get_local_ports)(rule, &ports) >= 0) {
-        defer w.SysFreeString(ports);
-        if (ports) |p| {
-            const n = w.SysStringLen(ports);
-            const len = std.unicode.wtf16LeToWtf8(ports_buf[0..@min(ports_buf.len, n * 3)], p[0..@min(n, ports_buf.len / 3)]);
-            o.local_ports = ports_buf[0..len];
-        }
+        var o: Observed = .{ .protocol = 0, .local_ports = "", .direction = 0, .action = 0, .profiles = 0, .enabled = false };
+        if (comMethod(GetI32, rule, rule_get_protocol)(rule, &o.protocol) < 0) return error.Unavailable;
+        if (comMethod(GetI32, rule, rule_get_direction)(rule, &o.direction) < 0) return error.Unavailable;
+        if (comMethod(GetI32, rule, rule_get_action)(rule, &o.action) < 0) return error.Unavailable;
+        if (comMethod(GetI32, rule, rule_get_profiles)(rule, &o.profiles) < 0) return error.Unavailable;
+        o.enabled = try getBool(rule, rule_get_enabled);
+        o.edge_traversal = try getBool(rule, rule_get_edge_traversal);
+        o.local_ports = getStr(rule, rule_get_local_ports, &r.bufs[0]);
+        o.local_addresses = getStr(rule, rule_get_local_addresses, &r.bufs[1]);
+        o.remote_addresses = getStr(rule, rule_get_remote_addresses, &r.bufs[2]);
+        o.interface_types = getStr(rule, rule_get_interface_types, &r.bufs[3]);
+        var app_buf: [8]u8 = undefined;
+        o.has_application = getStr(rule, rule_get_application, &app_buf).len > 0;
+        return o;
     }
-    var app: BSTR = null;
-    if (method(GetStr, rule, rule_get_application)(rule, &app) >= 0) {
-        defer w.SysFreeString(app);
-        o.has_application = app != null and w.SysStringLen(app) > 0;
+
+    fn getBool(rule: *anyopaque, index: usize) error{Unavailable}!bool {
+        var v: i16 = 0;
+        if (comMethod(GetBool, rule, index)(rule, &v) < 0) return error.Unavailable;
+        return v != 0;
     }
-    return o;
-}
+
+    /// The string (cut to `buf`), "" if unset.
+    fn getStr(rule: *anyopaque, index: usize, buf: []u8) []const u8 {
+        var s: BSTR = null;
+        if (comMethod(GetStr, rule, index)(rule, &s) < 0) return "";
+        defer w.SysFreeString(s);
+        const p = s orelse return "";
+        const n = @min(w.SysStringLen(s), buf.len / 3);
+        return buf[0..std.unicode.wtf16LeToWtf8(buf, p[0..n])];
+    }
+};
 
 /// Whether the rule allows UDP `port` (read-only, no administrator).
 pub fn status(port: u16) Status {
     if (!windows) return .unavailable;
-    const com = ComScope.init() orelse return .unavailable;
-    defer com.deinit();
-    const rules = openRules() orelse return .unavailable;
-    defer release(rules);
-    const r = item(rules) catch |err| return switch (err) {
-        error.NotFound => .missing,
-        error.Failed => .unavailable,
-    };
-    defer release(r);
-    var pb: [96]u8 = undefined;
-    const o = observe(r, &pb) orelse return .unavailable;
-    return statusOf(o, port);
+    var r: Reading = .{};
+    const first = r.read() catch return .unavailable;
+    return statusOf(first, port);
 }
 
-/// Adds the rule for `port`, or replaces a differing one (administrator
-/// only). Idempotent.
-pub fn apply(port: u16) !Plan {
-    if (!windows) return error.Unsupported;
-    const com = ComScope.init() orelse return error.ComInit;
-    defer com.deinit();
-    const rules = openRules() orelse return error.FirewallUnavailable;
-    defer release(rules);
-    const s = spec(port);
-    const p: Plan = blk: {
-        const r = item(rules) catch |err| switch (err) {
-            error.NotFound => break :blk .add,
-            error.Failed => return error.FirewallUnavailable,
-        };
-        defer release(r);
-        var pb: [96]u8 = undefined;
-        break :blk plan(observe(r, &pb) orelse return error.FirewallUnavailable, s);
-    };
-    switch (p) {
-        .already => return p,
-        .replace => _ = try removeFrom(rules),
-        .add => {},
-    }
-    var nr: ?*anyopaque = null;
-    if (w.CoCreateInstance(&CLSID_NetFwRule, null, CLSCTX_INPROC_SERVER, &IID_INetFwRule, &nr) < 0) return error.RuleCreate;
-    const rule = nr orelse return error.RuleCreate;
-    defer release(rule);
-    const name = bstr(rule_name);
-    defer w.SysFreeString(name);
-    const desc = bstr(rule_description);
-    defer w.SysFreeString(desc);
-    const group = bstr(rule_grouping);
-    defer w.SysFreeString(group);
-    const ports = bstrFmt("{d}", .{s.local_port});
-    defer w.SysFreeString(ports);
-    if (method(PutStr, rule, rule_put_name)(rule, name) < 0) return error.RuleSet;
-    if (method(PutStr, rule, rule_put_description)(rule, desc) < 0) return error.RuleSet;
-    // The protocol first: ports are only valid for TCP and UDP rules.
-    if (method(PutI32, rule, rule_put_protocol)(rule, s.protocol) < 0) return error.RuleSet;
-    if (method(PutStr, rule, rule_put_local_ports)(rule, ports) < 0) return error.RuleSet;
-    if (method(PutI32, rule, rule_put_direction)(rule, s.direction) < 0) return error.RuleSet;
-    if (method(PutI32, rule, rule_put_profiles)(rule, s.profiles) < 0) return error.RuleSet;
-    if (method(PutI32, rule, rule_put_action)(rule, s.action) < 0) return error.RuleSet;
-    if (method(PutStr, rule, rule_put_grouping)(rule, group) < 0) return error.RuleSet;
-    if (method(PutBool, rule, rule_put_enabled)(rule, -1) < 0) return error.RuleSet; // VARIANT_TRUE
-    if (method(*const fn (*anyopaque, *anyopaque) callconv(.winapi) HRESULT, rules, rules_add)(rules, rule) < 0) return error.RuleAdd;
-    return p;
-}
-
-/// Removes every rule of that name (administrator only). Returns how many.
-pub fn removeAll() !usize {
-    if (!windows) return error.Unsupported;
-    const com = ComScope.init() orelse return error.ComInit;
-    defer com.deinit();
-    const rules = openRules() orelse return error.FirewallUnavailable;
-    defer release(rules);
-    return removeFrom(rules);
-}
-
-fn removeFrom(rules: *anyopaque) !usize {
-    const name = bstr(rule_name);
-    defer w.SysFreeString(name);
-    var n: usize = 0;
-    // Remove takes one rule of that name per call; bounded, in case a
-    // rule cannot be removed (it would be found again).
-    while (n < 64) : (n += 1) {
-        const r = item(rules) catch |err| switch (err) {
-            error.NotFound => return n,
-            error.Failed => return error.FirewallUnavailable,
-        };
-        release(r);
-        if (method(PutStr, rules, rules_remove)(rules, name) < 0) return error.RuleRemove;
-    }
-    return error.RuleRemove;
-}
-
-/// This process runs with an administrator's (elevated) token.
-pub fn isElevated() bool {
-    if (!windows) return false;
-    var tok: ?*anyopaque = null;
-    if (w.OpenProcessToken(w.GetCurrentProcess(), 0x0008, &tok) == 0) return false; // TOKEN_QUERY
-    const t = tok orelse return false;
-    defer _ = w.CloseHandle(t);
-    var elevated: u32 = 0;
-    var len: u32 = 0;
-    if (w.GetTokenInformation(t, 20, &elevated, @sizeOf(u32), &len) == 0) return false; // TokenElevation
-    return elevated != 0;
-}
-
-pub const Elevated = union(enum) {
-    /// It ran; its exit code.
+const Elevated = union(enum) {
     exited: u32,
-    /// The administrator prompt was declined (or closed).
     declined,
-    /// It could not be started (Win32 error).
     failed: u32,
 };
 
-/// Runs `exe params` as administrator through ShellExecuteEx "runas":
-/// Windows shows ONE administrator prompt (UAC). Blocks until the program
-/// exits (a wait on its process handle, no polling): call it off the UI
-/// thread. `hwnd` (optional) owns the prompt. The program runs hidden.
-pub fn runElevated(exe: []const u8, params: []const u8, hwnd: ?*anyopaque) Elevated {
-    if (!windows) return .{ .failed = 50 }; // ERROR_NOT_SUPPORTED
-    var exe_w: [1024:0]u16 = undefined;
+/// Runs `netsh` (always the System32 one: `change` builds the path) as
+/// administrator through ShellExecuteEx "runas", hidden, and waits for it
+/// (a wait on its process handle).
+fn runElevated(netsh: []const u8, params: []const u8, hwnd: ?*anyopaque) Elevated {
+    var exe_w: [700:0]u16 = undefined;
     var par_w: [512:0]u16 = undefined;
-    const ne = std.unicode.wtf8ToWtf16Le(exe_w[0..1023], exe) catch return .{ .failed = 87 };
+    const ne = std.unicode.wtf8ToWtf16Le(exe_w[0..699], netsh) catch return .{ .failed = 87 };
     exe_w[ne] = 0;
     const np = std.unicode.wtf8ToWtf16Le(par_w[0..511], params) catch return .{ .failed = 87 };
     par_w[np] = 0;
-    const com = ComScope.init();
-    defer if (com) |c| c.deinit();
+    const scope = com.Scope.init();
+    defer if (scope) |s| s.deinit();
     var info: SHELLEXECUTEINFOW = .{
-        .fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        .fMask = 0x40 | 0x100 | 0x400, // NOCLOSEPROCESS | NOASYNC | FLAG_NO_UI
         .hwnd = hwnd,
         .lpVerb = std.unicode.utf8ToUtf16LeStringLiteral("runas"),
         .lpFile = exe_w[0..ne :0].ptr,
@@ -617,17 +575,17 @@ pub fn runElevated(exe: []const u8, params: []const u8, hwnd: ?*anyopaque) Eleva
     };
     if (w.ShellExecuteExW(&info) == 0) {
         const e = w.GetLastError();
-        return if (e == ERROR_CANCELLED) .declined else .{ .failed = e };
+        return if (e == 1223) .declined else .{ .failed = e }; // ERROR_CANCELLED
     }
-    const h = info.hProcess orelse return .{ .exited = 0 };
+    const h = info.hProcess orelse return .{ .failed = 0 };
     defer _ = w.CloseHandle(h);
-    _ = w.WaitForSingleObject(h, INFINITE);
+    _ = w.WaitForSingleObject(h, 0xFFFFFFFF);
     var code: u32 = 1;
     if (w.GetExitCodeProcess(h, &code) == 0) return .{ .failed = w.GetLastError() };
     return .{ .exited = code };
 }
 
-/// This program's own path (WTF-8), for relaunching it.
+/// This program's own path (WTF-8).
 pub fn selfExe(buf: []u8) ?[]const u8 {
     if (!windows) return null;
     var wb: [1024]u16 = undefined;
@@ -645,49 +603,116 @@ fn obs(port: []const u8) Observed {
     return .{ .protocol = protocol_udp, .local_ports = port, .direction = direction_in, .action = action_allow, .profiles = profiles_all, .enabled = true };
 }
 
-test "firewall: the spec is the documented rule" {
-    const s = spec(51820);
-    try testing.expectEqualStrings("Portal tunnel (WireGuard)", s.name);
-    try testing.expectEqual(@as(i32, 17), s.protocol);
-    try testing.expectEqual(@as(u16, 51820), s.local_port);
-    try testing.expectEqual(@as(i32, 1), s.direction);
-    try testing.expectEqual(@as(i32, 1), s.action);
-    try testing.expectEqual(@as(i32, 0x7fffffff), s.profiles);
-    try testing.expect(s.enabled);
+test "firewall: the manual command is the documented rule" {
     var b: [200]u8 = undefined;
-    // The same line README and docs/wireguard.md give.
     try testing.expectEqualStrings(
         "New-NetFirewallRule -DisplayName \"Portal tunnel (WireGuard)\" -Direction Inbound -Protocol UDP -LocalPort 51820 -Profile Any -Action Allow",
         manualAdd(&b, 51820),
     );
 }
 
-test "firewall: plan is idempotent (already, add, replace)" {
-    const s = spec(51820);
-    try testing.expectEqual(Plan.add, plan(null, s));
-    try testing.expectEqual(Plan.already, plan(obs("51820"), s));
-    try testing.expectEqual(Plan.already, plan(obs(" 51820 "), s));
-    try testing.expectEqual(Plan.replace, plan(obs("51821"), s));
-    try testing.expectEqual(Plan.replace, plan(obs("51820-51830"), s));
-    try testing.expectEqual(Plan.replace, plan(obs("*"), s));
-    var o = obs("51820");
+test "firewall: ports below 1024 and known service ports are refused" {
+    var b: [120]u8 = undefined;
+    try testing.expect(portRefusal(&b, 51820) == null);
+    try testing.expect(portRefusal(&b, 1024) == null);
+    try testing.expect(portRefusal(&b, 65535) == null);
+    for ([_]u16{ 0, 53, 500, 1023 }) |p| try testing.expect(std.mem.indexOf(u8, portRefusal(&b, p).?, "1024-65535") != null);
+    for ([_]u16{ 1900, 3389, 3702, 4500, 5353, 5355 }) |p| {
+        const why = portRefusal(&b, p).?;
+        var pb: [8]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, why, try std.fmt.bufPrint(&pb, "{d}", .{p})) != null);
+        try testing.expect(!validPort(p));
+    }
+}
+
+test "firewall: netsh's arguments are fixed text, the name and a validated port" {
+    var b: [400]u8 = undefined;
+    try testing.expectEqualStrings(
+        "advfirewall firewall add rule name=\"Portal tunnel (WireGuard)\" dir=in action=allow protocol=UDP localport=51820 profile=any",
+        try netshArgs(&b, .add, 51820),
+    );
+    try testing.expectEqualStrings(
+        "advfirewall firewall delete rule name=\"Portal tunnel (WireGuard)\"",
+        try netshArgs(&b, .delete, 0),
+    );
+    const set = try netshArgs(&b, .set, 51999);
+    try testing.expect(std.mem.startsWith(u8, set, "advfirewall firewall set rule name=\"Portal tunnel (WireGuard)\" new "));
+    for ([_][]const u8{ "dir=in", "action=allow", "protocol=UDP", "localport=51999", "profile=any", "localip=any", "remoteip=any", "interfacetype=any", "edge=no", "enable=yes" }) |part|
+        try testing.expect(std.mem.indexOf(u8, set, part) != null);
+    try testing.expectError(error.BadPort, netshArgs(&b, .add, 3389));
+    try testing.expectError(error.BadPort, netshArgs(&b, .set, 80));
+    // Only System32's netsh, never a relative or environment path.
+    var nb: [100]u8 = undefined;
+    try testing.expectEqualStrings("C:\\Windows\\system32\\netsh.exe", netshIn(&nb, "C:\\Windows\\system32").?);
+    try testing.expectEqualStrings("C:\\Windows\\system32\\netsh.exe", netshIn(&nb, "C:\\Windows\\system32\\").?);
+    try testing.expect(netshIn(&nb, "system32") == null);
+    if (windows) {
+        var sb: [600]u8 = undefined;
+        const sys = systemDir(&sb).?;
+        try testing.expect(std.ascii.endsWithIgnoreCase(netshIn(&nb, sys).?, "\\system32\\netsh.exe"));
+    }
+}
+
+test "firewall: matches checks every field; the plan follows" {
+    try testing.expect(matches(obs("51820"), 51820));
+    try testing.expect(matches(obs(" 51820 "), 51820));
+    const Case = struct { o: Observed, why: []const u8 };
+    var cases: [12]Case = undefined;
+    var n: usize = 0;
+    const add = struct {
+        fn f(c: []Case, k: *usize, o: Observed, why: []const u8) void {
+            c[k.*] = .{ .o = o, .why = why };
+            k.* += 1;
+        }
+    }.f;
+    var o = obs("51821");
+    add(&cases, &n, o, "port");
+    o = obs("51820-51830");
+    add(&cases, &n, o, "range");
+    o = obs("51820");
     o.enabled = false;
-    try testing.expectEqual(Plan.replace, plan(o, s));
+    add(&cases, &n, o, "disabled");
     o = obs("51820");
-    o.action = 0; // block
-    try testing.expectEqual(Plan.replace, plan(o, s));
+    o.action = 0;
+    add(&cases, &n, o, "block");
     o = obs("51820");
-    o.protocol = 6; // TCP
-    try testing.expectEqual(Plan.replace, plan(o, s));
+    o.protocol = 6;
+    add(&cases, &n, o, "TCP");
     o = obs("51820");
-    o.profiles = 0x4; // public only
-    try testing.expectEqual(Plan.replace, plan(o, s));
+    o.profiles = 0x4;
+    add(&cases, &n, o, "public only");
+    o = obs("51820");
+    o.direction = 2;
+    add(&cases, &n, o, "outbound");
+    o = obs("51820");
+    o.remote_addresses = "192.168.1.0/24";
+    add(&cases, &n, o, "remote addresses");
+    o = obs("51820");
+    o.local_addresses = "10.0.0.5";
+    add(&cases, &n, o, "local addresses");
+    o = obs("51820");
+    o.interface_types = "Wireless";
+    add(&cases, &n, o, "interface types");
+    o = obs("51820");
+    o.edge_traversal = true;
+    add(&cases, &n, o, "edge traversal");
     o = obs("51820");
     o.has_application = true;
-    try testing.expectEqual(Plan.replace, plan(o, s));
+    add(&cases, &n, o, "program");
+    for (cases[0..n]) |c| {
+        if (matches(c.o, 51820)) {
+            std.debug.print("matched despite {s}\n", .{c.why});
+            return error.TestUnexpectedResult;
+        }
+        const p = plan(c.o, 51820);
+        try testing.expectEqual(if (c.o.has_application) Plan.delete_add else Plan.set, p);
+    }
+    try testing.expectEqual(Plan.add, plan(null, 51820));
+    try testing.expectEqual(Plan.already, plan(obs("51820"), 51820));
     o = obs("51820");
-    o.direction = 2; // outbound
-    try testing.expectEqual(Plan.replace, plan(o, s));
+    o.local_addresses = "Any";
+    o.interface_types = "all";
+    try testing.expect(matches(o, 51820));
 }
 
 test "firewall: status after a port move names the old port" {
@@ -696,35 +721,28 @@ test "firewall: status after a port move names the old port" {
     try testing.expectEqual(@as(u16, 51820), statusOf(obs("51820"), 51821).other_port);
     var o = obs("51820");
     o.enabled = false;
-    try testing.expectEqual(Status.differs, statusOf(o, 51820));
     try testing.expectEqual(Status.differs, statusOf(o, 51821));
     var b: [200]u8 = undefined;
-    try testing.expect(std.mem.indexOf(u8, describe(.{ .other_port = 51820 }, 51821, &b), "Replace") != null);
-    try testing.expect(std.mem.indexOf(u8, describe(.missing, 51821, &b), "UDP 51821") != null);
+    try testing.expect(std.mem.indexOf(u8, describe(.{ .other_port = 51820 }, 51821, &b), "Replace it with UDP 51821") != null);
+    try testing.expect(std.mem.indexOf(u8, describe(.missing, 51821, &b), "Add rule for UDP 51821") != null);
+    // The declined text names the real port.
+    var ob: [400]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, outcomeText(.declined, .add, 51999, &ob), "-LocalPort 51999") != null);
 }
 
-test "firewall: the elevated child's arguments parse back" {
-    var b: [64]u8 = undefined;
-    const add = elevatedParams(&b, .add, 51999);
-    try testing.expectEqualStrings("firewall add --port 51999 --no-elevate", add);
-    var it = std.mem.tokenizeScalar(u8, add, ' ');
-    var parts: [8][]const u8 = undefined;
-    var n: usize = 0;
-    while (it.next()) |t| : (n += 1) parts[n] = t;
-    const a = parseArgs(parts[1..n]).?;
-    try testing.expect(a.sub == .add and a.port.? == 51999 and a.no_elevate);
-    const r = parseArgs(&.{ "remove", "--no-elevate" }).?;
-    try testing.expect(r.sub == .remove and r.no_elevate and r.port == null);
+test "firewall: arguments" {
+    const a = parseArgs(&.{ "add", "--port", "51999" }).?;
+    try testing.expect(a.sub == .add and a.port.? == 51999);
+    try testing.expect(parseArgs(&.{"remove"}).?.sub == .remove);
     try testing.expect(parseArgs(&.{}) == null);
     try testing.expect(parseArgs(&.{"open"}) == null);
-    try testing.expect(parseArgs(&.{ "add", "--port", "0" }) == null);
+    try testing.expect(parseArgs(&.{ "add", "--no-elevate" }) == null);
     try testing.expect(parseArgs(&.{ "add", "--port", "70000" }) == null);
     try testing.expect(parseArgs(&.{ "add", "--port" }) == null);
-    try testing.expect(parseArgs(&.{ "status", "--force" }) == null);
 }
 
 test "firewall: guid" {
-    const g = guid("98325047-c671-4174-8d81-defcd3f03186");
+    const g = com.guid("98325047-c671-4174-8d81-defcd3f03186");
     try testing.expectEqual(@as(u32, 0x98325047), g.a);
     try testing.expectEqual(@as(u16, 0xc671), g.b);
     try testing.expectEqual(@as(u16, 0x4174), g.c);
@@ -736,7 +754,7 @@ test "firewall: reading the real rule works without an administrator (read-only)
     // Any answer is fine (this machine may or may not have the rule); the
     // point is that the COM calls and their vtable slots are right. It
     // never adds, changes or removes a rule.
-    const st = status(51820);
-    _ = st;
-    _ = isElevated();
+    var r: Reading = .{};
+    const first = r.read() catch return error.SkipZigTest; // firewall service off
+    if (first) |o| _ = statusOf(o, 51820);
 }

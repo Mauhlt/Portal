@@ -9,10 +9,14 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const setup_lib = @import("setup_lib.zig");
 const w = @import("win32");
+const ops = @import("release_ops.zig");
+const com = @import("firewall").com;
 
-const HRESULT = i32;
+const HRESULT = com.HRESULT;
 const HKEY = *anyopaque;
-const GUID = extern struct { a: u32, b: u16, c: u16, d: [8]u8 };
+const GUID = com.GUID;
+const method = com.method;
+const release = com.release;
 
 extern "advapi32" fn RegCreateKeyExW(key: HKEY, sub: [*:0]const u16, reserved: u32, class: ?[*:0]const u16, options: u32, sam: u32, sa: ?*anyopaque, result: *?HKEY, disposition: ?*u32) callconv(.winapi) i32;
 extern "advapi32" fn RegOpenKeyExW(key: HKEY, sub: [*:0]const u16, options: u32, sam: u32, result: *?HKEY) callconv(.winapi) i32;
@@ -24,9 +28,21 @@ extern "advapi32" fn RegCloseKey(key: HKEY) callconv(.winapi) i32;
 extern "user32" fn SendMessageTimeoutW(hwnd: ?*anyopaque, msg: u32, wparam: usize, lparam: isize, flags: u32, timeout: u32, result: ?*usize) callconv(.winapi) isize;
 extern "kernel32" fn IsWow64Process2(process: *anyopaque, process_machine: *u16, native_machine: *u16) callconv(.winapi) i32;
 extern "kernel32" fn GetCurrentProcess() callconv(.winapi) *anyopaque;
-extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn LoadLibraryExW(name: [*:0]const u16, file: ?*anyopaque, flags: u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn SetDefaultDllDirectories(flags: u32) callconv(.winapi) i32;
+extern "kernel32" fn SetFileInformationByHandle(h: *anyopaque, class: u32, info: *const anyopaque, size: u32) callconv(.winapi) i32;
 extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
-extern "ole32" fn CoCreateInstance(clsid: *const GUID, outer: ?*anyopaque, ctx: u32, iid: *const GUID, out: *?*anyopaque) callconv(.winapi) HRESULT;
+
+/// LOAD_LIBRARY_SEARCH_SYSTEM32.
+const search_system32: u32 = 0x800;
+
+/// First thing: every DLL this process loads later (comctl32, COM's
+/// in-process servers) comes from System32 only, never from the folder the
+/// installer was started from (a Downloads folder may hold a planted DLL).
+/// The DLLs it imports directly are KnownDLLs or load before main.
+pub fn safeDllSearch() void {
+    _ = SetDefaultDllDirectories(search_system32);
+}
 
 /// HKEY_CURRENT_USER: (HKEY)(ULONG_PTR)(LONG)0x80000001, sign-extended.
 fn hkcu() HKEY {
@@ -157,22 +173,13 @@ const CLSID_ShellLink: GUID = .{ .a = 0x00021401, .b = 0, .c = 0, .d = .{ 0xC0, 
 const IID_IShellLinkW: GUID = .{ .a = 0x000214F9, .b = 0, .c = 0, .d = .{ 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
 const IID_IPersistFile: GUID = .{ .a = 0x0000010b, .b = 0, .c = 0, .d = .{ 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
 
-fn method(comptime F: type, obj: *anyopaque, index: usize) F {
-    const vtbl: *const [*]const *const anyopaque = @ptrCast(@alignCast(obj));
-    return @ptrCast(@alignCast(vtbl.*[index]));
-}
-
-fn release(obj: *anyopaque) void {
-    _ = method(*const fn (*anyopaque) callconv(.winapi) u32, obj, 2)(obj);
-}
-
 const SetW = *const fn (*anyopaque, [*:0]const u16) callconv(.winapi) HRESULT;
 
 /// Writes the shortcut `lnk` to `target args` (IShellLinkW + IPersistFile;
 /// replaces an existing one). COM must be initialized on this thread.
 pub fn writeShortcut(gpa: Allocator, lnk: []const u8, target: []const u8, args: []const u8, desc: []const u8, workdir: []const u8) !void {
     var obj: ?*anyopaque = null;
-    if (CoCreateInstance(&CLSID_ShellLink, null, 1, &IID_IShellLinkW, &obj) < 0) return error.ShellLink;
+    if (com.CoCreateInstance(&CLSID_ShellLink, null, 1, &IID_IShellLinkW, &obj) < 0) return error.ShellLink;
     const sl = obj.?;
     defer release(sl);
     const t = try wide(gpa, target);
@@ -248,7 +255,7 @@ fn taskDialogFn() ?TaskDialogIndirectFn {
     };
     if (!S.looked) {
         S.looked = true;
-        if (LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("comctl32.dll"))) |m|
+        if (LoadLibraryExW(std.unicode.utf8ToUtf16LeStringLiteral("comctl32.dll"), null, search_system32)) |m|
             if (GetProcAddress(m, "TaskDialogIndirect")) |p| {
                 S.f = @ptrCast(@alignCast(p));
             };
@@ -376,17 +383,12 @@ pub fn startDetached(gpa: Allocator, exe: []const u8, args: []const u8, cwd: []c
     _ = w.CloseHandle(pi.hProcess);
 }
 
-/// Runs `argv` hidden (no console window) and waits for it: its exit code.
+/// Runs `argv` hidden (no console window, never elevated) and waits for
+/// it: its exit code (release_ops.waitExact).
 pub fn runHidden(io: std.Io, argv: []const []const u8) !u32 {
     var child = try std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .create_no_window = true });
     errdefer child.kill(io);
-    const h: w.HANDLE = @ptrCast(child.id.?);
-    _ = w.WaitForSingleObject(h, w.INFINITE);
-    var code: w.DWORD = 1;
-    const ok = w.GetExitCodeProcess(h, &code) != 0;
-    _ = try child.wait(io);
-    if (!ok) return error.NoExitCode;
-    return code;
+    return ops.waitExact(io, &child);
 }
 
 /// Waits for process `pid` to end (the uninstaller's copy waits for the
@@ -397,3 +399,67 @@ pub fn waitForPid(pid: u32) void {
     _ = w.WaitForSingleObject(h, w.INFINITE);
     _ = w.CloseHandle(h);
 }
+
+// ---------------------------------------------------- the uninstall copy
+
+/// The uninstaller's working copy: %TEMP%\portal-uninstall-<16 random hex>\
+/// (a fresh folder nobody else knows the name of). Returns the folder,
+/// created; `io.random` supplies the name.
+pub fn freshTempDir(a: Allocator, io: std.Io, temp: []const u8) ![]u8 {
+    var rnd: [8]u8 = undefined;
+    io.random(&rnd);
+    const hex = std.fmt.bytesToHex(rnd, .lower);
+    const dir = try std.fs.path.join(a, &.{ temp, setup_lib.uninstall_dir_prefix ++ hex });
+    try std.Io.Dir.cwd().createDir(io, dir, .default_dir); // fails if it exists
+    return dir;
+}
+
+/// Deletes the running program's own file and then its folder (the
+/// uninstall copy, at its end): its data stream is renamed away first,
+/// which Windows allows for a running image, then the file is marked for
+/// deletion. Where that is refused, MoveFileEx(DELAY_UNTIL_REBOOT) is
+/// tried (it needs an administrator, so usually fails); a later
+/// portal-setup removes leftovers (setup_lib.staleUninstallDirs).
+pub fn deleteSelf(self_path: []const u8) void {
+    var pw_buf: [1024:0]u16 = undefined;
+    const n = std.unicode.wtf8ToWtf16Le(pw_buf[0..1023], self_path) catch return;
+    pw_buf[n] = 0;
+    const pw = pw_buf[0..n :0];
+    const DELETE: u32 = 0x00010000;
+    const FileRenameInfo: u32 = 3;
+    const FileDispositionInfo: u32 = 4;
+    renamed: {
+        const h = w.validHandle(w.CreateFileW(pw.ptr, DELETE | w.SYNCHRONIZE, w.FILE_SHARE_READ | w.FILE_SHARE_DELETE, null, w.OPEN_EXISTING, 0, null)) orelse break :renamed;
+        defer _ = w.CloseHandle(h);
+        var info: RenameInfo = .{};
+        _ = SetFileInformationByHandle(h, FileRenameInfo, &info, @sizeOf(@TypeOf(info)));
+    }
+    const h = w.validHandle(w.CreateFileW(pw.ptr, DELETE | w.SYNCHRONIZE, w.FILE_SHARE_READ | w.FILE_SHARE_DELETE, null, w.OPEN_EXISTING, 0, null));
+    var marked = false;
+    if (h) |hh| {
+        const del: u8 = 1; // FILE_DISPOSITION_INFO.DeleteFile
+        marked = SetFileInformationByHandle(hh, FileDispositionInfo, &del, 1) != 0;
+        _ = w.CloseHandle(hh);
+    }
+    if (!marked) {
+        _ = w.MoveFileExW(pw.ptr, null, 0x4); // MOVEFILE_DELAY_UNTIL_REBOOT
+        return;
+    }
+    // The file is gone once its handle closed: the folder can go too.
+    const dir = std.fs.path.dirname(self_path) orelse return;
+    var dw: [1024:0]u16 = undefined;
+    const dn = std.unicode.wtf8ToWtf16Le(dw[0..1023], dir) catch return;
+    dw[dn] = 0;
+    _ = RemoveDirectoryW(dw[0..dn :0].ptr);
+}
+
+/// FILE_RENAME_INFO with its name ":gone" (a new stream of the file).
+const gone_stream = std.unicode.utf8ToUtf16LeStringLiteral(":gone");
+const RenameInfo = extern struct {
+    replace: u32 = 0,
+    root: ?*anyopaque = null,
+    len: u32 = gone_stream.len * 2,
+    name: [gone_stream.len]u16 = gone_stream.*,
+};
+
+extern "kernel32" fn RemoveDirectoryW(path: [*:0]const u16) callconv(.winapi) i32;

@@ -173,31 +173,8 @@ fn lockReleases(ctx: Ctx, cmd: []const u8) void {
 
 // ---------------------------------------------------------------- process
 
-/// Searches PATH (absolute entries only; never the current directory).
-fn findOnPath(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, exe_name: []const u8) ?[]u8 {
-    const path_var = env.get("PATH") orelse return null;
-    var parts = std.mem.splitScalar(u8, path_var, ';');
-    while (parts.next()) |raw| {
-        const dir = std.mem.trim(u8, raw, " \"");
-        if (dir.len == 0 or !std.fs.path.isAbsolute(dir)) continue;
-        const candidate = std.fs.path.join(gpa, &.{ dir, exe_name }) catch return null;
-        if (isFile(io, candidate)) return candidate;
-        gpa.free(candidate);
-    }
-    return null;
-}
-
-/// Waits for the child and returns its full 32-bit exit code (std's Term
-/// truncates it to u8, which could turn 256 into "success").
-fn waitExact(io: Io, child: *std.process.Child) !u32 {
-    const h: w.HANDLE = @ptrCast(child.id.?);
-    if (w.WaitForSingleObject(h, w.INFINITE) == w.WAIT_FAILED) return error.WaitFailed;
-    var code: w.DWORD = 1;
-    const ok = w.GetExitCodeProcess(h, &code) != 0;
-    _ = try child.wait(io);
-    if (!ok) return error.NoExitCode;
-    return code;
-}
+const findOnPath = ops.findOnPath;
+const waitExact = ops.waitExact;
 
 fn runInherit(io: Io, argv: []const []const u8, cwd: []const u8) !u32 {
     var child = try std.process.spawn(io, .{ .argv = argv, .cwd = .{ .path = cwd } });

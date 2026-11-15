@@ -69,6 +69,7 @@ const tls_server = @import("tls/server.zig");
 const x509 = @import("tls/x509.zig");
 const pki = @import("tls/pki.zig");
 const settings = @import("settings.zig");
+const firewall = @import("firewall");
 const sysmon = @import("sysmon.zig");
 const sync = @import("sync.zig");
 const sync_cli = @import("sync_cli.zig");
@@ -314,7 +315,7 @@ pub fn main(init: std.process.Init) !void {
             defer gpa.free(dir);
             break :blk settings.load(gpa, io, dir).tunnelPort();
         } else |_| tunnelnet.default_udp_port;
-        std.process.exit(@import("firewall").command(args[1..], port));
+        std.process.exit(firewall.command(args[1..], port));
     }
     if (std.mem.eql(u8, cmd, "pair")) return cmdPair(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "devices")) return cmdDevices(gpa, io, init.environ_map);
@@ -1193,6 +1194,13 @@ fn prepare(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, paths: d
         "no program: pass -- <program> [args...] (or save one in the Portal window's first-run screen, settings.txt `program = ...`)" };
     if (cfg.project) |p| if (!title.validProject(p))
         return fail_(err_buf, "The project name must be 1-{d} bytes of printable text on one line.", .{title.max_project_bytes});
+    // The tunnel's port: 1024-65535 and no Windows service's (one list,
+    // src/firewall.zig, which also refuses a rule for it). The loopback
+    // test tunnel is never reachable from outside, so it is exempt.
+    if (!opts.tunnel_loopback) {
+        var rb: [120]u8 = undefined;
+        if (firewall.portRefusal(&rb, cfg.tunnel_port)) |why| return fail_(err_buf, "Tunnel UDP port: {s}", .{why});
+    }
     // Remote typing into a shell is a remote shell: refuse unless explicit.
     if ((cfg.policy == .instruct or cfg.policy == .text) and isShellProgram(command[0]) and !allow_remote_shell)
         return fail_(err_buf, "Refusing {t} input for a shell ({s}): remote typing would be a remote shell. Choose keys input, or pass --allow-remote-shell if you really mean it.", .{ cfg.policy, command[0] });
@@ -1545,6 +1553,8 @@ fn cmdTunnelPort(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, ar
         } else fatal("usage: portalctl tunnel-port <port> [--endpoint HOST:PORT] --router-forwarded", .{});
     }
     const p = port orelse fatal("usage: portalctl tunnel-port <port> [--endpoint HOST:PORT] --router-forwarded", .{});
+    var rb: [120]u8 = undefined;
+    if (firewall.portRefusal(&rb, p)) |why| fatal("{s}", .{why});
     if (endpoint) |e| if (!gui.validEndpoint(e)) fatal("--endpoint must be HOST:PORT", .{});
     if (!forwarded) fatal("forward UDP {d} on your router to this desktop first (Portal never changes the router), then run this again with --router-forwarded", .{p});
     var bb: [600]u8 = undefined;

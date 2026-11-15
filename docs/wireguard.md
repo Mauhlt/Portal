@@ -76,14 +76,27 @@ New-NetFirewallRule -DisplayName "Portal tunnel (WireGuard)" -Direction Inbound 
   -Protocol UDP -LocalPort 51820 -Profile Any -Action Allow
 ```
 
-The first three are the same code (src/firewall.zig): the Windows
-Firewall COM API (INetFwPolicy2), run by this release's `portalctl.exe`
-relaunched as administrator (ShellExecuteEx "runas", `--no-elevate` so
-it never asks twice). It is idempotent: a matching rule is left alone; a
-rule of that name that differs (another port, disabled, a block rule) is
-replaced. If you decline the prompt, nothing changes and Portal shows the
-command above. Portal changes the rule only when you ask, and never any
-other rule. Uninstalling the desk removes it (one prompt).
+The first three are the same code (src/firewall.zig). Reading the rule
+uses the Windows Firewall COM API (INetFwPolicy2), unelevated. Changing
+it runs exactly one program as administrator: Windows' own
+`<System32>\netsh.exe` (the folder from GetSystemDirectoryW), through
+ShellExecuteEx "runas", with fixed arguments and a validated port
+(`advfirewall firewall add rule name="Portal tunnel (WireGuard)" dir=in
+action=allow protocol=UDP localport=N profile=any`). Nothing Portal ships
+and nothing a user can write (no file from `%LOCALAPPDATA%`, no
+settings.txt) ever runs elevated. It is idempotent: a matching rule is
+left alone (no prompt); a rule of that name that differs (another port,
+disabled, a block rule, addresses, interface types, edge traversal) is
+rewritten with `set rule ... new` in the same one prompt; only a rule tied
+to a program needs `delete rule` and `add rule`, two prompts. Afterwards
+Portal reads the rule again and says what Windows now has. If you decline
+the prompt, nothing changes and Portal shows the command above with your
+port. Portal changes the rule only when you ask, and never any other
+rule. Uninstalling the desk removes it (one prompt).
+
+The tunnel port must be 1024-65535 and not a port Windows services use
+(1701, 1900, 3389, 3544, 3702, 4500, 5353, 5355): Settings, the first-run
+screen and `portalctl tunnel-port` refuse those, and so does the rule.
 
 It is deliberately not tied to a program (every release runs from its own
 folder) and covers all profiles: every packet on that port is checked by

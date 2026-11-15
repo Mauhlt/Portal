@@ -18,9 +18,9 @@
 //!     device), bin on the user PATH (HKCU\Environment, then a
 //!     WM_SETTINGCHANGE broadcast), the Settings > Apps entry (HKCU), and
 //!     install.txt (the role, for the uninstaller);
-//!   * desk: the firewall rule through `portalctl firewall add`, which asks
-//!     for an administrator ONCE (src/firewall.zig); declined, it says how
-//!     to add it later. Then the agent hooks (`portalctl hooks install`),
+//!   * desk: the firewall rule through `portalctl firewall add` (run
+//!     unelevated; only System32's netsh runs as administrator, one prompt,
+//!     src/firewall.zig); declined, it says how to add it later. Then the agent hooks (`portalctl hooks install`),
 //!     then Portal starts;
 //!   * device: Portal starts on its pairing screen (`portal connect`).
 //! Re-running upgrades in place and keeps Portal's data. Everything blocks
@@ -68,6 +68,8 @@ fn toFiles(comptime list: anytype) [list.len]inst.File {
 
 pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag != .windows) @compileError("portal-setup is the Windows installer");
+    // Before anything loads a DLL: System32 only (setup_win.safeDllSearch).
+    sw.safeDllSearch();
     const gpa = init.gpa;
     var args_list: std.ArrayList([]const u8) = .empty;
     defer args_list.deinit(gpa);
@@ -86,6 +88,7 @@ pub fn main(init: std.process.Init) !void {
         .env = init.environ_map,
     };
     sw.coInit();
+    s.removeStaleCopies();
 
     if (args.len > 0 and std.mem.eql(u8, args[0], "--version")) {
         _ = sw.show(gpa, .{ .heading = "Portal setup", .body = s.fmt("Version {s} ({s}), built with Zig {s}.", .{ options.version, @tagName(my_arch), builtin.zig_version_string }) });
@@ -134,8 +137,8 @@ const Setup = struct {
         return setup_lib.parseInfo(text);
     }
 
-    /// The current release's portalctl.exe (the real program, not the
-    /// launcher: the firewall step runs it elevated).
+    /// The current release's portalctl.exe (run unelevated: the firewall
+    /// step inside it elevates only System32's netsh).
     fn releaseCtl(s: Setup, c: ops.Ctx) ?[]const u8 {
         const id = ops.readPointer(c, lib.current_file) orelse return null;
         defer s.gpa.free(id);
@@ -145,6 +148,31 @@ const Setup = struct {
 
     fn home(s: Setup) []const u8 {
         return s.env.get("USERPROFILE") orelse "C:\\";
+    }
+
+    /// Uninstall copies an earlier uninstall could not delete (setup_lib
+    /// isUninstallDir; never this program's own folder).
+    fn removeStaleCopies(s: Setup) void {
+        const temp = s.env.get("TEMP") orelse return;
+        var self_buf: [1024]u8 = undefined;
+        const mine = if (firewall.selfExe(&self_buf)) |p| std.fs.path.dirname(p) orelse "" else "";
+        var d = std.Io.Dir.cwd().openDir(s.io, temp, .{ .iterate = true }) catch return;
+        defer d.close(s.io);
+        var it = d.iterate();
+        while (it.next(s.io) catch null) |e| {
+            if (e.kind != .directory or !setup_lib.isUninstallDir(e.name)) continue;
+            if (std.ascii.endsWithIgnoreCase(mine, e.name)) continue;
+            d.deleteTree(s.io, e.name) catch {};
+        }
+    }
+
+    /// The agent CLI is on PATH (setup_lib.agent_exes).
+    fn agentInstalled(s: Setup) bool {
+        for (setup_lib.agent_exes) |name| if (ops.findOnPath(s.gpa, s.io, s.env, name)) |p| {
+            s.gpa.free(p);
+            return true;
+        };
+        return false;
     }
 
     // ------------------------------------------------------------- install
@@ -273,27 +301,43 @@ const Setup = struct {
         const ctl = s.releaseCtl(c) orelse return;
         const fw = sw.show(s.gpa, .{
             .heading = "Let devices reach this desk through Windows Firewall",
-            .body = "Portal's tunnel needs one inbound rule: UDP on its port (51820 unless you change it), every network profile. Windows asks for an administrator once.",
+            .body = "Portal's tunnel needs one inbound rule: UDP on its port (51820, or the one saved in Settings), every network profile. Windows' own netsh adds it, and Windows asks for an administrator once.",
             .icon = .shield,
             .links = &.{
-                .{ .id = 100, .text = "Add the firewall rule\nOne administrator prompt" },
-                .{ .id = 101, .text = "Not now\nSettings has a Firewall button for later" },
+                .{ .id = 100, .text = "Add the firewall rule\nOne administrator prompt (Windows' netsh)" },
+                .{ .id = 101, .text = "Not now\nSettings has a Windows Firewall row for later" },
             },
             .default = 100,
         });
-        var mb: [300]u8 = undefined;
         if (fw.button == 100) {
+            // portalctl runs unelevated: it reads the saved port and asks
+            // Windows to run System32's netsh as administrator.
             const code = sw.runHidden(s.io, &.{ ctl, "firewall", "add" }) catch 255;
-            switch (code) {
-                firewall.exit.ok => notes.print(s.arena, "\u{2022} Windows Firewall allows the tunnel's UDP port\n", .{}) catch {},
-                firewall.exit.declined => notes.print(s.arena, "\u{2022} The firewall rule was not added (the prompt was declined). Add it later in Settings (Windows Firewall), or in an administrator PowerShell:\n   {s}\n", .{firewall.manualAdd(&mb, 51820)}) catch {},
-                else => notes.print(s.arena, "\u{2022} The firewall rule could not be added (exit code {d}). Settings (Windows Firewall) tries again\n", .{code}) catch {},
-            }
-        } else notes.print(s.arena, "\u{2022} No firewall rule yet: Settings (Windows Firewall) adds it\n", .{}) catch {};
+            notes.print(s.arena, "\u{2022} {s}\n", .{switch (code) {
+                firewall.exit.ok => "Windows Firewall allows the tunnel's UDP port",
+                firewall.exit.declined => "The firewall rule was not added (the prompt was declined). Settings, Windows Firewall adds it later and shows the command to do it by hand",
+                else => "The firewall rule could not be added. Settings, Windows Firewall tries again and shows why",
+            }}) catch {};
+        } else notes.print(s.arena, "\u{2022} No firewall rule yet: Settings, Windows Firewall adds it\n", .{}) catch {};
 
-        const bin_ctl = std.fs.path.join(s.arena, &.{ std.fs.path.dirname(c.releases).?, "bin", "portalctl.exe" }) catch return;
-        const hooks = sw.runHidden(s.io, &.{ bin_ctl, "hooks", "install" }) catch 255;
-        notes.print(s.arena, "\u{2022} {s}\n", .{if (hooks == 0) "Claude Code integration (agent hooks) installed" else "The agent hooks could not be installed: Settings, Claude Code integration"}) catch {};
+        // The agent hooks: only with the agent installed (never creates its
+        // settings on a PC without it), and only when the owner agrees.
+        if (s.agentInstalled()) {
+            const ask = sw.show(s.gpa, .{
+                .heading = "Connect Claude Code to Portal?",
+                .body = "Adds Portal's hooks to Claude Code's settings.json (a backup is kept next to it): each runs `portalctl hook`, which tells this Portal, over a pipe only you can open, when Claude in a tab works, waits for an answer or is done. Nothing leaves this computer. Settings can remove them.",
+                .links = &.{
+                    .{ .id = 100, .text = "Add the hooks (recommended)" },
+                    .{ .id = 101, .text = "Not now\nSettings, Claude Code integration adds them later" },
+                },
+                .default = 100,
+            });
+            if (ask.button == 100) {
+                const bin_ctl = std.fs.path.join(s.arena, &.{ std.fs.path.dirname(c.releases).?, "bin", "portalctl.exe" }) catch return;
+                const hooks = sw.runHidden(s.io, &.{ bin_ctl, "hooks", "install" }) catch 255;
+                notes.print(s.arena, "\u{2022} {s}\n", .{if (hooks == 0) "Claude Code integration (agent hooks) installed" else "The agent hooks could not be installed: Settings, Claude Code integration"}) catch {};
+            } else notes.print(s.arena, "\u{2022} Agent hooks: not installed (Settings, Claude Code integration)\n", .{}) catch {};
+        } else notes.print(s.arena, "\u{2022} Claude Code was not found: install the agent hooks later from Settings, Claude Code integration\n", .{}) catch {};
         notes.print(s.arena, "\u{2022} Next: in Settings, where devices reach this desk (your router's public address or a dynamic-DNS name); Settings walks you through the router\n", .{}) catch {};
     }
 
@@ -302,19 +346,26 @@ const Setup = struct {
     fn uninstall(s: Setup, wait_pid: ?u32) void {
         const l = s.layout();
         // A running exe cannot delete itself: the copy in the install
-        // folder hands over to a copy in %TEMP% and ends.
+        // folder hands over to a copy in a fresh random folder in %TEMP%
+        // (started in System32, not %TEMP%) and ends; the copy removes
+        // itself when it is done.
         var self_buf: [1024]u8 = undefined;
         const self = firewall.selfExe(&self_buf) orelse "";
         if (wait_pid == null and std.ascii.eqlIgnoreCase(self, l.setup_exe)) {
             const tmp = s.env.get("TEMP") orelse s.fail("Portal could not be removed", "TEMP is not set.");
-            const copy = std.fs.path.join(s.arena, &.{ tmp, s.fmt("portal-uninstall-{d}.exe", .{w.GetCurrentProcessId()}) }) catch return;
+            const dir = sw.freshTempDir(s.arena, s.io, tmp) catch |err|
+                s.fail("Portal could not be removed", s.fmt("Cannot make a folder in {s}: {t}.", .{ tmp, err }));
+            const copy = std.fs.path.join(s.arena, &.{ dir, setup_lib.setup_exe_name }) catch return;
             std.Io.Dir.copyFileAbsolute(self, copy, s.io, .{}) catch |err|
                 s.fail("Portal could not be removed", s.fmt("Cannot copy the uninstaller to {s}: {t}.", .{ copy, err }));
-            sw.startDetached(s.gpa, copy, s.fmt("--uninstall --wait-pid {d}", .{w.GetCurrentProcessId()}), tmp) catch |err|
+            var sys: [600]u8 = undefined;
+            sw.startDetached(s.gpa, copy, s.fmt("--uninstall --wait-pid {d}", .{w.GetCurrentProcessId()}), firewall.systemDir(&sys) orelse dir) catch |err|
                 s.fail("Portal could not be removed", s.fmt("Cannot start {s}: {t}.", .{ copy, err }));
             return;
         }
         if (wait_pid) |p| sw.waitForPid(p);
+        // The copy deletes itself (and its folder) however this ends.
+        defer if (wait_pid != null) sw.deleteSelf(self);
 
         const role: Role = if (s.previous(l)) |i| i.role else .device;
         const sure = sw.show(s.gpa, .{
@@ -341,11 +392,16 @@ const Setup = struct {
 
         const c = s.ctx(l);
         var notes: std.ArrayList(u8) = .empty;
-        var mb: [300]u8 = undefined;
+        if (role == .desk) {
+            // System32's netsh as administrator (one prompt); nothing of
+            // Portal's runs elevated.
+            var ob: [400]u8 = undefined;
+            const o = firewall.change(.remove, 0, null);
+            const ok = o == .nothing or (o == .changed and o.changed == .missing);
+            if (!ok) notes.print(s.arena, "\u{2022} Firewall: {s}\n", .{firewall.outcomeText(o, .remove, 0, &ob)}) catch {};
+        }
         if (s.releaseCtl(c)) |ctl| {
             if (role == .desk) {
-                const code = sw.runHidden(s.io, &.{ ctl, "firewall", "remove" }) catch 255;
-                if (code != firewall.exit.ok) notes.print(s.arena, "\u{2022} The firewall rule was not removed. In an administrator PowerShell:\n   {s}\n", .{firewall.manual_remove}) catch {};
                 const hooks = sw.show(s.gpa, .{
                     .heading = "Remove Portal's hooks from Claude Code too?",
                     .body = "They run Portal's portalctl, which is being removed. Everything else in Claude Code's settings.json stays as it is.",
@@ -359,7 +415,6 @@ const Setup = struct {
             }
             if (delete_data and role == .device) _ = sw.runHidden(s.io, &.{ ctl, "sync-device", "--drop-key" }) catch {};
         }
-        _ = &mb;
 
         // A running Portal holds its exe: ask to close it first.
         while (s.portalRunning(c)) {

@@ -150,8 +150,16 @@ fn sameRelease(ctx: ops.Ctx, p: Payload, hash: []const u8, id: []const u8) !bool
     const gpa = ctx.gpa;
     const dir_path = try ctx.path(id);
     defer gpa.free(dir_path);
-    var d = Io.Dir.cwd().openDir(ctx.io, dir_path, .{}) catch return false;
+    var d = Io.Dir.cwd().openDir(ctx.io, dir_path, .{ .iterate = true }) catch return false;
     defer d.close(ctx.io);
+    // Only the payload's files and BUILD-INFO.txt: a folder holding
+    // anything else (a planted DLL next to portal.exe, a release made by
+    // `zig build release` with its .pdb and source) is not reused.
+    var it = d.iterate();
+    while (try it.next(ctx.io)) |e| {
+        const expected = e.kind == .file and (std.mem.eql(u8, e.name, "BUILD-INFO.txt") or p.exe(e.name) != null);
+        if (!expected) return false;
+    }
     const info = d.readFileAlloc(ctx.io, "BUILD-INFO.txt", gpa, .limited(64 << 10)) catch return false;
     defer gpa.free(info);
     const recorded = lib.buildInfoSha256(info) orelse return false;
@@ -253,6 +261,14 @@ test "setup: installing twice reuses the release; a new build is an upgrade in p
     const r5 = try install(ctx, p1, .{ .stamp = "20261116-110000", .iso = "t5" });
     defer testing.allocator.free(r5.id);
     try testing.expect(!r5.reused);
+
+    // A folder with anything extra (here a DLL next to portal.exe) is not
+    // reused either: a fresh release folder is stored instead.
+    try tmp.dir.writeFile(io, .{ .sub_path = "Portal\\releases\\20261116-110000_zig-0.18.0-dev.1\\version.dll", .data = "planted" });
+    const r6 = try install(ctx, p1, .{ .stamp = "20261116-120000", .iso = "t6" });
+    defer testing.allocator.free(r6.id);
+    try testing.expect(!r6.reused);
+    try testing.expectEqualStrings("20261116-120000_zig-0.18.0-dev.1", r6.id);
 }
 
 test "setup: an incomplete payload is refused" {
