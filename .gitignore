@@ -4,3 +4,5 @@ releases/
 zig-pkg/
 # stray release-id files a release-tool run can leave at the repo root
 /[0-9]*-[0-9]*_zig-*
+# the iPhone signer's local settings (docs/portal-ios.conf.example)
+portal-ios.conf

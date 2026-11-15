@@ -631,12 +631,11 @@ const model_pin = @import("src/speech/model_pin.zig");
 ///                            iOS SDK needed; part of `zig build test`)
 ///   zig build ios            build zig-out/ios/Portal.app (on a Mac: needs
 ///                            the iOS SDK and MoltenVK, see the options)
-///   zig build ios-sign       sign it (env: PORTAL_SIGN_IDENTITY,
-///                            PORTAL_PROVISIONING_PROFILE, PORTAL_TEAM_ID,
-///                            PORTAL_TUNNEL_PROVISIONING_PROFILE with the
-///                            tunnel)
+///   zig build ios-sign       sign it (portal-ios.conf or the environment:
+///                            src/tools/ios_sign.zig)
 ///   zig build ios-kit        zig-out/ios-kit: the unsigned Portal.app, the
-///                            signer for aarch64-macos and README.txt, to
+///                            signer for arm64 and x86_64 macOS, its sample
+///                            portal-ios.conf and README.txt, to
 ///                            build on any host (iOS SDK copied from the
 ///                            Mac) and sign + install on a Mac without Zig
 fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Build.Step) void {
@@ -718,10 +717,16 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
         .optimize = .ReleaseSafe,
     }) });
     test_step.dependOn(&mac_sign_tool.step);
+    const mac_sign_tool_x86 = b.addExecutable(.{ .name = "portal-ios-sign-x86_64", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/ios_sign.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .macos }),
+        .optimize = .ReleaseSafe,
+    }) });
+    test_step.dependOn(&mac_sign_tool_x86.step);
 
     const ios_step = b.step("ios", "Build zig-out/ios/Portal.app (Mac: iOS SDK + -Dmoltenvk=...)");
-    const sign_step = b.step("ios-sign", "Sign zig-out/ios/Portal.app (env PORTAL_SIGN_IDENTITY, PORTAL_PROVISIONING_PROFILE, PORTAL_TEAM_ID, PORTAL_TUNNEL_PROVISIONING_PROFILE)");
-    const kit_step = b.step("ios-kit", "Build zig-out/ios-kit (unsigned Portal.app + aarch64-macos signer + README.txt) to sign and install on a Mac without Zig (-Dios-sdk, -Dmoltenvk)");
+    const sign_step = b.step("ios-sign", "Sign zig-out/ios/Portal.app (portal-ios.conf or env PORTAL_TEAM_ID, PORTAL_ACCOUNT, PORTAL_SIGN_IDENTITY, PORTAL_PROVISIONING_PROFILE, PORTAL_TUNNEL_PROVISIONING_PROFILE)");
+    const kit_step = b.step("ios-kit", "Build zig-out/ios-kit (unsigned Portal.app + macOS signer + portal-ios.conf.example + README.txt) to sign and install on a Mac without Zig (-Dios-sdk, -Dmoltenvk)");
     const sdk_path = sdk orelse {
         const fail = b.addFail("zig build ios / ios-kit needs the iPhoneOS SDK: run it on a Mac with Xcode, or pass -Dios-sdk=<path to iPhoneOS.sdk> / IOS_SDK (docs/ios-native.md, \"Build on another computer\")");
         ios_step.dependOn(&fail.step);
@@ -832,14 +837,18 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     // no Zig (docs/ios-native.md, "Build on another computer").
     const kit_app = b.addInstallDirectory(.{ .source_dir = app.getDirectory().path(b, "Portal.app"), .install_dir = .prefix, .install_subdir = "ios-kit/Portal.app" });
     const kit_sign = b.addInstallArtifact(mac_sign_tool, .{ .dest_dir = .{ .override = .{ .custom = "ios-kit" } } });
+    const kit_sign_x86 = b.addInstallArtifact(mac_sign_tool_x86, .{ .dest_dir = .{ .override = .{ .custom = "ios-kit" } } });
+    const kit_conf = b.addInstallFile(b.path("docs/portal-ios.conf.example"), "ios-kit/portal-ios.conf.example");
     const readme = std.mem.replaceOwned(u8, b.allocator, @embedFile("docs/ios-kit-readme.txt"), "@BUNDLE_ID@", bundle_id) catch @panic("OOM");
     const kit_readme = b.addInstallFile(b.addWriteFiles().add("README.txt", b.fmt(
         "Portal for iPhone: bundle id {s}, tunnel extension {s}, {t}.\n\n{s}",
-        .{ bundle_id, if (tunnel) "included (PORTAL_TUNNEL_PROVISIONING_PROFILE needed)" else "not included", optimize, readme },
+        .{ bundle_id, if (tunnel) "included (account = paid)" else "not included (account = paid or free)", optimize, readme },
     )), "ios-kit/README.txt");
     kit_step.dependOn(&kit_app.step);
     if (macho_check) |r| kit_step.dependOn(&r.step);
     kit_step.dependOn(&kit_sign.step);
+    kit_step.dependOn(&kit_sign_x86.step);
+    kit_step.dependOn(&kit_conf.step);
     kit_step.dependOn(&kit_readme.step);
 
     // Signs a copy (the cached bundle stays unsigned) and installs it over
@@ -848,7 +857,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     sign.addDirectoryArg(app.getDirectory().path(b, "Portal.app"));
     const signed = sign.addOutputDirectoryArg("signed");
     sign.addArgs(&.{ bundle_id, if (tunnel) "1" else "0" });
-    sign.has_side_effects = true; // reads the signing identity from the environment
+    sign.has_side_effects = true; // reads portal-ios.conf, the environment, the keychain and the profiles
     const install_signed = b.addInstallDirectory(.{ .source_dir = signed.path(b, "Portal.app"), .install_dir = .prefix, .install_subdir = "ios/Portal.app" });
     install_signed.step.dependOn(&install.step);
     sign_step.dependOn(&install_signed.step);

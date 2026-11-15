@@ -52,10 +52,11 @@ This is everything that cannot be done or checked on Windows:
 | Extension profile | developer.apple.com, App ID `<bundle id>.tunnel` (paid only) | signing with the tunnel |
 | Paid or free account | your Apple Developer membership | with or without `-Dios-tunnel=true` |
 
-The ios-kit's own setup section is the reference for how these are
-passed to the signer (the one-command setup lands with the ios-kit work).
-Until then they are the environment variables in docs/ios-native.md,
-"Build, sign, install", step 4.
+Only the team ID and paid or free go into the kit's `portal-ios.conf`
+(copied from `portal-ios.conf.example`, next to `portal-ios-sign`). The
+bundle ID is the app's own; the signer finds the identity, the profiles
+and the iPhone, and says what is missing when it cannot. Each can also be
+set in the file or by a flag (`./portal-ios-sign --help`).
 
 ## 0. Before the session (on Windows)
 
@@ -72,17 +73,26 @@ Until then they are the environment variables in docs/ios-native.md,
    `machocheck: <name>: stripped, arm64, no build paths` line for
    `Portal` and, with the tunnel, one for `PortalTunnel`. `zig-out/ios-kit/`
    holds `Portal.app` (with `stt/ggml-base.en.bin`, 148 MB: the desk's own
-   base model, src/speech/model_pin.zig, and
-   `Licenses.txt`), `portal-ios-sign` and `README.txt`.
+   base model, src/speech/model_pin.zig, and `Licenses.txt`),
+   `portal-ios-sign`, `portal-ios-sign-x86_64`, `portal-ios.conf.example`
+   and `README.txt`.
    The first build downloads the model and checks its size and SHA-256.
    A `fetch_file` error means the download or the pin is wrong.
    **Record** the build output.
 3. Copy `zig-out/ios-kit` to the Mac.
 
-## 1. Sign
+## 1. Sign and install: one command
 
-Follow the kit's README.txt, steps 1 to 5: certificate, App IDs,
-profiles, quarantine, the signer, and the otool and codesign checks.
+Follow the kit's README.txt, sections 1 to 4 (Xcode, the Apple account,
+Developer Mode, the kit), then in `ios-kit`:
+
+```
+cp portal-ios.conf.example portal-ios.conf    # fill in team_id and account
+./portal-ios-sign --install                   # Intel Mac: ./portal-ios-sign-x86_64 --install
+```
+
+It signs `ios-kit/signed/Portal.app` and installs it on the connected
+iPhone. Add `--launch` to start it too.
 
 * **Paid account, with the extension:** two App IDs with Network
   Extensions (`<bundle id>` and `<bundle id>.tunnel`), and a profile for
@@ -97,21 +107,23 @@ profiles, quarantine, the signer, and the otool and codesign checks.
 * `otool -L` lists only `/System/Library/` and `/usr/lib/` entries.
 * `LC_BUILD_VERSION` shows platform 2 with **minos 17.0**.
 * The entitlements are as the README lists them.
+* The install reports the bundle ID.
 
-**Record** the signer's output and `codesign -d --entitlements :-`.
+The README's section 6 has the otool and codesign checks, and section 7
+the logs. **Record** the signer's output and `codesign -d --entitlements :-`.
 
-## 2. Install
+## 2. Launch
 
 ```
-xcrun devicectl list devices
-xcrun devicectl device install app --device <id> ios-kit/signed/Portal.app
 xcrun devicectl device process launch --console --device <id> <bundle id>
 ```
+
+(`<id>` is the one the signer printed, or see `xcrun devicectl list devices`.)
 
 Keep Console.app streaming from the iPhone, filtered on "Portal"
 (processes Portal and PortalTunnel).
 
-**Success:** the install reports the bundle ID and the app launches to
+**Success:** the app launches to
 the lock cover ("Portal is locked. Tap to unlock with Face ID.").
 iOS 16 or older refuses the install: Portal needs iOS 17.
 

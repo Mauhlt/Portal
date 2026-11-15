@@ -1,120 +1,109 @@
-This folder (made by `zig build ios-kit` on another computer) signs and
-installs Portal on your iPhone from a Mac with Xcode. The Mac needs no Zig.
+This folder (made by `zig build ios-kit`) signs Portal and installs it on
+your iPhone from a Mac. The Mac needs no Zig. The first line of this file
+says whether the kit holds the background tunnel extension.
 
-  Portal.app        the app, unsigned
-  portal-ios-sign   the signer (arm64 macOS; Apple silicon Macs)
-  README.txt        this file
+  Portal.app               the app, unsigned
+  portal-ios-sign          the signer (arm64 macOS: Apple silicon Macs)
+  portal-ios-sign-x86_64   the same for Intel Macs
+  portal-ios.conf.example  its settings, to copy to portal-ios.conf
+  README.txt               this file
 
-All commands run in Terminal on the Mac. Replace <...> with your values.
+Everything runs in Terminal on the Mac. The iPhone needs iOS 17 or later.
 
-First install: use a kit built WITHOUT -Dios-tunnel (the first line of
-this file says which this is). The tunnel extension cannot start until
-the desk delivers the phone's WireGuard key (not implemented yet), so
-leaving it out keeps the first run to the app itself: one App ID, one
-profile, fewer entitlements to get wrong. Reach the desktop on the LAN
-or through the WireGuard app meanwhile; iOS asks once whether Portal may
-use the local network: allow it. Add the extension on a second install
-(kit rebuilt with -Dios-tunnel=true, PORTAL_TUNNEL_PROVISIONING_PROFILE
-set).
+1. The Mac (once)
 
-1. Once: certificate, App IDs, profiles (developer.apple.com, paid account)
+   Install Xcode from the App Store and open it once (it finishes
+   installing its parts). The command-line tools alone can sign but not
+   install: `xcrun devicectl` comes with Xcode.
 
-   - Xcode > Settings > Accounts: add your Apple ID; Manage Certificates >
-     + > Apple Development (its private key stays in this Mac's keychain).
-   - Team ID: developer.apple.com > Account > Membership details (10
-     characters). It is not the code in brackets after your name in the
-     certificate.
-   - Identifiers > + > App IDs > App: explicit Bundle ID @BUNDLE_ID@,
-     capability "Network Extensions".
-     With the tunnel extension, a second one: @BUNDLE_ID@.tunnel, also
-     "Network Extensions".
-   - Devices: register the iPhone's UDID (connect it by cable, then
-     `xcrun devicectl list devices` or Xcode > Window > Devices).
-   - Profiles > + > iOS App Development: App ID @BUNDLE_ID@, your
-     certificate, your iPhone -> download (e.g. ~/Portal.mobileprovision).
-     With the tunnel extension, a second one for @BUNDLE_ID@.tunnel
-     (e.g. ~/PortalTunnel.mobileprovision).
-   - On the iPhone: connect it by cable and tap Trust; then Settings >
-     Privacy & Security > Developer Mode > on (restart, confirm).
+2. The Apple account (once)
 
-2. Unpack this folder, then in Terminal:
+   Xcode > Settings > Accounts: add your Apple ID.
 
-   cd <folder that contains ios-kit>
-   xattr -dr com.apple.quarantine ios-kit
-   chmod +x ios-kit/portal-ios-sign
+   Paid account (Apple Developer Program), kit WITH the tunnel extension:
+   - Same window: Manage Certificates > + > Apple Development.
+   - developer.apple.com > Identifiers > + > App IDs > App, explicit
+     Bundle ID @BUNDLE_ID@, capability Network Extensions. A second
+     one, @BUNDLE_ID@.tunnel, also with Network Extensions.
+   - Devices > +: the iPhone's UDID (`xcrun devicectl list devices`
+     with the phone connected, or Xcode > Window > Devices).
+   - Profiles > + > iOS App Development, one for each App ID, with your
+     certificate and the iPhone.
+   - Xcode > Settings > Accounts > your team > Download Manual Profiles.
+     The signer finds them there; no need to move files.
 
-   (If codesign later complains about "resource fork, Finder information,
-   or similar detritus", run `xattr -cr ios-kit` and sign again.)
+   Free account (no Developer Program), kit WITHOUT the extension:
+   - Xcode > File > New > Project > iOS App, bundle identifier
+     @BUNDLE_ID@ (the bundle id must be yours alone: build the kit with
+     your own -Dios-bundle-id, e.g. com.<you>.portal). Signing &
+     Capabilities: Automatically manage signing, team = your Personal
+     Team. Connect the iPhone, pick it, press Run once. Xcode then holds
+     a certificate and a profile for that bundle id.
+   - Free profiles last 7 days: run the signer again after that.
 
-3. Find the signing identity:
+3. The iPhone (once)
 
-   security find-identity -v -p codesigning
+   Connect it by cable, unlock it and tap Trust. Settings > Privacy &
+   Security > Developer Mode: on (it restarts; confirm).
 
-   Use the quoted name, e.g. "Apple Development: Your Name (ABCDE12345)".
+4. The kit
 
-4. Sign (works from any directory; writes ios-kit/signed/Portal.app):
+   cd <the folder that holds ios-kit>/ios-kit
+   xattr -dr com.apple.quarantine .
+   chmod +x portal-ios-sign portal-ios-sign-x86_64
+   cp portal-ios.conf.example portal-ios.conf
+   open -e portal-ios.conf
 
-   export PORTAL_SIGN_IDENTITY="Apple Development: <Your Name> (<XXXXXXXXXX>)"
-   export PORTAL_TEAM_ID=<team id>
-   export PORTAL_PROVISIONING_PROFILE=~/Portal.mobileprovision
-   export PORTAL_TUNNEL_PROVISIONING_PROFILE=~/PortalTunnel.mobileprovision   # with the tunnel extension
-   ios-kit/portal-ios-sign
+   Fill in team_id and account (paid or free). Everything else is found
+   when left empty: the comments in the file say how.
 
-   The signer checks each profile first (development profile, App ID
-   <team id>.@BUNDLE_ID@ resp. .tunnel, Network Extensions) and says
-   which one is wrong. To look at the result:
-   codesign -d --entitlements :- ios-kit/signed/Portal.app
+5. Sign and install: the one command
 
-5. Check before installing (each of these failures otherwise shows up
-   only as an app that will not install or dies at launch):
+   ./portal-ios-sign --install           (Intel Mac: ./portal-ios-sign-x86_64 --install)
 
-   a. Linked libraries: only entries under /System/Library/ or /usr/lib/.
-      Anything else (a path from the build computer, /Users/..., C:\...)
-      makes dyld kill the app at launch. MoltenVK is not listed: the app
-      opens Frameworks/ at run time.
+   --launch also starts Portal; --help lists the flags. The signer reads
+   portal-ios.conf, picks the iPhone, the signing identity and the
+   profiles, checks each profile (development, team and App ID, not
+   expired, made for the identity's certificate, lists the iPhone, the
+   Keychain group, Network Extensions for the tunnel), signs a copy into
+   signed/Portal.app, verifies it and installs it. When something is
+   missing it says what and where to put it, then stops.
 
-      otool -L ios-kit/signed/Portal.app/Portal
-      otool -L ios-kit/signed/Portal.app/PlugIns/PortalTunnel.appex/PortalTunnel   # with the tunnel extension
+   Success: it prints the identity and profiles it used, "signed
+   .../signed/Portal.app", devicectl's install output with the bundle
+   id, then "Installed Portal on the iPhone." and the next steps: open
+   Portal (Face ID), pair it at the desk (Pair a device, compare the
+   check code), then on the phone Scan QR code and Connect.
 
-   b. Platform: LC_BUILD_VERSION must say platform 2 (iOS), minos 16.0,
-      and an sdk version (not 0.0 or n/a). Same for the extension and for
-      Frameworks/MoltenVK.framework/MoltenVK (or libMoltenVK.dylib).
+6. If the app will not install or dies at launch
 
-      otool -l ios-kit/signed/Portal.app/Portal | grep -A5 LC_BUILD_VERSION
-      otool -l ios-kit/signed/Portal.app/PlugIns/PortalTunnel.appex/PortalTunnel | grep -A5 LC_BUILD_VERSION
+   otool -L signed/Portal.app/Portal
+     only /System/Library/ and /usr/lib/ entries (MoltenVK is opened
+     from Frameworks/ at run time and is not listed)
+   otool -l signed/Portal.app/Portal | grep -A5 LC_BUILD_VERSION
+     platform 2 (iOS), minos 17.0, an sdk version (not 0.0); the same
+     for PlugIns/PortalTunnel.appex/PortalTunnel and the MoltenVK binary
+   codesign -d --entitlements :- signed/Portal.app
+     application-identifier <team>.@BUNDLE_ID@, team-identifier,
+     get-task-allow true, keychain-access-groups <team>.@BUNDLE_ID@;
+     with the tunnel also networkextension = packet-tunnel-provider (and
+     on the extension application-identifier <team>.@BUNDLE_ID@.tunnel
+     with the app's Keychain group)
+   If codesign complains about "resource fork, Finder information, or
+   similar detritus": `xattr -cr .` and run the signer again.
 
-   c. Signature and entitlements: application-identifier
-      <team id>.@BUNDLE_ID@, com.apple.developer.team-identifier,
-      get-task-allow true (development), keychain-access-groups
-      <team id>.@BUNDLE_ID@; with the tunnel extension also
-      com.apple.developer.networking.networkextension = packet-tunnel-provider
-      (and <team id>.@BUNDLE_ID@.tunnel on the extension).
+7. Logs
 
-      codesign --verify --deep --strict --verbose=2 ios-kit/signed/Portal.app
-      codesign -d --entitlements :- ios-kit/signed/Portal.app
-      codesign -d --entitlements :- ios-kit/signed/Portal.app/PlugIns/PortalTunnel.appex   # with the tunnel extension
-
-6. Install and launch (iPhone connected or paired, unlocked):
-
-   xcrun devicectl list devices
-   xcrun devicectl device install app --device <identifier> ios-kit/signed/Portal.app
-   xcrun devicectl device process launch --console --device <identifier> @BUNDLE_ID@
-
-   --console keeps Terminal attached to the app and shows what it prints
-   (stderr) until it exits; Ctrl-C detaches.
-
-7. Logs: open Console.app, select the iPhone in the sidebar, press Start
-   streaming, and search for "Portal" (the app; the tunnel extension
-   runs as "PortalTunnel"). Every message that ends the app, std.log
-   output and panics go to the system log as process Portal. Why an
-   install or launch failed is usually logged by a system process; search
-   for one at a time (type it, then pick "Process" in the search field):
+   Console.app > the iPhone in the sidebar > Start streaming, search
+   "Portal" (the app; the extension runs as "PortalTunnel"). Why an
+   install or launch failed is usually logged by a system process
+   (search it, then pick "Process"):
 
      installd    install refused (profile, bundle id, entitlements)
-     amfid       code signature or provisioning profile rejected at launch
+     amfid       code signature or profile rejected at launch
      dyld        a library or symbol missing at launch
-     Sandbox     a file the app may not read (e.g. a system font)
-     coreauthd   Face ID (LocalAuthentication)
-     securityd   Keychain (the device credential behind Face ID)
-     tccd        permissions: camera, Face ID, Local Network
-
+     Sandbox     a file the app may not read
+     coreauthd   Face ID
+     securityd   Keychain (the device credential, the tunnel key)
+     tccd        permissions: camera, microphone, Face ID, Local Network
+     nesessionmanager  the VPN session of the tunnel extension

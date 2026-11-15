@@ -412,40 +412,54 @@ downloads the dictation model (148 MB, src/speech/model_pin.zig).
    (add `-Dios-tunnel=true` with a paid account) -> `zig-out/ios/Portal.app`.
    The SDK path comes from `xcrun --sdk iphoneos --show-sdk-path`
    (override: `-Dios-sdk=` / `IOS_SDK`).
-3. **Signing identity and profile:** in Xcode, Settings > Accounts, add
-   the Apple ID; create a development certificate. Make a provisioning
-   profile for the bundle id with the iPhone registered (paid account:
-   developer.apple.com > Profiles; free Apple ID: create any Xcode iOS
-   app with the same bundle id once and run it on the phone, then use
-   `~/Library/Developer/Xcode/UserData/Provisioning Profiles/*.mobileprovision`).
-   With the tunnel (`-Dios-tunnel=true`): two explicit App IDs, both with
-   the Network Extensions capability, `<your.bundle.id>` and
-   `<your.bundle.id>.tunnel`, and an iOS App Development profile for each.
-4. **Sign:**
-   ```
-   export PORTAL_SIGN_IDENTITY="Apple Development: Your Name (XXXXXXXXXX)"   # security find-identity -v -p codesigning
-   export PORTAL_PROVISIONING_PROFILE=~/path/to/Portal.mobileprovision
-   export PORTAL_TUNNEL_PROVISIONING_PROFILE=~/path/to/PortalTunnel.mobileprovision   # with the tunnel
-   export PORTAL_TEAM_ID=XXXXXXXXXX
-   zig build ios-sign -Doptimize=ReleaseSafe -Dios-bundle-id=<your.bundle.id> -Dmoltenvk=<path>
-   ```
-   The signer (src/tools/ios_sign.zig) checks each profile (development,
-   App ID, Network Extensions), embeds the app's at
+3. **Apple account, certificate, profiles:** as in docs/ios-kit-readme.txt
+   (the kit's README), section 2. Paid account with the tunnel
+   (`-Dios-tunnel=true`): two explicit App IDs, `<your.bundle.id>` and
+   `<your.bundle.id>.tunnel`, both with the Network Extensions
+   capability, an iOS App Development profile for each, downloaded with
+   Xcode > Settings > Accounts > Download Manual Profiles. Free Apple ID:
+   make any Xcode iOS app with the same bundle id once and run it on the
+   phone; Xcode keeps the profile.
+4. **Settings:** copy docs/portal-ios.conf.example to `portal-ios.conf`
+   (the repo root when signing with `zig build ios-sign`; next to
+   `portal-ios-sign` in the kit; git ignores the name) and fill in
+   `team_id` and `account` (paid or free). The rest is found when left
+   empty. The environment still works underneath it: `PORTAL_TEAM_ID`,
+   `PORTAL_ACCOUNT`, `PORTAL_SIGN_IDENTITY`, `PORTAL_PROVISIONING_PROFILE`,
+   `PORTAL_TUNNEL_PROVISIONING_PROFILE`.
+5. **Sign and install:** `zig build ios-sign -Doptimize=ReleaseSafe
+   -Dios-bundle-id=<your.bundle.id> -Dmoltenvk=<path>` signs
+   zig-out/ios/Portal.app; `zig build ios-kit ...` then
+   `zig-out/ios-kit/portal-ios-sign --install` signs and installs in one
+   command (`--launch` also starts it). The signer
+   (src/tools/ios_sign.zig) picks the iPhone (`xcrun devicectl list
+   devices`: the only connected one, or `device =`), the profiles (the
+   newest valid ones in ~/Library/MobileDevice/Provisioning Profiles and
+   ~/Library/Developer/Xcode/UserData/Provisioning Profiles, or
+   `profile =` / `tunnel_profile =`) and the identity (`security
+   find-identity`: the Apple Development certificate the profile was made
+   for, signed by its SHA-1). Each profile must be a development profile
+   of the team whose App ID covers the bundle id (resp. `.tunnel`), not
+   expired, made for that certificate, listing the iPhone, with
+   keychain-access-groups covering `<team>.<your.bundle.id>` and, for the
+   tunnel, packet-tunnel-provider; it says which check failed for each
+   near miss and how to get a profile. It embeds the app's profile at
    `Portal.app/embedded.mobileprovision` and the extension's at
-   `Portal.app/PlugIns/PortalTunnel.appex/embedded.mobileprovision`, and
-   signs with development entitlements: `application-identifier`
-   (`<team>.<bundle id>`, resp. `.tunnel`), `com.apple.developer.team-identifier`,
-   `get-task-allow`, one `keychain-access-groups` entry
-   `<team>.<your.bundle.id>` shared by app and extension, and with the
-   tunnel `com.apple.developer.networking.networkextension` =
-   `[packet-tunnel-provider]` on both.
-5. **Install** (iPhone connected or paired, Developer Mode on):
-   `xcrun devicectl list devices` then
-   `xcrun devicectl device install app --device <id> zig-out/ios/Portal.app`.
-   Launch: `xcrun devicectl device process launch --console --device <id> <your.bundle.id>`.
-   Logs: Console.app, filter on the device and "Portal". Pre-install
-   checks (otool, codesign) and the system processes to search for when
-   install or launch fails: docs/ios-kit-readme.txt (the kit's README).
+   `Portal.app/PlugIns/PortalTunnel.appex/embedded.mobileprovision`,
+   clears extended attributes, and signs Frameworks/, the extension, then
+   the app (sealing Info.plist, the icons, `stt/ggml-tiny.en.bin` and
+   `Licenses.txt` as resources) with development entitlements:
+   `application-identifier` (`<team>.<bundle id>`, resp. `.tunnel`),
+   `com.apple.developer.team-identifier`, `get-task-allow`, one
+   `keychain-access-groups` entry `<team>.<your.bundle.id>` shared by app
+   and extension, and with the tunnel
+   `com.apple.developer.networking.networkextension` =
+   `[packet-tunnel-provider]` on both. Then `codesign --verify --deep
+   --strict`, `xcrun devicectl device install app --device <id>`, and the
+   next steps. To watch the app's stderr: `xcrun devicectl device process
+   launch --console --device <id> <your.bundle.id>`. Logs, the otool and
+   codesign checks, and the system processes to search for when install
+   or launch fails: the kit's README, sections 6 and 7.
 6. **First run:** Face ID, then the first-run screen shows the phone's
    key and check code: pair it at the desk (Pair a device, check the
    code), then tap **Scan QR code**, point at the desk's pairing code QR,
@@ -480,17 +494,19 @@ the Windows PC (or any host) and carry a kit to the Mac.
 3. **Kit:**
    `zig build ios-kit -Doptimize=ReleaseSafe -Dios-sdk=<...\iPhoneOS.sdk> -Dios-bundle-id=<your.bundle.id> -Dmoltenvk=<...\MoltenVK.xcframework\ios-arm64\MoltenVK.framework> -Dios-tunnel=true`
    -> `zig-out/ios-kit/`: the unsigned `Portal.app`, `portal-ios-sign`
-   (the signer for aarch64-macos, ad-hoc signed by Zig's linker; no macOS
-   SDK needed) and `README.txt` (docs/ios-kit-readme.txt with the bundle
-   id filled in). The linker also searches the SDK's PrivateFrameworks and
-   usr/lib/system: without a sysroot it finds re-exported libraries
-   (UIKit -> UIKitCore, libSystem -> libsystem_*) only by name there.
+   (the signer for arm64 macOS, ad-hoc signed by Zig's linker; no macOS
+   SDK needed), `portal-ios-sign-x86_64` (Intel Macs),
+   `portal-ios.conf.example` and `README.txt` (docs/ios-kit-readme.txt
+   with the bundle id filled in). The linker also searches the SDK's
+   PrivateFrameworks and usr/lib/system: without a sysroot it finds
+   re-exported libraries (UIKit -> UIKitCore, libSystem -> libsystem_*)
+   only by name there.
 4. Copy `ios-kit` to the Mac (zip, AirDrop, USB) and follow its
-   README.txt: remove the quarantine, `chmod +x portal-ios-sign`, set the
-   environment of step 4 above, run `ios-kit/portal-ios-sign` (from any
-   directory; it signs a copy into `ios-kit/signed/Portal.app` and sets
-   the executables' mode bits that a copy from Windows loses), then
-   `xcrun devicectl` as in step 5.
+   README.txt: remove the quarantine, `chmod +x portal-ios-sign`, copy
+   `portal-ios.conf.example` to `portal-ios.conf` and fill in `team_id`
+   and `account`, then `./portal-ios-sign --install`. It signs a copy into
+   `ios-kit/signed/Portal.app` (setting the executables' mode bits that a
+   copy from Windows loses) and installs it on the connected iPhone.
 
 CI: `.github/workflows/ios.yml` (a hosted macOS runner: `ios-check` and an
 unsigned Portal.app artifact). It is YAML because GitHub Actions only reads
