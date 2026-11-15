@@ -228,7 +228,7 @@ const pins = [_]Pin{
     .{ .name = "Renderer", .repo = "Renderer", .branch = "main", .client = true },
     .{ .name = "Image", .repo = "Image", .branch = "neuro-formats", .client = true },
     .{ .name = "WireGuard", .repo = "Wireguard", .branch = "master", .client = true },
-    .{ .name = "stt", .repo = "SpeechToText", .branch = "zig-packages", .client = false },
+    .{ .name = "stt", .repo = "SpeechToText", .branch = "packages-coreml", .client = false },
 };
 
 /// `zig build pin [-Dpin=<name>]`: re-pins the sibling repos (or the one
