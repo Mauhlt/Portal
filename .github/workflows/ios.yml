@@ -13,8 +13,9 @@
 # Inputs, all pinned:
 #   - Portal's dependencies are Zig URL packages in build.zig.zon (public
 #     repos, fetched and hash-checked by `zig build` itself).
-#   - Zig is build.zig.zon's minimum_zig_version, installed by ZVC's release
-#     binary (`zvc install --from .`: index sha256 or minisign check);
+#   - Zig is build.zig.zon's minimum_zig_version, installed by a pinned ZVC
+#     release binary, itself SHA-256 checked (`zvc install --from .`: index
+#     sha256 or minisign check);
 #     `zig build check-zig` fails if another zig is first on PATH.
 #   - MoltenVK for iOS: one release tarball, checked against its SHA-256.
 #   - The two actions used (cache, upload-artifact) are pinned by commit.
@@ -44,7 +45,10 @@ jobs:
     env:
       MOLTENVK_URL: https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar
       MOLTENVK_SHA256: b5d947b1660e6e9fed40b9cd2387e160aaab9e80b775c0cef7e14059405178c1
-      ZVC_URL: https://github.com/Mauhlt/ZVC/releases/latest/download/zvc-aarch64-macos
+      # ZVC pinned to one release and its SHA-256. When ZVC publishes a new
+      # release, bump the tag (its "+" written %2B) and the hash together.
+      ZVC_URL: https://github.com/Mauhlt/ZVC/releases/download/v2026-11-15-zig0.18.0-dev.1005%2B75d48dfff/zvc-aarch64-macos
+      ZVC_SHA256: a41e7707fbd6350f2871d27fa4f6207035056e7c2ae6be350af2e618fd5f483a
     steps:
       - name: Check out the pushed commit
         run: |
@@ -71,10 +75,11 @@ jobs:
 
       # ZVC installs exactly build.zig.zon's minimum_zig_version (stdin from
       # /dev/null accepts its suggested live folder, added to PATH here).
-      - name: Install the pinned Zig with ZVC
+      - name: Install the pinned Zig with the pinned ZVC
         run: |
           mkdir -p "$RUNNER_TEMP/zvc"
           curl -fsSL "$ZVC_URL" -o "$RUNNER_TEMP/zvc/zvc"
+          echo "$ZVC_SHA256  $RUNNER_TEMP/zvc/zvc" | shasum -a 256 -c -
           chmod +x "$RUNNER_TEMP/zvc/zvc"
           (cd "$RUNNER_TEMP/zvc" && ./zvc install --from "$GITHUB_WORKSPACE" < /dev/null)
           echo "$HOME/.local/share/zvc/zig" >> "$GITHUB_PATH"
