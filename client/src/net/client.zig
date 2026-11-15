@@ -43,6 +43,7 @@ const activity_wire = @import("shared").activity;
 const planusage = @import("shared").planusage;
 const projects_wire = @import("shared").projects;
 const sysinfo = @import("shared").sysinfo;
+const platform_wire = @import("shared").platform;
 const tlsconn = @import("tlsconn.zig");
 const x509check = @import("x509check.zig");
 const watchdog = @import("watchdog.zig");
@@ -902,6 +903,12 @@ pub const Client = struct {
                     if (back) |id| if (!sameId(c.shared.current, id)) c.sendTabIfOpen(id);
                     // A System panel still open: subscribe again.
                     if (c.shared.sys_wanted.load(.acquire)) _ = c.sendInput("y:on");
+                    // What kind of machine this is (OS and CPU only), so
+                    // the desk offers the packages that run here.
+                    if (platform_wire.current()) |p| {
+                        var pb: [platform_wire.max_frame]u8 = undefined;
+                        _ = c.sendInput(platform_wire.frame(p, &pb));
+                    }
                     backoff.* = 1000;
                     c.notify();
                     c.signalSync(); // look for updates on every (re)connect

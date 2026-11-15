@@ -70,6 +70,7 @@ const sysinfo = @import("shared").sysinfo;
 const subtabs_wire = @import("shared").subtabs;
 const sysmon = @import("sysmon.zig");
 const frames = @import("shared").frames;
+const platform_wire = @import("shared").platform;
 const foryou_ws = @import("foryou_ws.zig");
 const projects_ws = @import("projects_ws.zig");
 const ratelimit = @import("ratelimit.zig");
@@ -500,6 +501,9 @@ pub const Server = struct {
     sync_digests: [devices.max_devices]SyncDigest = @splat(.{}),
     sync_n: usize = 0,
     sync_gen: std.atomic.Value(u64) = .init(0),
+
+    /// Each device's OS and CPU, as it said (`d:platform`; PlatformTable).
+    platforms: PlatformTable = .{},
 
     /// Each paired device's `p:start` / `p:stop` rate (projects_ws.zig).
     project_limits: projects_ws.Limits = .{},
@@ -1775,6 +1779,12 @@ pub const Server = struct {
                 // A startable project (projects_ws.zig): a request, not
                 // typing, answered in every input mode.
                 if (known) |k| if (k.prefix == .project) return srv.projectRequest(ws, k.rest);
+                // What kind of machine the device is (any input mode;
+                // a name this desk does not know is ignored).
+                if (known) |k| if (k.prefix == .device) {
+                    if (platform_wire.parseRest(k.rest)) |p| srv.platforms.set(srv.io, ws.device.name.get(), p);
+                    return true;
+                };
                 // Switching tabs is not input: also in view-only mode.
                 if (payload[0] == 's') {
                     srv.subscribe(ws, payload[2..]);
@@ -2239,6 +2249,63 @@ test "conn table: a device over its upgraded cap loses its oldest on that channe
     try testing.expectEqual(cap, live);
 }
 
+
+/// Each paired device's platform as it said last (`d:platform`,
+/// shared/platform.zig), in memory only: the desk's automatic package
+/// subscriptions use it (sync.autoSubscribe). Unknown until it says.
+pub const PlatformTable = struct {
+    pub const Platform = platform_wire.Platform;
+    const Entry = struct { name: devices.Text = .{}, p: ?Platform = null };
+
+    mutex: Io.Mutex = .init,
+    entries: [devices.max_devices]Entry = @splat(.{}),
+    /// The next entry a new name takes when all are used (oldest first).
+    next: usize = 0,
+
+    pub fn set(t: *PlatformTable, io: Io, name: []const u8, p: Platform) void {
+        if (name.len == 0) return;
+        t.mutex.lockUncancelable(io);
+        defer t.mutex.unlock(io);
+        const k = t.find(name) orelse for (t.entries, 0..) |e, i| {
+            if (e.p == null) break i;
+        } else blk: {
+            const i = t.next;
+            t.next = (t.next + 1) % t.entries.len;
+            break :blk i;
+        };
+        t.entries[k].name.set(name);
+        t.entries[k].p = p;
+    }
+
+    pub fn get(t: *PlatformTable, io: Io, name: []const u8) ?Platform {
+        t.mutex.lockUncancelable(io);
+        defer t.mutex.unlock(io);
+        const k = t.find(name) orelse return null;
+        return t.entries[k].p;
+    }
+
+    fn find(t: *const PlatformTable, name: []const u8) ?usize {
+        for (t.entries, 0..) |e, i| if (e.p != null and std.mem.eql(u8, e.name.get(), name)) return i;
+        return null;
+    }
+};
+
+test "platform table: the last word per device; unknown until it says" {
+    var t: PlatformTable = .{};
+    const io = std.testing.io;
+    try std.testing.expectEqual(@as(?PlatformTable.Platform, null), t.get(io, "laptop"));
+    t.set(io, "laptop", .windows_x86_64);
+    t.set(io, "laptop", .windows_aarch64);
+    t.set(io, "iphone", .ios_aarch64);
+    try std.testing.expectEqual(@as(?PlatformTable.Platform, .windows_aarch64), t.get(io, "laptop"));
+    try std.testing.expectEqual(@as(?PlatformTable.Platform, .ios_aarch64), t.get(io, "iphone"));
+    // Full: the oldest entry makes room.
+    var nb: [8]u8 = undefined;
+    for (0..devices.max_devices) |i| t.set(io, std.fmt.bufPrint(&nb, "d{d}", .{i}) catch unreachable, .linux_x86_64);
+    try std.testing.expectEqual(@as(?PlatformTable.Platform, .linux_x86_64), t.get(io, "d15"));
+    // A `d:` frame naming no known platform changes nothing.
+    try std.testing.expectEqual(@as(?PlatformTable.Platform, null), platform_wire.parseRest("platform amiga-68k"));
+}
 test "input limit is per device: more sockets do not add budget" {
     var t: ratelimit.Table(DeviceInput) = .{};
     const dev: devices.DeviceId = @splat(1);

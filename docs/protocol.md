@@ -711,6 +711,7 @@ passed, so the program can't read the pair as Alt+key.
 | `p:start <name>`, `p:stop <name>` | start / stop a startable project (section 3f); answered by `project` |
 | `i:yes <id>`, `i:no <id>` | answer a For-you card (section 3g); answered by `item` |
 | `r:recap <tab id>` | ask that tab's agent for a recap (section 4b); answered by `recap` |
+| `d:platform <name>` | what kind of machine this is, sent once after every `hello`: `windows-x86_64`, `windows-aarch64`, `linux-x86_64`, `linux-aarch64`, `macos-aarch64` or `ios-aarch64` (OS and CPU only; shared/platform.zig). Not answered, every input mode; the desk keeps it in memory for the device (`web.PlatformTable`) to subscribe it to the packages that run there. Any other name is ignored |
 
 `k:`, `t:` and `l:` go to the tab the viewer last chose with `s:` (at
 first, the tab in `hello.session`); while that tab has ended or the last
