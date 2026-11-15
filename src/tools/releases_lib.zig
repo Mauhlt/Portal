@@ -183,6 +183,28 @@ pub fn formatBuildInfo(gpa: Allocator, info: BuildInfo) Allocator.Error![]u8 {
     });
 }
 
+/// The portal.exe SHA-256 (hex) a BUILD-INFO.txt records, or null.
+pub fn buildInfoSha256(text: []const u8) ?[]const u8 {
+    const key = "sha256(portal.exe): ";
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.startsWith(u8, line, key)) {
+            const v = std.mem.trim(u8, line[key.len..], " ");
+            if (v.len == 64) return v;
+        }
+    }
+    return null;
+}
+
+test buildInfoSha256 {
+    const s = try formatBuildInfo(testing.allocator, .{ .portal = "p", .zig_version = "z", .zig_path = "x", .git = "g", .built = "b", .sha256_hex = &sha256Hex("abc") });
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings(&sha256Hex("abc"), buildInfoSha256(s).?);
+    try testing.expect(buildInfoSha256("sha256(portal.exe): 00ff\r\n") == null);
+    try testing.expect(buildInfoSha256("") == null);
+}
+
 /// "none" when there is no commit; "<hash>" or "<hash> (uncommitted changes)".
 pub fn gitDescription(gpa: Allocator, rev_parse_out: ?[]const u8, porcelain_out: ?[]const u8) Allocator.Error![]u8 {
     const commit = std.mem.trim(u8, rev_parse_out orelse "", " \t\r\n");

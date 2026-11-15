@@ -63,19 +63,18 @@ const usage =
     \\
 ;
 
-const Ctx = struct {
-    gpa: Allocator,
-    io: Io,
-    env: *const std.process.Environ.Map,
-    releases: []const u8,
-    /// PORTAL_RELEASES_DIR is in effect (testing): the real data folder is
-    /// not touched (no voice packages published).
-    testing_override: bool = false,
-
-    fn path(ctx: Ctx, name: []const u8) ![]u8 {
-        return std.fs.path.join(ctx.gpa, &.{ ctx.releases, name });
-    }
-};
+const ops = @import("release_ops.zig");
+const Ctx = ops.Ctx;
+const readPointer = ops.readPointer;
+const readPointerRaw = ops.readPointerRaw;
+const writePointer = ops.writePointer;
+const moveReplace = ops.moveReplace;
+const moveNoReplace = ops.moveNoReplace;
+const appendHistory = ops.appendHistory;
+const isFile = ops.isFile;
+const isDir = ops.isDir;
+const releaseExe = ops.releaseExe;
+const Now = ops.Now;
 
 pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag != .windows) @compileError("portal-release supports Windows only.");
@@ -164,121 +163,12 @@ fn warn(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("release: warning: " ++ fmt ++ "\n", args);
 }
 
-// --------------------------------------------------------------- pointers
-
-/// Owned, validated id from a pointer file, or null if missing/invalid.
-fn readPointer(ctx: Ctx, name: []const u8) ?[]u8 {
-    const p = ctx.path(name) catch return null;
-    defer ctx.gpa.free(p);
-    const contents = Io.Dir.cwd().readFileAlloc(ctx.io, p, ctx.gpa, .limited(lib.max_pointer_bytes)) catch return null;
-    defer ctx.gpa.free(contents);
-    const id = lib.parsePointer(contents) orelse return null;
-    return ctx.gpa.dupe(u8, id) catch null;
-}
-
-/// Like readPointer, but tells a missing file apart from one that exists
-/// and cannot be read. Owned contents (unvalidated) on success.
-fn readPointerRaw(ctx: Ctx, name: []const u8) lib.PointerRead {
-    const p = ctx.path(name) catch return .unreadable;
-    defer ctx.gpa.free(p);
-    const contents = Io.Dir.cwd().readFileAlloc(ctx.io, p, ctx.gpa, .limited(lib.max_pointer_bytes)) catch |err| return switch (err) {
-        error.FileNotFound => .missing,
-        else => .unreadable,
-    };
-    return .{ .contents = contents };
-}
-
-/// Holds `<releases>\release.lock` open with no sharing (and delete-on-
-/// close) until the process exits, so two commands that change the
-/// pointers (`release`, `mark-good`, `rollback`) cannot share _staging or
-/// race on current.txt / known-good.txt. Fails command `cmd` if another
-/// holds it; nothing has been changed then.
+/// release.lock for the whole command (ops.lock); exits if it is taken.
 fn lockReleases(ctx: Ctx, cmd: []const u8) void {
-    const p = ctx.path(lib.lock_file) catch fatal(cmd, "out of memory", .{});
-    defer ctx.gpa.free(p);
-    const p_w = std.unicode.wtf8ToWtf16LeAllocZ(ctx.gpa, p) catch fatal(cmd, "out of memory", .{});
-    defer ctx.gpa.free(p_w);
-    const h = w.validHandle(w.CreateFileW(p_w.ptr, w.GENERIC_READ | w.GENERIC_WRITE, 0, null, w.OPEN_ALWAYS, w.FILE_ATTRIBUTE_NORMAL | w.FILE_FLAG_DELETE_ON_CLOSE, null));
-    if (h == null) {
-        const e = w.GetLastError();
-        if (e == 32) fatal(cmd, "another portal-release command (release, mark-good or rollback) is running ({s} is in use); nothing was changed", .{p});
-        fatal(cmd, "cannot create lock file {s} (error {d}); nothing was changed", .{ p, e });
-    }
-    // Never closed: the handle (and lock) lasts until the process exits.
-}
-
-/// Atomic pointer update: write and flush a temp file, then
-/// MoveFileEx(REPLACE_EXISTING | WRITE_THROUGH) over the pointer.
-fn writePointer(ctx: Ctx, name: []const u8, id: []const u8) !void {
-    if (!lib.isValidId(id)) return error.InvalidReleaseId;
-    const gpa = ctx.gpa;
-    const dest = try ctx.path(name);
-    defer gpa.free(dest);
-    const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp", .{dest});
-    defer gpa.free(tmp);
-    {
-        const f = try Io.Dir.cwd().createFile(ctx.io, tmp, .{});
-        defer f.close(ctx.io);
-        try f.writeStreamingAll(ctx.io, id);
-        try f.sync(ctx.io);
-    }
-    try moveReplace(gpa, tmp, dest);
-}
-
-fn moveReplace(gpa: Allocator, from: []const u8, to: []const u8) !void {
-    const from_w = try std.unicode.wtf8ToWtf16LeAllocZ(gpa, from);
-    defer gpa.free(from_w);
-    const to_w = try std.unicode.wtf8ToWtf16LeAllocZ(gpa, to);
-    defer gpa.free(to_w);
-    if (w.MoveFileExW(from_w.ptr, to_w.ptr, w.MOVEFILE_REPLACE_EXISTING | w.MOVEFILE_WRITE_THROUGH) == 0) {
-        std.debug.print("MoveFileExW({s} -> {s}) failed, error {d}\n", .{ from, to, w.GetLastError() });
-        return error.MoveFailed;
-    }
-}
-
-/// Plain rename (MoveFileEx without REPLACE_EXISTING), like PowerShell's
-/// Rename-Item. Unlike std's rename, this succeeds on a running exe, which
-/// the launcher swap relies on.
-fn moveNoReplace(gpa: Allocator, from: []const u8, to: []const u8) !void {
-    const from_w = try std.unicode.wtf8ToWtf16LeAllocZ(gpa, from);
-    defer gpa.free(from_w);
-    const to_w = try std.unicode.wtf8ToWtf16LeAllocZ(gpa, to);
-    defer gpa.free(to_w);
-    if (w.MoveFileExW(from_w.ptr, to_w.ptr, 0) == 0) return switch (w.GetLastError()) {
-        2, 3 => error.FileNotFound,
-        5 => error.AccessDenied,
-        32 => error.SharingViolation,
-        80, 183 => error.PathAlreadyExists,
-        else => error.MoveFailed,
+    ops.lock(ctx) catch |err| switch (err) {
+        error.Busy => fatal(cmd, "another portal-release command (release, mark-good or rollback) or the installer is running ({s} in {s} is in use); nothing was changed", .{ lib.lock_file, ctx.releases }),
+        else => fatal(cmd, "cannot create the lock file {s} in {s} ({t}); nothing was changed", .{ lib.lock_file, ctx.releases, err }),
     };
-}
-
-fn appendHistory(ctx: Ctx, id: []const u8) !void {
-    if (!lib.isValidId(id)) return error.InvalidReleaseId;
-    const p = try ctx.path(lib.history_file);
-    defer ctx.gpa.free(p);
-    const f = try Io.Dir.cwd().createFile(ctx.io, p, .{ .truncate = false });
-    defer f.close(ctx.io);
-    const end = try f.length(ctx.io);
-    var line_buf: [256]u8 = undefined;
-    const line = try std.fmt.bufPrint(&line_buf, "{s}\r\n", .{id});
-    try f.writePositionalAll(ctx.io, line, end);
-    try f.sync(ctx.io);
-}
-
-fn isFile(io: Io, p: []const u8) bool {
-    const st = Io.Dir.cwd().statFile(io, p, .{}) catch return false;
-    return st.kind == .file;
-}
-
-fn isDir(io: Io, p: []const u8) bool {
-    const st = Io.Dir.cwd().statFile(io, p, .{}) catch return false;
-    return st.kind == .directory;
-}
-
-fn releaseExe(ctx: Ctx, id: []const u8) ![]u8 {
-    std.debug.assert(lib.isValidId(id));
-    return std.fs.path.join(ctx.gpa, &.{ ctx.releases, id, "portal.exe" });
 }
 
 // ---------------------------------------------------------------- process
@@ -349,25 +239,6 @@ fn runCapture(gpa: Allocator, io: Io, argv: []const []const u8, cwd: []const u8)
     const err_out = try mr.toOwnedSlice(1);
     return .{ .code = code, .stdout = out, .stderr = err_out };
 }
-
-// ------------------------------------------------------------------- time
-
-const Now = struct {
-    stamp_buf: [15]u8 = undefined,
-    iso_buf: [33]u8 = undefined,
-    stamp: []const u8 = "",
-    iso: []const u8 = "",
-
-    fn get(n: *Now) void {
-        var utc: w.FILETIME = undefined;
-        w.GetSystemTimeAsFileTime(&utc);
-        var local: w.FILETIME = undefined;
-        if (w.FileTimeToLocalFileTime(&utc, &local) == 0) local = utc;
-        const t = lib.fromFileTime(local.toU64());
-        n.stamp = lib.formatStamp(&n.stamp_buf, t);
-        n.iso = lib.formatIso(&n.iso_buf, t, lib.utcOffsetMinutes(utc.toU64(), local.toU64()));
-    }
-};
 
 // ---------------------------------------------------------------- release
 
@@ -471,7 +342,7 @@ fn cmdRelease(ctx: Ctx, zig_arg: ?[]const u8, repo_arg: ?[]const u8) !void {
 
     const bin_dir = try lib.launcherBinDir(gpa, ctx.releases);
     defer gpa.free(bin_dir);
-    installLauncher(ctx, stage, bin_dir, now.stamp);
+    _ = ops.installLauncher(ctx, stage, bin_dir, now.stamp);
     Io.Dir.cwd().deleteTree(io, stage) catch |err| warn("could not remove {s}: {t}", .{ stage, err });
 
     // The laptop speech engine and its model: published by the new
@@ -489,7 +360,7 @@ fn cmdRelease(ctx: Ctx, zig_arg: ?[]const u8, repo_arg: ?[]const u8) !void {
             break :blk null;
         },
         .prune => |k| blk: {
-            prune(ctx, id, k);
+            ops.prune(ctx, id, k);
             break :blk k;
         },
     };
@@ -627,159 +498,6 @@ fn copyTree(gpa: Allocator, io: Io, from_parent: Io.Dir, from_sub: []const u8, t
         .directory => try to.createDirPath(io, e.path),
         else => try from.copyFile(e.path, to, e.path, io, .{}),
     };
-}
-
-// --------------------------------------------------------------- launcher
-
-/// Installs the launchers: stage\bin\portal-launcher.exe (GUI subsystem)
-/// as <bin_dir>\portal.exe, stage\bin\portal-launcher-console.exe as
-/// portalctl.exe and portal-show.exe. An old launcher may be running (it
-/// waits for its child), so it is renamed aside first, which Windows allows
-/// for a running exe, then deleted if possible. Leftover *.old files are
-/// cleaned up when no longer in use.
-fn installLauncher(ctx: Ctx, stage: []const u8, bin_dir: []const u8, stamp: []const u8) void {
-    cleanup: {
-        Io.Dir.cwd().createDirPath(ctx.io, bin_dir) catch break :cleanup;
-        var bin = Io.Dir.cwd().openDir(ctx.io, bin_dir, .{ .iterate = true }) catch break :cleanup;
-        defer bin.close(ctx.io);
-        cleanOldLaunchers(ctx.gpa, ctx.io, bin);
-    }
-    for (lib.release_exes) |exe| {
-        installLauncherInner(ctx, stage, bin_dir, stamp, lib.launcherFor(exe), exe) catch |err|
-            warn("could not install the launcher {s} into {s}: {t}. The previous one (if any) still works.", .{ exe, bin_dir, err });
-    }
-}
-
-fn installLauncherInner(ctx: Ctx, stage: []const u8, bin_dir: []const u8, stamp: []const u8, launcher: []const u8, exe: []const u8) !void {
-    const gpa = ctx.gpa;
-    const io = ctx.io;
-    const cwd = Io.Dir.cwd();
-    const src = try std.fs.path.join(gpa, &.{ stage, "bin", launcher });
-    defer gpa.free(src);
-    if (!isFile(io, src)) return error.LauncherNotBuilt;
-
-    try cwd.createDirPath(io, bin_dir);
-    var bin = try cwd.openDir(io, bin_dir, .{ .iterate = true });
-    defer bin.close(io);
-
-    const dest = try std.fs.path.join(gpa, &.{ bin_dir, exe });
-    defer gpa.free(dest);
-    const old = try std.fmt.allocPrint(gpa, "{s}.{s}.old", .{ dest, stamp });
-    defer gpa.free(old);
-    var renamed = false;
-    if (isFile(io, dest)) {
-        try moveNoReplace(gpa, dest, old);
-        renamed = true;
-    }
-
-    cwd.copyFile(src, bin, exe, io, .{}) catch |err| {
-        if (renamed) moveNoReplace(gpa, old, dest) catch {};
-        return err;
-    };
-    if (renamed) Io.Dir.cwd().deleteFile(io, old) catch {
-        std.debug.print("release: previous launcher is running; left as {s} (removed by a later release)\n", .{old});
-    };
-    std.debug.print("release: launcher installed: {s}\n", .{dest});
-}
-
-fn cleanOldLaunchers(gpa: Allocator, io: Io, bin: Io.Dir) void {
-    var names: std.ArrayList([]u8) = .empty;
-    defer {
-        for (names.items) |n| gpa.free(n);
-        names.deinit(gpa);
-    }
-
-    var iter = bin.iterate();
-    while (iter.next(io) catch null) |e| {
-        if (e.kind == .file and lib.isOldLauncherName(e.name)) {
-            const copy = gpa.dupe(u8, e.name) catch return;
-            names.append(gpa, copy) catch {
-                gpa.free(copy);
-                return;
-            };
-        }
-    }
-    for (names.items) |n| bin.deleteFile(io, n) catch {};
-}
-
-// ------------------------------------------------------------------ prune
-
-/// Never fails: anything that cannot be removed is reported and skipped.
-fn prune(ctx: Ctx, current: []const u8, known_good: ?[]const u8) void {
-    pruneInner(ctx, current, known_good) catch |err| warn("pruning skipped: {t}", .{err});
-}
-
-fn pruneInner(ctx: Ctx, current: []const u8, known_good: ?[]const u8) !void {
-    const gpa = ctx.gpa;
-    const io = ctx.io;
-    var root = try Io.Dir.cwd().openDir(io, ctx.releases, .{ .iterate = true });
-    defer root.close(io);
-
-    var names: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (names.items) |n| gpa.free(n);
-        names.deinit(gpa);
-    }
-    var leftovers: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (leftovers.items) |n| gpa.free(n);
-        leftovers.deinit(gpa);
-    }
-    var iter = root.iterate();
-    while (try iter.next(io)) |e| {
-        if (e.kind != .directory) continue;
-        if (lib.isValidId(e.name)) {
-            try names.append(gpa, try gpa.dupe(u8, e.name));
-        } else if (std.mem.endsWith(u8, e.name, lib.deleting_suffix) and
-            lib.isValidId(e.name[0 .. e.name.len - lib.deleting_suffix.len]))
-        {
-            try leftovers.append(gpa, try gpa.dupe(u8, e.name));
-        }
-    }
-
-    // Folders a previous prune renamed but could not finish deleting.
-    for (leftovers.items) |n| {
-        root.deleteTree(io, n) catch |err| {
-            warn("could not finish deleting {s} ({t}); skipping", .{ n, err });
-            continue;
-        };
-        std.debug.print("release: removed leftover {s}\n", .{n});
-    }
-
-    const victims = try lib.selectPrune(gpa, names.items, current, known_good, lib.default_keep);
-    defer gpa.free(victims);
-    for (victims) |n| {
-        std.debug.assert(lib.isValidId(n));
-        const from = try ctx.path(n);
-        defer gpa.free(from);
-        const tmp = try std.fmt.allocPrint(gpa, "{s}" ++ lib.deleting_suffix, .{from});
-        defer gpa.free(tmp);
-        // Rename first, so a half-deleted folder never looks like a release.
-        // This fails if a file inside is open without sharing.
-        moveNoReplace(gpa, from, tmp) catch |err| {
-            std.debug.print("release: could not prune {s} (in use? {t}); skipping\n", .{ n, err });
-            continue;
-        };
-        // Windows lets a folder be renamed while its portal.exe is running,
-        // but not the running exe be deleted: delete it first and, if that
-        // fails, put the release back untouched.
-        const exe = try std.fs.path.join(gpa, &.{ tmp, "portal.exe" });
-        defer gpa.free(exe);
-        Io.Dir.cwd().deleteFile(io, exe) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => {
-                moveNoReplace(gpa, tmp, from) catch |err2|
-                    warn("could not restore {s} from {s} ({t})", .{ n, tmp, err2 });
-                std.debug.print("release: could not prune {s} (portal.exe in use? {t}); skipping\n", .{ n, err });
-                continue;
-            },
-        };
-        root.deleteTree(io, tmp) catch |err| {
-            warn("pruned {s} but could not delete all of {s} ({t}); will retry next release", .{ n, tmp, err });
-            continue;
-        };
-        std.debug.print("release: pruned {s}\n", .{n});
-    }
 }
 
 fn cmdMarkGood(ctx: Ctx) !void {
