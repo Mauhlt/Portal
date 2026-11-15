@@ -323,6 +323,8 @@ fn guiMain(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     if (std.mem.eql(u8, cmd, "connect")) {
         const client = @import("client");
         client.report_fn = messageBox;
+        // Dictation on this device: stt-local from the desk (devicespeech.zig).
+        @import("devicespeech.zig").install(gpa, io);
         client.main(gpa, io, "portal connect", args[1..]);
     }
     if (std.mem.eql(u8, cmd, "show")) {
@@ -1956,6 +1958,7 @@ test {
     _ = @import("panic.zig");
     _ = @import("conpty.zig");
     _ = @import("gui.zig");
+    _ = @import("devicespeech.zig");
     _ = @import("localgrid.zig");
     _ = @import("localinput.zig");
     _ = @import("workdir.zig");

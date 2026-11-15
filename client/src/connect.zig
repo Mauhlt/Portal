@@ -107,7 +107,8 @@ pub const Platform = struct {
     /// changes.
     note: ?*const fn (buf: []u8) []const u8 = null,
     /// Speech-to-text on the device itself (the iPhone: stt's Core ML
-    /// engine), behind the same input-line hooks the desk's engine uses.
+    /// engine; a Windows laptop: stt-local on its NPU, src/devicespeech.zig),
+    /// behind the same input-line hooks the desk's engine uses.
     speech: ?Speech = null,
 };
 pub var platform: Platform = .{};
@@ -121,16 +122,23 @@ pub const SyncMode = union(enum) {
 
 /// The device's own speech engine on a sync pass (the sync worker's
 /// thread calls these; each may block until that engine answers):
-///   installed   for each allowed package that is installed: its current
+///   installed   for each allowed package (Platform.sync .only), or each
+///               of `packages` (.full), that is installed: its current
 ///               version's folder (read-only) and version, after every
 ///               pass (also when nothing changed);
+///   checked     then, once all of them were reported (a package not
+///               reported is not installed);
 ///   next_bundle the next training bundle to send home (owned, gpa), or
 ///               null: nothing pending, or learning is off on the device;
 ///   sent        the desk stored it: the device deletes those samples.
 /// A bundle the desk did not store stays on the device for a later pass.
 pub const SpeechSync = struct {
     ctx: *anyopaque,
+    /// The packages the engine uses, with Platform.sync .full (which has no
+    /// allow list of its own).
+    packages: []const []const u8 = &.{},
     installed: *const fn (ctx: *anyopaque, pkg: []const u8, dir: []const u8, version: []const u8) void,
+    checked: ?*const fn (ctx: *anyopaque) void = null,
     next_bundle: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator) ?Bundle,
     sent: *const fn (ctx: *anyopaque, through: u32) void,
 
@@ -147,6 +155,17 @@ pub fn requestSync() void {
     const s = running_sync.load(.acquire) orelse return;
     _ = s.shared.sync_gen.fetchAdd(1, .release);
     s.shared.sync_wake.set(s.io());
+}
+
+/// The running viewer's state (null before its window is up).
+var running_shared: std.atomic.Value(?*client_mod.Shared) = .init(null);
+
+/// Any thread: draw the viewer's window again soon (the device's speech
+/// engine has news for Platform.speech.frame). Nothing before the window.
+pub fn redraw() void {
+    const sh = running_shared.load(.acquire) orelse return;
+    _ = sh.version.fetchAdd(1, .release);
+    if (sh.wake_fn) |f| f(sh.wake_ctx.?);
 }
 
 /// A device's own dictation: `dictation` is the shell's 🎤 (start, stop,
@@ -618,6 +637,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
             v.wake();
         }
     }.f;
+    running_shared.store(shared, .release);
 
     // The network thread runs for the life of the process (its socket reads
     // cannot be cancelled portably); exiting the process ends it.
@@ -827,7 +847,7 @@ const SyncState = struct {
             s.mutex.unlock(s.io());
             s.refreshRows(st);
         }
-        if (platform.speech_sync) |sp| s.speechSync(sp, st, allow orelse &.{}, &rem);
+        if (platform.speech_sync) |sp| s.speechSync(sp, st, allow orelse sp.packages, &rem);
     }
 
     /// After the packages: the device's speech engine learns of the
@@ -842,6 +862,7 @@ const SyncState = struct {
             const dir = st.path(&pb, &.{ "packages", pkg, cur.version() }) catch continue;
             sp.installed(sp.ctx, pkg, dir, cur.version());
         }
+        if (sp.checked) |f| f(sp.ctx);
         const Put = struct {
             rem: *const sync.engine.Remote,
             pub fn put(p: @This(), bytes: []const u8) anyerror!u16 {
