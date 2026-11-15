@@ -1,63 +1,115 @@
 # CONFIGURATION, NOT CODE: GitHub Actions only reads YAML. This is the one
 # file type in the iPhone work that is not Zig (the owner's "all code in
-# Zig" rule makes an exception for config files); every step below just
-# runs `zig build`, all logic lives in build.zig and src/tools/*.zig.
+# Zig" rule makes an exception for config files); every step below only
+# fetches a pinned input or runs `zig build`, all logic lives in build.zig
+# and src/tools/*.zig.
 #
-# Builds the iPhone app on a hosted macOS runner (Xcode's iOS SDK is
-# preinstalled there): the aarch64-ios compile check, then an UNSIGNED
-# Portal.app with MoltenVK embedded, uploaded as an artifact. Signing stays
-# on the owner's Mac (no certificates in CI).
+# Builds the iPhone app on a hosted Apple-silicon macOS runner (Xcode's iOS
+# SDK is preinstalled there): the aarch64-ios compile check, then the
+# UNSIGNED kit (Portal.app with MoltenVK embedded, the Mac signer, README)
+# in release mode, without and with the tunnel extension, uploaded as an
+# artifact. No secrets and no signing: signing stays on the owner's Mac.
 #
-# Portal builds against sibling checkouts (../Renderer, ../Image, ../Vulkan,
-# ../Windows, ../Wayland, ../MacOS), so the job checks those out next to it.
-# Private repos need a token with read access in the PORTAL_DEPS_TOKEN
-# secret. ZIG_URL must point at the exact Zig build Portal requires
-# (build.zig.zon minimum_zig_version), a macOS aarch64 tarball.
+# Inputs, all pinned:
+#   - Portal's dependencies are Zig URL packages in build.zig.zon (public
+#     repos, fetched and hash-checked by `zig build` itself).
+#   - Zig is build.zig.zon's minimum_zig_version, installed by ZVC's release
+#     binary (`zvc install --from .`: index sha256 or minisign check);
+#     `zig build check-zig` fails if another zig is first on PATH.
+#   - MoltenVK for iOS: one release tarball, checked against its SHA-256.
+#   - The two actions used (cache, upload-artifact) are pinned by commit.
 name: ios
 
 on:
   workflow_dispatch:
   push:
-    branches: [feat/ios-native]
+    branches: [main]
+    paths:
+      - client/**
+      - ui/**
+      - shared/**
+      - src/tools/ios_sign.zig
+      - src/tools/fetch_file.zig
+      - src/tools/machocheck.zig
+      - build.zig
+      - build.zig.zon
+      - .github/workflows/ios.yml
+
+permissions:
+  contents: read
 
 jobs:
   ios:
     runs-on: macos-15
     env:
-      ZIG_URL: ${{ vars.ZIG_URL }}
       MOLTENVK_URL: https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar
+      MOLTENVK_SHA256: b5d947b1660e6e9fed40b9cd2387e160aaab9e80b775c0cef7e14059405178c1
+      ZVC_URL: https://github.com/Mauhlt/ZVC/releases/latest/download/zvc-aarch64-macos
     steps:
-      - uses: actions/checkout@v4
-        with: { path: Portal }
-      - uses: actions/checkout@v4
-        with: { repository: Mauhlt/Renderer, path: Renderer, token: "${{ secrets.PORTAL_DEPS_TOKEN || github.token }}" }
-      - uses: actions/checkout@v4
-        with: { repository: Mauhlt/Image, path: Image, token: "${{ secrets.PORTAL_DEPS_TOKEN || github.token }}" }
-      - uses: actions/checkout@v4
-        with: { repository: Mauhlt/Vulkan, path: Vulkan, token: "${{ secrets.PORTAL_DEPS_TOKEN || github.token }}" }
-      - uses: actions/checkout@v4
-        with: { repository: Mauhlt/Windows, path: Windows, token: "${{ secrets.PORTAL_DEPS_TOKEN || github.token }}" }
-      - uses: actions/checkout@v4
-        with: { repository: Mauhlt/Wayland, path: Wayland, token: "${{ secrets.PORTAL_DEPS_TOKEN || github.token }}" }
-      - uses: actions/checkout@v4
-        with: { repository: Mauhlt/MacOS, path: MacOS, token: "${{ secrets.PORTAL_DEPS_TOKEN || github.token }}" }
-      - name: Zig
+      - name: Check out the pushed commit
         run: |
-          curl -fsSL "$ZIG_URL" -o zig.tar.xz
-          mkdir zig && tar -xf zig.tar.xz -C zig --strip-components=1
-          echo "$PWD/zig" >> "$GITHUB_PATH"
-      - name: MoltenVK (iOS)
+          git init -q .
+          git fetch -q --depth 1 "https://github.com/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      # Zig's caches in known places, kept between runs: the global cache
+      # holds the URL packages; the local cache holds the build outputs,
+      # including files a build step downloads (the pinned dictation model,
+      # fetched by src/tools/fetch_file.zig).
+      - name: Cache locations
         run: |
-          curl -fsSL "$MOLTENVK_URL" -o mvk.tar
-          tar -xf mvk.tar
-          echo "MOLTENVK_PATH=$PWD/MoltenVK/MoltenVK/dynamic/MoltenVK.xcframework/ios-arm64/MoltenVK.framework" >> "$GITHUB_ENV"
-      - name: Compile check (aarch64-ios)
-        working-directory: Portal
-        run: zig build ios-check
-      - name: Portal.app (unsigned)
-        working-directory: Portal
-        run: zig build ios -Doptimize=ReleaseSafe -Dmoltenvk="$MOLTENVK_PATH"
-      - uses: actions/upload-artifact@v4
+          echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-global-cache" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$RUNNER_TEMP/zig-local-cache" >> "$GITHUB_ENV"
+      - name: Restore Zig's caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: Portal-unsigned.app
-          path: Portal/zig-out/ios/Portal.app
+          path: |
+            ${{ runner.temp }}/zig-global-cache
+            ${{ runner.temp }}/zig-local-cache
+          key: zig-ios-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-ios-${{ runner.os }}-${{ runner.arch }}-
+
+      # ZVC installs exactly build.zig.zon's minimum_zig_version (stdin from
+      # /dev/null accepts its suggested live folder, added to PATH here).
+      - name: Install the pinned Zig with ZVC
+        run: |
+          mkdir -p "$RUNNER_TEMP/zvc"
+          curl -fsSL "$ZVC_URL" -o "$RUNNER_TEMP/zvc/zvc"
+          chmod +x "$RUNNER_TEMP/zvc/zvc"
+          (cd "$RUNNER_TEMP/zvc" && ./zvc install --from "$GITHUB_WORKSPACE" < /dev/null)
+          echo "$HOME/.local/share/zvc/zig" >> "$GITHUB_PATH"
+      - name: Check the Zig version
+        run: zig build check-zig
+
+      - name: MoltenVK for iOS (pinned, SHA-256 checked)
+        run: |
+          mkdir -p "$RUNNER_TEMP/mvk"
+          curl -fsSL "$MOLTENVK_URL" -o "$RUNNER_TEMP/mvk/MoltenVK-ios.tar"
+          echo "$MOLTENVK_SHA256  $RUNNER_TEMP/mvk/MoltenVK-ios.tar" | shasum -a 256 -c -
+          tar -xf "$RUNNER_TEMP/mvk/MoltenVK-ios.tar" -C "$RUNNER_TEMP/mvk"
+          echo "MOLTENVK_PATH=$RUNNER_TEMP/mvk/MoltenVK/MoltenVK/dynamic/MoltenVK.xcframework/ios-arm64/MoltenVK.framework" >> "$GITHUB_ENV"
+      - name: iPhoneOS SDK
+        run: echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_ENV"
+
+      - name: Compile check (aarch64-ios)
+        run: zig build ios-check
+
+      # Release mode: the executables are stripped and checked by machocheck.
+      - name: Unsigned kit
+        run: zig build ios-kit -Doptimize=ReleaseSafe -Dios-sdk="$IOS_SDK" -Dmoltenvk="$MOLTENVK_PATH" -p zig-out/plain
+      - name: Unsigned kit with the tunnel extension
+        run: zig build ios-kit -Doptimize=ReleaseSafe -Dios-tunnel=true -Dios-sdk="$IOS_SDK" -Dmoltenvk="$MOLTENVK_PATH" -p zig-out/tunnel
+
+      # tar keeps the signer's executable bit (an artifact zip drops it).
+      - name: Pack the kits
+        run: |
+          tar -cf Portal-ios-kit.tar -C zig-out/plain ios-kit
+          tar -cf Portal-ios-kit-tunnel.tar -C zig-out/tunnel ios-kit
+      - name: Upload the kits
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: Portal-ios-kit-unsigned
+          path: |
+            Portal-ios-kit.tar
+            Portal-ios-kit-tunnel.tar
+          if-no-files-found: error
