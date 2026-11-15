@@ -26,6 +26,7 @@ const sel = objc.sel;
 pub const scan = @import("scan.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const speech = @import("speech.zig");
+const mic = @import("mic.zig");
 
 /// LAPolicy values.
 const policy_biometrics: objc.NSInteger = 1; // DeviceOwnerAuthenticationWithBiometrics
@@ -82,6 +83,8 @@ fn onSuspend() void {
 /// nothing reconnects until then), then bring the tunnel up.
 fn onResume() void {
     waitUnlocked();
+    // Settings may have changed microphone access while off screen.
+    _ = mic.refreshPermission();
     tunnel.start();
 }
 

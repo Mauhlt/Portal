@@ -48,7 +48,24 @@ const perm_undetermined: objc.NSInteger = 0x756e6474; // 'undt'
 const perm_denied: objc.NSInteger = 0x64656e79; // 'deny'
 const perm_granted: objc.NSInteger = 0x67726e74; // 'grnt'
 
-pub const Permission = enum { granted, denied, undetermined };
+pub const Permission = enum(u8) { granted, denied, undetermined };
+
+/// The last answer iOS gave (read on start, on its own reply, at launch and
+/// back on screen): the UI shows it without asking iOS every frame.
+var cached: std.atomic.Value(Permission) = .init(.undetermined);
+
+/// Ask iOS again and remember the answer (the user may have changed it in
+/// Settings while Portal was off screen).
+pub fn refreshPermission() Permission {
+    const p = permission();
+    cached.store(p, .release);
+    return p;
+}
+
+/// The remembered answer; no Objective-C call.
+pub fn cachedPermission() Permission {
+    return cached.load(.acquire);
+}
 
 pub const StartError = error{ NotAllowed, AskedForAccess, SessionFailed, NoInput, EngineFailed, OutOfMemory };
 
@@ -74,6 +91,7 @@ var engine: ?*Object = null;
 pub fn init(the_io: std.Io, the_gpa: std.mem.Allocator) void {
     io = the_io;
     gpa = the_gpa;
+    _ = refreshPermission();
 }
 
 fn session() ?*Object {
@@ -96,6 +114,7 @@ var access_block: objc.Block = objc.Block.global(@ptrCast(&accessAnswered));
 /// requestRecordPermission's answer (any queue): the window redraws, so
 /// the 🎤 shows the new state; the next tap records.
 fn accessAnswered(_: *const objc.Block, _: objc.BOOL) callconv(.c) void {
+    _ = refreshPermission();
     ios.postEvent(.expose);
 }
 
@@ -117,7 +136,7 @@ pub fn isFull() bool {
 
 /// App thread: start recording.
 pub fn start() StartError!void {
-    switch (permission()) {
+    switch (refreshPermission()) {
         .granted => {},
         .denied => return error.NotAllowed,
         .undetermined => {

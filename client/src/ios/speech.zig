@@ -194,7 +194,7 @@ fn frame(ctx: *anyopaque, sh: *ui.Shell) void {
         if (failed) setNote(s, r) else if (!sh.dictated(r) and r.len > 0) setNote(s, "The transcript did not fit in the line.");
     }
     sh.mic_label = if (s.recording) mic.inputName(&s.mic_buf) else "";
-    const denied = mic.permission() == .denied;
+    const denied = mic.cachedPermission() == .denied;
     sh.speech_off = if (denied)
         startNote(error.NotAllowed)
     else if (s.note_len > 0)
