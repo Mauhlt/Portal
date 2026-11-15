@@ -845,7 +845,8 @@ keystroke on the interactive one (`shared/bulk.zig`, the one codec for
 both ends). One request at a time; each is answered in full:
 
 * client: a text message `get key` | `get index` |
-  `get manifest <id> <version>` | `get file <id> <version> <n>`;
+  `get manifest <id> <version>` | `get file <id> <version> <n>` |
+  `put bundle <len>` (below);
 * server: a text message `ok <len> [<signature hex>]`, then the body in
   binary messages of at most 16 KiB, exactly `<len>` bytes in all; or
   `err <code>` (`404`: unknown or not subscribed, they look the same;
@@ -876,8 +877,23 @@ checked against the manifest's size and SHA-256, and moves them into a new
 read-only version folder. `executable` packages wait for approval on the
 device, every version; nothing is ever run automatically.
 
+**Speech training bundles** (`put bundle <len>`, the other direction):
+a device's stt training bundle (opaque, at most 5 MiB) going home. The
+desk answers the header first: `ok 0` (send it) or `err <code>` with no
+body sent. The device then sends exactly `<len>` bytes in binary
+messages of at most 4 KiB, and the desk answers `ok 0` once stt.Home
+stored it (only then does the device delete those samples) or
+`err <code>`: `400` not a bundle, `403` learning is off at the desk,
+`404` no speech engine there, `413` too large, `429` over a per-device
+limit, `503` busy (try later). The device is the connection's paired
+session; the desk's gate (src/speech/inbox.zig, gate.zig) admits two
+devices at once and reads the body by a 30 s deadline.
+
 ## 6. Voice
 
-iPhone voice = keyboard dictation into the input box; laptops transcribe
-locally on their NPU. Portal never records or sends audio from the phone,
-and the protocol has no audio messages or routes.
+Every device transcribes on itself: the desk on its GPU (stt.Home), the
+iPhone on Core ML (stt.Local, client/src/ios/speech.zig), laptops on
+their NPU. No device sends audio for transcription and there is no
+transcription route. With learning on, the samples stt keeps from a
+device's corrections go home as training bundles (`put bundle`, section
+7), and the adapter home trains comes back as the `stt-adapter` package.

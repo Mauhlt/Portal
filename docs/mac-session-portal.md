@@ -31,9 +31,12 @@ This is everything that cannot be done or checked on Windows:
    configuration" prompt, the extension starting (process
    PortalTunnel), the tunnel up while Portal is on screen and down in
    the background, and the status line.
-6. **Dictation:** the microphone prompt, AVAudioEngine capture, a
+6. **Dictation:** the microphone prompt (its text: Portal transcribes on
+   this iPhone; with learning on, corrected samples go to your own
+   desktop through Portal's private tunnel), AVAudioEngine capture, a
    headset microphone chosen over the built-in one, Core ML on the Neural
-   Engine, and the Core ML cache in Library/Caches.
+   Engine, the Core ML cache in Library/Caches, home's personal adapter
+   reaching the phone and the phone's samples reaching home.
 7. **Screen shape:** safe-area insets, the keyboard pushing the input
    line up, rotation, and tap versus drag on the real touch screen.
 8. **Logs:** syslog reaching Console.app.
@@ -68,7 +71,8 @@ Until then they are the environment variables in docs/ios-native.md,
    **Success:** the build ends without errors and prints one
    `machocheck: <name>: stripped, arm64, no build paths` line for
    `Portal` and, with the tunnel, one for `PortalTunnel`. `zig-out/ios-kit/`
-   holds `Portal.app` (with `stt/ggml-tiny.en.bin`, about 74 MB, and
+   holds `Portal.app` (with `stt/ggml-base.en.bin`, 148 MB: the desk's own
+   base model, src/speech/model_pin.zig, and
    `Licenses.txt`), `portal-ios-sign` and `README.txt`.
    The first build downloads the model and checks its size and SHA-256.
    A `fetch_file` error means the download or the pin is wrong.
@@ -172,6 +176,11 @@ PortalTunnel starting and stopping with no `tunnel:` errors.
    second dictation is fast.
 5. Send Portal to the background and back, then dictate again. The model
    reloads from Library/Caches, which is quicker than the first time.
+   Leave it alone for over a minute and dictate again: the engine was
+   released after 60 s idle and loads again (Console: no errors).
+6. Dictate, edit a word in the line, then Send. That correction is a
+   training sample: within moments the desk's log (`portal.log`) shows
+   `speech: training bundle from '<phone>' (... bytes): stored`.
 
 **Success:**
 * The transcript in the line matches what you said. A one-word
@@ -182,6 +191,29 @@ PortalTunnel starting and stopping with no `tunnel:` errors.
 On failure the 🎤 hint shows the reason, for example "Speech could not
 start on this iPhone (...)". **Record** that text and the Console lines
 for Portal.
+
+## 5b. Trained at home, better on the phone
+
+The phone runs the adapter the desk trains from every device's
+corrections. To check the whole loop:
+
+1. At the desk, subscribe the phone to the adapter: Devices, P on the
+   phone's row, Subscribe `stt-adapter` (or `portalctl sync subscribe
+   <phone> stt-adapter`).
+2. Let home train a run: once 20 new samples have come in, training
+   starts in the nightly window (02:00 to 06:00). Its adapter is
+   `%LOCALAPPDATA%\Portal\stt-home\adapter.bin`, its version N the
+   newest `adapters\vNNNN.bin` beside it. Publish it from a folder holding
+   that `adapter.bin`:
+   `portalctl publish stt-adapter <folder> --kind data --version N`.
+3. With Portal on the phone's screen, the desk announces the new version
+   and the phone fetches, verifies and installs it (Console: `speech:
+   personal adapter vN for the next load`).
+4. Dictate. **Success:** the button reads **🎤 Dictate · your voice vN**
+   with the version from step 2, and Console has no `speech:` errors. An
+   older or tampered package is never installed.
+
+**Record** the version shown and the Console lines.
 
 ## 6. Screen shape and touch
 

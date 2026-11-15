@@ -279,6 +279,14 @@ sync-device` (headless, for tests):
    pruned unless a file in them can't be opened exclusively (a running
    program), in which case they stay.
 
+**The iPhone** runs the same pass for one package only, `stt-adapter`
+(`connect.Platform.sync = .only`, `engine.Options.allow`): other index
+lines are skipped without being fetched, and a manifest naming another
+package, or any executable, is refused after its signature verified. No
+approval or voice-offer panels. Its store is under the app container's
+Library/Application Support/Portal/sync with iOS file protection
+Complete. Host tests: client/src/sync/engine.zig (`vet`).
+
 Leftover staging, `.incoming-*` and `.trash-*` folders are removed at the
 start of every pass. Rollback (`sync-device --server S --rollback <pkg>`,
 Roll back in Packages) swaps current and previous in one record write and

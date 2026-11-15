@@ -92,7 +92,7 @@ Rules:
 | 4 | Lock on leave: cover before the app-switcher snapshot, cover while `UIScreen.isCaptured`, drop the connection in the background, Face ID before showing anything on return | Renderer `Window/ios.zig` (cover, lock, `.background`), shared `Presenter.isSuspended` -> `Client.setPaused`, `client/src/ios/device.zig` (LocalAuthentication) | done |
 | 5 | QR pairing: the phone shows its key and check code, the desk pairs it, then shows the pairing code (address, CA SHA-256, endpoint, desk key) as a QR the phone scans and pins | `shared/pairqr.zig` (text format), `ui/qr.zig` (Zig QR encoder, `portal_ui.qr`), `ui/panels/desk.zig` (Pair panel), `ui/frame.zig` `Panel.qr`, `ui/panels/setup.zig` (Scan QR code), `client/src/ios/scan.zig` (AVFoundation) | done |
 | 6 | Per-app tunnel on the owner's own Zig WireGuard (../WireGuard) | `client/src/ios/tunnel_ext` (extension), `client/src/ios/tunnel.zig` + `tunnel_note.zig` (app side), `devicelink.wgQuick` | done: configured from pairing and every later launch, started on screen, stopped in the background; unverified on device |
-| 7 | Dictation on the phone itself: stt's Core ML engine, the bundled tiny.en model, the shared input line's 🎤 | `client/src/ios/speech.zig`, `client/src/ios/mic.zig`, `connect.Platform.speech` | done, compile-checked only |
+| 7 | Dictation on the phone itself: stt.Local on Core ML, the bundled base.en model (the desk's own), the shared input line's 🎤; home's personal adapter applied, training samples sent home | `client/src/ios/speech.zig`, `client/src/ios/mic.zig`, `connect.Platform.speech` / `speech_sync` | done, compile-checked only |
 
 ### 4. Lock on leave, in detail
 
@@ -249,7 +249,8 @@ Rules:
   VK_EXT_metal_surface.
 * **Credential store:** `credstore.zig`'s `impl` switch; iOS shares the
   Apple Keychain code with macOS, with the Face ID access control.
-* **Device hooks:** `connect.Platform` (sync on/off, suspend/resume,
+* **Device hooks:** `connect.Platform` (sync off / full / only some
+  packages, `speech_sync`, suspend/resume,
   QR scan, `system_tunnel`, the status `note`, `speech`). The iPhone
   section (`client/src/ios`) fills them; everything they drive is shared.
 * **Shared UI** (module `portal_ui`, ui/): layout inside `Frame.insets`,
@@ -269,8 +270,10 @@ Rules:
   cancel), plus a per-frame `frame` that hands a finished transcript to
   `Shell.dictated` and sets the 🎤's state (`transcribing`, `mic_label`,
   `speech_off`, `setSpeechReady`). So the 🎤 Dictate / Listening /
-  Transcribing row, the hint text and the line work as on the desk; no
-  stt feedback (the desk's learning) on the phone.
+  Transcribing row, the hint text and the line work as on the desk, and
+  so does stt's feedback: `sent` / `cleared` go through ui/dictation.zig
+  (edited then sent: the correction is learned; cleared: discarded;
+  unchanged: silence confirms it after 60 s).
 * **Microphone (client/src/ios/mic.zig):** AVAudioSession (category
   Record, Bluetooth hands-free allowed) and an AVAudioEngine tap on the
   input node, event-driven (the tap's callback). The input is chosen with
@@ -285,28 +288,75 @@ Rules:
   shaped around Win32 events (WaitForMultipleObjects) and the WASAPI
   device list; the shared parts are the selection rule, the limits and
   the input-line API.
-* **Engine (client/src/ios/speech.zig):** one worker thread (never the
-  UIKit main thread, never the app thread), asleep on an Io.Condition.
-  The first Dictate starts loading in parallel with the recording:
-  `stt.Model.load` of `Portal.app/stt/ggml-tiny.en.bin`, then
-  `stt.Transcriber.init` with `.coreml` (`cpu_and_neural_engine`, cache
-  `Library/Caches/stt-coreml`). The first launch generates and compiles
-  the Core ML programs (seconds); later ones load them from the cache.
-  "Transcribing (cancel)" drops the result (stt cannot stop mid-clip).
-* **Off screen:** `onSuspend` stops and drops a recording, drops a
-  pending result, and releases the transcriber and the model: iOS
-  reclaims memory from background apps first, and the programs reload
-  from Caches on the next Dictate.
-* **Model:** the whisper.cpp project's `ggml-tiny.en.bin` on Hugging Face,
-  pinned to a commit of that repository, with its size (77,704,715 bytes)
-  and SHA-256 (build.zig `ios_model`). Zig's package fetcher accepts only
-  archives and git repositories, so the single file is fetched by
-  src/tools/fetch_file.zig, which keeps it only if size and hash match.
-  Only the steps that build the app run it (`ios`, `ios-sign`,
-  `ios-kit`), never `ios-check` or `test`, and the build cache keeps it;
-  it is never in git. `-Dios-model=<file>` bundles a local ggml file
-  instead. Its MIT notices are in `Portal.app/Licenses.txt`
-  (docs/ios-licenses.txt).
+* **Engine (client/src/ios/speech.zig):** `stt.Local` with backend
+  `.coreml` (`cpu_and_neural_engine`, cache `Library/Caches/stt-coreml`),
+  on one worker thread (never the UIKit main thread, never the app
+  thread), asleep on an Io.Condition until there is work or a deadline.
+  The first Dictate starts loading in parallel with the recording (the
+  model `Portal.app/stt/ggml-base.en.bin`, then the Core ML programs:
+  generated and compiled the first time, seconds; later from the cache).
+  A clip loses its leading and trailing silence first (src/speech/trim.zig,
+  20 ms frames against the clip's loudest, 200 ms margin; nothing voiced
+  means nothing heard, no stt call). "Transcribing (cancel)" drops the
+  result (stt cannot stop mid-clip) and tells stt it was wrong.
+* **Energy:** the engine (model, Core ML programs, profile) is released
+  60 s after the last dictation: the worker sleeps until that deadline,
+  or stt's own 60 s silence confirm if sooner (`Condition.waitTimeout`,
+  no polling), and closes it when nothing is pending. Off screen
+  (`onSuspend`) a recording is stopped and dropped, a pending result
+  dropped, and the engine released at once (stt confirms what is pending
+  first): iOS reclaims memory from background apps first.
+* **Trained at home, better everywhere:** the desk's GPU trains the
+  personal adapter from every device's corrections; the phone runs it.
+  * *Adapter in:* the sync worker (connect.zig) runs on the phone for one
+    package only, `stt-adapter` (`Platform.sync = .only`,
+    `sync.engine.Options.allow`): the same checks as the laptop (manifest
+    SHA-256 = index line, Ed25519 signature by the release key pinned at
+    pairing, strict parse, a sequence above anything installed: no
+    downgrade, no replay), data only (an executable, or any other package,
+    is refused even when signed), files verified in staging, installed
+    read-only in the per-desktop store. No approval panels, no voice
+    offer, nothing else is fetched. A pass runs on every connect and on
+    the desk's `{"t":"updates"}` (subscribe the phone at the desk:
+    Devices, P on its row, `stt-adapter`; or `portalctl sync subscribe
+    <phone> stt-adapter`). The package holds `update.bin` (stt's update:
+    adapter + rules + vocabulary, from `Home.exportUpdate`) or a raw
+    `adapter.bin` whose package version is the adapter version
+    (`portalctl publish stt-adapter <folder> --kind data --version N`).
+    An update is swapped into the open engine at once
+    (`Local.importUpdate`: only the Core ML decoder is rebuilt, the model
+    stays loaded) or imported into the profile for the next load; a raw
+    adapter is used from the next load (the engine closes at the next
+    idle moment). The Dictate button shows `your voice vN` once an
+    adapter is in use.
+  * *Samples out:* with learning on (the default; `speech_learning = off`
+    in the device settings file turns it off: then stt keeps no audio and
+    nothing is sent), after each sync pass and after every learned
+    correction (`connect.requestSync`) the phone sends its pending samples
+    home as stt bundles (at most 2 MiB each, 16 a pass) with `put bundle`
+    on the bulk WebSocket, inside the tunnel and the CA-pinned TLS. The
+    desk answers "ok" only once stt.Home stored them; only then are they
+    deleted on the phone. The desk's limits apply (src/speech/inbox.zig,
+    gate.zig: 2 devices at once, 5 MiB a bundle, 100 MiB and 500 clips a
+    day per device); a refusal keeps them for a later pass.
+  * *Storage:* the stt profile (samples, rules, vocabulary, the adapter)
+    is `Library/Application Support/Portal/stt-local`, the sync store
+    `.../Portal/sync`, both and the Core ML cache with iOS file protection
+    Complete (readable only while the phone is unlocked), the class of
+    the device key's Keychain item (WhenUnlockedThisDeviceOnly). One
+    thread (the speech worker) touches the profile.
+* **Model:** the desk's own base model, pinned once in
+  src/speech/model_pin.zig: the whisper.cpp project's `ggml-base.en.bin`
+  on Hugging Face at commit 5359861, 147,964,211 bytes, SHA-256
+  a03779c8...d002, byte for byte the file the desk's stt.Home trains on
+  (an adapter fits only the base model it was trained on). Zig's package
+  fetcher accepts only archives and git repositories, so the single file
+  is fetched by src/tools/fetch_file.zig, which keeps it only if size and
+  hash match. Only the steps that build the app run it (`ios`,
+  `ios-sign`, `ios-kit`), never `ios-check` or `test`, and the build
+  cache keeps it; it is never in git. `-Dios-model=<file>` bundles a
+  local copy instead (it must be that same file). Its MIT notices are in
+  `Portal.app/Licenses.txt` (docs/ios-licenses.txt).
 * **One Objective-C binding:** the window (the Renderer's IosObjC) and
   stt's Core ML backend (TranslateCoreML) both build on the MacOS
   package's types and its `msgSend` signature builder. They asked for it
@@ -350,7 +400,7 @@ like) is docs/mac-session-portal.md; this section is the reference.
 Prerequisites: Xcode (iOS SDK) and the Zig in build.zig.zon. The sibling
 repos are pinned URL dependencies (build.zig.zon), fetched by the build;
 `--fork=<checkout>` builds against a local one. The first app build also
-downloads the dictation model (77.7 MB, build.zig `ios_model`).
+downloads the dictation model (148 MB, src/speech/model_pin.zig).
 
 1. **MoltenVK for iOS** (not committed): either the LunarG Vulkan SDK for
    macOS (`<SDK>/MoltenVK/dynamic/dylib/iOS/libMoltenVK.dylib`, or the

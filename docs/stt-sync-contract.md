@@ -26,7 +26,7 @@ added to Audio, not to Portal.
 |---|---|---|---|
 | **Desktop** (Portal's own window) | `stt.Home` linked into Portal, NVIDIA GPU; also trains | in-process | no |
 | **Laptop** (Snapdragon X) | `stt-local` child process wrapping `stt.Local`, on the NPU (QNN) | delivered by signed sync, approved on the laptop | no; only training bundles go home |
-| **iPhone** | Apple keyboard dictation into the input box | iOS | no; only the resulting text |
+| **iPhone** | `stt.Local` on Core ML (client/src/ios/speech.zig), home's adapter from the `stt-adapter` package | in-process | no; only training bundles go home (learning on) |
 
 So no device uploads audio for transcription, and Portal has no
 `/stt/transcribe` endpoint.
@@ -94,7 +94,17 @@ it as a child process; see "Running delivered programs" in
   any conversion Windows can't do goes into `../Audio`) and sends
   `pcm_s16le_b64`.
 
-## Laptop → desktop: training data (proposed endpoints, not built)
+## Device → desktop: training data
+
+**Built (the iPhone uses it):** `put bundle <len>` on the bulk WebSocket
+(docs/protocol.md section 7): a bundle from `exportBundle`, the desk's
+"ok" only after `Home.importBundle` returned (home.Engine.importBundleWait,
+behind src/speech/inbox.zig and gate.zig), then the device's
+`commitExport`. Adapters come back as the signed `stt-adapter` package
+(an update file or a raw adapter), not as a reply. The proposal below is
+what it replaced.
+
+### The earlier proposal
 
 All require a live session from a paired device; the device name comes from
 the session, never from the request. Payloads are opaque to Portal.
