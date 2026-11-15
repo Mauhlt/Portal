@@ -832,23 +832,39 @@ const StoreWatch = struct {
         }
     }
 
-    /// Every paired device gets the voice packages (sync.autoSubscribe:
-    /// a new pairing, and devices paired before this build on its first
-    /// start), except any the owner unsubscribed it from. The desk has no
-    /// record of a device's platform, so it is `unknown`: all three.
+    /// Every paired device gets the voice packages that run on it
+    /// (sync.autoSubscribe: a new pairing, and devices paired before this
+    /// build on its first start), except any the owner unsubscribed it
+    /// from. Its platform is what it said this run (web.PlatformTable):
+    /// unknown until then, the adapter alone; platformReported adds the rest.
     fn autoSubscribe(sw: *StoreWatch, st: *const devices.Store) void {
-        var names: [devices.max_devices][]const u8 = undefined;
+        var devs: [devices.max_devices]sync.AutoDevice = undefined;
         var n: usize = 0;
         for (&st.devices) |*d| if (d.*) |*dev| {
-            names[n] = dev.name.get();
+            devs[n] = .{ .name = dev.name.get(), .platform = sw.srv.platforms.get(sw.io, dev.name.get()) };
             n += 1;
         };
         if (n == 0) return;
-        const added = sync.autoSubscribe(sw.gpa, sw.io, .{ .dir = sw.paths.dir }, names[0..n], .unknown) catch |err| {
-            sw.srv.log.print("sync: could not subscribe the paired devices to the voice packages ({t})", .{err});
+        sw.subscribeLogged(devs[0..n]);
+    }
+
+    fn subscribeLogged(sw: *StoreWatch, devs: []const sync.AutoDevice) void {
+        const added = sync.autoSubscribe(sw.gpa, sw.io, .{ .dir = sw.paths.dir }, devs) catch |err| {
+            sw.srv.log.print("sync: could not subscribe paired devices to the voice packages ({t})", .{err});
             return;
         };
-        if (added > 0) sw.srv.log.print("sync: {d} voice package subscription(s) added for paired devices (stt-adapter, stt-model, stt-local)", .{added});
+        if (added > 0) sw.srv.log.print("sync: {d} voice package subscription(s) added for paired devices", .{added});
+    }
+
+    /// web.Server.platform_notify_fn: a device said its platform (news for
+    /// this run): subscribe it to what runs there. Event-driven, once per
+    /// device per run; the device is the WebSocket's authenticated one.
+    /// No `mutex`: a reload holding it may wait for this device's
+    /// connections to end; the subscriptions file's own lock serializes
+    /// the write (sync.withSubs).
+    fn platformReported(ctx: *anyopaque, device: []const u8, p: web.PlatformTable.Platform) void {
+        const sw: *StoreWatch = @ptrCast(@alignCast(ctx));
+        sw.subscribeLogged(&.{.{ .name = device, .platform = p }});
     }
 
     /// The speech inbox follows the store: an unpaired or replaced
@@ -1839,6 +1855,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .io = io,
         .gpa = gpa,
     };
+    // A device saying its platform subscribes it to what runs there.
+    server.platform_notify_ctx = &store_watch;
+    server.platform_notify_fn = StoreWatch.platformReported;
     // A change between prepare's read and the watch opening signalled
     // nobody: read once more now that the watch is open (a failure is
     // logged and shown by reload; the next change retries).

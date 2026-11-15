@@ -672,36 +672,38 @@ pub fn subscribe(gpa: Allocator, io: Io, paths: Paths, device: []const u8, packa
     return changed;
 }
 
-/// What the desk knows of a device's platform. The device record has no
-/// field for it (pairing gives a name and a key, nothing else), so the
-/// desk passes `unknown` today.
-pub const Platform = enum { unknown, windows_aarch64, other };
+/// A device's OS and CPU as it said (`d:platform`, shared/platform.zig;
+/// the desk keeps it in memory, web.PlatformTable); null until it says.
+pub const Platform = @import("shared").platform.Platform;
 
 /// The packages a device is subscribed to automatically: the trained
 /// adapter for every device; the laptop speech engine and its model too
-/// for a Windows aarch64 device, or one whose platform the desk can't tell
-/// (its own engine then says if it has none for its architecture; the
-/// iPhone's sync fetches stt-adapter alone whatever it is offered).
-pub fn autoPackages(p: Platform) []const []const u8 {
-    return switch (p) {
-        .unknown, .windows_aarch64 => &manifest.voice_packages,
-        .other => &.{"stt-adapter"},
-    };
+/// for an aarch64 Windows device (the only build of stt-local). A device
+/// that has not said its platform yet gets the adapter alone; it gets the
+/// rest when it says (main.zig StoreWatch.platformReported).
+pub fn autoPackages(p: ?Platform) []const []const u8 {
+    const all = if (p) |x| x == .windows_aarch64 else false;
+    return if (all) &manifest.voice_packages else &.{"stt-adapter"};
 }
 
-/// Subscribes each device to its automatic packages, except those it is
-/// subscribed to already or the owner opted it out of. Runs on every
-/// device store read (main.zig StoreWatch): a new pairing, and devices
-/// paired earlier on the first start that runs it. Idempotent: the file is
-/// written only when something is added. Returns how many were added.
-pub fn autoSubscribe(gpa: Allocator, io: Io, paths: Paths, devs: []const []const u8, platform: Platform) !usize {
+/// A paired device and what the desk knows of its platform.
+pub const AutoDevice = struct { name: []const u8, platform: ?Platform = null };
+
+/// Subscribes each device to its automatic packages (autoPackages), except
+/// those it is subscribed to already or the owner opted it out of. Runs on
+/// every device store read (main.zig StoreWatch: a new pairing, and
+/// devices paired earlier on the first start that runs it) and when a
+/// device says its platform. Idempotent: the file is written only when
+/// something is added; nothing is ever removed here. Returns how many were
+/// added.
+pub fn autoSubscribe(gpa: Allocator, io: Io, paths: Paths, devs: []const AutoDevice) !usize {
     var added: usize = 0;
-    const Ctx = struct { devs: []const []const u8, pkgs: []const []const u8, added: *usize };
-    try withSubs(gpa, io, paths, Ctx{ .devs = devs, .pkgs = autoPackages(platform), .added = &added }, struct {
+    const Ctx = struct { devs: []const AutoDevice, added: *usize };
+    try withSubs(gpa, io, paths, Ctx{ .devs = devs, .added = &added }, struct {
         fn op(c: Ctx, s: *Subs) !bool {
-            for (c.devs) |d| for (c.pkgs) |p| {
-                if (s.optedOut(d, p)) continue;
-                if (try s.add(d, p)) c.added.* += 1;
+            for (c.devs) |d| for (autoPackages(d.platform)) |p| {
+                if (s.optedOut(d.name, p)) continue;
+                if (try s.add(d.name, p)) c.added.* += 1;
             };
             return c.added.* > 0;
         }
@@ -873,28 +875,30 @@ test "prune: keeps the newest by sequence (not by name); nothing published, noth
     try testing.expectError(error.BadPackageId, prune(gpa, io, paths, "../x", 2));
 }
 
-test "auto-subscribe: new and existing devices get the voice packages once; an opt-out sticks across restarts" {
+test "auto-subscribe: new and existing devices get their voice packages once; an opt-out sticks across restarts" {
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var pb: [512]u8 = undefined;
     const paths = try tmpPaths(&tmp, &pb);
+    const arm: AutoDevice = .{ .name = "laptop", .platform = .windows_aarch64 };
+    const phone: AutoDevice = .{ .name = "phone", .platform = .windows_aarch64 };
     // Devices paired before this build: subscribed on the first start.
-    try testing.expectEqual(@as(usize, 6), try autoSubscribe(gpa, io, paths, &.{ "laptop", "phone" }, .unknown));
+    try testing.expectEqual(@as(usize, 6), try autoSubscribe(gpa, io, paths, &.{ arm, phone }));
     // The next start (or store change) adds nothing.
-    try testing.expectEqual(@as(usize, 0), try autoSubscribe(gpa, io, paths, &.{ "laptop", "phone" }, .unknown));
+    try testing.expectEqual(@as(usize, 0), try autoSubscribe(gpa, io, paths, &.{ arm, phone }));
     var s = try readSubs(gpa, io, paths);
     for (manifest.voice_packages) |p| try testing.expect(s.has("laptop", p) and s.has("phone", p));
     // The owner unsubscribes the phone from stt-model: it stays off, also
     // after a restart (read back from the file).
     try testing.expect(try subscribe(gpa, io, paths, "phone", "stt-model", false));
-    try testing.expectEqual(@as(usize, 0), try autoSubscribe(gpa, io, paths, &.{ "laptop", "phone" }, .unknown));
+    try testing.expectEqual(@as(usize, 0), try autoSubscribe(gpa, io, paths, &.{ arm, phone }));
     s = try readSubs(gpa, io, paths);
     try testing.expect(!s.has("phone", "stt-model"));
     try testing.expect(s.optedOut("phone", "stt-model"));
     // A new pairing gets subscribed; the opt-out is untouched.
-    try testing.expectEqual(@as(usize, 3), try autoSubscribe(gpa, io, paths, &.{ "laptop", "phone", "surface" }, .unknown));
+    try testing.expectEqual(@as(usize, 3), try autoSubscribe(gpa, io, paths, &.{ arm, phone, .{ .name = "surface", .platform = .windows_aarch64 } }));
     s = try readSubs(gpa, io, paths);
     try testing.expect(s.has("surface", "stt-local") and !s.has("phone", "stt-model"));
     // Subscribing by hand clears the opt-out.
@@ -903,20 +907,33 @@ test "auto-subscribe: new and existing devices get the voice packages once; an o
     try testing.expect(!s.optedOut("phone", "stt-model"));
 }
 
-test "auto-subscribe: aarch64 Windows (or unknown) gets all three voice packages, others only the adapter" {
+test "auto-subscribe follows the reported platform: aarch64 Windows all three, others and unknown the adapter; the rest once it says" {
     try testing.expectEqual(@as(usize, 3), autoPackages(.windows_aarch64).len);
-    try testing.expectEqual(@as(usize, 3), autoPackages(.unknown).len);
-    const other = autoPackages(.other);
-    try testing.expectEqual(@as(usize, 1), other.len);
-    try testing.expectEqualStrings("stt-adapter", other[0]);
+    for ([_]?Platform{ null, .windows_x86_64, .linux_x86_64, .linux_aarch64, .macos_aarch64, .ios_aarch64 }) |p| {
+        const one = autoPackages(p);
+        try testing.expectEqual(@as(usize, 1), one.len);
+        try testing.expectEqualStrings("stt-adapter", one[0]);
+    }
     const gpa = testing.allocator;
+    const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var pb: [512]u8 = undefined;
     const paths = try tmpPaths(&tmp, &pb);
-    try testing.expectEqual(@as(usize, 1), try autoSubscribe(gpa, testing.io, paths, &.{"mac"}, .other));
-    const s = try readSubs(gpa, testing.io, paths);
+    // Paired, platform not said yet: the adapter alone.
+    try testing.expectEqual(@as(usize, 2), try autoSubscribe(gpa, io, paths, &.{ .{ .name = "mac", .platform = .macos_aarch64 }, .{ .name = "laptop" } }));
+    var s = try readSubs(gpa, io, paths);
     try testing.expect(s.has("mac", "stt-adapter") and !s.has("mac", "stt-local"));
+    try testing.expect(s.has("laptop", "stt-adapter") and !s.has("laptop", "stt-local") and !s.has("laptop", "stt-model"));
+    // The laptop says windows-aarch64: the engine and the model follow.
+    try testing.expectEqual(@as(usize, 2), try autoSubscribe(gpa, io, paths, &.{.{ .name = "laptop", .platform = .windows_aarch64 }}));
+    s = try readSubs(gpa, io, paths);
+    try testing.expect(s.has("laptop", "stt-local") and s.has("laptop", "stt-model"));
+    // An opt-out made before it said is respected when it says.
+    _ = try subscribe(gpa, io, paths, "surface", "stt-local", false);
+    try testing.expectEqual(@as(usize, 2), try autoSubscribe(gpa, io, paths, &.{.{ .name = "surface", .platform = .windows_aarch64 }}));
+    s = try readSubs(gpa, io, paths);
+    try testing.expect(!s.has("surface", "stt-local") and s.has("surface", "stt-model") and s.has("surface", "stt-adapter"));
 }
 
 test "subscriptions file: optout lines round-trip; any other line is refused" {
