@@ -35,7 +35,7 @@
             .url = "git+https://github.com/Mauhlt/Wireguard?ref=master#145c0c7f25967a2b94cdf736640117d8dc7bbc3a",
             .hash = "WireGuard-0.0.0-76mJEZqQEAC4aTcvD0UjedHorvPU-PNVHVvUwYW0ssjo",
         },
-        // The owner's speech-to-text (branch packages-coreml; read-only):
+        // The owner's speech-to-text (branch main; read-only):
         // stt.Home runs in-process on the desktop GPU (src/speech/home.zig);
         // its stt-local program is the laptop's engine. stt brings Audio
         // (the WAV Portal hands it is encoded there) and, lazily, only for
@@ -43,7 +43,7 @@
         // Apple targets its Core ML backend (the iPhone's dictation), lazily
         // TranslateCoreML.
         .stt = .{
-            .url = "git+https://github.com/Mauhlt/SpeechToText?ref=packages-coreml#e2014efbf593e0693c4b3889048d9e720d11c060",
+            .url = "git+https://github.com/Mauhlt/SpeechToText#e2014efbf593e0693c4b3889048d9e720d11c060",
             .hash = "stt-0.1.0-iyO9SCunCQDHswHtpTv6jac-6zuT_PVcRZ2OVIOzkZTE",
         },
     },
