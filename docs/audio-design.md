@@ -99,6 +99,10 @@ the active input where the platform reports it.
   Home.setLearning(false). Desk: Audio panel and settings.txt
   `speech_learning = on|off`, applied live. Every device (laptop, Surface,
   iPhone) gets the same switch, default on, with the device speech work.
+* "Share voice improvements with devices", default ON (desk only: Audio
+  panel, settings.txt `speech_share = on|off`): each new adapter training
+  produces is published as the signed `stt-adapter` package
+  (docs/stt-sync-contract.md); off, nothing is published.
 * Future device routes: call `speech.gate.Gate` (begin / feedback /
   bundle / end, `retain` with the device store's names when it
   changes) and `home.Engine.deviceFeedback`, whose entries can take at

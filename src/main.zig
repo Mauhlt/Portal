@@ -1993,6 +1993,7 @@ test {
     _ = @import("tls/pki.zig");
     _ = @import("sync.zig");
     _ = @import("sync_cli.zig");
+    _ = @import("voiceshare.zig");
     _ = @import("fsutil.zig");
     _ = @import("bucket.zig");
     _ = @import("ratelimit.zig");

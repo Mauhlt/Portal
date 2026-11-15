@@ -104,6 +104,19 @@ behind src/speech/inbox.zig and gate.zig), then the device's
 (an update file or a raw adapter), not as a reply. The proposal below is
 what it replaced.
 
+**Adapters go out by themselves** (src/voiceshare.zig): when a training
+run finishes (Home's `finished` event), when Home opens, and when the
+desk switches "Share voice improvements with devices" on (Audio panel,
+settings.txt `speech_share = on|off`, default on), the engine asks
+`exportUpdate(<newest published version>)`; a newer adapter becomes the
+next `stt-adapter` version (its number = the adapter version) through
+`sync.publish`, the code `portalctl publish` runs: `update.bin` (the
+update) and `adapter.bin` (the raw adapter from it). SyncWatch sees the
+new version and sends `{"t":"updates"}` to every subscribed device; only
+the newest 3 versions stay published (`sync.prune`). Logged, and shown in
+the Audio panel ("Your voice v7 published to devices"). Off: nothing is
+published.
+
 ### The earlier proposal
 
 All require a live session from a paired device; the device name comes from

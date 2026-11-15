@@ -429,6 +429,44 @@ pub fn latest(gpa: Allocator, io: Io, paths: Paths, package: []const u8) !?Versi
     return best;
 }
 
+/// Unpublishes every version of `package` but the `keep` newest (by
+/// sequence), so superseded versions are not served for ever (devices
+/// keep what they installed; sequences and names stay used). A version
+/// that can't be removed now (a file of it open, e.g. being served) is
+/// left for the next prune. Returns how many went.
+pub fn prune(gpa: Allocator, io: Io, paths: Paths, package: []const u8, keep: usize) !usize {
+    if (!manifest.validPackageId(package)) return error.BadPackageId;
+    const Seen = struct { seq: u64, name: [manifest.max_version]u8, len: usize };
+    var seen: std.ArrayList(Seen) = .empty;
+    defer seen.deinit(gpa);
+    {
+        var pb: [1024]u8 = undefined;
+        var dir = Io.Dir.cwd().openDir(io, try paths.join(&pb, &.{ "publish", package }), .{ .iterate = true }) catch return 0;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |e| {
+            if (e.kind != .directory or !manifest.validVersion(e.name)) continue;
+            var v = readVersion(gpa, io, paths, package, e.name) catch continue;
+            defer v.deinit(gpa);
+            var s: Seen = .{ .seq = v.m.sequence, .name = undefined, .len = e.name.len };
+            @memcpy(s.name[0..e.name.len], e.name);
+            try seen.append(gpa, s);
+        }
+    }
+    if (seen.items.len <= keep) return 0;
+    std.mem.sort(Seen, seen.items, {}, struct {
+        fn newer(_: void, a: Seen, b: Seen) bool {
+            return a.seq > b.seq;
+        }
+    }.newer);
+    var gone: usize = 0;
+    for (seen.items[keep..]) |*s| {
+        unpublish(io, paths, package, s.name[0..s.len]) catch continue;
+        gone += 1;
+    }
+    return gone;
+}
+
 /// The stored file `n` of a published version: its path and the size the
 /// manifest promises.
 pub fn filePath(paths: Paths, buf: []u8, package: []const u8, version: []const u8, n: usize) ![]const u8 {
@@ -726,4 +764,30 @@ test "subscriptions file is strict" {
     const s = try Subs.parse(subs_header ++ "\nsub laptop stt-model\nsub laptop npu-probe\n");
     var b: [4][]const u8 = undefined;
     try testing.expectEqual(@as(usize, 2), s.forDevice("laptop", &b).len);
+}
+
+test "prune: keeps the newest by sequence (not by name); nothing published, nothing to do" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [512]u8 = undefined;
+    const paths = try tmpPaths(&tmp, &pb);
+    _ = try initKey(gpa, io, paths, false);
+    try testing.expectEqual(@as(usize, 0), try prune(gpa, io, paths, "stt-adapter", 2));
+    var fb: [1024]u8 = undefined;
+    try Io.Dir.cwd().createDirPath(io, try paths.join(&fb, &.{"src"}));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try paths.join(&fb, &.{ "src", "a.bin" }), .data = "a" });
+    var sb: [1024]u8 = undefined;
+    const src = try paths.join(&sb, &.{"src"});
+    var problem: [300]u8 = undefined;
+    for ([_][]const u8{ "9", "10", "b", "a" }) |v| _ = try publish(gpa, io, paths, .{ .package = "stt-adapter", .folder = src, .kind = .data, .version = v, .now = 1 }, &problem);
+    try testing.expectEqual(@as(usize, 2), try prune(gpa, io, paths, "stt-adapter", 2));
+    try testing.expectError(error.NotPublished, readVersion(gpa, io, paths, "stt-adapter", "9"));
+    try testing.expectError(error.NotPublished, readVersion(gpa, io, paths, "stt-adapter", "10"));
+    var l = (try latest(gpa, io, paths, "stt-adapter")).?;
+    defer l.deinit(gpa);
+    try testing.expectEqualStrings("a", l.m.version);
+    try testing.expectEqual(@as(usize, 0), try prune(gpa, io, paths, "stt-adapter", 2));
+    try testing.expectError(error.BadPackageId, prune(gpa, io, paths, "../x", 2));
 }

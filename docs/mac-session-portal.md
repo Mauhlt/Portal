@@ -202,10 +202,10 @@ corrections. To check the whole loop:
    <phone> stt-adapter`).
 2. Let home train a run: once 20 new samples have come in, training
    starts in the nightly window (02:00 to 06:00). Its adapter is
-   `%LOCALAPPDATA%\Portal\stt-home\adapter.bin`, its version N the
-   newest `adapters\vNNNN.bin` beside it. Publish it from a folder holding
-   that `adapter.bin`:
-   `portalctl publish stt-adapter <folder> --kind data --version N`.
+   `%LOCALAPPDATA%\Portal\stt-home\adapter.bin`. With "Share voice
+   improvements with devices" on (the Audio panel, default on), the desk
+   publishes it as `stt-adapter` version N by itself when the run ends
+   (the Audio panel then says "Your voice vN published to devices").
 3. With Portal on the phone's screen, the desk announces the new version
    and the phone fetches, verifies and installs it (Console: `speech:
    personal adapter vN for the next load`).

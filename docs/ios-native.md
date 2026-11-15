@@ -321,8 +321,8 @@ Rules:
     Devices, P on its row, `stt-adapter`; or `portalctl sync subscribe
     <phone> stt-adapter`). The package holds `update.bin` (stt's update:
     adapter + rules + vocabulary, from `Home.exportUpdate`) or a raw
-    `adapter.bin` whose package version is the adapter version
-    (`portalctl publish stt-adapter <folder> --kind data --version N`).
+    `adapter.bin` whose package version is the adapter version (the
+    desk publishes both after each training run: src/voiceshare.zig).
     An update is swapped into the open engine at once
     (`Local.importUpdate`: only the Core ML decoder is rebuilt, the model
     stays loaded) or imported into the profile for the next load; a raw
