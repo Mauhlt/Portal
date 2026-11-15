@@ -1118,6 +1118,8 @@ pub const Shell = struct {
                 .title = d.title,
                 .tabs = sh.tabBar(st, true),
                 .add_id = if (d.can_add) ids.tab_add else null,
+                // The desk keeps its tools; long tab names are cut instead.
+                .tab_need_cells = 12,
                 .right = viewerText(d.viewers, &sh.bufs.right),
                 .right_tone = if (watching) .warn else .muted,
                 .right_badge = watching,
@@ -2910,7 +2912,7 @@ test "hidden tabs (devices): the menu hides, the bar skips them, the amber butto
     try testing.expectEqualStrings("Gamma", o.top_bar.?.tabs[1].label);
     // Positions stay the desk's: Gamma is still tab0 + 2.
     try testing.expectEqual(ids.tab0 + 2, o.top_bar.?.tabs[1].id);
-    try testing.expectEqualStrings("\u{22EF} 1 hidden", o.top_bar.?.hidden.?.label);
+    try testing.expectEqualStrings("\u{2022}\u{2022}\u{2022} 1 hidden", o.top_bar.?.hidden.?.label);
     try testing.expect(!o.top_bar.?.hidden.?.alert);
     // Ctrl+Tab skips the hidden tab.
     Shell.onKey(&sh, .tab, .{ .ctrl = true });

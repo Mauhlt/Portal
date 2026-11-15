@@ -7,7 +7,7 @@
 //!   * Hide: a long press (or right-click) on a tab opens its menu, "Hide
 //!     this tab" (and "Close (desk only)", shown disabled); Ctrl+Shift+H
 //!     hides the tab shown.
-//!   * The tab strip then shows "⋯ N hidden", amber with a dot while a
+//!   * The tab strip then shows "••• N hidden", amber with a dot while a
 //!     hidden tab waits for an answer or has For-you items that need the
 //!     desk. It opens the sheet listing them (colour, name, waiting /
 //!     working / idle) with Show, which puts the tab back and switches to it.
@@ -123,7 +123,7 @@ fn inList(id: tabs_wire.Id, list: []const tabs_wire.Id) bool {
 
 /// "⋯ 3 hidden".
 pub fn buttonLabel(s: Summary, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "\u{22EF} {d} hidden", .{s.count}) catch "\u{22EF} hidden";
+    return std.fmt.bufPrint(buf, frame.more_label ++ " {d} hidden", .{s.count}) catch (frame.more_label ++ " hidden");
 }
 
 /// What the sheet is showing.
@@ -269,7 +269,7 @@ test "summarize: open hidden tabs only; amber for waiting or needs-desk" {
     s = summarize(&l, &tabs, &.{@as(tabs_wire.Id, @splat(3))});
     try testing.expect(!s.alert);
     var lb: [32]u8 = undefined;
-    try testing.expectEqualStrings("\u{22EF} 2 hidden", buttonLabel(.{ .count = 2 }, &lb));
+    try testing.expectEqualStrings("\u{2022}\u{2022}\u{2022} 2 hidden", buttonLabel(.{ .count = 2 }, &lb));
 }
 
 test "panel: the sheet lists the hidden tabs with Show; the menu" {

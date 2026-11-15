@@ -86,6 +86,11 @@ pub const TopBar = struct {
     more_id: ?u32 = null,
     /// The "⋯" button's menu is open (drawn as the chosen one).
     more_active: bool = false,
+    /// When deciding whether the buttons collapse, each tab counts as at
+    /// most this many cells (the desk: its tools stay at normal widths and
+    /// long tab names are cut instead); null: the tabs at their full width
+    /// (devices: the buttons give way first).
+    tab_need_cells: ?u16 = null,
 };
 
 /// The tab strip's hidden-tabs button: amber with a dot (`alert`) while a
@@ -1156,7 +1161,10 @@ pub const Frame = struct {
             if (tb.right.len > 0) fixed += textWidth(ui, tb.right) + (if (tb.right_badge) 3 * pad else pad);
             if (tb.hidden) |hb| fixed += textWidth(ui, hb.label) + 2 * cw + (if (hb.alert) 2 * cw else 0) + @round(4 * s);
             var need: f32 = 0;
-            for (tb.tabs) |t| need += 4 * cw + (if (t.close_id != null) 2 * cw else 0) + (if (t.badge.len > 0) textWidth(ui, t.badge) + 2 * cw else 0) + textWidth(ui, t.label) + @round(4 * s);
+            for (tb.tabs) |t| {
+                const full = 4 * cw + (if (t.close_id != null) 2 * cw else 0) + (if (t.badge.len > 0) textWidth(ui, t.badge) + 2 * cw else 0) + textWidth(ui, t.label);
+                need += (if (tb.tab_need_cells) |c| @min(full, @as(f32, @floatFromInt(c)) * cw) else full) + @round(4 * s);
+            }
             if (tb.add_id != null) need += 3 * cw + @round(4 * s);
             if (tb.tabs.len == 0 and tb.add_id == null) need = @min(textWidth(ui, tb.title), 16 * cw);
             var widths: [3]?f32 = @splat(null);
@@ -2327,8 +2335,8 @@ pub fn collapseButtons(buttons: []const TopButton, level: u2, more_id: ?u32, mor
     return out[0..n];
 }
 
-/// The "⋯" button's label: three bullets (U+22EF draws as a short dash at
-/// the chrome's size).
+/// The "more" button's label (and the hidden-tabs button's): three bullets
+/// (U+22EF draws as a short dash at the chrome's size).
 pub const more_label = "\u{2022}\u{2022}\u{2022}";
 
 /// How far the top bar's buttons collapse: the first level (0 full, 1
@@ -2773,7 +2781,7 @@ test "tab strip: the hidden button's hit, a tab's menu by right-click and by lon
         .{ .label = "Alpha", .color = .{ 0x33, 0x66, 0xCC }, .active = true, .id = 1000, .menu_id = 1780 },
         .{ .label = "Beta", .color = .{ 0x10, 0xB9, 0x81 }, .id = 1001, .menu_id = 1781 },
     };
-    const o: Overlay = .{ .top_bar = .{ .tabs = &tabs_, .hidden = .{ .label = "\u{22EF} 3 hidden", .alert = true, .id = 1700 } } };
+    const o: Overlay = .{ .top_bar = .{ .tabs = &tabs_, .hidden = .{ .label = "\u{2022}\u{2022}\u{2022} 3 hidden", .alert = true, .id = 1700 } } };
     f.build(&fs, .{ 1200, 800 }, 1, &g, o);
     try expectHits(&f, &.{ 1000, 1001, 1700 }, &.{ 1780, 1781 });
     // The hidden button sits right of the last tab.
@@ -3231,4 +3239,42 @@ test "top bar at phone width: both tabs, the view toggle and ⋯; wide: unchange
     // Wide: every button as it is.
     f.build(&fs, .{ 1200, 800 }, 1, &g, .{ .top_bar = tb });
     try expectHits(&f, &.{ 1000, 1001, 916, 905, 906, 913 }, &.{1960});
+}
+
+test "top bar on the desk: tabs count at most 12 cells, so the tools stay and long names are cut" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    const tools = [_]TopButton{
+        .{ .label = "Pair a device\u{2026}", .id = 1 },
+        .{ .label = "Devices", .id = 2 },
+        .{ .label = "Export certificate\u{2026}", .id = 3 },
+        .{ .label = "Settings", .id = 4 },
+        .{ .label = "Audio", .id = 5 },
+        .{ .label = "Projects", .id = 6 },
+        .{ .label = "Conversation", .id = 906, .toggle = true, .short = "Chat" },
+        .{ .label = "Usage", .id = 913 },
+    };
+    const tabs_ = [_]TopTab{
+        .{ .label = "showcase-foryou", .color = .{ 0x33, 0x66, 0xCC }, .active = true, .id = 1000, .close_id = 1100 },
+        .{ .label = "website \u{00B7} started by laptop", .color = .{ 0x10, 0xB9, 0x81 }, .id = 1001, .close_id = 1101, .badge = "2", .badge_id = 1201 },
+    };
+    var tb: TopBar = .{ .tabs = &tabs_, .add_id = 1400, .buttons = &tools, .right = "1 REMOTE VIEWER WATCHING", .right_badge = true, .more_id = 1960, .tab_need_cells = 12 };
+    f.build(&fs, .{ 1184, 761 }, 1, &g, .{ .top_bar = tb });
+    try expectHits(&f, &.{ 1, 2, 3, 4, 5, 6, 906, 913, 1000, 1001 }, &.{1960});
+    var cut = false;
+    for (f.list.cmds.items) |c| switch (c) {
+        .text => |t| if (std.mem.startsWith(u8, f.list.textOf(t), "web") and std.mem.endsWith(u8, f.list.textOf(t), "\u{2026}")) {
+            cut = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(cut);
+    // Counting the tabs at full width (a device's rule), the tools would go.
+    tb.tab_need_cells = null;
+    f.build(&fs, .{ 1184, 761 }, 1, &g, .{ .top_bar = tb });
+    try expectHits(&f, &.{ 906, 1960 }, &.{ 1, 913 });
 }
