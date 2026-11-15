@@ -755,7 +755,7 @@ test "store: per tab, replaced whole, malformed ignored, results, closed tabs dr
     try testing.expect(s.get(@splat(0xb)) != null);
 }
 
-const Sent = struct {
+pub const Sent = struct {
     frames: [8][64]u8 = undefined,
     lens: [8]usize = @splat(0),
     n: usize = 0,
@@ -766,7 +766,7 @@ const Sent = struct {
         t.n += 1;
         return true;
     }
-    fn last(t: *const Sent) []const u8 {
+    pub fn last(t: *const Sent) []const u8 {
         return t.frames[t.n - 1][0..t.lens[t.n - 1]];
     }
 };
@@ -856,7 +856,7 @@ test "panel: focus keys, the swipe guard's first sight, rows by point" {
 const convo = @import("convo.zig");
 const convo_wire = shared.convo;
 
-const Clock = struct {
+pub const Clock = struct {
     t: i64 = 0,
     fn now(ctx: ?*anyopaque) i64 {
         const c: *Clock = @ptrCast(@alignCast(ctx.?));
@@ -864,7 +864,7 @@ const Clock = struct {
     }
 };
 
-const Rig = struct {
+pub const Rig = struct {
     c: convo.Conversation = .{},
     s: Store = .{},
     v: cv.View,
@@ -872,7 +872,7 @@ const Rig = struct {
     sent: Sent = .{},
     clk: Clock = .{},
 
-    fn init(r: *Rig, gpa: std.mem.Allocator, mode_name: []const u8, items: []const convo_wire.Item) !void {
+    pub fn init(r: *Rig, gpa: std.mem.Allocator, mode_name: []const u8, items: []const convo_wire.Item) !void {
         r.* = .{ .v = cv.View.init(gpa), .p = Panel.init(gpa) };
         try r.c.apply(gpa, .{ .snapshot = true, .id = @splat(0xa), .on = true, .items = @constCast(items) });
         const l = testList(@splat(0xa));
@@ -888,7 +888,7 @@ const Rig = struct {
         r.v.presented(r.clk.t);
     }
 
-    fn deinit(r: *Rig, gpa: std.mem.Allocator) void {
+    pub fn deinit(r: *Rig, gpa: std.mem.Allocator) void {
         r.v.deinit();
         r.p.deinit();
         r.s.deinit(gpa);
@@ -909,7 +909,7 @@ const Rig = struct {
     }
 };
 
-const reply = [_]convo_wire.Item{.{ .n = 1, .kind = .assistant, .text = "Run `zig build run` next. Keep UDP 51820?" }};
+pub const reply = [_]convo_wire.Item{.{ .n = 1, .kind = .assistant, .text = "Run `zig build run` next. Keep UDP 51820?" }};
 
 test "rows swipe with the view's gesture: left = Yes, guarded, springs back short, flies off" {
     const gpa = testing.allocator;

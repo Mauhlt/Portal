@@ -75,8 +75,8 @@ deferred: Window.Queue = .{},
 /// until `.foreground` (a GPU submit in the background gets an iOS app
 /// killed).
 suspended: bool = false,
-/// The id of the frame's text slot the native field last showed (focus
-/// moves raise the keyboard).
+/// The id of the frame's text slot the native field last showed, null
+/// while it is hidden (see raisesKeyboard).
 native_id: ?u32 = null,
 /// What the native field is known to contain (the last text exchanged
 /// with it), to turn its edits into key presses for the host.
@@ -646,7 +646,7 @@ fn syncNativeField(p: *Presenter) void {
         p.native_id = null;
         return;
     };
-    const moved = p.native_id != null and p.native_id.? != slot.id;
+    const raise = raisesKeyboard(p.native_id, slot.id);
     if (!p.window.showTextInput(.{
         .x = slot.rect.x,
         .y = slot.rect.y,
@@ -655,17 +655,30 @@ fn syncNativeField(p: *Presenter) void {
         .font_px = slot.font_px,
         .fg = ui.theme.ui.text,
         .bg = ui.theme.ui.field,
-        .focus = moved,
+        .focus = raise,
     })) {
         p.native_supported = false;
         return;
     }
-    if (moved or p.native_id == null or !std.mem.eql(u8, slot.value(), p.native_buf[0..p.native_len])) {
+    if (raise or !std.mem.eql(u8, slot.value(), p.native_buf[0..p.native_len])) {
         p.window.setTextInputText(slot.value());
         @memcpy(p.native_buf[0..slot.value_len], slot.value());
         p.native_len = slot.value_len;
     }
     p.native_id = slot.id;
+}
+
+/// The UI's focused field takes the keyboard when it appears (the first
+/// time too: nothing was shown before it) or the focus moved to another
+/// field; not again while the same field stays on screen.
+fn raisesKeyboard(shown: ?u32, id: u32) bool {
+    return if (shown) |s| s != id else true;
+}
+
+test "the native field takes the keyboard when it first appears, reappears or the focus moves" {
+    try std.testing.expect(raisesKeyboard(null, 7)); // the first show
+    try std.testing.expect(!raisesKeyboard(7, 7)); // still shown
+    try std.testing.expect(raisesKeyboard(7, 8)); // another field
 }
 
 /// The native field's text changed: hand the difference to the host as
