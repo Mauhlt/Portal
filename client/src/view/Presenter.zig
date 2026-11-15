@@ -19,6 +19,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Renderer = @import("Renderer");
 const Instanced2D = Renderer.Instanced2D;
+/// Instanced2D's shaders (shaders/quad_*.zig, compiled by the build).
+const quad_vert align(4) = @embedFile("quad_vert.spv").*;
+const quad_frag align(4) = @embedFile("quad_frag.spv").*;
 const Window = @import("Window");
 const Font = @import("Font");
 const ui = @import("portal_ui");
@@ -109,6 +112,8 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Presenter {
     const fb = window.framebufferSize();
     const renderer = try Instanced2D.init(gpa, window.surfaceSource(), fb[0], fb[1], .{
         .app_name = "Portal",
+        .vertex_spirv = &quad_vert,
+        .fragment_spirv = &quad_frag,
         .texture_width = tex_w,
         .texture_height = tex_h,
     });

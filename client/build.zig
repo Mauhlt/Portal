@@ -113,7 +113,7 @@ pub const Modules = struct {
 /// The view module (src/view) and the shared UI (../ui), wired to the
 /// Renderer package.
 pub fn modules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *Modules {
-    const renderer = b.dependency("Renderer", .{ .target = target, .optimize = optimize, .demo = false });
+    const renderer = b.dependency("Renderer", .{ .target = target, .optimize = optimize });
     const shared = sharedModule(b, target, optimize);
     const inputrules = inputrulesModule(b, target, optimize);
     const ui = b.createModule(.{
@@ -164,6 +164,9 @@ pub fn modules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
             .{ .name = "portal_ui", .module = ui },
         },
     });
+    // Instanced2D's shaders (src/view/shaders): Zig, compiled to SPIR-V.
+    for ([_][]const u8{ "quad_vert", "quad_frag" }) |name|
+        view.addAnonymousImport(b.fmt("{s}.spv", .{name}), .{ .root_source_file = @import("Renderer").addShader(b, name, b.path(b.fmt("src/view/shaders/{s}.zig", .{name}))) });
     // The hero art for the start-up splash (../docs/brand).
     view.addAnonymousImport("portal_hero", .{ .root_source_file = b.path("../docs/brand/portal-hero-768.png") });
     const m = b.allocator.create(Modules) catch @panic("OOM");

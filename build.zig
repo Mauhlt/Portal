@@ -471,7 +471,7 @@ fn fontModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 }
 
 fn rendererDep(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Dependency {
-    return b.dependency("Renderer", .{ .target = target, .optimize = optimize, .demo = false });
+    return b.dependency("Renderer", .{ .target = target, .optimize = optimize });
 }
 
 // ---- inline images ----
@@ -584,6 +584,9 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
     });
     // The hero art for the start-up splash (docs/brand, `zig build brand`).
     view.addAnonymousImport("portal_hero", .{ .root_source_file = b.path(hero_png) });
+    // Instanced2D's shaders (client/src/view/shaders): Zig, compiled to SPIR-V.
+    for ([_][]const u8{ "quad_vert", "quad_frag" }) |name|
+        view.addAnonymousImport(b.fmt("{s}.spv", .{name}), .{ .root_source_file = @import("Renderer").addShader(b, name, b.path(b.fmt("client/src/view/shaders/{s}.zig", .{name}))) });
     const client = b.createModule(.{
         .root_source_file = b.path("client/src/connect.zig"),
         .target = target,
