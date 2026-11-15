@@ -1,10 +1,10 @@
 //! The desk's panels, as a state machine with no drawing and no I/O:
 //! first-run / Settings (with the tunnel: this desktop's key, port,
 //! endpoint and its peers), "Pair a device…" with the check-code
-//! question, the Devices list with Unpair (and a device's sync packages),
-//! and "Export certificate…". The desk's window glue (src/gui.zig) feeds it
-//! keys, characters and button clicks, performs the `Action`s it returns
-//! (the device store, the CA export) and draws `panel()` with the frame.
+//! question, and the Devices list with Unpair (and a device's sync
+//! packages). The desk's window glue (src/gui.zig) feeds it keys,
+//! characters and button clicks, performs the `Action`s it returns (the
+//! device store) and draws `panel()` with the frame.
 //!
 //! Generic over the desk's device store module (`devices`: Text,
 //! max_name, max_devices, validName), so the pairing rules stay defined
@@ -29,13 +29,12 @@ const pairqr = @import("shared").pairqr;
 
 pub fn Panels(comptime devices: type) type {
     return struct {
-        pub const Screen = enum { none, setup, pair_name, pair_check, pair_result, devices, dev_packages, export_form, export_done };
+        pub const Screen = enum { none, setup, pair_name, pair_check, pair_result, devices, dev_packages };
 
         /// Button and field ids (the frame reports clicks by id).
         pub const id = struct {
             pub const tb_pair: u32 = 10;
             pub const tb_devices: u32 = 11;
-            pub const tb_export: u32 = 12;
             pub const tb_settings: u32 = 13;
             /// The Audio panel (ui/panels/audio.zig; Ctrl+Shift+A).
             pub const tb_audio: u32 = 14;
@@ -44,9 +43,7 @@ pub fn Panels(comptime devices: type) type {
             pub const cancel: u32 = 2;
             pub const approve: u32 = 3;
             pub const deny: u32 = 4;
-            pub const stop: u32 = 5;
             pub const again: u32 = 6;
-            pub const export_: u32 = 7;
             pub const start: u32 = 8;
             pub const open_pair: u32 = 9;
             pub const save: u32 = 10;
@@ -58,12 +55,11 @@ pub fn Panels(comptime devices: type) type {
             pub const pkg0: u32 = 260;
         };
 
-        /// The top bar's desk tools (keyboard: Ctrl+Shift+P / D / E / S): the
+        /// The top bar's desk tools (keyboard: Ctrl+Shift+P / D / S / A): the
         /// shell draws them on the desk only; clicks come back to the glue.
         pub const tools = [_]frame.TopButton{
             .{ .label = "Pair a device\u{2026}", .id = id.tb_pair },
             .{ .label = "Devices", .id = id.tb_devices },
-            .{ .label = "Export certificate\u{2026}", .id = id.tb_export },
             .{ .label = "Settings", .id = id.tb_settings },
             .{ .label = "Audio", .id = id.tb_audio },
         };
@@ -79,8 +75,6 @@ pub fn Panels(comptime devices: type) type {
             load_devices,
             /// Unpair `ui.devs[i]`.
             unpair: usize,
-            /// Write the CA files to `ui.export_dir`.
-            export_ca,
             /// Fill `ui.pkgs` for `ui.devs[i]` (setPackages): Portal sync.
             load_subs: usize,
             /// Flip the subscription of `ui.devs[ui.sub_dev]` to `ui.pkgs[i]`.
@@ -187,10 +181,6 @@ pub fn Panels(comptime devices: type) type {
             pkgs: [max_pkgs]PkgRow = undefined,
             n_pkgs: usize = 0,
 
-            // ---- export
-            export_dir: form.TextField(512) = .{},
-            exported_to: form.TextField(512) = .{},
-
             pub fn open(ui: *const Ui) bool {
                 return ui.screen != .none;
             }
@@ -244,11 +234,6 @@ pub fn Panels(comptime devices: type) type {
             pub fn openDevices(ui: *Ui) Action {
                 ui.show(.devices);
                 return .load_devices;
-            }
-
-            pub fn openExport(ui: *Ui, default_dir: []const u8) void {
-                if (ui.export_dir.len == 0) ui.export_dir.set(default_dir);
-                ui.show(.export_form);
             }
 
             // ------------------------------------------------------- host results
@@ -306,11 +291,6 @@ pub fn Panels(comptime devices: type) type {
                 ui.n_pkgs = 0;
                 ui.show(.dev_packages);
                 return .{ .load_subs = row };
-            }
-
-            pub fn exported(ui: *Ui, dir: []const u8) void {
-                ui.exported_to.set(dir);
-                ui.show(.export_done);
             }
 
             /// Text from the clipboard for the focused field.
@@ -373,7 +353,6 @@ pub fn Panels(comptime devices: type) type {
                 return switch (ui.screen) {
                     .setup => if (ui.setup.first_run) 4 else 9,
                     .pair_name => 2,
-                    .export_form => 1,
                     else => 0,
                 };
             }
@@ -388,7 +367,6 @@ pub fn Panels(comptime devices: type) type {
                         else => .choice,
                     },
                     .pair_name => if (i == 0) ui.nameRef() else ref(64, &ui.key_text),
-                    .export_form => ref(512, &ui.export_dir),
                     else => unreachable,
                 };
             }
@@ -429,11 +407,6 @@ pub fn Panels(comptime devices: type) type {
                         },
                     },
                     .devices, .dev_packages => add(out, &n, id.ok),
-                    .export_form => {
-                        add(out, &n, id.cancel);
-                        add(out, &n, id.export_);
-                    },
-                    .export_done => add(out, &n, id.ok),
                 }
                 return out[0..n];
             }
@@ -659,13 +632,6 @@ pub fn Panels(comptime devices: type) type {
                         ui.show(.pair_name);
                         ui.setNote(.bad, "Not paired: the check codes did not match. Copy the key from the device again.", .{});
                     },
-                    id.export_ => if (ui.screen == .export_form) {
-                        if (std.mem.trim(u8, ui.export_dir.text(), " ").len == 0) {
-                            ui.setNote(.bad, "Enter a folder to write the certificate files to.", .{});
-                            return .none;
-                        }
-                        return .export_ca;
-                    },
                     else => {},
                 }
                 return .none;
@@ -674,8 +640,6 @@ pub fn Panels(comptime devices: type) type {
             // ------------------------------------------------------- drawing
 
             pub const Ctx = struct {
-                /// "AB:CD:..." SHA-256 of the Portal CA, if there is one.
-                fingerprint: ?[]const u8 = null,
                 /// This desktop's WireGuard public key and its check code.
                 desk_key: []const u8 = "",
                 desk_check: []const u8 = "",
@@ -722,9 +686,7 @@ pub fn Panels(comptime devices: type) type {
                     id.cancel => "Cancel",
                     id.approve => "Approve",
                     id.deny => "Deny",
-                    id.stop => "Stop pairing",
                     id.again => "Try again",
-                    id.export_ => "Export",
                     id.start => "Start",
                     id.save => "Save",
                     id.open_pair => "Check key",
@@ -857,20 +819,6 @@ pub fn Panels(comptime devices: type) type {
                         }
                         p.rows = bufs.rows[0..ui.n_pkgs];
                     },
-                    .export_form => {
-                        p.title = "Export certificate";
-                        L.add(&bufs.lines, &nl, .{ .text = "Writes portal-ca.cer, portal-ca.pem and portal-ca.mobileconfig: the Portal CA that each device must trust once. The files hold no secret." });
-                        bufs.fields[0] = .{ .label = "Folder", .value = ui.export_dir.text(), .id = id.field0, .focused = ui.focus.index == 0 };
-                        p.fields = bufs.fields[0..1];
-                        ui.caLines(bufs, &bufs.after, &na, c);
-                    },
-                    .export_done => {
-                        p.title = "Certificate exported";
-                        p.title_tone = .good;
-                        L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("Wrote portal-ca.cer, portal-ca.pem and portal-ca.mobileconfig to {s}.", .{ui.exported_to.text()}) });
-                        L.add(&bufs.lines, &nl, .{ .text = "Windows: double-click portal-ca.cer, Install Certificate, Current User, Trusted Root Certification Authorities. iPhone/iPad: install the profile, then enable full trust in Settings > General > About > Certificate Trust Settings. Portal on a laptop: pick portal-ca.pem when it asks." });
-                        ui.caLines(bufs, &bufs.after, &na, c);
-                    },
                 }
                 p.lines = bufs.lines[0..nl];
                 p.after = bufs.after[0..na];
@@ -900,17 +848,6 @@ pub fn Panels(comptime devices: type) type {
                 add(arr, n, .{ .text = bufs.fmt("Listening on UDP {d}; devices reach 10.8.0.1 inside the tunnel. A changed port applies at the next start.", .{c.tunnel_port}) });
                 if (ui.n_devs == 0) add(arr, n, .{ .text = "Peers: none yet (Pair a device)." });
                 for (ui.devs[0..ui.n_devs]) |d| add(arr, n, .{ .text = bufs.fmt("Peer {s: <16} {s: <10} key {s}", .{ d.name.get(), d.ip.get(), d.key.get() }) });
-            }
-
-            fn caLines(ui: *const Ui, bufs: *Bufs, arr: []frame.PanelText, n: *usize, c: Ctx) void {
-                _ = ui;
-                if (n.* >= arr.len) return;
-                if (c.fingerprint) |fp| {
-                    arr[n.*] = .{ .text = bufs.fmt("Portal CA SHA-256: {s}", .{fp}), .tone = .normal };
-                } else {
-                    arr[n.*] = .{ .text = "No Portal CA (plain HTTP)." };
-                }
-                n.* += 1;
             }
         };
 

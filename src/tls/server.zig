@@ -562,7 +562,7 @@ pub const Connection = struct {
     }
 
     fn handshakeInner(c: *Connection, opts: Options) Error!void {
-        // Not TLS at all? (A browser pointed at http:// on this port.)
+        // Not TLS at all? (Plain HTTP on this port.)
         const first = c.input.peekArray(1) catch |err| return mapReadErr(err);
         if (first[0] != @backingInt(ContentType.handshake)) {
             if (first[0] >= 'A' and first[0] <= 'Z') c.diag.http_on_tls = true;

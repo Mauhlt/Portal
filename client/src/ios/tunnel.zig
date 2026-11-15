@@ -10,9 +10,9 @@
 //!
 //! Built only with `-Dios-tunnel=true` (needs a paid Apple Developer
 //! account: the Network Extension entitlement, packet-tunnel-provider).
-//! Without it every function here is a no-op and the phone uses the
-//! WireGuard app (the pairing page's Shortcuts automations), exactly as
-//! before. With it, `zig build ios` also builds the extension into
+//! Without it every function here is a no-op and the app runs the same
+//! tunnel in its own process (client/src/tunnel), as `portal connect`
+//! does. With it, `zig build ios` also builds the extension into
 //! Portal.app/PlugIns.
 
 const std = @import("std");

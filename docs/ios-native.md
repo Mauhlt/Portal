@@ -174,8 +174,9 @@ Rules:
   Needs a **paid Apple Developer account** (the Network Extension
   entitlement; App IDs for the app and `<bundle id>.tunnel`, both with the
   Network Extensions capability, and profiles for both). With a free
-  Apple ID build without it: the app works unchanged over the WireGuard
-  app.
+  Apple ID build without it: the app then runs the same tunnel in its own
+  process (client/src/tunnel, as `portal connect` does), while it is on
+  screen.
 * **Keys:** the phone generates its X25519 pair (wgkey.zig); the private
   key never leaves it. `tunnel.configure` takes it out of the wg-quick
   text before the VPN configuration is saved (that lives in the system's

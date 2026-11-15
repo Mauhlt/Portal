@@ -33,8 +33,9 @@
 //! %LOCALAPPDATA%\Portal\tls\ca.key offline and restore it before the
 //! server certificate is due for renewal (`portal ca` shows when).
 //!
-//! Also produces the device exports: portal-ca.cer (DER), portal-ca.pem
-//! and portal-ca.mobileconfig (Apple configuration profile).
+//! Also writes the CA for checking elsewhere (`portalctl ca export`):
+//! portal-ca.cer (DER) and portal-ca.pem. Devices need neither: they pin
+//! the CA by the fingerprint in their pairing code.
 
 const std = @import("std");
 const Io = std.Io;
@@ -288,102 +289,11 @@ pub fn ensureLeaf(s: Store, ca: *const Ca, sans: []const x509.SanEntry, now: i64
 /// portal-ca.pem (shared/pki/pem.zig, also the native client's writer).
 pub const pem = @import("shared").pki.pem.alloc;
 
-/// A UUID derived from the CA certificate, so the same CA always yields the
-/// same profile UUIDs.
-fn stableUuid(label: []const u8, der_bytes: []const u8) [36]u8 {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update(label);
-    h.update(der_bytes);
-    var d = h.finalResult();
-    d[6] = (d[6] & 0x0f) | 0x80; // version 8 (custom, RFC 9562)
-    d[8] = (d[8] & 0x3f) | 0x80; // RFC variant
-    const hex = std.fmt.bytesToHex(d[0..16], .upper);
-    var out: [36]u8 = undefined;
-    @memcpy(out[0..8], hex[0..8]);
-    out[8] = '-';
-    @memcpy(out[9..13], hex[8..12]);
-    out[13] = '-';
-    @memcpy(out[14..18], hex[12..16]);
-    out[18] = '-';
-    @memcpy(out[19..23], hex[16..20]);
-    out[23] = '-';
-    @memcpy(out[24..36], hex[20..32]);
-    return out;
-}
-
-pub const profile_identifier = "local.portal.ca";
-
-/// Apple configuration profile with the CA as a com.apple.security.root
-/// payload. Installing it on iOS/iPadOS also requires enabling full trust in
-/// Settings > General > About > Certificate Trust Settings.
-pub fn mobileconfig(gpa: Allocator, ca: *const Ca) ![]u8 {
-    const enc = std.base64.standard.Encoder;
-    const b64 = try gpa.alloc(u8, enc.calcSize(ca.der.len));
-    defer gpa.free(b64);
-    _ = enc.encode(b64, ca.der);
-    var wrapped: std.ArrayList(u8) = .empty;
-    defer wrapped.deinit(gpa);
-    var i: usize = 0;
-    while (i < b64.len) : (i += 52) {
-        try wrapped.appendSlice(gpa, "\t\t\t");
-        try wrapped.appendSlice(gpa, b64[i..@min(i + 52, b64.len)]);
-        try wrapped.append(gpa, '\n');
-    }
-    const cn = ca.commonName(); // "Portal Local CA (<hex>)": no XML specials
-    const profile_uuid = stableUuid("portal profile", ca.der);
-    const payload_uuid = stableUuid("portal root payload", ca.der);
-    return std.fmt.allocPrint(gpa,
-        \\<?xml version="1.0" encoding="UTF-8"?>
-        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        \\<plist version="1.0">
-        \\<dict>
-        \\  <key>PayloadContent</key>
-        \\  <array>
-        \\    <dict>
-        \\      <key>PayloadCertificateFileName</key>
-        \\      <string>portal-ca.cer</string>
-        \\      <key>PayloadContent</key>
-        \\      <data>
-        \\{s}      </data>
-        \\      <key>PayloadDescription</key>
-        \\      <string>Root certificate of this desktop's Portal (private, name-constrained to the Portal network).</string>
-        \\      <key>PayloadDisplayName</key>
-        \\      <string>{s}</string>
-        \\      <key>PayloadIdentifier</key>
-        \\      <string>{s}.root</string>
-        \\      <key>PayloadType</key>
-        \\      <string>com.apple.security.root</string>
-        \\      <key>PayloadUUID</key>
-        \\      <string>{s}</string>
-        \\      <key>PayloadVersion</key>
-        \\      <integer>1</integer>
-        \\    </dict>
-        \\  </array>
-        \\  <key>PayloadDescription</key>
-        \\  <string>Lets this device verify the HTTPS connection to Portal on your desktop.</string>
-        \\  <key>PayloadDisplayName</key>
-        \\  <string>{s}</string>
-        \\  <key>PayloadIdentifier</key>
-        \\  <string>{s}</string>
-        \\  <key>PayloadRemovalDisallowed</key>
-        \\  <false/>
-        \\  <key>PayloadType</key>
-        \\  <string>Configuration</string>
-        \\  <key>PayloadUUID</key>
-        \\  <string>{s}</string>
-        \\  <key>PayloadVersion</key>
-        \\  <integer>1</integer>
-        \\</dict>
-        \\</plist>
-        \\
-    , .{ wrapped.items, cn, profile_identifier, &payload_uuid, cn, profile_identifier, &profile_uuid });
-}
-
 pub const Exported = struct {
     fingerprint: [32]u8,
 };
 
-/// Writes portal-ca.cer, portal-ca.pem and portal-ca.mobileconfig to `out_dir`.
+/// Writes portal-ca.cer and portal-ca.pem to `out_dir`.
 pub fn exportCa(gpa: Allocator, io: Io, ca: *const Ca, out_dir: []const u8) !Exported {
     try Io.Dir.cwd().createDirPath(io, out_dir);
     var buf: [1024]u8 = undefined;
@@ -391,26 +301,8 @@ pub fn exportCa(gpa: Allocator, io: Io, ca: *const Ca, out_dir: []const u8) !Exp
     const p = try pem(gpa, ca.der);
     defer gpa.free(p);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}\\portal-ca.pem", .{out_dir}), .data = p });
-    const mc = try mobileconfig(gpa, ca);
-    defer gpa.free(mc);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}\\portal-ca.mobileconfig", .{out_dir}), .data = mc });
     return .{ .fingerprint = x509.fingerprint(ca.der) };
 }
-
-pub const iphone_steps =
-    \\On an iPhone or iPad (once per device):
-    \\  1. Open the profile (portal-ca.mobileconfig) on the device, e.g. from
-    \\     http://<desktop WireGuard IP>:<port+1>/ while pairing is open,
-    \\     or AirDrop / Mail the file. Tap Allow.
-    \\  2. Settings > General > VPN & Device Management > "Portal Local CA ..."
-    \\     > Install (enter the passcode), then Install again.
-    \\  3. Settings > General > About > Certificate Trust Settings >
-    \\     enable full trust for "Portal Local CA ...". Without this step
-    \\     Safari will not trust Portal.
-    \\  Compare the SHA-256 fingerprint shown in the profile details with
-    \\  the one printed here.
-    \\
-;
 
 // -------------------------------------------------------------------- tests
 
@@ -480,21 +372,8 @@ test "pki: CA init, leaf issue/reuse/renew, export" {
     const cer = try Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&fbuf, "{s}\\portal-ca.cer", .{out_dir}), gpa, .limited(max_file));
     defer gpa.free(cer);
     try testing.expectEqualSlices(u8, ca2.der, cer);
-    const mc = try Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&fbuf, "{s}\\portal-ca.mobileconfig", .{out_dir}), gpa, .limited(max_file));
-    defer gpa.free(mc);
-    try testing.expect(std.mem.indexOf(u8, mc, "<string>com.apple.security.root</string>") != null);
-    try testing.expect(std.mem.indexOf(u8, mc, "<string>local.portal.ca</string>") != null);
-    // Same CA -> same profile bytes (stable UUIDs).
-    const mc2 = try mobileconfig(gpa, &ca2);
-    defer gpa.free(mc2);
-    try testing.expectEqualStrings(mc, mc2);
-    // The <data> block decodes back to the certificate.
-    const start = std.mem.indexOf(u8, mc, "<data>").? + 6;
-    const end = std.mem.indexOf(u8, mc, "</data>").?;
-    const dec = std.base64.standard.decoderWithIgnore(" \t\r\n");
-    var raw: [2048]u8 = undefined;
-    const n = try dec.decode(&raw, mc[start..end]);
-    try testing.expectEqualSlices(u8, ca2.der, raw[0..n]);
+    // No Apple profile any more (nothing installs the CA).
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, try std.fmt.bufPrint(&fbuf, "{s}\\portal-ca.mobileconfig", .{out_dir}), .{}));
 }
 
 test "pki: CA load/create failures free the certificate exactly once" {

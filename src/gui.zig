@@ -102,17 +102,12 @@ pub const SetupValues = struct {
 pub const Desk = struct {
     srv: *web.Server,
     paths: devices.Paths,
-    /// "AB:CD:..." of the Portal CA, and its 32 bytes (pairing codes).
-    fingerprint: []const u8,
+    /// The Portal CA's SHA-256 (pairing codes).
     ca_sha256: [32]u8,
     /// This desktop's WireGuard public key.
     desk_public: tunneldesk.Key,
     /// The UDP port the tunnel listens on.
     tunnel_port: u16,
-    /// %USERPROFILE%\Downloads\Portal-CA
-    export_default: []const u8,
-    /// %LOCALAPPDATA%\Portal\tls
-    tls_dir: []const u8,
     /// Filled by attachDesk: the key's text and check code (Settings).
     desk_key_text: [44]u8 = undefined,
     desk_check: [tunnelnet.check_code_len]u8 = undefined,
@@ -626,7 +621,6 @@ pub const LocalHost = struct {
             .subs = h.subs.slice(),
             .sub_shown = h.sub_shown,
             .panel = audio_panel orelse h.ui.panel(&h.bufs, .{
-                .fingerprint = if (d) |x| x.fingerprint else null,
                 .desk_key = if (d) |*x| x.desk_key_text[0..] else "",
                 .desk_check = if (d) |*x| x.desk_check[0..] else "",
                 .tunnel_port = if (d) |x| x.tunnel_port else 0,
@@ -730,7 +724,6 @@ pub const LocalHost = struct {
             .approve_pair => h.approvePair(),
             .load_devices => h.loadDevices(),
             .unpair => |i| h.unpair(i),
-            .export_ca => h.exportCa(),
             .load_subs => |i| h.loadSubs(i),
             .toggle_sub => |i| h.toggleSub(i),
         }
@@ -884,30 +877,6 @@ pub const LocalHost = struct {
             return;
         }
         h.ui.setNote(.good, "Unpaired '{s}'. Its key is no longer let in; its viewers are disconnected.", .{name});
-    }
-
-    fn exportCa(h: *LocalHost) void {
-        const d = h.desk orelse return;
-        const dir = std.mem.trim(u8, h.ui.export_dir.text(), " ");
-        const store: pki.Store = .{ .gpa = h.gpa, .io = h.io, .dir = d.tls_dir };
-        var ca = (pki.loadCa(store) catch |err| {
-            h.ui.setNote(.bad, "Cannot read the Portal CA: {t}.", .{err});
-            return;
-        }) orelse {
-            h.ui.setNote(.bad, "There is no Portal CA (this Portal serves plain HTTP).", .{});
-            return;
-        };
-        defer ca.deinit(h.gpa);
-        std.Io.Dir.cwd().createDirPath(h.io, dir) catch |err| {
-            h.ui.setNote(.bad, "Cannot create {s}: {t}.", .{ dir, err });
-            return;
-        };
-        _ = pki.exportCa(h.gpa, h.io, &ca, dir) catch |err| {
-            h.ui.setNote(.bad, "Export to {s} failed: {t}.", .{ dir, err });
-            return;
-        };
-        d.srv.log.print("CA certificate exported from the Portal window", .{});
-        h.ui.exported(dir);
     }
 
     fn openSettings(h: *LocalHost) void {
@@ -1184,7 +1153,6 @@ pub const LocalHost = struct {
             .button => |b| switch (b) {
                 deskui.id.tb_pair => if (h.desk != null) h.ui.openPair(),
                 deskui.id.tb_devices => if (h.desk != null) h.perform(h.ui.openDevices()),
-                deskui.id.tb_export => if (h.desk) |d| h.ui.openExport(d.export_default),
                 deskui.id.tb_settings => h.openSettings(),
                 deskui.id.tb_audio => h.openAudio(),
                 projects_panel.id.tool => h.openProjects(),
@@ -1209,7 +1177,6 @@ pub const LocalHost = struct {
             'w', 'W' => if (f == .terminal) h.closeShown() else return false,
             'p', 'P' => h.ui.openPair(),
             'd', 'D' => h.perform(h.ui.openDevices()),
-            'e', 'E' => h.ui.openExport(h.desk.?.export_default),
             's', 'S' => h.openSettings(),
             'a', 'A' => h.openAudio(),
             'j', 'J' => h.openProjects(),

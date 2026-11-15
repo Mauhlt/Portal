@@ -1,5 +1,5 @@
 //! The desk's panels (portal_ui's panels.desk: first-run / Settings,
-//! pairing approval, Devices, Export certificate) bound to the device
+//! pairing approval, Devices) bound to the device
 //! store's types (devices.zig), and their tests. The window glue (gui.zig)
 //! performs the panels' actions.
 
@@ -208,17 +208,6 @@ test "settings: Background art is a sixth choice, on by default" {
     _ = s.key(.right, .{});
     try testing.expect(s.setup.bg_art);
     try testing.expect(s.setup.sysmon == false); // the monitor is untouched
-}
-
-test "export: needs a folder" {
-    var ui: Ui = .{};
-    ui.openExport("C:\\Users\\me\\Downloads\\Portal-CA");
-    try testing.expectEqual(Action.export_ca, ui.key(.enter, .{}));
-    ui.export_dir.clear();
-    try testing.expectEqual(Action.none, ui.key(.enter, .{}));
-    try testing.expect(ui.note().len > 0);
-    ui.exported("D:\\x");
-    try testing.expectEqual(Screen.export_done, ui.screen);
 }
 
 test "ago" {

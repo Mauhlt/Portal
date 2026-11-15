@@ -902,7 +902,7 @@ pub const Server = struct {
             .read_buffer = &.{},
             .write_buffer = &st.plain_out,
         }) catch |err| {
-            srv.noteTlsFailure(conn, err, st.tls.diag, raw_out);
+            srv.noteTlsFailure(conn, err, st.tls.diag);
             return;
         };
         conn.tls = &st.tls;
@@ -913,16 +913,10 @@ pub const Server = struct {
         st.tls.close();
     }
 
-    fn noteTlsFailure(srv: *Server, conn: *Conn, err: tls.Error, diag: tls.Diagnostics, raw: *Io.Writer) void {
-        if (diag.http_on_tls) {
-            // A browser asked for http:// on the HTTPS port: say so.
-            conn.setDeadline(srv.nowMs() +| 5000);
-            http1.writeResponse(raw, .bad_request, &.{
-                .{ .name = "content-type", .value = "text/plain; charset=utf-8" },
-                .{ .name = "x-content-type-options", .value = "nosniff" },
-            }, "This Portal port speaks HTTPS: use https:// in the address.\n", false) catch {};
-            return;
-        }
+    fn noteTlsFailure(srv: *Server, conn: *Conn, err: tls.Error, diag: tls.Diagnostics) void {
+        // Plain HTTP on the TLS port: nothing of Portal's speaks it, so the
+        // connection just closes (no answer).
+        if (diag.http_on_tls) return;
         switch (err) {
             // Peer went away, or the deadline cancelled us: not worth a line.
             error.EndOfStream, error.ReadFailed, error.WriteFailed => return,

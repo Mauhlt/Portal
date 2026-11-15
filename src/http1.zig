@@ -28,8 +28,8 @@ pub const ParseError = error{
 
 pub const Request = struct {
     method: Method,
+    /// The target up to any `?` (no route takes a query).
     path: []const u8,
-    query: []const u8,
     host: ?[]const u8 = null,
     content_length: ?u64 = null,
     /// Any Transfer-Encoding header at all. Portal never accepts one.
@@ -83,7 +83,6 @@ pub fn parseHead(head: []const u8) ParseError!Request {
     var req: Request = .{
         .method = if (std.mem.eql(u8, m, "GET")) .GET else if (std.mem.eql(u8, m, "POST")) .POST else .other,
         .path = if (q) |i| target[0..i] else target,
-        .query = if (q) |i| target[i + 1 ..] else "",
     };
 
     while (lines.next()) |hl| {
@@ -230,7 +229,6 @@ test "parse simple GET" {
     const r = try parseHead("GET /ws?e=1 HTTP/1.1\r\nHost: 10.8.0.1:8420\r\nX-A: 1\r\nX-A: 2\r\n\r\n");
     try testing.expectEqual(Method.GET, r.method);
     try testing.expectEqualStrings("/ws", r.path);
-    try testing.expectEqualStrings("e=1", r.query);
     try testing.expectEqualStrings("10.8.0.1:8420", r.host.?);
     try testing.expectEqual(@as(usize, 3), r.header_count);
 }

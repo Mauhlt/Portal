@@ -184,9 +184,9 @@ const usage =
     \\      none). --force replaces an existing CA: every device must then
     \\      trust the new one.
     \\  portalctl ca export [--out DIR]
-    \\      Write portal-ca.cer, portal-ca.pem and portal-ca.mobileconfig
-    \\      (default: current directory) and print the fingerprint and the
-    \\      iPhone trust steps. (In the window: Export certificate.)
+    \\      Write portal-ca.cer and portal-ca.pem (default: current
+    \\      directory) and print the fingerprint, to check the CA elsewhere.
+    \\      Devices need neither: they pin it from their pairing code.
     \\
     \\  portalctl show <file.png> [--cols N] [--stdout]
     \\      Same as `portal-show`: show a PNG inline in this terminal (kitty
@@ -649,7 +649,7 @@ fn cmdCa(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []co
         var fp: [95]u8 = undefined;
         std.debug.print("Created {s}\n  SHA-256 {s}\n  permitted names:\n", .{ ca.commonName(), x509.formatFingerprint(x509.fingerprint(ca.der), &fp) });
         printConstraints(&ca.constraints);
-        std.debug.print("Next: `portalctl ca export` and trust it on each device.\n", .{});
+        std.debug.print("Devices pin it from their pairing code: pair each device (again, after --force).\n", .{});
         return;
     }
 
@@ -667,20 +667,16 @@ fn cmdCa(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []co
         _ = pki.exportCa(gpa, io, &ca, out_dir) catch |err| fatal("export to {s} failed: {t}", .{ out_dir, err });
         std.debug.print(
             \\Wrote to {s}:
-            \\  portal-ca.cer           DER certificate (Windows, macOS, Android, Linux)
-            \\  portal-ca.pem           PEM certificate (Linux, curl --cacert)
-            \\  portal-ca.mobileconfig  Apple configuration profile (iPhone, iPad, Mac)
+            \\  portal-ca.cer  DER certificate
+            \\  portal-ca.pem  PEM certificate
             \\
             \\{s}
             \\SHA-256 fingerprint: {s}
             \\
-            \\{s}
-            \\Windows: double-click portal-ca.cer > Install Certificate > Current User >
-            \\  "Trusted Root Certification Authorities". macOS: open the profile or the
-            \\  .cer in Keychain Access and set "Always Trust". Android: Settings >
-            \\  Security > Encryption & credentials > Install a certificate > CA certificate.
+            \\Devices do not need these files: they pin the CA by the fingerprint
+            \\in their pairing code.
             \\
-        , .{ out_dir, ca.commonName(), fingerprint, pki.iphone_steps });
+        , .{ out_dir, ca.commonName(), fingerprint });
         return;
     }
     if (!std.mem.eql(u8, sub, "show")) fatal("usage: portalctl ca [show | init ... | export [--out DIR]]", .{});
@@ -1798,13 +1794,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     // tunnel) use the device store directly; store changes wake it.
     if (host) |h| {
         const desk_public = (tunneldesk.loadPublic(io, paths) catch null) orelse fatal("this desktop's WireGuard key is missing", .{});
-        const home = env.get("USERPROFILE") orelse dir;
         h.attachDesk(.{
-            .export_default = std.fs.path.join(gpa, &.{ home, "Downloads", "Portal-CA" }) catch fatal("out of memory", .{}),
-            .tls_dir = std.fs.path.join(gpa, &.{ dir, "tls" }) catch fatal("out of memory", .{}),
             .srv = &server,
             .paths = paths,
-            .fingerprint = fingerprint,
             .ca_sha256 = ca_sha256,
             .desk_public = desk_public,
             .tunnel_port = prep.tun.udpPort(),

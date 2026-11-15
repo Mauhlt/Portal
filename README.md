@@ -326,7 +326,6 @@ reach the session):
 | Ctrl+Tab / Ctrl+Shift+Tab | click a tab | the next / previous tab |
 | Ctrl+Shift+P | Pair a device… | pair a device by the key it shows (check its check code), then show the pairing code for it |
 | Ctrl+Shift+D | Devices | paired devices with address and last use; Unpair |
-| Ctrl+Shift+E | Export certificate… | write portal-ca.cer / .pem / .mobileconfig to a folder (default `%USERPROFILE%\Downloads\Portal-CA`) |
 | Ctrl+Shift+S | Settings | tunnel port and endpoint (with this desktop's tunnel key and its peers), program, project, input mode for the next start; system monitor, background art and the agent integration (these apply at once) |
 | Ctrl+Shift+J | Projects | the projects paired devices may start, Ask or Plan each |
 
@@ -438,8 +437,8 @@ certificate, and a device accepts it only if its SHA-256 is the one in the
 pairing code it was given at the desk; from then on it pins it (it never
 trusts on first use). A wrong or replaced certificate is shown in its
 window ("Cannot verify this Portal"), with the pinned fingerprint.
-**Export certificate…** (or `portalctl ca export [--out DIR]`) still
-writes the CA files if you want to check them elsewhere.
+`portalctl ca export [--out DIR]` still writes the CA (portal-ca.cer and
+portal-ca.pem) if you want to check it elsewhere.
 
 `portalctl ca` shows the CA, its constraints and the server certificate.
 `portalctl ca init --force` replaces the CA, and every device must then

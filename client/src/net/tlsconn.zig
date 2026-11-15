@@ -12,7 +12,7 @@
 //!    falls back to the OS chain engine (crypt32, the Windows root store) and
 //!    accepts any certificate Windows trusts, then swaps the system roots
 //!    into our bundle. A server with a certificate from some other CA the
-//!    user trusts (another Portal's CA installed for a browser, a corporate
+//!    user trusts (another Portal's CA in the OS trust store, a corporate
 //!    TLS-inspection root, a public CA) would be accepted.
 //!  * std's certificate parser is not bounds-checked (see x509check.zig):
 //!    a malformed certificate from an unauthenticated server can crash it.
