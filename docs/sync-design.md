@@ -108,13 +108,16 @@ overlapping/overwriting".
 * **Device subscription:** the owner chooses per device which packages it
   receives (e.g. `stt-npu-test` only to the laptop). **Voice packages are
   automatic (owner decision, 2026-11-14):** every paired device is
-  subscribed to `stt-adapter`, `stt-model` and `stt-local` at pairing, and
-  devices paired earlier on the first start of a build that has this
-  (`sync.autoSubscribe`, on every device store read). The rule is
-  all three for a Windows aarch64 device, the adapter alone for others;
-  the desk has no record of a device's platform, so today every device
-  gets all three (a device without an engine for its architecture says
-  so; the iPhone fetches `stt-adapter` alone). Unsubscribing a device
+  subscribed to `stt-adapter` at pairing, and devices paired earlier on
+  the first start of a build that has this (`sync.autoSubscribe`, on every
+  device store read). A device says its platform after each hello
+  (`d:platform`, kept in memory, web.PlatformTable); the first time this
+  run it says `windows-aarch64` it is subscribed to `stt-local` and
+  `stt-model` too (main.zig `StoreWatch.platformReported`). Until it says,
+  and on any other platform, it gets the adapter alone. The desk publishes
+  the voice packages itself: the adapter after training, `stt-local` and
+  `stt-model` with each `zig build release` when they changed
+  (docs/stt-sync-contract.md). Unsubscribing a device
   (Devices panel or `portalctl sync unsubscribe`) records an opt-out that
   automatic subscription never undoes; subscribing again clears it.
 * **Event-driven delivery:** an `{"t":"updates", ...}` message on the
@@ -232,6 +235,10 @@ end
   version names are never reused, even after `unpublish`. The default
   version is the sequence number.
 * `portalctl publish --list`, `portalctl unpublish <pkg> <version>`.
+* `portalctl voice-publish <folder>` (run by `zig build release`): the same
+  publish for `stt-local` and `stt-model`, skipped for a package whose
+  files match the newest version's manifest (`sync.sameAsLatest`); names
+  `<base>+<sequence>`; newest 3 kept (docs/stt-sync-contract.md).
 * Subscriptions: `%LOCALAPPDATA%\Portal\sync-subscriptions.txt` (locked
   read-modify-write, flushed temp file, MoveFileEx WRITE_THROUGH), via
   `portalctl sync subscribe|unsubscribe <device> <pkg>`, `portalctl sync

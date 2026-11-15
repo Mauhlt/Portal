@@ -138,20 +138,49 @@ it as a child process; see "Running delivered programs" in
   `export_bundle` → `put bundle` → `commit_export`, only after the desk's
   200 (`connect.sendSamples`). With it off, nothing is sent.
 
-### Publishing the laptop's engine (once, at the desk)
+### Publishing the laptop's engine (automatic, with each desk release)
 
-```
-zig build voice-packages            # zig-out\voice\stt-local\stt-local.exe (aarch64 Windows; fetches the QAIRT SDK)
-                                    # zig-out\voice\stt-model\ggml-base.en.bin (the pinned model)
-portalctl publish stt-local zig-out\voice\stt-local --kind executable
-portalctl publish stt-model zig-out\voice\stt-model --kind data
-portalctl sync subscribe laptop stt-local     # and stt-model, stt-adapter; or Devices, P on its row
-```
+`zig build release` publishes the engine and the model by itself once the
+desk's own release is promoted (src/tools/release.zig `publishVoice`):
 
-Publish again only when stt-local changes: each version must be approved
-on the laptop. The device reports its platform (`d:platform`,
-docs/protocol.md section 4), so the desk can subscribe only aarch64
-Windows devices to stt-local and stt-model.
+1. The new release's `portalctl voice-publish --enabled` checks the Audio
+   panel's **Publish the laptop speech engine** (settings.txt
+   `speech_publish_engine = on|off`, default on). Off: nothing is built or
+   published, and the release says so.
+2. `zig build voice-packages --prefix <releases>\_voice`: stt-local for
+   aarch64 Windows (fetches the QAIRT SDK, or `-Dsdk` / `QNN_SDK_ROOT`) and
+   the pinned model (src/speech/model_pin.zig, size and SHA-256 checked).
+3. `portalctl voice-publish <releases>\_voice\voice`: each package goes
+   through `sync.publish` (what `portalctl publish` and the adapter's
+   auto-publish run), signed by the desk's release key, **only when its
+   content changed**: `sync.sameAsLatest` compares every file's path, size
+   and SHA-256 with the newest published version's manifest, so a rebuilt
+   but identical engine, or the same model, adds no version (and the laptop
+   is not asked to approve one).
+   * `stt-local` (executable): version `<Portal version>+<sequence>`, e.g.
+     `0.1.0+4`.
+   * `stt-model` (data): version `<first 16 hex of the pin's SHA-256>+<sequence>`.
+   * The sequence only goes up and is never reused, so the names are unique
+     and devices order versions by it. Only the newest 3 of each stay
+     published (`sync.prune`).
+
+A failure (the SDK fetch, the cross-build, the model download, no release
+key) never fails the desk's release: it ends with a WARNING line saying the
+laptop speech engine was NOT published, and devices keep what they have.
+Each run's result is one line in `%LOCALAPPDATA%\Portal\voice-engine.txt`;
+the desk logs it when it starts and shows it in the Audio panel (red when
+nothing was published). With the PORTAL_RELEASES_DIR testing override
+nothing is built or published.
+
+**Subscriptions follow the platform.** Every paired device is subscribed to
+`stt-adapter`. A device reports its platform after each hello
+(`d:platform`, docs/protocol.md section 4; kept in memory,
+web.PlatformTable); the first time this run that a device says
+`windows-aarch64`, the desk subscribes it to `stt-local` and `stt-model`
+too (main.zig `StoreWatch.platformReported`, sync.autoSubscribe). Until it
+says, and on any other platform, it gets the adapter alone. Unsubscribing
+(Devices panel or `portalctl sync unsubscribe`) records an opt-out that
+automatic subscription never undoes.
 
 ## Device → desktop: training data
 
