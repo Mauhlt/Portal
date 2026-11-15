@@ -607,6 +607,19 @@ test "setup: install.txt round trip" {
     try testing.expectEqualStrings("", shortcutArgs(.desk));
 }
 
+test "setup: the mode table: Windows offers desk and device, the Mac device only (for now)" {
+    var win: usize = 0;
+    var mac: usize = 0;
+    for (modes) |m| {
+        if (m.windows) win += 1;
+        if (m.macos) mac += 1;
+        try testing.expect(std.mem.indexOfScalar(u8, m.choice, '\n') != null); // title + line
+    }
+    try testing.expectEqual(@as(usize, 2), win);
+    try testing.expectEqual(@as(usize, 1), mac);
+    try testing.expect(modeOf(.device).macos and !modeOf(.desk).macos);
+}
+
 test "setup: a mismatched architecture is refused with the right download" {
     var b: [300]u8 = undefined;
     try testing.expect(archMismatch(&b, .x86_64, .x86_64) == null);

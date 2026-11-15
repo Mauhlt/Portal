@@ -1,0 +1,98 @@
+# CONFIGURATION, NOT CODE: GitHub Actions only reads YAML (the one non-Zig
+# file type the owner's "all code in Zig" rule allows). Every step below
+# only fetches a pinned input or runs `zig build`; the logic lives in
+# build.zig and src/tools/*.zig.
+#
+# Builds the installers and publishes them as a GitHub Release:
+#   portal-setup-x64.exe, portal-setup-arm64.exe   (zig build installer)
+#   Portal-mac.zip                                 (zig build mac-installer)
+# all stripped and checked for build-machine paths and names
+# (src/tools/check_dist.zig; machocheck for the Mac's arm64 slice).
+# Unsigned: no secrets beyond the default token, no signing.
+#
+# Inputs, all pinned:
+#   - Zig: build.zig.zon's minimum_zig_version, installed by a pinned ZVC
+#     release binary, itself SHA-256 checked; `zig build check-zig` fails
+#     if another zig is first on PATH.
+#   - MoltenVK for macOS (the Mac app's Vulkan): one release tarball,
+#     SHA-256 checked.
+#   - Portal's dependencies: Zig URL packages in build.zig.zon, fetched and
+#     hash-checked by `zig build` itself.
+#   - No actions are used.
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      # ZVC pinned to one release and its SHA-256 (as ios.yml). When ZVC
+      # publishes a new release, bump the tag (its "+" written %2B) and the
+      # hash together.
+      ZVC_URL: https://github.com/Mauhlt/ZVC/releases/download/v2026-11-15-zig0.18.0-dev.1005%2B75d48dfff/zvc-x86_64-windows.exe
+      ZVC_SHA256: 0d8d355e67c90d2223b895878ca5c540f2539fd333dd14554f8677a1fa3020c2
+      MOLTENVK_URL: https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos.tar
+      MOLTENVK_SHA256: f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
+    steps:
+      - name: Check out the commit
+        run: |
+          git init -q .
+          git fetch -q --depth 1 "https://github.com/$GITHUB_REPOSITORY" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+
+      # ZVC installs exactly build.zig.zon's minimum_zig_version (stdin from
+      # /dev/null accepts its suggested live folder, %LOCALAPPDATA%\zvc\zig).
+      - name: Install the pinned Zig with the pinned ZVC
+        run: |
+          mkdir -p "$RUNNER_TEMP/zvc"
+          curl -fsSL "$ZVC_URL" -o "$RUNNER_TEMP/zvc/zvc.exe"
+          echo "$ZVC_SHA256  $RUNNER_TEMP/zvc/zvc.exe" | sha256sum -c -
+          (cd "$RUNNER_TEMP/zvc" && ./zvc.exe install --from "$GITHUB_WORKSPACE" < /dev/null)
+          echo "$LOCALAPPDATA\\zvc\\zig" >> "$GITHUB_PATH"
+      - name: Check the Zig version
+        run: zig build check-zig
+
+      - name: Test
+        run: zig build test
+
+      - name: MoltenVK for macOS (pinned, SHA-256 checked)
+        run: |
+          mkdir -p "$RUNNER_TEMP/mvk"
+          curl -fsSL "$MOLTENVK_URL" -o "$RUNNER_TEMP/mvk/MoltenVK-macos.tar"
+          echo "$MOLTENVK_SHA256  $RUNNER_TEMP/mvk/MoltenVK-macos.tar" | sha256sum -c -
+          tar -xf "$RUNNER_TEMP/mvk/MoltenVK-macos.tar" -C "$RUNNER_TEMP/mvk"
+
+      # A tag push releases that tag; a manual run makes a prerelease named
+      # after the run.
+      - name: Version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then echo "VERSION=$GITHUB_REF_NAME" >> "$GITHUB_ENV"; else echo "VERSION=build-$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"; fi
+
+      - name: Build the installers (stripped, path-checked) and the notes
+        run: >-
+          zig build installer mac-installer release-notes
+          -Dsetup-version="$VERSION" -Dsetup-commit="$GITHUB_SHA"
+          -Dmoltenvk-macos="$RUNNER_TEMP/mvk/MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib"
+
+      - name: Create the release
+        run: >-
+          gh release create "$VERSION"
+          zig-out/installer/portal-setup-x64.exe
+          zig-out/installer/portal-setup-arm64.exe
+          zig-out/installer/Portal-mac.zip
+          --target "$GITHUB_SHA"
+          --title "Portal $VERSION"
+          --notes-file zig-out/release-notes.md
+          $([ "$GITHUB_REF_TYPE" = tag ] || echo --prerelease)

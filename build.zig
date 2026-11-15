@@ -237,6 +237,7 @@ pub fn build(b: *std.Build) void {
     const check = checkDist(b, test_step);
     addInstaller(b, test_step, check);
     addMacInstaller(b, test_step, check);
+    addReleaseNotes(b);
     addPin(b);
     addCheckZig(b);
 }
@@ -594,6 +595,38 @@ fn addMacInstaller(b: *std.Build, test_step: *std.Build.Step, check: *std.Build.
     install.step.dependOn(&paths.step);
     install.step.dependOn(&macho.step);
     step.dependOn(&install.step);
+}
+
+/// `zig build release-notes`: zig-out/release-notes.md for the GitHub
+/// Release the workflow creates (.github/workflows/release.yml).
+fn addReleaseNotes(b: *std.Build) void {
+    const v = setupVersion(b);
+    const wf = b.addWriteFiles();
+    const notes = wf.add("release-notes.md", b.fmt(
+        \\Portal {s} (commit {s}).
+        \\
+        \\Download the installer for your machine, run it, and pick what it is:
+        \\
+        \\| File | For |
+        \\|---|---|
+        \\| `portal-setup-x64.exe` | Windows on Intel or AMD: the desk, or a device |
+        \\| `portal-setup-arm64.exe` | Windows on ARM (Snapdragon laptops, the Surface): a device |
+        \\| `Portal-mac.zip` | a Mac (Apple silicon or Intel): a device |
+        \\
+        \\Everything installs for your user only, without an administrator; the
+        \\desk asks once, for its Windows Firewall rule. Running a newer installer
+        \\upgrades in place and keeps your devices, keys and settings.
+        \\
+        \\**Unsigned for now.** Windows SmartScreen warns about the installers:
+        \\choose **More info**, then **Run anyway**. On a Mac, open the zip, then
+        \\right-click Portal.app and choose **Open** (or System Settings, Privacy &
+        \\Security, **Open Anyway**); Portal then moves itself to
+        \\~/Applications.
+        \\
+        \\Setup and the manual fallback: README.md, "Setup".
+        \\
+    , .{ v.version, v.commit }));
+    b.step("release-notes", "Write zig-out/release-notes.md (-Dsetup-version, -Dsetup-commit)").dependOn(&b.addInstallFile(notes, "release-notes.md").step);
 }
 
 /// The no-build-machine-paths check (src/tools/check_dist.zig, after
