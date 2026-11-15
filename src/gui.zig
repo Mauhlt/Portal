@@ -1070,6 +1070,7 @@ pub const LocalHost = struct {
             },
             .learning => |on| st.speech_learning = on,
             .share => |on| st.speech_share = on,
+            .publish_engine => |on| st.speech_publish_engine = on,
         }
         settings.save(h.gpa, h.io, d.paths.dir, &st) catch |err|
             return s.panel.setNote(.bad, "Could not save the settings: {t}.", .{err});

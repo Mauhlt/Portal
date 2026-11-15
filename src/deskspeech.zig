@@ -72,6 +72,13 @@ pub const DeskSpeech = struct {
     /// stt-adapter package (voiceshare.zig, on the engine's thread).
     share: bool = true,
     share_ctx: voiceshare.Share = undefined,
+    /// "Publish the laptop speech engine" (settings.txt
+    /// speech_publish_engine, default on): read by `zig build release`.
+    publish_engine: bool = true,
+    /// The last release's word on the laptop engine
+    /// (voiceshare.engine_status_file), read when Audio opens.
+    engine_buf: [voiceshare.max_status + 16]u8 = undefined,
+    engine_status: ?voiceshare.Status = null,
     /// The desk's log (publishes are logged there).
     log: ?*Log = null,
     /// The engine's last publish as of the last poll (redraw on change).
@@ -114,7 +121,11 @@ pub const DeskSpeech = struct {
         s.instruct_mode = saved.instruct_mode orelse .auto;
         s.learning = saved.speech_learning orelse true;
         s.share = saved.speech_share orelse true;
+        s.publish_engine = saved.speech_publish_engine orelse true;
         s.share_ctx = .{ .gpa = s.gpa, .io = s.io, .paths = .{ .dir = s.data_dir }, .log = s.log };
+        // What the last `zig build release` did with the laptop engine.
+        s.engine_status = voiceshare.readEngineStatus(s.io, .{ .dir = s.data_dir }, &s.engine_buf);
+        if (s.log) |l| if (s.engine_status) |st| l.print("{s}speech: {s}", .{ if (st.tone == .failed) "ERROR: " else "", st.text });
         if (s.inbox) |ib| ib.setLimits(s.limits);
         const model = saved.speech_model.get();
         s.startEngine(model);
@@ -469,6 +480,8 @@ pub const DeskSpeech = struct {
         s.panel.show(s.snap.automatic, s.model_path, s.instruct_mode);
         s.panel.learning = s.learning;
         s.panel.share = s.share;
+        s.panel.publish_engine = s.publish_engine;
+        s.engine_status = voiceshare.readEngineStatus(s.io, .{ .dir = s.data_dir }, &s.engine_buf);
         // The meter runs exactly while the panel is open.
         s.mic.setMeter(true);
     }
@@ -494,6 +507,12 @@ pub const DeskSpeech = struct {
             .mic_error = s.snap.err(),
             .shared = s.sharedText(),
             .shared_bad = speech.has_home and s.last_shared.failed != null,
+            .engine = if (s.engine_status) |st| st.text else "",
+            .engine_tone = if (s.engine_status) |st| switch (st.tone) {
+                .ok => .good,
+                .failed => .bad,
+                .off => .muted,
+            } else .muted,
         };
     }
 
@@ -511,7 +530,7 @@ pub const DeskSpeech = struct {
 
     /// What an Audio panel action changes in the settings (the window
     /// saves them): the microphone choice or the model path.
-    pub const Saved = union(enum) { none, mic: ?[]const u8, model: []const u8, reload, instruct_mode: ui.shell.InstructMode, learning: bool, share: bool };
+    pub const Saved = union(enum) { none, mic: ?[]const u8, model: []const u8, reload, instruct_mode: ui.shell.InstructMode, learning: bool, share: bool, publish_engine: bool };
 
     /// New speech limits (settings.txt reloaded at the desk): applied live.
     pub fn setLimits(s: *DeskSpeech, c: speech.limits.Config) void {
@@ -534,6 +553,11 @@ pub const DeskSpeech = struct {
                 if (speech.has_home) if (s.engine) |e| e.setShare(on);
                 if (s.log) |l| l.print("speech: sharing voice improvements with devices {s}", .{if (on) "on" else "off"});
                 return .{ .share = on };
+            },
+            .set_publish_engine => |on| {
+                s.publish_engine = on;
+                if (s.log) |l| l.print("speech: publishing the laptop speech engine on release {s}", .{if (on) "on" else "off"});
+                return .{ .publish_engine = on };
             },
             .set_instruct_mode => |m| {
                 s.instruct_mode = m;
