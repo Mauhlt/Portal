@@ -2249,7 +2249,6 @@ test "conn table: a device over its upgraded cap loses its oldest on that channe
     try testing.expectEqual(cap, live);
 }
 
-
 /// Each paired device's platform as it said last (`d:platform`,
 /// shared/platform.zig), in memory only: the desk's automatic package
 /// subscriptions use it (sync.autoSubscribe). Unknown until it says.
