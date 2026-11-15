@@ -52,6 +52,8 @@ pub const net_client = client_mod;
 pub const tlsconn = @import("net/tlsconn.zig");
 pub const watchdog = @import("net/watchdog.zig");
 pub const credstore_mod = credstore;
+/// The shared UI, for device sections that fill Platform.speech.
+pub const ui_mod = ui;
 /// The in-process WireGuard tunnel (the desk uses it too: src/tunneldesk.zig).
 pub const tunnel = @import("tunnel/root.zig");
 /// The device's link to its desktop: pairing code, tunnel, trust.
@@ -86,8 +88,35 @@ pub const Platform = struct {
     /// copied into `buf`, at most once; shown as the setup screen's note.
     /// The device wakes the window when it has one.
     take_scan_note: ?*const fn (buf: []u8) ?[]const u8 = null,
+    /// UI thread, once the pairing code is known (just paired, and on
+    /// every later launch): the device runs the tunnel itself (the
+    /// iPhone's packet tunnel extension, built with -Dios-tunnel). It
+    /// gets the same tunnel as wg-quick text (devicelink.wgQuick, with
+    /// the private key; wiped after the call) and returns true if it took
+    /// it: the viewer then dials the desk through the OS, which routes
+    /// 10.8.0.1 into that tunnel, instead of starting the in-process one.
+    /// False (or no hook): the in-process tunnel, as on every desktop.
+    system_tunnel: ?*const fn (wg_quick: []const u8) bool = null,
+    /// UI thread, each frame: the device's own status note ("" for none),
+    /// e.g. why the background tunnel is not up, shown in the status line
+    /// (ui/shell.zig Viewer.note). The device wakes the window when it
+    /// changes.
+    note: ?*const fn (buf: []u8) []const u8 = null,
+    /// Speech-to-text on the device itself (the iPhone: stt's Core ML
+    /// engine), behind the same input-line hooks the desk's engine uses.
+    speech: ?Speech = null,
 };
 pub var platform: Platform = .{};
+
+/// A device's own dictation: `dictation` is the shell's 🎤 (start, stop,
+/// cancel; ui/shell.zig), and `frame` (UI thread, every frame, before the
+/// shell is built) hands finished transcripts (Shell.dictated) and the
+/// engine's state (Shell.transcribing, setSpeechReady) to the shell. The
+/// device wakes the window when it has something new.
+pub const Speech = struct {
+    dictation: shell_mod.Dictation,
+    frame: *const fn (ctx: *anyopaque, sh: *ui.Shell) void,
+};
 
 const usage =
     \\usage: {s} [--pairing-code CODE] [--key] [--forget]
@@ -224,6 +253,9 @@ const Host = struct {
         if (s.has_sys) h.sys = s.sys;
         h.projects = s.projects;
         const qk = h.convo_view.questionKeys();
+        if (platform.speech) |sp| sp.frame(sp.dictation.ctx, &h.shell);
+        var note_buf: [160]u8 = undefined;
+        const note = if (platform.note) |f| f(&note_buf) else "";
         const now_unix = std.Io.Timestamp.now(h.client.io, .real).toSeconds();
         const o = h.shell.overlay(.{
             .tabs = if (st == .connected) h.tabs.slice() else &.{},
@@ -245,6 +277,7 @@ const Host = struct {
                 .status = uiStatus(st),
                 .mode = s.mode,
                 .detail = detail,
+                .note = note,
                 .host = h.client.host(),
                 .has_grid = s.grid.cols > 0,
                 .trust_error = trust,
@@ -479,8 +512,13 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     if (newly_paired) devicelink.save(io, code) catch |err|
         std.debug.print("portal connect: could not save the pairing code ({t}); it is asked for again next time\n", .{err});
 
-    const tun = devicelink.startTunnel(gpa, io, code, &key) catch |err|
-        fatal(prog, "cannot start this device's tunnel: {t}", .{err});
+    // The tunnel: the device's own (the iPhone's packet tunnel
+    // extension, reached through OS sockets), or the in-process one.
+    const dialer = if (systemTunnel(code, &key)) @import("shared").transport.Dialer.os else blk: {
+        const tun = devicelink.startTunnel(gpa, io, code, &key) catch |err|
+            fatal(prog, "cannot start this device's tunnel: {t}", .{err});
+        break :blk tun.dialer();
+    };
     key.wipe();
     const ca_buf = gpa.create([x509check.max_cert_len]u8) catch fatal(prog, "out of memory", .{});
     const trust = devicelink.trust(io, code, ca_buf);
@@ -488,7 +526,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     const shared = gpa.create(client_mod.Shared) catch fatal(prog, "out of memory", .{});
     shared.* = .{};
     const client = gpa.create(client_mod.Client) catch fatal(prog, "out of memory", .{});
-    client.* = client_mod.Client.init(gpa, io, shared, devicelink.server, tun.dialer(), trust) catch
+    client.* = client_mod.Client.init(gpa, io, shared, devicelink.server, dialer, trust) catch
         fatal(prog, "bad desktop address", .{});
     const io_ptr = gpa.create(std.Io) catch fatal(prog, "out of memory", .{});
     io_ptr.* = io;
@@ -520,6 +558,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
         host_ui.shell.hidden = ui.hidden_tabs.List.parse(pin_mod.loadHiddenTabs(io, &hbuf));
     }
     host_ui.shell.conversation = host_ui.convo_view.contentView();
+    if (platform.speech) |sp| host_ui.shell.dictation = sp.dictation;
     // Portal sync (docs/sync-design.md): a worker that runs a pass on
     // every (re)connect and {"t":"updates"}; only over TLS, where the
     // release key was pinned at pairing.
@@ -586,6 +625,16 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     }
     tv.deinit();
     std.process.exit(0);
+}
+
+/// Hands the tunnel to the device (Platform.system_tunnel) if it runs one
+/// itself; false: the caller starts the in-process tunnel.
+fn systemTunnel(c: *const devicelink.Code, key: *const tunnel.keys.KeyPair) bool {
+    const f = platform.system_tunnel orelse return false;
+    var buf: [devicelink.max_wg_quick]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    const text = devicelink.wgQuick(c, key, &buf) catch return false;
+    return f(text);
 }
 
 /// The device side of Portal sync inside the viewer: a worker thread for

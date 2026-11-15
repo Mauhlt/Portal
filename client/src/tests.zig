@@ -13,5 +13,4 @@ test {
     _ = @import("net/pin.zig");
     _ = @import("net/client.zig");
     _ = @import("sync/root.zig");
-    _ = @import("ios/wgkey.zig");
 }

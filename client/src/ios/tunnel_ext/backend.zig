@@ -145,14 +145,11 @@ pub const ZigBackend = struct {
         errdefer z.teardown();
         const peers = try z.gpa.alloc(wg.device.device.PeerConfig, c.peers.len);
         defer z.gpa.free(peers);
-        for (c.peers, peers) |*pc_in, *pc| pc.* = .{
-            .public_key = pc_in.public_key,
-            .preshared_key = pc_in.preshared_key,
-            .allowed_ips = pc_in.allowed_ips,
-            .persistent_keepalive = pc_in.persistent_keepalive,
-            // Literal addresses only: the app writes the desk's IP.
-            .endpoint = if (pc_in.endpoint) |e| e.literal() else null,
-        };
+        // zwg's own path from a [Peer] to the device's peer config, as the
+        // in-process tunnel uses it (client/src/tunnel): a literal
+        // endpoint as it is, a name (the desk's DNS name in the pairing
+        // code) looked up now and again later while the peer is silent.
+        for (c.peers, peers) |*pc_in, *pc| pc.* = wg.device.device.PeerConfig.fromConfig(z.io, pc_in).peer;
         z.device = try wg.device.Device.create(z.gpa, &z.clock, z.tun.?.tun(), .{
             .private_key = c.interface.private_key,
             .listen_port = c.interface.listen_port,
@@ -221,8 +218,12 @@ pub fn settingsFrom(c: *const wg.device.config.Config, out: *NetSettings) !void 
             .v6 => {},
         };
         if (out.remote_len == 0) if (p.endpoint) |e| {
-            const n = @min(e.host.len, out.remote_buf.len);
-            @memcpy(out.remote_buf[0..n], e.host[0..n]);
+            // tunnelRemoteAddress is an address: a DNS name (looked up by
+            // WireGuard itself, `start`) is shown as 127.0.0.1, as
+            // WireGuard's own iOS app does.
+            const host = if (e.literal() != null) e.host else "127.0.0.1";
+            const n = @min(host.len, out.remote_buf.len);
+            @memcpy(out.remote_buf[0..n], host[0..n]);
             out.remote_len = n;
         };
     }
@@ -278,4 +279,24 @@ test "settings from a wg-quick config, masks" {
     try std.testing.expectEqualStrings("255.255.255.0", mask(24, &b));
     try std.testing.expectEqualStrings("255.255.255.255", mask(32, &b));
     try std.testing.expectEqualStrings("0.0.0.0", mask(0, &b));
+}
+
+test "a DNS name endpoint: the remote address is a placeholder" {
+    const text =
+        \\[Interface]
+        \\PrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=
+        \\Address = 10.8.0.3/32
+        \\
+        \\[Peer]
+        \\PublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=
+        \\Endpoint = home.example.org:51820
+        \\AllowedIPs = 10.8.0.1/32
+        \\
+    ;
+    var diag: wg.device.config.Diagnostic = .{};
+    var c = try wg.device.config.parse(std.testing.allocator, text, &diag);
+    defer c.deinit();
+    var s: NetSettings = .{};
+    try settingsFrom(&c, &s);
+    try std.testing.expectEqualStrings("127.0.0.1", s.remote());
 }

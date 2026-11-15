@@ -25,6 +25,7 @@ const msgSend = objc.msgSend;
 const sel = objc.sel;
 pub const scan = @import("scan.zig");
 pub const tunnel = @import("tunnel.zig");
+pub const speech = @import("speech.zig");
 
 /// LAPolicy values.
 const policy_biometrics: objc.NSInteger = 1; // DeviceOwnerAuthenticationWithBiometrics
@@ -48,7 +49,15 @@ pub fn install(the_io: std.Io) void {
         .scan_qr = scan.start,
         .take_scanned = scan.take,
         .take_scan_note = scan.takeNote,
+        // With -Dios-tunnel the packet tunnel extension carries the
+        // tunnel (tunnel.zig); without, configure says no and the
+        // viewer runs the in-app tunnel.
+        .system_tunnel = tunnel.configure,
+        .note = tunnel.note,
+        .speech = speech.hooks(),
     };
+    tunnel.init(io);
+    speech.init(io);
     ios.setUnlockHandler(requestUnlock);
     // Nothing is shown before the first Face ID: main.zig starts the
     // window locked (AppOptions.start_locked, applied before UIKit runs).
@@ -65,6 +74,8 @@ fn onSuspend() void {
     // Forget the authentication: the next Keychain read asks again.
     if (credstore.apple_auth_context.swap(null, .acq_rel)) |old| objc.release(@as(*Object, @ptrCast(old)));
     tunnel.stop();
+    // No recording off screen; the speech engine's memory goes back.
+    speech.suspend_();
 }
 
 /// App thread, back on screen: wait for Face ID (the cover stays up and

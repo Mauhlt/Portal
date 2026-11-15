@@ -608,6 +608,24 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
 
 // ---- iPhone app (client/src/ios; docs/ios-native.md) ----
 
+/// The oldest iOS the app runs on (deployment target and both
+/// Info.plists' MinimumOSVersion): the dictation engine's Core ML
+/// programs target iOS 17.
+const ios_min_major = 17;
+
+/// The dictation model bundled into Portal.app (iOS builds only): the
+/// whisper.cpp project's ggml tiny.en file on Hugging Face, pinned to a
+/// commit of that repository, its size and SHA-256. Zig's package
+/// fetcher takes only archives and git repositories, so a single file
+/// comes through src/tools/fetch_file.zig, run only by the steps that
+/// build the app (never by ios-check or test); the build cache keeps it.
+/// -Dios-model=<path> uses a local ggml file instead.
+const ios_model = .{
+    .url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.en.bin",
+    .sha256 = "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+    .size = "77704715",
+};
+
 /// The iPhone app: the same viewer as `portal connect` (module "client")
 /// with the iPhone section (client/src/ios) as its entry.
 ///
@@ -628,6 +646,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     const tunnel = b.option(bool, "ios-tunnel", "iPhone app: control the per-app WireGuard tunnel extension (needs the Network Extension entitlement, paid account)") orelse false;
     const env = &b.graph.environ_map;
     const moltenvk = b.option([]const u8, "moltenvk", "iOS MoltenVK: path to libMoltenVK.dylib or MoltenVK.framework for iOS arm64 (env MOLTENVK_PATH)") orelse env.get("MOLTENVK_PATH");
+    const model_path = b.option([]const u8, "ios-model", "iPhone app: a local ggml model to bundle for dictation instead of the pinned tiny.en download");
     const sdk = b.option([]const u8, "ios-sdk", "iPhoneOS SDK path (env IOS_SDK; default: xcrun --sdk iphoneos --show-sdk-path on a Mac)") orelse env.get("IOS_SDK") orelse if (b.graph.host.result.os.tag == .macos)
         std.mem.trim(u8, b.run(&.{ "xcrun", "--sdk", "iphoneos", "--show-sdk-path" }), " \r\n")
     else
@@ -636,7 +655,9 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     const t = b.resolveTargetQuery(.{
         .cpu_arch = .aarch64,
         .os_tag = .ios,
-        .os_version_min = .{ .semver = .{ .major = 16, .minor = 0, .patch = 0 } },
+        // iOS 17: the Core ML programs of the dictation engine (stt) target
+        // it (docs/ios-native.md).
+        .os_version_min = .{ .semver = .{ .major = ios_min_major, .minor = 0, .patch = 0 } },
     });
 
     // Compile check (object): the whole iPhone app and its tunnel extension
@@ -655,6 +676,14 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
         .imports = &.{.{ .name = "WireGuard", .module = wireguardModule(b, b.graph.host, .Debug) }},
     }) })).step);
 
+    // The background tunnel's decisions and status line (tunnel.zig's pure
+    // part) on this host.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("client/src/ios/tunnel_note.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) })).step);
+
     // The app icon (drawn by src/tools/icon_art.zig) and the tools' own tests.
     const icon_tool = b.addExecutable(.{ .name = "ios-icon", .root_module = b.createModule(.{
         .root_source_file = b.path("src/tools/ios_icon.zig"),
@@ -671,6 +700,20 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     // The same signer for the Mac kit: pure Zig, links against Zig's own
     // libSystem stubs (no macOS SDK) and comes out ad-hoc signed (arm64
     // macOS). `zig build test` links it so it cannot rot.
+    // The model download (one pinned file) and the release check of the
+    // built executables (stripped, no build-machine paths), with tests.
+    const fetch_tool = b.addExecutable(.{ .name = "fetch-file", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/fetch_file.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fetch_tool.root_module })).step);
+    const macho_tool = b.addExecutable(.{ .name = "machocheck", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/machocheck.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = macho_tool.root_module })).step);
     const mac_sign_tool = b.addExecutable(.{ .name = "portal-ios-sign", .root_module = b.createModule(.{
         .root_source_file = b.path("src/tools/ios_sign.zig"),
         .target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos }),
@@ -704,6 +747,10 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     };
 
     const mod = iosModule(b, t, optimize, bundle_id, tunnel);
+    // A release build carries no debug info (machocheck below checks it,
+    // and that no build-machine path is embedded).
+    const release = optimize != .debug;
+    if (release) mod.strip = true;
     addIosSdkPaths(b, mod, sdk_path);
     mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/include" }) });
     for ([_][]const u8{ "UIKit", "QuartzCore", "Foundation", "CoreGraphics", "Metal", "Security", "AVFoundation", "LocalAuthentication" }) |fw|
@@ -719,6 +766,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     // NetworkExtension, no UIKit window.
     const ext_exe: ?*std.Build.Step.Compile = if (tunnel) blk: {
         const em = tunnelExtModule(b, t, optimize);
+        if (release) em.strip = true;
         addIosSdkPaths(b, em, sdk_path);
         em.linkFramework("Foundation", .{});
         em.linkFramework("NetworkExtension", .{});
@@ -749,6 +797,15 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
         _ = app.addCopyFile(e.getEmittedBin(), "Portal.app/PlugIns/PortalTunnel.appex/PortalTunnel");
         _ = app.add("Portal.app/PlugIns/PortalTunnel.appex/Info.plist", tunnelPlist(b, bundle_id));
     }
+    // The dictation model (speech.zig `model_name`) and the notices of what
+    // the app bundles (docs/ios-licenses.txt).
+    const model_file: std.Build.LazyPath = if (model_path) |p| .{ .cwd_relative = p } else blk: {
+        const f = b.addRunArtifact(fetch_tool);
+        f.addArgs(&.{ ios_model.url, ios_model.sha256, ios_model.size });
+        break :blk f.addOutputFileArg("ggml-tiny.en.bin");
+    };
+    _ = app.addCopyFile(model_file, "Portal.app/stt/ggml-tiny.en.bin");
+    _ = app.addCopyFile(b.path("docs/ios-licenses.txt"), "Portal.app/Licenses.txt");
     if (std.mem.endsWith(u8, std.mem.trimEnd(u8, mvk, "/"), ".framework")) {
         _ = app.addCopyDirectory(.{ .cwd_relative = mvk }, "Portal.app/Frameworks/MoltenVK.framework", .{});
     } else {
@@ -764,6 +821,14 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     }
     const install = b.addInstallDirectory(.{ .source_dir = app.getDirectory().path(b, "Portal.app"), .install_dir = .prefix, .install_subdir = "ios/Portal.app" });
     ios_step.dependOn(&install.step);
+    // Release: the executables are stripped and embed no build paths.
+    const macho_check: ?*std.Build.Step.Run = if (release) blk: {
+        const r = b.addRunArtifact(macho_tool);
+        r.addFileArg(exe.getEmittedBin());
+        if (ext_exe) |e| r.addFileArg(e.getEmittedBin());
+        install.step.dependOn(&r.step);
+        break :blk r;
+    } else null;
 
     // The Mac kit: build here, sign + install on a Mac that has Xcode but
     // no Zig (docs/ios-native.md, "Build on another computer").
@@ -775,6 +840,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
         .{ bundle_id, if (tunnel) "included (PORTAL_TUNNEL_PROVISIONING_PROFILE needed)" else "not included", optimize, readme },
     )), "ios-kit/README.txt");
     kit_step.dependOn(&kit_app.step);
+    if (macho_check) |r| kit_step.dependOn(&r.step);
     kit_step.dependOn(&kit_sign.step);
     kit_step.dependOn(&kit_readme.step);
 
@@ -821,8 +887,26 @@ fn iosModule(b: *std.Build, t: std.Build.ResolvedTarget, optimize: std.builtin.O
             .{ .name = "view", .module = gui.view },
             .{ .name = "client", .module = gui.client },
             .{ .name = "ios_options", .module = opts.createModule() },
+            // Dictation on the phone (client/src/ios/speech.zig): stt with
+            // its Core ML backend (on for Apple targets), and the speech
+            // module's headset-first microphone rule (src/speech/mics.zig).
+            .{ .name = "stt", .module = iosStt(b, t, optimize) },
+            .{ .name = "speech", .module = speechModule(b, t, optimize) },
         },
     });
+}
+
+/// stt for the iPhone app, sharing ONE Objective-C binding with the
+/// window: stt's Core ML backend (TranslateCoreML) and the Renderer's iOS
+/// backend (IosObjC) both build on the MacOS package, but with different
+/// optimize modes (stt is always fast), which would make two "MacOS"
+/// modules over the same files in one compilation. The Core ML module
+/// gets the Renderer's MacOS instead.
+fn iosStt(b: *std.Build, t: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const stt = b.dependency("stt", .{ .target = t, .optimize = .fast }).module("stt");
+    const mac = rendererDep(b, t, optimize).builder.dependency("MacOS", .{ .target = t, .optimize = optimize }).module("MacOS");
+    if (stt.import_table.get("coreml")) |cm| cm.addImport("MacOS", mac);
+    return stt;
 }
 
 /// The packet tunnel extension's root module: client/src/ios/tunnel_ext
@@ -859,7 +943,7 @@ fn tunnelPlist(b: *std.Build, bundle_id: []const u8) []const u8 {
         \\    <key>CFBundleShortVersionString</key><string>0.1.0</string>
         \\    <key>CFBundleVersion</key><string>1</string>
         \\    <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
-        \\    <key>MinimumOSVersion</key><string>16.0</string>
+        \\    <key>MinimumOSVersion</key><string>{d}.0</string>
         \\    <key>NSExtension</key>
         \\    <dict>
         \\        <key>NSExtensionPointIdentifier</key><string>com.apple.networkextension.packet-tunnel</string>
@@ -867,13 +951,14 @@ fn tunnelPlist(b: *std.Build, bundle_id: []const u8) []const u8 {
         \\    </dict>
         \\</dict>
         \\</plist>
-    , .{bundle_id});
+    , .{ bundle_id, ios_min_major });
 }
 
 /// Info.plist (configuration text, not code): what iOS reads before the
 /// app runs. Scene-based (the Renderer's Window backend provides the scene
 /// delegate), launch screen without a storyboard, camera and Face ID
-/// usage strings, local-network note for the desk on the LAN.
+/// usage strings, local-network note for the desk on the LAN, the
+/// microphone for dictation.
 fn infoPlist(b: *std.Build, bundle_id: []const u8) []const u8 {
     return b.fmt(
         \\<?xml version="1.0" encoding="UTF-8"?>
@@ -891,7 +976,7 @@ fn infoPlist(b: *std.Build, bundle_id: []const u8) []const u8 {
         \\    <key>CFBundleVersion</key><string>1</string>
         \\    <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
         \\    <key>DTPlatformName</key><string>iphoneos</string>
-        \\    <key>MinimumOSVersion</key><string>16.0</string>
+        \\    <key>MinimumOSVersion</key><string>{d}.0</string>
         \\    <key>LSRequiresIPhoneOS</key><true/>
         \\    <key>UIDeviceFamily</key><array><integer>1</integer></array>
         \\    <key>UIRequiredDeviceCapabilities</key><array><string>arm64</string><string>metal</string></array>
@@ -906,11 +991,12 @@ fn infoPlist(b: *std.Build, bundle_id: []const u8) []const u8 {
         \\    <dict><key>CFBundlePrimaryIcon</key><dict><key>CFBundleIconFiles</key><array><string>AppIcon60x60</string></array></dict></dict>
         \\    <key>NSCameraUsageDescription</key><string>Portal scans the pairing QR code shown on your desktop.</string>
         \\    <key>NSFaceIDUsageDescription</key><string>Portal asks for Face ID before it shows your session or signs in.</string>
+        \\    <key>NSMicrophoneUsageDescription</key><string>Portal records while you dictate an instruction; the speech is transcribed on this iPhone and never leaves it.</string>
         \\    <key>NSLocalNetworkUsageDescription</key><string>Portal connects to the Portal running on your desktop.</string>
         \\</dict>
         \\</plist>
         \\
-    , .{bundle_id});
+    , .{ bundle_id, ios_min_major });
 }
 
 // ---- speech (src/speech; docs/audio-design.md, docs/stt-sync-contract.md) ----

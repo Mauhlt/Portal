@@ -112,7 +112,6 @@ comptime {
     // `zig build ios-check` compiles an object, which std's start code
     // does not give a main: reference it so the whole app is analysed.
     _ = &main;
-    _ = &device.tunnel.configure;
 }
 
 test {
