@@ -57,6 +57,7 @@ const devices = @import("devices.zig");
 const fsutil = @import("fsutil.zig");
 const w = @import("win32.zig");
 const web = @import("web.zig");
+const speech = @import("speech");
 const gui = @import("gui.zig");
 const view = @import("view");
 const title = @import("title.zig");
@@ -1769,6 +1770,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     // From here on the child is running. Exit only via fatal()/ExitProcess:
     // process exit closes the job handles, which kills every tab's tree.
 
+    // Devices' speech training bundles (the bulk channel): the window's
+    // speech engine attaches to it once it runs (deskspeech.zig).
+    var speech_inbox: speech.inbox.Inbox = .{ .io = io };
     var server: web.Server = .{
         .gpa = gpa,
         .io = io,
@@ -1780,6 +1784,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .devices = paths,
             .tls = &tls_creds,
             .sync_key = sync_key,
+            .speech_inbox = &speech_inbox,
         },
         .sysmon = monitor,
     };

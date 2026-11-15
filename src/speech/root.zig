@@ -24,6 +24,8 @@ pub const limits = @import("limits.zig");
 pub const model_pin = @import("model_pin.zig");
 /// The desktop's gate for device speech traffic (future /sync routes).
 pub const gate = @import("gate.zig");
+/// Training bundles from paired devices (the bulk channel's `put bundle`).
+pub const inbox = @import("inbox.zig");
 pub const mics = @import("mics.zig");
 pub const capture = @import("capture.zig");
 pub const wasapi = @import("wasapi.zig");
@@ -37,6 +39,7 @@ test {
     _ = limits;
     _ = model_pin;
     _ = gate;
+    _ = inbox;
     _ = mics;
     _ = capture;
     _ = wasapi;

@@ -116,6 +116,30 @@ pub fn get(r: *const Remote, req: bulk.Request, target: BodyTarget) anyerror!Res
     return res;
 }
 
+fn putTask(r: *const Remote, wd: *watchdog.Watchdog, bytes: []const u8) anyerror!u16 {
+    var sock = try wsclient.Socket.open(r.gpa, r.io, r.dialer, r.addr, r.security, r.host, .bulk, &wd.stopped);
+    defer sock.close();
+    // The desk answers only once the bundle is stored: allow for its
+    // import (and the 30 s it may take to read the body).
+    wd.extend(2 * progress_timeout_ms);
+    return switch (try sock.upload(.{ .put_bundle = bytes.len }, bytes)) {
+        .ok => 200,
+        .err => |code| code,
+    };
+}
+
+/// Sends one speech training bundle home (`put bundle`): 200 once the
+/// desk stored it (only then may the device delete those samples), else
+/// the desk's code (shared/bulk.zig). Under a watchdog like `get`.
+pub fn putBundle(r: *const Remote, bytes: []const u8) anyerror!u16 {
+    if (bytes.len == 0 or bytes.len > bulk.max_upload) return error.TooLarge;
+    var wd: watchdog.Watchdog = .{ .io = r.io };
+    wd.extend(connect_timeout_ms);
+    const res = wd.run(putTask, .{ r, &wd, bytes }, null);
+    if (wd.expired.load(.acquire)) return error.TimedOut;
+    return res;
+}
+
 /// The release key the desktop reports (`get key`).
 pub fn fetchKey(r: *const Remote) !keypin.Key {
     var resp = try get(r, .key, .{ .collect = 256 });

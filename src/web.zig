@@ -73,6 +73,7 @@ const frames = @import("shared").frames;
 const foryou_ws = @import("foryou_ws.zig");
 const projects_ws = @import("projects_ws.zig");
 const ratelimit = @import("ratelimit.zig");
+const speech_inbox = @import("speech").inbox;
 
 /// Hard cap on simultaneous connections (each costs a supervisor thread and
 /// a worker thread, a WebSocket one more).
@@ -140,6 +141,9 @@ pub const Config = struct {
     /// The sync release public key (docs/sync-design.md); null: every bulk
     /// request is answered 404.
     sync_key: ?[32]u8 = null,
+    /// Speech training bundles from devices (`put bundle` on the bulk
+    /// channel, src/speech/inbox.zig); null: answered 404.
+    speech_inbox: ?*speech_inbox.Inbox = null,
 };
 
 /// What a device's sync index currently hashes to (main.zig's sync
@@ -1937,7 +1941,7 @@ pub const Server = struct {
                     _ = ws.send(srv, if (f.payload.len >= 2) f.payload[0..2] else "", .close);
                     return;
                 },
-                .text => if (!srv.bulkRequest(ws, f.payload)) return,
+                .text => if (!srv.bulkRequest(ws, &fr, f.payload)) return,
                 else => return,
             }
         }
@@ -1962,11 +1966,12 @@ pub const Server = struct {
     }
 
     /// Returns false to end the connection.
-    fn bulkRequest(srv: *Server, ws: *WsConn, text: []const u8) bool {
+    fn bulkRequest(srv: *Server, ws: *WsConn, fr: *FrameReader, text: []const u8) bool {
         const r = bulk.parseRequest(text) orelse return srv.bulkErr(ws, 400);
-        const key = srv.cfg.sync_key orelse return srv.bulkErr(ws, 404);
         const device = ws.device.name.get();
         if (!devices.validName(device)) return srv.bulkErr(ws, 404);
+        if (r == .put_bundle) return srv.bulkBundle(ws, fr, device, r.put_bundle);
+        const key = srv.cfg.sync_key orelse return srv.bulkErr(ws, 404);
         const paths: sync.Paths = .{ .dir = srv.cfg.devices.dir };
         switch (r) {
             .key => {
@@ -1982,6 +1987,7 @@ pub const Server = struct {
                 return srv.bulkBody(ws, body, null);
             },
             .manifest, .file => {},
+            .put_bundle => unreachable,
         }
         const pkg = switch (r) {
             .manifest => |m| m,
@@ -2008,6 +2014,51 @@ pub const Server = struct {
             },
             else => unreachable,
         }
+    }
+
+    /// `put bundle <len>` (shared/bulk.zig): a device's speech training
+    /// bundle. The gate first (two devices at once, the payload budget, the
+    /// bundle cap), so a refusal costs no body; then exactly `len` bytes in
+    /// binary messages, read by the gate's deadline (not through the input
+    /// limiter: the size was declared and admitted); then the import, and
+    /// "ok 0" only once the desk holds it. Returns false to end the
+    /// connection (a short or malformed body, a missed deadline).
+    fn bulkBundle(srv: *Server, ws: *WsConn, fr: *FrameReader, device: []const u8, len: u64) bool {
+        const inbox = srv.cfg.speech_inbox orelse return srv.bulkErr(ws, 404);
+        const ticket = switch (inbox.begin(device, len, srv.nowMs())) {
+            .ok => |t| t,
+            .busy => return srv.bulkErr(ws, 503),
+            .too_large => return srv.bulkErr(ws, 413),
+            .refused => return srv.bulkErr(ws, 404),
+        };
+        defer inbox.end(ticket);
+        var hb: [bulk.max_header]u8 = undefined;
+        if (!ws.send(srv, bulk.formatReply(&hb, .{ .ok = .{ .len = 0 } }) catch return false, .text)) return false;
+        const body = srv.gpa.alloc(u8, @intCast(len)) catch return false;
+        var owned = true;
+        defer if (owned) srv.gpa.free(body);
+        var got: usize = 0;
+        ws.conn.setDeadline(ticket.read_deadline);
+        defer ws.conn.setDeadline(no_deadline);
+        while (got < body.len) {
+            const f = (fr.next(ws.conn, srv.io) catch return false) orelse return false;
+            switch (f.opcode) {
+                .binary => {
+                    if (f.payload.len == 0 or f.payload.len > body.len - got) return false;
+                    @memcpy(body[got..][0..f.payload.len], f.payload);
+                    got += f.payload.len;
+                },
+                .ping => if (!ws.send(srv, f.payload, .pong)) return false,
+                .pong => {},
+                else => return false,
+            }
+        }
+        ws.conn.setDeadline(no_deadline);
+        owned = false;
+        const v = inbox.store(srv.gpa, device, body, srv.nowMs());
+        srv.log.print("speech: training bundle from '{s}' ({d} bytes): {t}", .{ device, len, v });
+        if (v == .stored) return ws.send(srv, bulk.formatReply(&hb, .{ .ok = .{ .len = 0 } }) catch return false, .text);
+        return srv.bulkErr(ws, v.code());
     }
 
     /// Streams stored file `n`: exactly the size its manifest promises, in

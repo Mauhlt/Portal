@@ -134,6 +134,44 @@ pub const Socket = struct {
         s.used = 0;
     }
 
+    /// The next reply header (pings answered on the way).
+    fn replyHeader(s: *Socket) !bulk.Reply {
+        while (true) {
+            const f = (try s.next(bulk.max_header)) orelse return error.ConnectionClosed;
+            switch (f.opcode) {
+                .text => return bulk.parseReply(f.payload) orelse error.BadReply,
+                .ping => try s.send(.pong, f.payload),
+                .pong => {},
+                else => return error.BadReply,
+            }
+        }
+    }
+
+    /// One bulk upload (`put bundle`, shared/bulk.zig): the header, the
+    /// server's go-ahead, `body` in binary messages, and the final reply.
+    /// A refusal of the header comes back as is, with nothing sent.
+    pub fn upload(s: *Socket, req: bulk.Request, body: []const u8) !bulk.Reply {
+        var rb: [bulk.max_header]u8 = undefined;
+        try s.send(.text, try bulk.formatRequest(&rb, req));
+        const go = try s.replyHeader();
+        switch (go) {
+            .err => return go,
+            .ok => |o| if (o.len != 0) return error.BadReply,
+        }
+        var rest = body;
+        while (rest.len > 0) {
+            const n = @min(rest.len, bulk.upload_chunk);
+            try s.send(.binary, rest[0..n]);
+            rest = rest[n..];
+        }
+        const done = try s.replyHeader();
+        switch (done) {
+            .err => {},
+            .ok => |o| if (o.len != 0) return error.BadReply,
+        }
+        return done;
+    }
+
     /// One bulk request (shared/bulk.zig): the reply header, then the body
     /// handed to `sink(ctx, chunk)` chunk by chunk (exactly `len` bytes),
     /// ping/pong answered on the way.

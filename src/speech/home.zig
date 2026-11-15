@@ -110,6 +110,8 @@ const Clip = struct { purpose: Purpose, pcm: []i16, seq: u64 };
 /// or Portal's: they get at most half the queue.
 const Source = enum { desk, device, portal };
 const Feedback = struct { id: u64, text: []u8, ok: bool, source: Source = .desk };
+/// An importBundleWait's answer (on the waiter's stack until it is set).
+const Done = struct { ev: sys.HANDLE, ok: bool = false };
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -156,7 +158,7 @@ pub const Engine = struct {
     feedbacks: std.ArrayList(Feedback) = .empty,
     result: ?Result = null,
     /// One bundle import and one update export waiting at most.
-    import_job: ?struct { bytes: []u8, device: [limits.max_device_name]u8, device_len: usize } = null,
+    import_job: ?struct { bytes: []u8, device: [limits.max_device_name]u8, device_len: usize, done: ?*Done = null } = null,
     export_job: ?u32 = null,
     sync_result: ?SyncResult = null,
     deadline: ?i64 = null,
@@ -204,7 +206,7 @@ pub const Engine = struct {
         for (e.feedbacks.items) |f| e.gpa.free(f.text);
         e.feedbacks.deinit(e.gpa);
         if (e.result) |r| e.gpa.free(r.text);
-        if (e.import_job) |j| e.gpa.free(j.bytes);
+        e.failImport();
         if (e.sync_result) |r| switch (r) {
             .exported => |x| if (x.bytes) |b| e.gpa.free(b),
             .imported => {},
@@ -441,6 +443,41 @@ pub const Engine = struct {
     /// gate.Gate allowed it): imported on the heavy-job thread. One waits at
     /// most (another: Busy). Takes ownership of `bytes` (also on error).
     pub fn importBundle(e: *Engine, device: []const u8, bytes: []u8) SyncError!void {
+        return e.queueImport(device, bytes, null);
+    }
+
+    /// A device's bundle from the bulk channel (speech/inbox.zig): queued
+    /// like `importBundle`, then waits until the heavy-job thread imported
+    /// it. True once the desk holds it (the device may then delete those
+    /// samples); false if the import failed or the engine stopped first.
+    /// Takes ownership of `bytes` (also on error).
+    pub fn importBundleWait(e: *Engine, device: []const u8, bytes: []u8) SyncError!bool {
+        const ev = sys.CreateEventW(null, 1, 0, null) orelse {
+            e.gpa.free(bytes);
+            return error.OutOfMemory;
+        };
+        defer _ = sys.CloseHandle(ev);
+        var done: Done = .{ .ev = ev };
+        try e.queueImport(device, bytes, &done);
+        // The import is local work (bounded by the bundle cap); the engine
+        // answers every queued waiter when it fails or stops (failImport).
+        _ = sys.WaitForSingleObject(ev, sys.INFINITE);
+        return done.ok;
+    }
+
+    /// Caller holds `lock` (or the thread is gone): a queued import is
+    /// dropped and its waiter, if any, told it failed.
+    fn failImport(e: *Engine) void {
+        const j = e.import_job orelse return;
+        e.import_job = null;
+        e.gpa.free(j.bytes);
+        if (j.done) |d| {
+            d.ok = false;
+            _ = sys.SetEvent(d.ev);
+        }
+    }
+
+    fn queueImport(e: *Engine, device: []const u8, bytes: []u8, done: ?*Done) SyncError!void {
         var keep = false;
         defer if (!keep) e.gpa.free(bytes);
         e.lock.lock();
@@ -451,7 +488,7 @@ pub const Engine = struct {
         // (stt's import doesn't look at the profile's learning flag).
         if (!e.learning) return error.LearningOff;
         if (e.import_job != null) return error.Busy;
-        var j: @TypeOf(e.import_job.?) = .{ .bytes = bytes, .device = undefined, .device_len = device.len };
+        var j: @TypeOf(e.import_job.?) = .{ .bytes = bytes, .device = undefined, .device_len = device.len, .done = done };
         @memcpy(j.device[0..device.len], device);
         e.import_job = j;
         keep = true;
@@ -503,6 +540,7 @@ pub const Engine = struct {
         e.status.why_len = s.len;
         if (e.queued) |c| e.gpa.free(c.pcm);
         e.queued = null;
+        e.failImport();
         e.inflight = null;
         e.inflight_deadline = null;
         e.status.busy = 0;
@@ -566,7 +604,13 @@ pub const Engine = struct {
             const hs = [_]sys.HANDLE{ e.stop_ev, e.job_ev, e.rearm_ev };
             const r = sys.WaitForMultipleObjects(hs.len, &hs, 0, sys.msUntil(deadline, e.nowMs()));
             switch (r) {
-                0 => break,
+                0 => {
+                    // Stopping: a device waiting on its import hears now.
+                    e.lock.lock();
+                    e.failImport();
+                    e.lock.unlock();
+                    break;
+                },
                 1 => e.drain(home),
                 2 => {}, // the deadline moved: wait again with the new one
                 sys.WAIT_TIMEOUT => {
@@ -619,7 +663,10 @@ pub const Engine = struct {
             if (imp) |j| {
                 defer e.gpa.free(j.bytes);
                 const ok = if (home.importBundle(e.gpa, j.bytes)) |_| true else |_| false;
-                e.setSync(.{ .imported = .{ .device = j.device, .device_len = j.device_len, .ok = ok } });
+                if (j.done) |d| {
+                    d.ok = ok;
+                    _ = sys.SetEvent(d.ev);
+                } else e.setSync(.{ .imported = .{ .device = j.device, .device_len = j.device_len, .ok = ok } });
                 continue;
             }
             if (exp) |v| {
@@ -936,4 +983,29 @@ test "capOwned and wavBytes bounds" {
     const big = try testClip(limits.max_samples + 1);
     defer testing.allocator.free(big);
     try testing.expectError(error.AudioTooLong, wavBytes(testing.allocator, big));
+}
+
+test "a waiting device import hears the result, or that the engine failed" {
+    const e = try bare();
+    defer e.destroy();
+    var h: FakeHome = .{};
+    const ev = sys.CreateEventW(null, 1, 0, null).?;
+    defer _ = sys.CloseHandle(ev);
+    var done: Done = .{ .ev = ev };
+    try e.queueImport("iphone", try testing.allocator.dupe(u8, "bundle"), &done);
+    try testing.expectEqual(sys.WAIT_TIMEOUT, sys.WaitForSingleObject(ev, 0));
+    e.drain(&h);
+    try testing.expectEqual(@as(usize, 1), h.imports);
+    try testing.expectEqual(sys.WAIT_OBJECT_0, sys.WaitForSingleObject(ev, 0));
+    try testing.expect(done.ok);
+    // Answered by the waiter's event, not the desk's takeSync.
+    try testing.expect(e.takeSync() == null);
+
+    _ = sys.ResetEvent(ev);
+    done = .{ .ev = ev, .ok = true };
+    try e.queueImport("iphone", try testing.allocator.dupe(u8, "bundle"), &done);
+    e.setFailed("test", .{});
+    try testing.expectEqual(sys.WAIT_OBJECT_0, sys.WaitForSingleObject(ev, 0));
+    try testing.expect(!done.ok);
+    try testing.expect(e.import_job == null);
 }

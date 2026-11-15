@@ -279,7 +279,7 @@ pub const LocalHost = struct {
         h.desk.?.desk_check = tunnelnet.checkCode(&d.desk_public);
         h.p.setBackgroundArt(d.saved.background_art orelse true);
         const s = h.gpa.create(deskspeech.DeskSpeech) catch return;
-        s.* = .{ .gpa = h.gpa, .io = h.io, .data_dir = d.paths.dir, .notify_ctx = h, .notify_fn = notifyThunk, .mic = undefined };
+        s.* = .{ .gpa = h.gpa, .io = h.io, .data_dir = d.paths.dir, .notify_ctx = h, .notify_fn = notifyThunk, .mic = undefined, .inbox = d.srv.cfg.speech_inbox };
         s.start(&h.desk.?.saved);
         h.speech = s;
         h.shell.dictation = s.hooks();

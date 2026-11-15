@@ -68,6 +68,9 @@ pub const DeskSpeech = struct {
     retire_thread: ?std.Thread = null,
     retiring: std.atomic.Value(bool) = .init(false),
     next_model: ?[]u8 = null,
+    /// Where devices' training bundles come in (web.Config.speech_inbox):
+    /// the engine is attached while it runs, detached before it stops.
+    inbox: ?*speech.inbox.Inbox = null,
 
     panel: audio_panel.Ui = .{},
     bufs: audio_panel.Ui.Bufs = .{},
@@ -95,6 +98,7 @@ pub const DeskSpeech = struct {
         s.limits = saved.speech;
         s.instruct_mode = saved.instruct_mode orelse .auto;
         s.learning = saved.speech_learning orelse true;
+        if (s.inbox) |ib| ib.setLimits(s.limits);
         const model = saved.speech_model.get();
         s.startEngine(model);
     }
@@ -115,10 +119,12 @@ pub const DeskSpeech = struct {
             return;
         };
         s.engine = e;
+        if (s.inbox) |ib| ib.attach(e);
     }
 
     fn stopEngine(s: *DeskSpeech) void {
         if (!speech.has_home) return;
+        if (s.inbox) |ib| ib.detach();
         if (s.engine) |e| e.destroy();
         s.engine = null;
         s.tracker = .{};
@@ -136,6 +142,7 @@ pub const DeskSpeech = struct {
         s.retiring.store(true, .release);
         s.retire_thread = std.Thread.spawn(.{}, reap, .{ s, e }) catch {
             // No thread: stop it here (the window waits this once).
+            if (s.inbox) |ib| ib.detach();
             e.destroy();
             s.retiring.store(false, .release);
             return;
@@ -143,6 +150,8 @@ pub const DeskSpeech = struct {
     }
 
     fn reap(s: *DeskSpeech, e: *Engine) void {
+        // Imports in flight on it finish first (off the window's thread).
+        if (s.inbox) |ib| ib.detach();
         e.destroy();
         s.retiring.store(false, .release);
         s.notify_fn(s.notify_ctx);
@@ -473,6 +482,7 @@ pub const DeskSpeech = struct {
         s.limits = c.clamped();
         s.mic.setLimits(s.limits);
         if (speech.has_home) if (s.engine) |e| e.setLimits(s.limits);
+        if (s.inbox) |ib| ib.setLimits(s.limits);
     }
 
     pub fn act(s: *DeskSpeech, a: audio_panel.Action) Saved {
