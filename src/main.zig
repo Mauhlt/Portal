@@ -180,6 +180,12 @@ const usage =
     \\      when Claude in a tab works, waits for an answer or is done.
     \\      Everything else in the file stays as it is; a backup is kept
     \\      next to it. In the window: Settings, "Claude Code integration".
+    \\  portalctl firewall status | add | remove [--port N]
+    \\      The desk's Windows Firewall rule "Portal tunnel (WireGuard)":
+    \\      inbound UDP on the tunnel port (default: the saved one), every
+    \\      profile. status needs no administrator; add (or replace, after a
+    \\      port move) and remove ask for one, once (UAC). In the window:
+    \\      Settings, "Windows Firewall".
     \\  portalctl hook
     \\      Run by Claude Code (reads the hook's JSON on stdin); does nothing
     \\      outside a Portal tab.
@@ -301,6 +307,15 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(0);
     }
     if (std.mem.eql(u8, cmd, "hooks")) std.process.exit(agenthooks.command(gpa, io, init.environ_map, args[1..]));
+    // The desk's firewall rule (src/firewall.zig); the port defaults to
+    // the saved one. The installer and Settings run it too.
+    if (std.mem.eql(u8, cmd, "firewall")) {
+        const port = if (dataDir(gpa, init.environ_map)) |dir| blk: {
+            defer gpa.free(dir);
+            break :blk settings.load(gpa, io, dir).tunnelPort();
+        } else |_| tunnelnet.default_udp_port;
+        std.process.exit(@import("firewall").command(args[1..], port));
+    }
     if (std.mem.eql(u8, cmd, "pair")) return cmdPair(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "devices")) return cmdDevices(gpa, io, init.environ_map);
     if (std.mem.eql(u8, cmd, "tunnel-port")) return cmdTunnelPort(gpa, io, init.environ_map, args[1..]);

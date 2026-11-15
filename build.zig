@@ -35,6 +35,8 @@ fn rootModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // its key and peer table (src/tunneldesk.zig).
     root.addImport("WireGuard", wireguardModule(b, target, optimize));
     root.addImport("tunnel_options", tunnelOptions(b));
+    // The desk's Windows Firewall rule (`portalctl firewall`, Settings).
+    root.addImport("firewall", firewallModule(b, target, optimize));
     const gui_mods = addGuiModules(b, root, target, optimize, rules);
     return .{ .root = root, .gui = gui_mods };
 }
@@ -60,6 +62,13 @@ fn showModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 /// whose module roots are in src/tools.
 fn win32Module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     return b.createModule(.{ .root_source_file = b.path("src/win32.zig"), .target = target, .optimize = optimize });
+}
+
+/// "firewall" (src/firewall.zig): the desk's one firewall rule, its
+/// status, and the elevated helper; self-contained, so the main program
+/// and the installer can both import it.
+fn firewallModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("src/firewall.zig"), .target = target, .optimize = optimize });
 }
 
 /// portal-launcher: the GUI build is installed as bin\portal.exe, the
@@ -225,6 +234,7 @@ pub fn build(b: *std.Build) void {
     addIos(b, optimize, test_step);
     addBrand(b, test_step);
     addPackage(b, test_step);
+    addInstaller(b, test_step);
     addPin(b);
     addCheckZig(b);
 }
@@ -311,14 +321,10 @@ fn addPackage(b: *std.Build, test_step: *std.Build.Step) void {
         // Baseline CPU (no -mcpu=native): the folder runs on any machine of
         // that architecture, not only the one that built it.
         const t = b.resolveTargetQuery(.{ .cpu_arch = arch, .os_tag = .windows });
-        const gui_root = rootModule(b, t, .ReleaseSafe, .gui);
-        const ctl_root = rootModule(b, t, .ReleaseSafe, .ctl);
-        const exe = b.addExecutable(.{ .name = "portal", .root_module = gui_root.root });
-        exe.subsystem = .windows;
-        addAppIcon(b, exe);
-        const ctl = b.addExecutable(.{ .name = "portalctl", .root_module = ctl_root.root });
-        addAppIcon(b, ctl);
-        const show = b.addExecutable(.{ .name = "portal-show", .root_module = showModule(b, t, .ReleaseSafe, gui_root.gui.imgcheck) });
+        const set = portalExes(b, t, false);
+        const exe = set.gui;
+        const ctl = set.ctl;
+        const show = set.show;
 
         const name = b.fmt("portal-{t}-windows", .{arch});
         const wf = b.addWriteFiles();
@@ -348,6 +354,177 @@ fn addPackage(b: *std.Build, test_step: *std.Build.Step) void {
         step.dependOn(&install.step);
         step.dependOn(&b.addInstallFile(report, b.fmt("{s}-check.txt", .{name})).step);
     }
+}
+
+/// portal.exe, portalctl.exe and portal-show.exe, ReleaseSafe, for `t`
+/// (`zig build package` and the installers' payload; `strip` for a
+/// published installer).
+const PortalExes = struct { gui: *std.Build.Step.Compile, ctl: *std.Build.Step.Compile, show: *std.Build.Step.Compile };
+fn portalExes(b: *std.Build, t: std.Build.ResolvedTarget, strip: bool) PortalExes {
+    const gui_root = rootModule(b, t, .ReleaseSafe, .gui);
+    const ctl_root = rootModule(b, t, .ReleaseSafe, .ctl);
+    const show_mod = showModule(b, t, .ReleaseSafe, gui_root.gui.imgcheck);
+    if (strip) for ([_]*std.Build.Module{ gui_root.root, ctl_root.root, show_mod }) |m| {
+        m.strip = true;
+    };
+    const exe = b.addExecutable(.{ .name = "portal", .root_module = gui_root.root });
+    exe.subsystem = .windows;
+    addAppIcon(b, exe);
+    const ctl = b.addExecutable(.{ .name = "portalctl", .root_module = ctl_root.root });
+    addAppIcon(b, ctl);
+    const show = b.addExecutable(.{ .name = "portal-show", .root_module = show_mod });
+    return .{ .gui = exe, .ctl = ctl, .show = show };
+}
+
+/// The installer's manifest: run as the invoker (Windows would otherwise
+/// ask for an administrator for any program named *setup*), common
+/// controls v6 (TaskDialog), per-monitor DPI.
+const setup_manifest =
+    \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    \\<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+    \\  <assemblyIdentity type="win32" name="Portal.Setup" version="1.0.0.0"/>
+    \\  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    \\    <security><requestedPrivileges>
+    \\      <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+    \\    </requestedPrivileges></security>
+    \\  </trustInfo>
+    \\  <dependency><dependentAssembly>
+    \\    <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    \\  </dependentAssembly></dependency>
+    \\  <application xmlns="urn:schemas-microsoft-com:asm.v3"><windowsSettings>
+    \\    <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+    \\    <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    \\  </windowsSettings></application>
+    \\</assembly>
+    \\
+;
+
+/// -Dsetup-version / -Dsetup-commit (declared once, read by every installer).
+const SetupVersion = struct { version: []const u8, commit: []const u8 };
+var setup_version: ?SetupVersion = null;
+fn setupVersion(b: *std.Build) SetupVersion {
+    if (setup_version) |v| return v;
+    setup_version = .{
+        .version = b.option([]const u8, "setup-version", "Installers: the version they show and record (the release tag)") orelse "dev",
+        .commit = b.option([]const u8, "setup-commit", "Installers: the commit they record") orelse "none",
+    };
+    return setup_version.?;
+}
+
+/// portal-setup for `t`, carrying `payload` (a module whose root declares
+/// `exes` and `launchers` as {name, @embedFile} pairs).
+fn setupExe(b: *std.Build, t: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, payload: *std.Build.Module, name: []const u8, strip: bool) struct { exe: *std.Build.Step.Compile, mod: *std.Build.Module } {
+    const opts = b.addOptions();
+    const v = setupVersion(b);
+    opts.addOption([]const u8, "version", v.version);
+    opts.addOption([]const u8, "commit", v.commit);
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/setup.zig"),
+        .target = t,
+        .optimize = optimize,
+        .strip = if (strip) true else null,
+        .imports = &.{
+            .{ .name = "win32", .module = win32Module(b, t, optimize) },
+            .{ .name = "firewall", .module = firewallModule(b, t, optimize) },
+            .{ .name = "payload", .module = payload },
+        },
+    });
+    mod.addOptions("setup_options", opts);
+    const exe = b.addExecutable(.{ .name = name, .root_module = mod });
+    exe.subsystem = .windows;
+    // The icon and the manifest (RT_MANIFEST, id 1) in one resource script.
+    const wf = b.addWriteFiles();
+    _ = wf.addCopyFile(b.path("docs/brand/portal.ico"), "portal.ico");
+    _ = wf.add("portal-setup.manifest", setup_manifest);
+    const rc = wf.add("portal-setup.rc", "1 ICON \"portal.ico\"\n1 24 \"portal-setup.manifest\"\n");
+    exe.root_module.addWin32ResourceFile(.{ .file = rc });
+    return .{ .exe = exe, .mod = mod };
+}
+
+/// A payload module: `files` (name -> file) copied next to a generated
+/// root that embeds them.
+fn payloadModule(b: *std.Build, exes: []const [2][]const u8, sources: []const std.Build.LazyPath) *std.Build.Module {
+    const wf = b.addWriteFiles();
+    var src: std.ArrayList(u8) = .empty;
+    src.appendSlice(b.allocator, "//! Generated by build.zig: the Portal this installer carries.\n") catch @panic("OOM");
+    for ([_][]const u8{ "exes", "launchers" }) |list| {
+        src.print(b.allocator, "pub const {s} = .{{\n", .{list}) catch @panic("OOM");
+        for (exes, sources) |e, s| {
+            if (!std.mem.eql(u8, e[0], list)) continue;
+            _ = wf.addCopyFile(s, e[1]);
+            src.print(b.allocator, "    .{{ \"{s}\", @embedFile(\"{s}\") }},\n", .{ e[1], e[1] }) catch @panic("OOM");
+        }
+        src.appendSlice(b.allocator, "};\n") catch @panic("OOM");
+    }
+    const root = wf.add("payload.zig", src.items);
+    return b.createModule(.{ .root_source_file = root });
+}
+
+/// `zig build installer`: zig-out/installer/portal-setup-x64.exe and
+/// portal-setup-arm64.exe, stripped ReleaseSafe, each carrying its
+/// architecture's Portal (stripped too) and checked by check-dist for
+/// paths of the machine that built them. `zig build test` compiles a
+/// setup with a tiny stand-in payload and runs its tests.
+fn addInstaller(b: *std.Build, test_step: *std.Build.Step) void {
+    const step = b.step("installer", "Build the Windows installers (zig-out/installer/portal-setup-x64.exe, -arm64.exe), stripped and path-checked");
+    const check = checkDist(b, test_step);
+    for ([_]struct { arch: std.Target.Cpu.Arch, asset: []const u8 }{
+        .{ .arch = .x86_64, .asset = "portal-setup-x64" },
+        .{ .arch = .aarch64, .asset = "portal-setup-arm64" },
+    }) |e| {
+        const t = b.resolveTargetQuery(.{ .cpu_arch = e.arch, .os_tag = .windows });
+        const set = portalExes(b, t, true);
+        const lmod_gui = launcherModule(b, t, .ReleaseSafe, true);
+        lmod_gui.strip = true;
+        const lgui = b.addExecutable(.{ .name = "portal-launcher", .root_module = lmod_gui });
+        lgui.subsystem = .windows;
+        addAppIcon(b, lgui);
+        const lmod_con = launcherModule(b, t, .ReleaseSafe, false);
+        lmod_con.strip = true;
+        const lcon = b.addExecutable(.{ .name = "portal-launcher-console", .root_module = lmod_con });
+        addAppIcon(b, lcon);
+        const parts = [_]*std.Build.Step.Compile{ set.gui, set.ctl, set.show, lgui, lcon };
+        const payload = payloadModule(b, &.{
+            .{ "exes", "portal.exe" },
+            .{ "exes", "portalctl.exe" },
+            .{ "exes", "portal-show.exe" },
+            .{ "launchers", "portal-launcher.exe" },
+            .{ "launchers", "portal-launcher-console.exe" },
+        }, &.{ parts[0].getEmittedBin(), parts[1].getEmittedBin(), parts[2].getEmittedBin(), parts[3].getEmittedBin(), parts[4].getEmittedBin() });
+        const setup = setupExe(b, t, .ReleaseSafe, payload, e.asset, true).exe;
+        const run = b.addRunArtifact(check);
+        run.setCwd(b.path("."));
+        for (parts) |p| run.addFileArg(p.getEmittedBin());
+        run.addFileArg(setup.getEmittedBin());
+        const install = b.addInstallArtifact(setup, .{ .dest_dir = .{ .override = .{ .custom = "installer" } } });
+        install.step.dependOn(&run.step);
+        step.dependOn(&install.step);
+    }
+
+    // `zig build test`: the installer's tests and a full compile, with a
+    // stand-in payload (no Portal build inside).
+    const target = b.graph.host;
+    const wf = b.addWriteFiles();
+    _ = wf.add("stub.exe", "stand-in");
+    const stub = b.createModule(.{ .root_source_file = wf.add("payload.zig",
+        \\pub const exes = .{ .{ "portal.exe", @embedFile("stub.exe") }, .{ "portalctl.exe", @embedFile("stub.exe") }, .{ "portal-show.exe", @embedFile("stub.exe") } };
+        \\pub const launchers = .{ .{ "portal-launcher.exe", @embedFile("stub.exe") }, .{ "portal-launcher-console.exe", @embedFile("stub.exe") } };
+        \\
+    ) });
+    const s = setupExe(b, target, .Debug, stub, "portal-setup-stub", false);
+    test_step.dependOn(&s.exe.step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = s.mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = firewallModule(b, target, .Debug) })).step);
+}
+
+/// The no-build-machine-paths check (src/tools/check_dist.zig, after
+/// ZVC's): its tests run in `zig build test`; the returned tool takes the
+/// binaries to check (run it from the repo: it adds the repo folder, the
+/// home folder, the Zig caches and the user's name to its needles).
+fn checkDist(b: *std.Build, test_step: *std.Build.Step) *std.Build.Step.Compile {
+    const mod = b.createModule(.{ .root_source_file = b.path("src/tools/check_dist.zig"), .target = b.graph.host, .optimize = .Debug });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
+    return b.addExecutable(.{ .name = "portal-check-dist", .root_module = mod });
 }
 
 /// `text` with CRLF line ends, for Notepad on any Windows.
