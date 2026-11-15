@@ -58,6 +58,7 @@ const fsutil = @import("fsutil.zig");
 const w = @import("win32.zig");
 const web = @import("web.zig");
 const gui = @import("gui.zig");
+const view = @import("view");
 const title = @import("title.zig");
 const workdir = @import("workdir.zig");
 const tls_server = @import("tls/server.zig");
@@ -380,6 +381,15 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
         showBox(msg, 0x10); // MB_ICONERROR
     }
     w.ExitProcess(1);
+}
+
+/// The window could not open. No usable Vulkan gets the plain-language
+/// fix for this platform (view.vulkanhelp) in the message box, with the
+/// error itself in the log; anything else is reported by name.
+fn windowFailed(io: Io, log: *Log, err: anyerror) noreturn {
+    log.print("window: cannot open ({t})", .{err});
+    if (view.vulkanhelp.message(err, view.vulkanhelp.detect(io))) |m| fatal("{s}", .{m});
+    fatal("cannot open the Portal window: {t}", .{err});
 }
 
 // ------------------------------------------------------------- data paths
@@ -1596,7 +1606,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     // configuration, so a first run, or a bad address or program, is
     // answered inside it (deskui.zig's setup panel) instead of a dialog.
     var host: ?*gui.LocalHost = null;
-    if (gui_app) host = gui.LocalHost.init(gpa, io) catch |err| fatal("cannot open the Portal window: {t}", .{err});
+    if (gui_app) host = gui.LocalHost.init(gpa, io) catch |err| windowFailed(io, &log, err);
 
     var err_buf: [512]u8 = undefined;
     var prep: Prepared = undefined;

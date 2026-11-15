@@ -432,6 +432,12 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
         // system font paths are found at run time and may differ).
         if (err == error.NoMonospaceFont)
             fatal(prog, "cannot open the window: no monospace font (tried: {s})", .{view.font.fontset.triedPaths()});
+        // No usable Vulkan: say what to install (view.vulkanhelp).
+        if (view.vulkanhelp.message(err, view.vulkanhelp.detect(io))) |m| {
+            std.log.err("window: Vulkan unavailable ({t})", .{err});
+            report("{s}", .{m});
+            std.process.exit(1);
+        }
         fatal(prog, "cannot open the window: {t}", .{err});
     };
     // The hero art while connecting (Presenter.beginSplash: ends once

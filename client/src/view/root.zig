@@ -9,6 +9,7 @@
 //!              the UI's frame and draws its draw list; window input
 //!              through the frame's hit-testing to an InputSink
 //!   images     PNG decode / scale / pack into the texture's image region
+//!   vulkanhelp the plain-language message (and fix) when Vulkan won't start
 //!   hero_png   the brand's hero art, embedded: the start-up splash
 //!   Window     the Renderer's Window module (re-exported): one window API
 //!              for Win32, Wayland and macOS
@@ -16,6 +17,8 @@
 
 pub const Presenter = @import("Presenter.zig");
 pub const images = @import("images.zig");
+/// The message for a window that cannot start Vulkan (per platform).
+pub const vulkanhelp = @import("vulkanhelp.zig");
 pub const Window = @import("Window");
 pub const font = @import("Font");
 pub const wcwidth = font.wcwidth;
@@ -29,4 +32,5 @@ pub const hero_png = @embedFile("portal_hero");
 test {
     _ = Presenter;
     _ = images;
+    _ = vulkanhelp;
 }
