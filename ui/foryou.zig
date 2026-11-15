@@ -279,6 +279,7 @@ pub const Panel = struct {
     laid: bool = false,
     laid_w: f32 = -1,
     laid_fonts: [3]u32 = .{ 0, 0, 0 },
+    laid_touch: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Panel {
         return .{ .gpa = gpa };
@@ -493,10 +494,11 @@ pub const Panel = struct {
     /// returns its height.
     pub fn layout(p: *Panel, f: cv.Fonts, colw: f32) f32 {
         const key: [3]u32 = .{ f.body.cell_h, f.small.cell_h, f.act.cell_h };
-        if (p.laid and p.laid_w == colw and std.mem.eql(u32, &key, &p.laid_fonts)) return p.height;
+        if (p.laid and p.laid_w == colw and std.mem.eql(u32, &key, &p.laid_fonts) and p.laid_touch == f.touch) return p.height;
         p.laid = true;
         p.laid_w = colw;
         p.laid_fonts = key;
+        p.laid_touch = f.touch;
         const s = f.s;
         const pad = @round(10 * s);
         const gap = @round(6 * s);
@@ -515,7 +517,8 @@ pub const Panel = struct {
             const lbl = "\u{21BA} Recap";
             const cw: f32 = @floatFromInt(f.small.cell_w);
             const bw = frame.textWidth(f.small, lbl) + 3 * cw;
-            const bh = @round(slh * 1.6);
+            // On touch a finger tall (frame.touch_target).
+            const bh = if (f.touch) @max(@round(slh * 1.6), @ceil(frame.touch_target * s)) else @round(slh * 1.6);
             const bx = colw - pad - bw;
             ch.boxes.append(p.gpa, .{ .x = bx, .y = y - @round((bh - slh) / 2), .w = bw, .h = bh, .color = theme.ui.button }) catch {};
             ch.lines.append(p.gpa, .{ .str = lbl, .x = bx + @round((bw - frame.textWidth(f.small, lbl)) / 2), .y = y + @round((slh - @as(f32, @floatFromInt(f.small.cell_h))) / 2), .font = .small, .color = theme.ui.question_head, .bold = true }) catch {};
@@ -555,7 +558,10 @@ pub const Panel = struct {
         r.boxes.clearRetainingCapacity();
         const s = f.s;
         const rpad = @round(9 * s);
-        const h1 = @max(frame.answerButtonHeight(f.act), @round(@as(f32, @floatFromInt(f.body.cell_h)) * 1.3) + 2 * @round(7 * s));
+        const h0 = @max(frame.answerButtonHeight(f.act), @round(@as(f32, @floatFromInt(f.body.cell_h)) * 1.3) + 2 * @round(7 * s));
+        // On touch a row is a finger tall (frame.touch_target): its target
+        // need not borrow from the gaps to its neighbours.
+        const h1 = if (f.touch) @max(h0, @ceil(frame.touch_target * s)) else h0;
         const warm = amber(it.kind);
         const focus = p.focus_shown and p.focus == i;
         const sc: f32 = @floatFromInt(f.small.cell_w);

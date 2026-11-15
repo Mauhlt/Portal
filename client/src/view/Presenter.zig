@@ -296,6 +296,13 @@ pub fn pollEvents(p: *Presenter, sink: input.InputSink) bool {
             // pointer; elsewhere grid rows that do not fit (handleViewEvent).
             // (iOS drags arrive as the pointer: Frame.touch.)
             .scroll => |w| if (!p.frame.wheel(w.x, w.y, w.dy, sink)) p.handleViewEvent(e),
+            // The window turned or was resized: a finger still down began
+            // in the old layout (a swipe would read the new space's points
+            // as a fling); it is cancelled before its next move.
+            .resize => |r| {
+                p.frame.layoutChanged(.{ r.width, r.height }, sink);
+                p.handleViewEvent(e);
+            },
             else => p.handleViewEvent(e),
         }
         p.dirty = true;
@@ -380,6 +387,13 @@ pub fn present(p: *Presenter) void {
         p.art_uploaded = true;
     }
     p.img.clearUploads();
+    // The swapchain follows the size this frame was laid out for: the
+    // window can change size again after its last .resize was handled (an
+    // iPhone turning lays out more than once), and a frame drawn into the
+    // old extent would stay stretched until the next event. Unchanged,
+    // this does nothing (Instanced2D.resize).
+    const built = p.frame.fb;
+    if (built[0] > 0 and built[1] > 0) renderer.resize(built[0], built[1]);
     const bg = p.frame.list.clear;
     renderer.drawFrame(.{
         @as(f32, @floatFromInt(bg[0])) / 255,

@@ -114,8 +114,9 @@ pub const Clock = struct {
     }
 };
 
-/// The fonts a layout is made with (device pixels).
-pub const Fonts = struct { body: Metrics, small: Metrics, act: Metrics, s: f32 };
+/// The fonts a layout is made with (device pixels) at `s` device px per
+/// logical px; `touch`: finger-sized targets (Overlay.touch).
+pub const Fonts = struct { body: Metrics, small: Metrics, act: Metrics, s: f32, touch: bool = false };
 
 // ------------------------------------------------------------ pure parts
 
@@ -622,7 +623,7 @@ const Geo = struct {
     }
 };
 
-const LayoutKey = struct { colw: f32 = -1, body: [2]u32 = .{ 0, 0 }, small: [2]u32 = .{ 0, 0 }, act: [2]u32 = .{ 0, 0 }, s: f32 = 0, yes_side: YesSide = .left };
+const LayoutKey = struct { colw: f32 = -1, body: [2]u32 = .{ 0, 0 }, small: [2]u32 = .{ 0, 0 }, act: [2]u32 = .{ 0, 0 }, s: f32 = 0, touch: bool = false, yes_side: YesSide = .left };
 
 /// A swipe in progress, or its animation.
 const Swipe = struct {
@@ -1035,7 +1036,7 @@ pub const View = struct {
     pub fn prepare(v: *View, r: frame.Rect, f: Fonts) void {
         const g = Geo.of(f);
         const colw = @max(1, @min(r.w - 2 * g.pad, @as(f32, @floatFromInt(f.body.cell_w * 104))));
-        const k: LayoutKey = .{ .colw = colw, .body = .{ f.body.cell_w, f.body.cell_h }, .small = .{ f.small.cell_w, f.small.cell_h }, .act = .{ f.act.cell_w, f.act.cell_h }, .s = f.s, .yes_side = v.yes_side };
+        const k: LayoutKey = .{ .colw = colw, .body = .{ f.body.cell_w, f.body.cell_h }, .small = .{ f.small.cell_w, f.small.cell_h }, .act = .{ f.act.cell_w, f.act.cell_h }, .s = f.s, .touch = f.touch, .yes_side = v.yes_side };
         if (!std.meta.eql(k, v.key)) {
             v.key = k;
             for (v.entries.items) |*e| e.laid = false;
@@ -1447,7 +1448,7 @@ pub const View = struct {
     }
 
     pub fn draw(v: *View, p: *frame.Painter, r: frame.Rect) void {
-        const f: Fonts = .{ .body = p.metrics(body_em), .small = p.metrics(small_em), .act = p.act, .s = p.s };
+        const f: Fonts = .{ .body = p.metrics(body_em), .small = p.metrics(small_em), .act = p.act, .s = p.s, .touch = p.f.touch_sized };
         v.prepare(r, f);
         v.shown_q = null;
         if (v.emptyState()) |msg| return p.message(r, msg);
@@ -1492,7 +1493,7 @@ pub const View = struct {
     /// The grabbed card's fonts and transform (a card `w` x `h` px, held
     /// `offset` px sideways at scale `k`).
     fn grabXform(v: *const View, p: *frame.Painter, f: Fonts, w: f32, h: f32, yes_no: bool, offset: f32, k: f32, shake: f32) struct { fonts: Fonts, xf: Xform } {
-        const fk: Fonts = if (k == 1) f else .{ .body = p.metrics(body_em * k), .small = p.metrics(small_em * k), .act = p.metrics(frame.action_em * k), .s = f.s };
+        const fk: Fonts = if (k == 1) f else .{ .body = p.metrics(body_em * k), .small = p.metrics(small_em * k), .act = p.metrics(frame.action_em * k), .s = f.s, .touch = f.touch };
         const need = @max(w * swipe_share, swipe_min_px * f.s);
         const tilt = std.math.clamp(offset / @max(1, w), -1.5, 1.5) * 0.12 + shake;
         return .{ .fonts = fk, .xf = .{ .dx = offset, .tilt = tilt, .k = k, .cx = w / 2, .cy = h / 2, .tint = swipeTint(offset, need, v.yes_side, yes_no) } };
