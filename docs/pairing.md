@@ -5,16 +5,29 @@ the Surface and the iPhone. Each device is paired once, approved at the
 desk. A device *is* its WireGuard key: there are no passwords, cookies or
 sign-in, and nothing secret is ever typed or copied.
 
-| Device | Package | Tunnel address | Pair name |
-|---|---|---|---|
-| Desktop (hub) | `zig-out/portal-x86_64-windows` (or `zig build release`) | `10.8.0.1` | (none: it is the desk) |
-| Snapdragon X laptop | `zig-out/portal-aarch64-windows` | `10.8.0.2` | `laptop` |
-| iPhone | the Portal app (`zig build ios`, docs/ios-native.md) | `10.8.0.3` | `iphone` |
-| Surface | `zig-out/portal-aarch64-windows` | `10.8.0.4` | `surface` |
+| Device | Installer (latest release) | Or built here | Tunnel address | Pair name |
+|---|---|---|---|---|
+| Desktop (hub) | `portal-setup-x64.exe`, **desk** | `zig build release` | `10.8.0.1` | (none: it is the desk) |
+| Snapdragon X laptop | `portal-setup-arm64.exe`, **device** | `zig-out/portal-aarch64-windows` | `10.8.0.2` | `laptop` |
+| iPhone | (none) | the Portal app (`zig build ios`, docs/ios-native.md) | `10.8.0.3` | `iphone` |
+| Surface | `portal-setup-arm64.exe`, **device** | `zig-out/portal-aarch64-windows` | `10.8.0.4` | `surface` |
+| A Mac | `Portal-mac.zip` (always a device) | `zig build mac-installer` | next free | e.g. `mac` |
 
 Addresses are given in pairing order (pair in this order to get these).
 
-## Building the packages
+## The installers
+
+Download the file for the machine from the latest release and run it
+(README, "Setup": the SmartScreen and Gatekeeper first-run steps, since
+the installers are unsigned). On Windows choose **desk** or **device**;
+everything installs for your user, without an administrator, except the
+desk's one firewall prompt. The desk installer adds the firewall rule and
+the agent hooks and starts Portal; a device installer (and the Mac app,
+which moves itself to `~/Applications`) opens straight on the pairing
+screen, so step 1 below is already done: go on with step 2 at the desk.
+Running a newer installer upgrades in place; pairings stay.
+
+## Building the packages (the manual way)
 
 ```powershell
 zig build package
@@ -29,11 +42,14 @@ has `portal.exe`, `portalctl.exe`, `portal-show.exe`, a `README.txt` and
 
 ## 1. Desktop (10.8.0.1)
 
+With `portal-setup-x64.exe` (desk), steps 2 and 3 are done by the
+installer and Settings opens with the router steps of step 1.
+
 1. **Router**: forward UDP 51820 to the desktop (docs/wireguard.md).
 2. **Firewall** (administrator, once): the one inbound UDP rule in
-   docs/wireguard.md, "Firewall". This is the only step that needs an
-   administrator.
-3. **Install**: `zig build release`, or copy `portal-x86_64-windows`.
+   docs/wireguard.md, "Firewall" (Settings → Windows Firewall, one
+   prompt). This is the only step that needs an administrator.
+3. **Install**: the installer, `zig build release`, or copy `portal-x86_64-windows`.
 4. **Start** `portal.exe` (not as administrator). On the first run set the
    **Program to run** (and the tunnel port if not 51820) and click
    **Start**. The first start creates the desk's tunnel key, the Portal CA
@@ -43,7 +59,8 @@ has `portal.exe`, `portalctl.exe`, `portal-show.exe`, a `README.txt` and
 
 ## 2. Laptop (10.8.0.2), and the Surface (10.8.0.4) the same way
 
-1. Copy `portal-aarch64-windows` to the laptop and run `portal connect`.
+1. Run `portal-setup-arm64.exe` (device) on the laptop, which opens
+   `portal connect`; or copy `portal-aarch64-windows` and run `portal connect`.
    The window shows **this device's tunnel key** and its **check code**
    (`portal connect --key` prints them too). A check code is 16
    characters in 4 groups, like `ABCD-EFGH-JKMN-PQRS` (80 bits of the

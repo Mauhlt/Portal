@@ -55,24 +55,41 @@ cannot work (ask the ISP for a public address). If the public address
 changes, use a dynamic-DNS name: devices look it up again when the desk
 stops answering.
 
-## Firewall (one rule, added once by an administrator)
+## Firewall (one rule, added with one administrator prompt)
 
 The desk's UDP socket is owned by `portal.exe`. Windows asks about it the
 first time Portal starts; an answer of "Private" leaves the Public profile
-blocked, and the desktop's internet adapter is usually Public. Add one
-inbound rule instead, in an **administrator** PowerShell, once:
+blocked, and the desktop's internet adapter is usually Public. Portal uses
+one inbound rule instead, named **Portal tunnel (WireGuard)**: UDP on the
+tunnel port, inbound, every profile, allow. Any of these adds it:
+
+* the installer (`portal-setup`, desk): one administrator prompt;
+* **Settings → Windows Firewall** (Ctrl+Shift+S): shows whether the rule
+  allows the port the tunnel listens on now (read without an
+  administrator); a click adds it, or replaces it after a port move, with
+  one administrator prompt;
+* `portalctl firewall add [--port N]` (`status` and `remove` too);
+* by hand, in an **administrator** PowerShell:
 
 ```powershell
 New-NetFirewallRule -DisplayName "Portal tunnel (WireGuard)" -Direction Inbound `
   -Protocol UDP -LocalPort 51820 -Profile Any -Action Allow
 ```
 
+The first three are the same code (src/firewall.zig): the Windows
+Firewall COM API (INetFwPolicy2), run by this release's `portalctl.exe`
+relaunched as administrator (ShellExecuteEx "runas", `--no-elevate` so
+it never asks twice). It is idempotent: a matching rule is left alone; a
+rule of that name that differs (another port, disabled, a block rule) is
+replaced. If you decline the prompt, nothing changes and Portal shows the
+command above. Portal changes the rule only when you ask, and never any
+other rule. Uninstalling the desk removes it (one prompt).
+
 It is deliberately not tied to a program (every release runs from its own
 folder) and covers all profiles: every packet on that port is checked by
-WireGuard (only paired keys' handshakes are answered at all). Use your own
-port if you changed it in Settings. Portal itself never adds, changes or
-removes firewall rules. If Windows still shows its prompt, choose Allow
-(never Cancel: that adds a Block rule, which beats the Allow rule).
+WireGuard (only paired keys' handshakes are answered at all). If Windows
+still shows its prompt, choose Allow (never Cancel: that adds a Block
+rule, which beats the Allow rule).
 
 Nothing else needs an inbound rule: there is no TCP listener on any
 adapter (8420 exists only inside the tunnel).
@@ -87,7 +104,13 @@ adapter (8420 exists only inside the tunnel).
   after a confirmation: see "Changing the port");
 * **Tunnel endpoint for devices**: `HOST:PORT` as devices reach the desk,
   e.g. `home.example.org:51820`. It goes into every pairing code; Portal
-  cannot know your public address itself;
+  cannot know your public address itself, and never asks a service on the
+  internet (privacy: no third-party lookups). While it is empty, Settings
+  opens when the desk starts and lists the router steps (above) next
+  to it, and an address on your own network or behind CGNAT is warned
+  about;
+* **Windows Firewall**: the rule's state for the live port, with Add /
+  Replace (see "Firewall");
 * the peers: every paired device with its address and key check code.
 
 `settings.txt`: `tunnel_port = 51820`, `tunnel_endpoint = home.example.org:51820`.
@@ -110,8 +133,9 @@ Only the desk changes the desk's port and endpoint (Settings, or
 `portalctl tunnel-port <port> [--endpoint HOST:PORT] --router-forwarded`).
 No device message can change, request or influence them.
 
-1. Forward the new UDP port on your router to the desktop (and allow it
-   in the firewall rule above) **before** switching. Portal never changes
+1. Forward the new UDP port on your router to the desktop **before**
+   switching; after the switch, Settings → Windows Firewall shows the rule
+   is for the old port and replaces it (one administrator prompt). Portal never changes
    the router: no UPnP, no NAT-PMP.
 2. Save Settings with the new port (and/or endpoint). The desk asks to
    confirm ("Forward UDP <new port> on your router before switching").

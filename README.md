@@ -213,7 +213,64 @@ it out.
 
 ## Setup
 
-### 0. A new machine
+### The installer (no typed commands)
+
+Download the installer for the machine from the
+[latest release](https://github.com/Mauhlt/Portal/releases/latest), run
+it, and pick what the machine is:
+
+| File | Machine |
+|---|---|
+| `portal-setup-x64.exe` | Windows on Intel or AMD: the desk (the hub), or a device |
+| `portal-setup-arm64.exe` | Windows on ARM (Snapdragon laptops, the Surface): a device |
+| `Portal-mac.zip` | a Mac, Apple silicon or Intel: always a device |
+
+The installers are **unsigned for now**, so the first run warns:
+
+* **Windows SmartScreen** ("Windows protected your PC"): choose **More
+  info**, then **Run anyway**.
+* **macOS Gatekeeper** ("cannot be opened because the developer cannot be
+  verified"): open the zip, then right-click (Control-click) Portal.app and
+  choose **Open**, then **Open** again; or System Settings → Privacy &
+  Security → **Open Anyway**.
+
+What it does, for your user only and without an administrator:
+
+* **Windows** (`portal-setup`): installs into `%LOCALAPPDATA%\Portal`, the
+  same layout `zig build release` uses (so `zig build release`,
+  `rollback` and `mark-good` keep working on it), adds a Start-menu
+  shortcut, puts `%LOCALAPPDATA%\Portal\bin` on your PATH and adds Portal
+  to Settings → Apps (Uninstall is there). An installer for the other kind
+  of PC refuses to install and names the right one.
+  * **Desk**: adds the one Windows Firewall rule (inbound UDP on the
+    tunnel port, any profile) through **one administrator prompt**; if you
+    decline, it says how to add it later (Settings → Windows Firewall, or
+    the command under "Manual setup"). It installs the agent hooks, then
+    starts Portal; Settings then walks you through the router (forward the
+    port, DHCP reservation, UPnP off, the CGNAT check) and asks for your
+    public address or dynamic-DNS name. Portal never looks it up on the
+    internet.
+  * **Device**: starts Portal on its pairing screen (`portal connect`);
+    pair it at the desk ([docs/pairing.md](docs/pairing.md)).
+* **Mac**: Portal.app moves itself to `~/Applications` on its first start
+  and opens on the pairing screen. To remove it, drag it to the Trash, or
+  run `~/Applications/Portal.app/Contents/MacOS/Portal uninstall` in
+  Terminal, which also asks whether to delete your data and this Mac's
+  tunnel key.
+
+Running a newer installer upgrades in place and keeps your devices, keys
+and settings. Uninstalling (Settings → Apps, or `portal-setup.exe
+--uninstall`) removes the program, shortcut, PATH entry and, on the desk,
+the firewall rule (one administrator prompt) and, if you agree, the agent
+hooks; it asks before deleting your data and keeps it by default.
+
+Releases are built by `.github/workflows/release.yml` (a `v*` tag, or by
+hand): `zig build test`, then `zig build installer mac-installer`, stripped
+and checked for build-machine paths, with the pinned Zig.
+
+### Manual setup (the fallback, and for development)
+
+#### 0. A new machine
 
 Install the Zig version in `build.zig.zon`'s `minimum_zig_version`
 (0.18.0-dev.1005+75d48dfff; the owner's ZVC installs a given version), then:
@@ -228,7 +285,7 @@ Every other repo comes from GitHub at a pinned commit (see Development,
 "Dependencies: pinned on GitHub"). The window needs a Vulkan driver: if there
 is none, Portal says what to install.
 
-### 1. Build a release
+#### 1. Build a release
 
 ```powershell
 zig build release
@@ -246,16 +303,20 @@ For the other Windows devices, `zig build package` writes ready-to-copy
 ReleaseSafe folders: `zig-out/portal-x86_64-windows` (the desktop) and
 `zig-out/portal-aarch64-windows` (Snapdragon X laptops, the Surface).
 Installing and pairing each device, in order:
-[docs/pairing.md](docs/pairing.md).
+[docs/pairing.md](docs/pairing.md). `zig build installer` builds the
+Windows installers (`zig-out/installer`), `zig build mac-installer` the
+Mac's `Portal-mac.zip` (on Windows too; `-Dmoltenvk-macos=<libMoltenVK.dylib>`
+bundles MoltenVK).
 
-### 2. Portal's tunnel (nothing to install)
+#### 2. Portal's tunnel (nothing to install)
 
 Portal carries its own WireGuard (the owner's Zig WireGuard, in-process: no
 WireGuard app, adapter, driver or administrator rights). See
 [docs/wireguard.md](docs/wireguard.md). One-time desk setup:
 
-1. **Firewall** (the only step that needs an administrator): in an
-   administrator PowerShell, once:
+1. **Firewall** (the only step that needs an administrator): Settings →
+   **Windows Firewall** (one administrator prompt), or `portalctl firewall
+   add`, or in an administrator PowerShell, once:
    ```powershell
    New-NetFirewallRule -DisplayName "Portal tunnel (WireGuard)" -Direction Inbound -Protocol UDP -LocalPort 51820 -Profile Any -Action Allow
    ```
@@ -377,7 +438,7 @@ reach the session):
 | Ctrl+Tab / Ctrl+Shift+Tab | click a tab | the next / previous tab |
 | Ctrl+Shift+P | Pair a device… | pair a device by the key it shows (check its check code), then show the pairing code for it |
 | Ctrl+Shift+D | Devices | paired devices with address and last use; Unpair |
-| Ctrl+Shift+S | Settings | tunnel port and endpoint (with this desktop's tunnel key and its peers), program, project, input mode for the next start; system monitor, background art and the agent integration (these apply at once) |
+| Ctrl+Shift+S | Settings | tunnel port and endpoint (with this desktop's tunnel key and its peers, the router steps while no endpoint is set, and the Windows Firewall rule: its state and an Add / Replace button), program, project, input mode for the next start; system monitor, background art and the agent integration (these apply at once) |
 | Ctrl+Shift+J | Projects | the projects paired devices may start, Ask or Plan each |
 
 Panels are keyboard driven: Tab / arrows move, Enter activates, Esc closes.
