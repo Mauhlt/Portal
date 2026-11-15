@@ -43,8 +43,11 @@ var pending: std.atomic.Value(?*Object) = .init(null);
 pub fn install(the_io: std.Io) void {
     io = the_io;
     connect.platform = .{
-        // The iPhone installs no packages: no sync worker.
-        .sync = false,
+        // The iPhone takes one package from its desk, the personal speech
+        // adapter (data, signed, never older), and sends its training
+        // samples home on the same passes (speech.zig).
+        .sync = .{ .only = speech.sync_packages },
+        .speech_sync = speech.syncHooks(),
         .on_suspend = onSuspend,
         .on_resume = onResume,
         .scan_qr = scan.start,

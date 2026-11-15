@@ -26,6 +26,8 @@ pub const model_pin = @import("model_pin.zig");
 pub const gate = @import("gate.zig");
 /// Training bundles from paired devices (the bulk channel's `put bundle`).
 pub const inbox = @import("inbox.zig");
+/// Leading and trailing silence off a clip (before stt).
+pub const trim = @import("trim.zig");
 pub const mics = @import("mics.zig");
 pub const capture = @import("capture.zig");
 pub const wasapi = @import("wasapi.zig");
@@ -40,6 +42,7 @@ test {
     _ = model_pin;
     _ = gate;
     _ = inbox;
+    _ = trim;
     _ = mics;
     _ = capture;
     _ = wasapi;

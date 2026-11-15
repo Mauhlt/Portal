@@ -71,9 +71,13 @@ pub var report_fn: ?*const fn (text: []const u8) void = null;
 /// ios) sets its own before calling `main`. Only device glue lives behind
 /// these hooks: what the viewer does with them is shared.
 pub const Platform = struct {
-    /// Run the Portal sync worker (TLS only). Off on the iPhone, which
-    /// installs no packages.
-    sync: bool = true,
+    /// The Portal sync worker (TLS only): every subscribed package with
+    /// the approval panels (desktops, laptops), or only some data packages
+    /// and no panels (the iPhone: its adapter), or none.
+    sync: SyncMode = .full,
+    /// Speech data the device exchanges with its desk on every sync pass
+    /// (after the packages): see SpeechSync.
+    speech_sync: ?SpeechSync = null,
     /// UI thread: the view went off screen (the connection is dropped
     /// meanwhile) / came back (the device may ask for Face ID first).
     on_suspend: ?*const fn () void = null,
@@ -107,6 +111,43 @@ pub const Platform = struct {
     speech: ?Speech = null,
 };
 pub var platform: Platform = .{};
+
+pub const SyncMode = union(enum) {
+    off,
+    full,
+    /// Only these packages, and only as data (sync.engine.Options.allow).
+    only: []const []const u8,
+};
+
+/// The device's own speech engine on a sync pass (the sync worker's
+/// thread calls these; each may block until that engine answers):
+///   installed   for each allowed package that is installed: its current
+///               version's folder (read-only) and version, after every
+///               pass (also when nothing changed);
+///   next_bundle the next training bundle to send home (owned, gpa), or
+///               null: nothing pending, or learning is off on the device;
+///   sent        the desk stored it: the device deletes those samples.
+/// A bundle the desk did not store stays on the device for a later pass.
+pub const SpeechSync = struct {
+    ctx: *anyopaque,
+    installed: *const fn (ctx: *anyopaque, pkg: []const u8, dir: []const u8, version: []const u8) void,
+    next_bundle: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator) ?Bundle,
+    sent: *const fn (ctx: *anyopaque, through: u32) void,
+
+    pub const Bundle = struct { bytes: []u8, through: u32 };
+};
+
+/// The running viewer's sync worker (null before it starts, or without one).
+var running_sync: std.atomic.Value(?*SyncState) = .init(null);
+
+/// Any thread: run a sync pass soon (the device's speech engine learned a
+/// correction, so there is a bundle to send home). Nothing without a
+/// sync worker.
+pub fn requestSync() void {
+    const s = running_sync.load(.acquire) orelse return;
+    _ = s.shared.sync_gen.fetchAdd(1, .release);
+    s.shared.sync_wake.set(s.io());
+}
 
 /// A device's own dictation: `dictation` is the shell's 🎤 (start, stop,
 /// cancel; ui/shell.zig), and `frame` (UI thread, every frame, before the
@@ -562,8 +603,11 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     // Portal sync (docs/sync-design.md): a worker that runs a pass on
     // every (re)connect and {"t":"updates"}; only over TLS, where the
     // release key was pinned at pairing.
-    if (platform.sync) {
-        if (std.Thread.spawn(.{}, SyncState.run, .{sync_state})) |t| t.detach() else |_| {}
+    if (platform.sync != .off) {
+        if (std.Thread.spawn(.{}, SyncState.run, .{sync_state})) |t| {
+            t.detach();
+            running_sync.store(sync_state, .release);
+        } else |_| {}
     }
     host_ui.pin_fp_len = x509check.formatFingerprint(code.ca_sha256, &host_ui.pin_fp_buf).len;
     tv.setLiveRedraw(host_ui, Host.liveRedraw);
@@ -595,7 +639,7 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
         // worker and no sync store, so here).
         if (!gone_handled and shared.desktop_gone.load(.acquire)) {
             gone_handled = true;
-            if (platform.sync) {
+            if (platform.sync != .off) {
                 sync_state.forget_gone.store(true, .release);
                 sync_state.pending.store(@backingInt(SyncState.Op.forget), .release);
                 shared.sync_wake.set(io);
@@ -755,8 +799,14 @@ const SyncState = struct {
         var approvals: [sync.ui.max_marks]sync.engine.Approval = undefined;
         var marks: [sync.ui.max_marks]sync.ui.Mark = undefined;
         var opts: sync.engine.Options = .{ .client_version = client_version, .between = .{ .ctx = s, .f = between } };
+        const allow: ?[]const []const u8 = switch (platform.sync) {
+            .only => |list| list,
+            else => null,
+        };
+        opts.allow = allow;
         s.mutex.lockUncancelable(s.io());
-        if (s.shared.just_paired.swap(false, .acq_rel)) s.ui.startVoiceOffer();
+        // The voice offer is for devices that install the voice packages.
+        if (s.shared.just_paired.swap(false, .acq_rel) and allow == null) s.ui.startVoiceOffer();
         s.ui.setDesktop(host, pinned);
         const n_marks = s.ui.n_approved;
         @memcpy(marks[0..n_marks], s.ui.approved[0..n_marks]);
@@ -767,14 +817,42 @@ const SyncState = struct {
         defer s.client.gpa.destroy(rep);
         rep.* = .{};
         const rem = s.client.syncRemote();
-        sync.engine.run(&rem, st, pinned, opts, rep, .{ .f = logLine }) catch |err| {
+        const ok = if (sync.engine.run(&rem, st, pinned, opts, rep, .{ .f = logLine })) |_| true else |err| blk: {
             std.debug.print("portal connect: sync: {s}\n", .{sync.engine.describe(err)});
-            return;
+            break :blk false;
         };
-        s.mutex.lockUncancelable(s.io());
-        s.ui.setReport(rep);
-        s.mutex.unlock(s.io());
-        s.refreshRows(st);
+        if (ok) {
+            s.mutex.lockUncancelable(s.io());
+            s.ui.setReport(rep);
+            s.mutex.unlock(s.io());
+            s.refreshRows(st);
+        }
+        if (platform.speech_sync) |sp| s.speechSync(sp, st, allow orelse &.{}, &rem);
+    }
+
+    /// After the packages: the device's speech engine learns of the
+    /// installed adapter, and its training bundles go home one at a time
+    /// (each deleted on the device only once the desk stored it). At most
+    /// `max_bundles` a pass; the next pass (a reconnect, the desk's
+    /// updates, a new correction) goes on.
+    fn speechSync(s: *SyncState, sp: SpeechSync, st: *sync.store.Store, allowed: []const []const u8, rem: *const sync.engine.Remote) void {
+        for (allowed) |pkg| {
+            const cur = (st.current(pkg) catch null) orelse continue;
+            var pb: [pin_mod.max_path]u8 = undefined;
+            const dir = st.path(&pb, &.{ "packages", pkg, cur.version() }) catch continue;
+            sp.installed(sp.ctx, pkg, dir, cur.version());
+        }
+        const Put = struct {
+            rem: *const sync.engine.Remote,
+            pub fn put(p: @This(), bytes: []const u8) anyerror!u16 {
+                return sync.engine.putBundle(p.rem, bytes);
+            }
+        };
+        const r = sendSamples(sp, s.client.gpa, Put{ .rem = rem }, max_bundles_per_pass);
+        if (r.failed) |err| std.debug.print("portal connect: speech: sending samples home failed: {t}\n", .{err});
+        // Kept on the device for a later pass (403: learning is off at the
+        // desk, 404: no speech there, 503: busy, ...).
+        if (r.refused != 0) std.debug.print("portal connect: speech: the desk did not take the samples ({d}); kept here\n", .{r.refused});
     }
 
     /// Between two packages of a pass: a posted rollback / revoke runs now
@@ -944,6 +1022,107 @@ const SyncState = struct {
         s.redraw();
     }
 };
+
+pub const max_bundles_per_pass = 16;
+
+pub const SendReport = struct {
+    /// Bundles the desk stored (and the device then deleted).
+    stored: usize = 0,
+    /// The desk's code for the bundle it did not take (0: none refused).
+    refused: u16 = 0,
+    failed: ?anyerror = null,
+};
+
+/// The device's training bundles home, oldest first, at most `max`: each
+/// is deleted on the device (`sent`) only after the desk answered 200; the
+/// first refusal or failure ends the pass and that bundle stays. `dst`
+/// has `put(bytes) !u16` (sync.engine.putBundle on a real pass).
+pub fn sendSamples(sp: SpeechSync, gpa: std.mem.Allocator, dst: anytype, max: usize) SendReport {
+    var r: SendReport = .{};
+    for (0..max) |_| {
+        const b = sp.next_bundle(sp.ctx, gpa) orelse break;
+        defer gpa.free(b.bytes);
+        const code = dst.put(b.bytes) catch |err| {
+            r.failed = err;
+            break;
+        };
+        if (code != 200) {
+            r.refused = code;
+            break;
+        }
+        sp.sent(sp.ctx, b.through);
+        r.stored += 1;
+    }
+    return r;
+}
+
+/// A device's sample queue for the tests: `pending` samples, one per
+/// bundle; nothing with learning off.
+const FakeSamples = struct {
+    pending: u32,
+    sent_through: u32 = 0,
+    learning: bool = true,
+    fn next(ctx: *anyopaque, gpa: std.mem.Allocator) ?SpeechSync.Bundle {
+        const q: *FakeSamples = @ptrCast(@alignCast(ctx));
+        if (!q.learning or q.sent_through >= q.pending) return null;
+        const id = q.sent_through + 1;
+        const bytes = std.fmt.allocPrint(gpa, "sample {d}", .{id}) catch return null;
+        return .{ .bytes = bytes, .through = id };
+    }
+    fn sent(ctx: *anyopaque, through: u32) void {
+        const q: *FakeSamples = @ptrCast(@alignCast(ctx));
+        q.sent_through = through;
+    }
+    fn installed(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) void {}
+    fn hooks(q: *FakeSamples) SpeechSync {
+        return .{ .ctx = q, .installed = installed, .next_bundle = next, .sent = sent };
+    }
+};
+
+const FakeDesk = struct {
+    codes: []const u16,
+    got: *usize,
+    pub fn put(d: @This(), bytes: []const u8) anyerror!u16 {
+        if (!std.mem.startsWith(u8, bytes, "sample ")) return error.Unexpected;
+        const i = d.got.*;
+        d.got.* += 1;
+        return if (i < d.codes.len) d.codes[i] else error.ConnectionClosed;
+    }
+};
+
+test "samples home: deleted only once the desk stored them; a refusal keeps the rest; learning off sends nothing" {
+    const gpa = std.testing.allocator;
+    var got: usize = 0;
+    var q: FakeSamples = .{ .pending = 3 };
+    var r = sendSamples(q.hooks(), gpa, FakeDesk{ .codes = &.{ 200, 503 }, .got = &got }, max_bundles_per_pass);
+    try std.testing.expectEqual(@as(usize, 1), r.stored);
+    try std.testing.expectEqual(@as(u16, 503), r.refused);
+    try std.testing.expectEqual(@as(u32, 1), q.sent_through); // samples 2 and 3 stay
+    // The next pass picks up where it stopped.
+    got = 0;
+    r = sendSamples(q.hooks(), gpa, FakeDesk{ .codes = &.{ 200, 200, 200 }, .got = &got }, max_bundles_per_pass);
+    try std.testing.expectEqual(@as(usize, 2), r.stored);
+    try std.testing.expectEqual(@as(u32, 3), q.sent_through);
+    // A connection lost mid-way: nothing deleted for that bundle.
+    var q2: FakeSamples = .{ .pending = 2 };
+    got = 0;
+    r = sendSamples(q2.hooks(), gpa, FakeDesk{ .codes = &.{}, .got = &got }, max_bundles_per_pass);
+    try std.testing.expect(r.failed != null);
+    try std.testing.expectEqual(@as(u32, 0), q2.sent_through);
+    // Learning off: no bundle at all, the desk is never asked.
+    var off: FakeSamples = .{ .pending = 5, .learning = false };
+    got = 0;
+    r = sendSamples(off.hooks(), gpa, FakeDesk{ .codes = &.{200}, .got = &got }, max_bundles_per_pass);
+    try std.testing.expectEqual(@as(usize, 0), got);
+    try std.testing.expectEqual(@as(usize, 0), r.stored);
+    // At most `max` a pass.
+    var many: FakeSamples = .{ .pending = 40 };
+    const all_ok: [40]u16 = @splat(200);
+    got = 0;
+    r = sendSamples(many.hooks(), gpa, FakeDesk{ .codes = &all_ok, .got = &got }, 4);
+    try std.testing.expectEqual(@as(usize, 4), r.stored);
+    try std.testing.expectEqual(@as(u32, 4), many.sent_through);
+}
 
 /// What forgetting a desktop removed.
 pub const Forgotten = struct {
