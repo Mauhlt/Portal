@@ -142,6 +142,11 @@ pub const Options = struct {
     approved: []const Approval = &.{},
     /// Restrict the pass to one package.
     only: ?[]const u8 = null,
+    /// The only packages this device accepts at all (null: any). The
+    /// iPhone takes `stt-adapter` alone: every other line of the index is
+    /// skipped unfetched, and a manifest naming another package, or any
+    /// executable, is refused even after its signature verified.
+    allow: ?[]const []const u8 = null,
     /// Packages to offer instead of installing (the app's "Install voice
     /// model?" right after pairing): reported as `.offered`.
     hold: []const []const u8 = &.{},
@@ -261,6 +266,7 @@ pub fn run(r: *const Remote, st: *store_mod.Store, pinned: keypin.Key, opts: Opt
     const entries = try manifest.parseIndex(idx.body, &entries_buf);
     for (entries) |e| {
         if (opts.only) |o| if (!std.mem.eql(u8, o, e.package)) continue;
+        if (opts.allow) |a| if (!listed(a, e.package)) continue;
         if (opts.between) |h| h.f(h.ctx);
         const it = &rep.items[rep.n];
         rep.n += 1;
@@ -298,27 +304,51 @@ pub fn describe(err: anyerror) []const u8 {
     };
 }
 
+fn listed(list: []const []const u8, pkg: []const u8) bool {
+    for (list) |p| if (std.mem.eql(u8, p, pkg)) return true;
+    return false;
+}
+
 fn passOne(r: *const Remote, st: *store_mod.Store, pinned: keypin.Key, opts: Options, e: manifest.IndexEntry, it: *Item) !void {
     var resp = try get(r, .{ .manifest = .{ .id = e.package, .version = e.version } }, .{ .collect = manifest.max_manifest_bytes });
     defer resp.deinit(r.gpa);
     if (resp.status != 200) return error.ManifestRefused;
-    const sig = resp.sig orelse return error.NoSignature;
+    var m = (try vet(r.gpa, st, pinned, opts, e, resp.body, resp.sig, it)) orelse return;
+    defer m.deinit(r.gpa);
+    var src: FileSource = .{ .r = r, .package = e.package, .version = e.version };
+    const res = try st.install(&m, resp.body, resp.sig.?, &src);
+    it.outcome = .installed;
+    if (res.kept_in_use > 0) it.setDetail("kept {d} older version(s) still in use", .{res.kept_in_use});
+}
+
+/// Steps 2-4 for one index line and the manifest the desktop sent for it
+/// (nothing fetched or written): the manifest to install (the caller
+/// frees it), or null with the item's outcome set (up to date, refused,
+/// held, waiting for approval). Errors mean rejected.
+pub fn vet(gpa: Allocator, st: *const store_mod.Store, pinned: keypin.Key, opts: Options, e: manifest.IndexEntry, body: []const u8, sig_opt: ?[manifest.signature_len]u8, it: *Item) !?manifest.Manifest {
+    const sig = sig_opt orelse return error.NoSignature;
     var digest: [32]u8 = undefined;
-    Sha256.hash(resp.body, &digest, .{});
+    Sha256.hash(body, &digest, .{});
     if (!std.mem.eql(u8, &digest, &e.manifest_sha256)) return error.ManifestMismatch;
     // The signature first: nothing else is interpreted from unsigned bytes.
-    try manifest.verify(resp.body, sig, pinned);
-    var m = try manifest.parse(r.gpa, resp.body);
-    defer m.deinit(r.gpa);
+    try manifest.verify(body, sig, pinned);
+    var m = try manifest.parse(gpa, body);
+    var keep = false;
+    defer if (!keep) m.deinit(gpa);
     if (!std.mem.eql(u8, m.package, e.package) or !std.mem.eql(u8, m.version, e.version) or
         m.sequence != e.sequence or m.kind != e.kind or m.totalSize() != e.size) return error.ManifestMismatch;
+    if (opts.allow) |a| if (!listed(a, m.package) or m.kind != .data) {
+        it.outcome = .refused;
+        it.setDetail("not accepted on this device", .{});
+        return null;
+    };
 
     const offer = try st.checkOffer(&m, opts.client_version);
     switch (offer) {
         .install => {},
         .up_to_date => {
             it.outcome = .up_to_date;
-            return;
+            return null;
         },
         else => {
             it.outcome = .refused;
@@ -329,23 +359,21 @@ fn passOne(r: *const Remote, st: *store_mod.Store, pinned: keypin.Key, opts: Opt
                 .over_quota => "not enough sync quota left on this device",
                 else => "refused",
             }});
-            return;
+            return null;
         },
     }
     for (opts.hold) |held| if (std.mem.eql(u8, held, m.package)) {
         it.outcome = .offered;
         it.setDetail("offered: waiting for your answer", .{});
-        return;
+        return null;
     };
     if (m.kind == .executable and !approvedFor(opts, &m, digest)) {
         it.outcome = .pending_approval;
         it.setDetail("waiting for approval on this device", .{});
-        return;
+        return null;
     }
-    var src: FileSource = .{ .r = r, .package = e.package, .version = e.version };
-    const res = try st.install(&m, resp.body, sig, &src);
-    it.outcome = .installed;
-    if (res.kept_in_use > 0) it.setDetail("kept {d} older version(s) still in use", .{res.kept_in_use});
+    keep = true;
+    return m;
 }
 
 fn approvedFor(opts: Options, m: *const manifest.Manifest, digest: [32]u8) bool {
@@ -354,4 +382,155 @@ fn approvedFor(opts: Options, m: *const manifest.Manifest, digest: [32]u8) bool 
         if (std.mem.eql(u8, a.package, m.package) and a.sequence == m.sequence and std.mem.eql(u8, &a.manifest_sha256, &digest)) return true;
     }
     return false;
+}
+
+// ------------------------------------------------------------------ tests
+
+const testing = std.testing;
+
+/// A signed test package (one file) and its index line.
+const TestOffer = struct {
+    file: [1]manifest.File,
+    m: manifest.Manifest,
+    bytes: []u8,
+    sig: [manifest.signature_len]u8,
+
+    fn make(gpa: Allocator, kp: manifest.Ed25519.KeyPair, pkg: []const u8, ver: []const u8, seq: u64, kind: manifest.Kind, content: []const u8) !*TestOffer {
+        const t = try gpa.create(TestOffer);
+        errdefer gpa.destroy(t);
+        var d: [32]u8 = undefined;
+        Sha256.hash(content, &d, .{});
+        t.file = .{.{ .path = "adapter.bin", .size = content.len, .sha256 = d }};
+        t.m = .{ .package = pkg, .version = ver, .kind = kind, .sequence = seq, .created = 1, .min_client = "0.1.0", .files = &t.file };
+        t.bytes = try manifest.encode(gpa, &t.m);
+        t.sig = try manifest.sign(kp, t.bytes);
+        return t;
+    }
+
+    fn entry(t: *const TestOffer) manifest.IndexEntry {
+        var d: [32]u8 = undefined;
+        Sha256.hash(t.bytes, &d, .{});
+        return .{ .package = t.m.package, .version = t.m.version, .sequence = t.m.sequence, .kind = t.m.kind, .size = t.m.totalSize(), .manifest_sha256 = d };
+    }
+
+    fn destroy(t: *TestOffer, gpa: Allocator) void {
+        gpa.free(t.bytes);
+        gpa.destroy(t);
+    }
+};
+
+const OneFile = struct {
+    content: []const u8,
+    pub fn fetch(src: *OneFile, _: usize, sink: *store_mod.FileSink) !void {
+        try sink.write(src.content);
+    }
+};
+
+/// The iPhone's acceptance: `stt-adapter` data only, signed by the pinned
+/// key, never an older sequence.
+const phone: Options = .{ .client_version = "0.1.0", .allow = &.{"stt-adapter"} };
+
+fn testStore(gpa: Allocator, tmp: *testing.TmpDir, signer: [32]u8) !store_mod.Store {
+    const io = testing.io;
+    var abs_buf: [1024]u8 = undefined;
+    const n = try Io.Dir.cwd().realPath(io, &abs_buf);
+    const sep = std.fs.path.sep_str;
+    const root = try std.fmt.allocPrint(gpa, "{s}" ++ sep ++ ".zig-cache" ++ sep ++ "tmp" ++ sep ++ "{s}", .{ abs_buf[0..n], &tmp.sub_path });
+    errdefer gpa.free(root);
+    return store_mod.Store.open(gpa, io, root, manifest.fingerprint(signer));
+}
+
+/// vet, then install what it accepts.
+fn tryOffer(gpa: Allocator, st: *store_mod.Store, pinned: keypin.Key, opts: Options, t: *const TestOffer, content: []const u8, it: *Item) !Outcome {
+    it.* = .{};
+    var m = (try vet(gpa, st, pinned, opts, t.entry(), t.bytes, t.sig, it)) orelse return it.outcome;
+    defer m.deinit(gpa);
+    var src: OneFile = .{ .content = content };
+    _ = try st.install(&m, t.bytes, t.sig, &src);
+    return .installed;
+}
+
+test "iPhone acceptance: a signed stt-adapter installs; another package, an executable, a bad signature or an older sequence is refused" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const kp = try manifest.Ed25519.KeyPair.generateDeterministic(@splat(3));
+    const pinned = kp.public_key.toBytes();
+    var st = try testStore(gpa, &tmp, pinned);
+    defer gpa.free(st.root);
+    var it: Item = .{};
+
+    const v2 = try TestOffer.make(gpa, kp, "stt-adapter", "2", 2, .data, "STTUPD01 two");
+    defer v2.destroy(gpa);
+    try testing.expectEqual(Outcome.installed, try tryOffer(gpa, &st, pinned, phone, v2, "STTUPD01 two", &it));
+    try testing.expectEqualStrings("2", (try st.current("stt-adapter")).?.version());
+    try testing.expectEqual(Outcome.up_to_date, try tryOffer(gpa, &st, pinned, phone, v2, "STTUPD01 two", &it));
+
+    // Rollback protection: an older (or the same) sequence never installs.
+    const v1 = try TestOffer.make(gpa, kp, "stt-adapter", "1", 1, .data, "STTUPD01 one");
+    defer v1.destroy(gpa);
+    try testing.expectEqual(Outcome.refused, try tryOffer(gpa, &st, pinned, phone, v1, "STTUPD01 one", &it));
+    try testing.expect(std.mem.startsWith(u8, it.detail(), "downgrade"));
+    const replay = try TestOffer.make(gpa, kp, "stt-adapter", "2b", 2, .data, "STTUPD01 again");
+    defer replay.destroy(gpa);
+    try testing.expectEqual(Outcome.refused, try tryOffer(gpa, &st, pinned, phone, replay, "STTUPD01 again", &it));
+    try testing.expectEqualStrings("2", (try st.current("stt-adapter")).?.version());
+
+    // Any other package, even signed by the pinned key: refused, nothing written.
+    const model = try TestOffer.make(gpa, kp, "stt-model", "9", 9, .data, "weights");
+    defer model.destroy(gpa);
+    try testing.expectEqual(Outcome.refused, try tryOffer(gpa, &st, pinned, phone, model, "weights", &it));
+    try testing.expectEqualStrings("not accepted on this device", it.detail());
+    try testing.expect((try st.current("stt-model")) == null);
+    // An executable under the adapter package name.
+    const exe = try TestOffer.make(gpa, kp, "stt-adapter", "3", 3, .executable, "MZ");
+    defer exe.destroy(gpa);
+    try testing.expectEqual(Outcome.refused, try tryOffer(gpa, &st, pinned, phone, exe, "MZ", &it));
+
+    // Signed by another key: rejected before anything is parsed.
+    const other = try manifest.Ed25519.KeyPair.generateDeterministic(@splat(4));
+    const forged = try TestOffer.make(gpa, other, "stt-adapter", "4", 4, .data, "STTUPD01 forged");
+    defer forged.destroy(gpa);
+    try testing.expectError(error.BadSignature, tryOffer(gpa, &st, pinned, phone, forged, "STTUPD01 forged", &it));
+    // Tampered after signing, no signature, or an index line that lies.
+    const v5 = try TestOffer.make(gpa, kp, "stt-adapter", "5", 5, .data, "STTUPD01 five");
+    defer v5.destroy(gpa);
+    var bad_sig = v5.sig;
+    bad_sig[0] ^= 1;
+    try testing.expectError(error.BadSignature, vet(gpa, &st, pinned, phone, v5.entry(), v5.bytes, bad_sig, &it));
+    try testing.expectError(error.NoSignature, vet(gpa, &st, pinned, phone, v5.entry(), v5.bytes, null, &it));
+    var lie = v5.entry();
+    lie.sequence = 50;
+    try testing.expectError(error.ManifestMismatch, vet(gpa, &st, pinned, phone, lie, v5.bytes, v5.sig, &it));
+    lie = v5.entry();
+    lie.manifest_sha256[0] ^= 1;
+    try testing.expectError(error.ManifestMismatch, vet(gpa, &st, pinned, phone, lie, v5.bytes, v5.sig, &it));
+    // A file that is not what the signed manifest says: nothing changes.
+    {
+        var m5 = (try vet(gpa, &st, pinned, phone, v5.entry(), v5.bytes, v5.sig, &it)).?;
+        defer m5.deinit(gpa);
+        var wrong: OneFile = .{ .content = "STTUPD01 fivX" };
+        try testing.expectError(error.HashMismatch, st.install(&m5, v5.bytes, v5.sig, &wrong));
+    }
+    try testing.expectEqualStrings("2", (try st.current("stt-adapter")).?.version());
+    // The newer one, intact, installs.
+    try testing.expectEqual(Outcome.installed, try tryOffer(gpa, &st, pinned, phone, v5, "STTUPD01 five", &it));
+    try testing.expectEqualStrings("5", (try st.current("stt-adapter")).?.version());
+}
+
+test "without an allow list every package is vetted as before" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const kp = try manifest.Ed25519.KeyPair.generateDeterministic(@splat(5));
+    const pinned = kp.public_key.toBytes();
+    var st = try testStore(gpa, &tmp, pinned);
+    defer gpa.free(st.root);
+    var it: Item = .{};
+    const model = try TestOffer.make(gpa, kp, "stt-model", "1", 1, .data, "weights");
+    defer model.destroy(gpa);
+    try testing.expectEqual(Outcome.installed, try tryOffer(gpa, &st, pinned, .{ .client_version = "0.1.0" }, model, "weights", &it));
+    const exe = try TestOffer.make(gpa, kp, "npu-probe", "1", 1, .executable, "MZ");
+    defer exe.destroy(gpa);
+    try testing.expectEqual(Outcome.pending_approval, try tryOffer(gpa, &st, pinned, .{ .client_version = "0.1.0" }, exe, "MZ", &it));
 }
