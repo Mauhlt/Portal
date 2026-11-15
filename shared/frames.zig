@@ -40,6 +40,9 @@ pub const Prefix = enum(u8) {
     item = 'i',
     /// `r:recap <tab id>`: ask a tab for a recap (recap.zig).
     recap = 'r',
+    /// `d:platform <name>`: what kind of machine the device is, once after
+    /// `hello` (platform.zig). Not answered.
+    device = 'd',
 };
 
 pub const Frame = struct { prefix: Prefix, rest: []const u8 };

@@ -11,6 +11,7 @@
 //!   home      the desktop engine: stt.Home on the GPU in-process, one
 //!             deadline-driven waiter thread (x86_64 Windows builds only)
 //!   local     the laptop engine: stt-local as a child process, protocol 1
+//!             (launched, supervised and restarted after a crash)
 //!
 //! Portal does no audio-format work of its own: the WAV handed to stt is
 //! encoded by ../Audio, and transcription is stt's.
@@ -32,6 +33,8 @@ pub const mics = @import("mics.zig");
 pub const capture = @import("capture.zig");
 pub const wasapi = @import("wasapi.zig");
 pub const local = @import("local.zig");
+/// What the stt-adapter package holds (an update or a raw adapter).
+pub const adapter_pkg = @import("adapter_pkg.zig");
 /// stt.Home in-process: only where it is linked (the x86_64 desktop).
 pub const has_home = options.home;
 pub const home = if (options.home) @import("home.zig") else struct {};
@@ -47,5 +50,6 @@ test {
     _ = capture;
     _ = wasapi;
     _ = local;
+    _ = adapter_pkg;
     if (options.home) _ = @import("tests.zig");
 }

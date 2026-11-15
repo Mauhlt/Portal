@@ -386,12 +386,14 @@ mutates the store, so a rollback can't race an install or prune.
 
 ### Deferred
 
-* Running installed programs (e.g. launching `npu-probe` from Packages):
-  nothing runs packages yet.
+* Running installed programs other than stt-local (e.g. `npu-probe` from
+  Packages). stt-local runs as the laptop's speech engine
+  (docs/stt-sync-contract.md, "Portal's side on the laptop").
 * Self-update of `portal-client` through sync, and publishing other
-  packages from the desk window (`portalctl publish`; the one exception
-  is the trained `stt-adapter`, which the desk publishes by itself, newest
-  3 kept: docs/stt-sync-contract.md).
+  packages from the desk window (`portalctl publish`; the exceptions are
+  the voice packages, which the desk publishes by itself, newest 3 kept:
+  the trained `stt-adapter`, and `stt-local` and `stt-model` after
+  `zig build release`: docs/stt-sync-contract.md).
 * Quotas are fixed (8 GiB per version, 32 GiB per desktop); no setting yet.
 * Approvals given in the app are kept in memory for the run (an
   approved manifest installs at once, so nothing more is needed); a

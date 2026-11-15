@@ -34,6 +34,7 @@
 //!   foryou   For-you cards per tab (foryou message, i: frames, item answer)
 //!   recap    asking a tab for a recap (r: frame, recap answer)
 //!   planusage the plan-usage bar (usage message: week / five-hour limits)
+//!   platform a device's OS and CPU (d:platform frame), for its packages
 
 pub const screen = @import("screen.zig");
 pub const ws = @import("ws.zig");
@@ -56,6 +57,7 @@ pub const frames = @import("frames.zig");
 pub const foryou = @import("foryou.zig");
 pub const recap = @import("recap.zig");
 pub const planusage = @import("planusage.zig");
+pub const platform = @import("platform.zig");
 
 test {
     _ = screen;
@@ -79,4 +81,5 @@ test {
     _ = foryou;
     _ = recap;
     _ = planusage;
+    _ = platform;
 }
