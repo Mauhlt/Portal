@@ -35,7 +35,7 @@
 //! Keychain group shared by app and extension, the packet-tunnel
 //! entitlement on both with the tunnel), sign every dylib/framework in
 //! Frameworks/, then the extension, then the app (which seals every other
-//! file as a resource: Info.plist, the icons, stt/ggml-tiny.en.bin,
+//! file as a resource: Info.plist, the icons, stt/ggml-base.en.bin,
 //! Licenses.txt), verify; with --install install it on the iPhone (and
 //! with --launch start it).
 //!

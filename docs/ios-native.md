@@ -447,7 +447,7 @@ downloads the dictation model (148 MB, src/speech/model_pin.zig).
    `Portal.app/embedded.mobileprovision` and the extension's at
    `Portal.app/PlugIns/PortalTunnel.appex/embedded.mobileprovision`,
    clears extended attributes, and signs Frameworks/, the extension, then
-   the app (sealing Info.plist, the icons, `stt/ggml-tiny.en.bin` and
+   the app (sealing Info.plist, the icons, `stt/ggml-base.en.bin` and
    `Licenses.txt` as resources) with development entitlements:
    `application-identifier` (`<team>.<bundle id>`, resp. `.tunnel`),
    `com.apple.developer.team-identifier`, `get-task-allow`, one

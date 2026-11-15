@@ -403,13 +403,24 @@ pub fn present(p: *Presenter) void {
     const built = p.frame.fb;
     if (built[0] > 0 and built[1] > 0) renderer.resize(built[0], built[1]);
     const bg = p.frame.list.clear;
-    renderer.drawFrame(.{
+    const clear: [4]f32 = .{
         @as(f32, @floatFromInt(bg[0])) / 255,
         @as(f32, @floatFromInt(bg[1])) / 255,
         @as(f32, @floatFromInt(bg[2])) / 255,
         1,
-    }, p.instances.items) catch |err| std.log.warn("draw failed: {t}", .{err});
-    p.dirty = false;
+    };
+    // A frame the renderer skipped (swapchain out of date, e.g. mid-rotation)
+    // is drawn once more right away: the swapchain is recreated at the start
+    // of the next call, and no later event may come to redraw it.
+    var shown: Instanced2D.Presented = .skipped;
+    for (0..2) |_| {
+        shown = renderer.drawFrame(clear, p.instances.items) catch |err| blk: {
+            std.log.warn("draw failed: {t}", .{err});
+            break :blk .presented; // an error is logged, not retried
+        };
+        if (shown == .presented) break;
+    }
+    p.dirty = shown == .skipped;
     p.syncNativeField();
 }
 
