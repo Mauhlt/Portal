@@ -194,8 +194,14 @@ pub fn build(b: *std.Build) void {
 
     // Speech input: the microphone thread with a fake backend, the
     // selection rules, and (with an NVIDIA GPU and ../SpeechToText's model)
-    // a recording through stt.Home.
-    const speech_tests = b.addRunArtifact(b.addTest(.{ .root_module = speechModule(b, target, optimize) }));
+    // a recording through stt.Home; the laptop engine's protocol client
+    // against a fake stt-local (src/speech/fake_stt_local.zig).
+    const fake_stt_local = b.addExecutable(.{ .name = "fake-stt-local", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/speech/fake_stt_local.zig"),
+        .target = target,
+        .optimize = .Debug,
+    }) });
+    const speech_tests = b.addRunArtifact(b.addTest(.{ .root_module = speechModuleWith(b, target, optimize, fake_stt_local.getEmittedBin()) }));
     test_step.dependOn(&speech_tests.step);
     b.step("test-speech", "Run only the speech module's tests").dependOn(&speech_tests.step);
     // A manual check of the real microphone (never part of `test`).
@@ -214,6 +220,7 @@ pub fn build(b: *std.Build) void {
     const stt_sdk = b.option([]const u8, "sdk", "stt-local for aarch64-windows: the QAIRT/QNN SDK root (else QNN_SDK_ROOT)");
     const stt_local = b.dependency("stt", .{ .target = target, .optimize = .fast, .sdk = stt_sdk }).artifact("stt-local");
     b.step("stt-local", "Build stt-local (the laptop speech engine) into zig-out/bin").dependOn(&b.addInstallArtifact(stt_local, .{}).step);
+    addVoicePackages(b, stt_sdk);
     addE2e(b, target, optimize, gui_mods, ctl_exe, show_exe);
     addIos(b, optimize, test_step);
     addBrand(b, test_step);
@@ -700,12 +707,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     // macOS). `zig build test` links it so it cannot rot.
     // The model download (one pinned file) and the release check of the
     // built executables (stripped, no build-machine paths), with tests.
-    const fetch_tool = b.addExecutable(.{ .name = "fetch-file", .root_module = b.createModule(.{
-        .root_source_file = b.path("src/tools/fetch_file.zig"),
-        .target = b.graph.host,
-        .optimize = .ReleaseSafe,
-    }) });
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fetch_tool.root_module })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fetchTool(b).root_module })).step);
     const macho_tool = b.addExecutable(.{ .name = "machocheck", .root_module = b.createModule(.{
         .root_source_file = b.path("src/tools/machocheck.zig"),
         .target = b.graph.host,
@@ -797,11 +799,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     }
     // The dictation model (speech.zig `model_name`) and the notices of what
     // the app bundles (docs/ios-licenses.txt).
-    const model_file: std.Build.LazyPath = if (model_path) |p| .{ .cwd_relative = p } else blk: {
-        const f = b.addRunArtifact(fetch_tool);
-        f.addArgs(&.{ model_pin.url, model_pin.sha256_hex, b.fmt("{d}", .{model_pin.size}) });
-        break :blk f.addOutputFileArg(model_pin.file_name);
-    };
+    const model_file: std.Build.LazyPath = if (model_path) |p| .{ .cwd_relative = p } else pinnedModel(b);
     _ = app.addCopyFile(model_file, "Portal.app/stt/" ++ model_pin.file_name);
     _ = app.addCopyFile(b.path("docs/ios-licenses.txt"), "Portal.app/Licenses.txt");
     if (std.mem.endsWith(u8, std.mem.trimEnd(u8, mvk, "/"), ".framework")) {
@@ -1005,12 +1003,19 @@ fn infoPlist(b: *std.Build, bundle_id: []const u8) []const u8 {
 /// always built ReleaseFast (inference is ~100x slower in Debug). "Audio"
 /// is the instance stt itself uses (one module per compilation).
 fn speechModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return speechModuleWith(b, target, optimize, null);
+}
+
+/// The speech module; its tests get `fake_stt_local` (the fake program
+/// the laptop engine's tests run; "" elsewhere).
+fn speechModuleWith(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, fake_stt_local: ?std.Build.LazyPath) *std.Build.Module {
     const home = target.result.os.tag == .windows and target.result.cpu.arch == .x86_64;
     const stt_dep = b.dependency("stt", .{ .target = target, .optimize = .fast });
     const opts = b.addOptions();
     opts.addOption(bool, "home", home);
     // Tests read its testdata and models (skipped when missing).
     opts.addOptionPathUntracked("stt_dir", stt_dep.path("."));
+    if (fake_stt_local) |p| opts.addOptionPath("fake_stt_local", p) else opts.addOption([]const u8, "fake_stt_local", "");
     const m = b.createModule(.{
         .root_source_file = b.path("src/speech/root.zig"),
         .target = target,
@@ -1019,5 +1024,50 @@ fn speechModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     m.addOptions("speech_options", opts);
     m.addImport("Audio", stt_dep.builder.dependency("Audio", .{ .target = target }).module("Audio"));
     if (home) m.addImport("stt", stt_dep.module("stt"));
+    // The PE header check of a delivered stt-local (local.fitsThisMachine).
+    m.addAnonymousImport("pecheck", .{ .root_source_file = b.path("src/tools/pecheck.zig"), .target = target, .optimize = optimize });
     return m;
+}
+
+/// `zig build voice-packages`: the laptop's speech packages as folders,
+/// each exactly what the desk publishes once (docs/stt-sync-contract.md,
+/// "Publishing the laptop's engine"):
+///   zig-out/voice/stt-local/stt-local.exe      aarch64 Windows (the
+///       Snapdragon X), whatever -Dtarget says: the only build that fetches
+///       the QAIRT SDK (or -Dsdk / QNN_SDK_ROOT)
+///   zig-out/voice/stt-model/<model_pin.file_name>   the pinned base model,
+///       the desk's own file (downloaded and checked like the iPhone's)
+/// Publishing stays a step of its own (portalctl publish), so a rebuild
+/// never asks the laptop to approve a new version.
+fn addVoicePackages(b: *std.Build, sdk: ?[]const u8) void {
+    const step = b.step("voice-packages", "Build the laptop's stt-local (aarch64 Windows) and the pinned model into zig-out/voice, to publish with portalctl");
+    const t = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .windows });
+    const exe = b.dependency("stt", .{ .target = t, .optimize = .fast, .sdk = sdk }).artifact("stt-local");
+    step.dependOn(&b.addInstallArtifact(exe, .{
+        .dest_dir = .{ .override = .{ .custom = "voice/stt-local" } },
+        .pdb_dir = .disabled,
+        .implib_dir = .disabled,
+    }).step);
+    step.dependOn(&b.addInstallFileWithDir(pinnedModel(b), .{ .custom = "voice/stt-model" }, model_pin.file_name).step);
+}
+
+/// The pinned base model (src/speech/model_pin.zig), downloaded once by
+/// src/tools/fetch_file.zig and kept only if its size and SHA-256 match;
+/// the build cache keeps it. Only steps that need the file run it.
+fn pinnedModel(b: *std.Build) std.Build.LazyPath {
+    const f = b.addRunArtifact(fetchTool(b));
+    f.addArgs(&.{ model_pin.url, model_pin.sha256_hex, b.fmt("{d}", .{model_pin.size}) });
+    return f.addOutputFileArg(model_pin.file_name);
+}
+
+var fetch_tool_exe: ?*std.Build.Step.Compile = null;
+
+fn fetchTool(b: *std.Build) *std.Build.Step.Compile {
+    if (fetch_tool_exe) |e| return e;
+    fetch_tool_exe = b.addExecutable(.{ .name = "fetch-file", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/fetch_file.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }) });
+    return fetch_tool_exe.?;
 }
