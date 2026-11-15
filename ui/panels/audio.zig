@@ -19,7 +19,8 @@ pub const id = struct {
     pub const save: u32 = 1702;
     pub const reload: u32 = 1703;
     /// field0 + index: Automatic (0), speech model (1), Instruct (2),
-    /// Learn from my voice (3).
+    /// Learn from my voice (3), Share voice improvements with devices (4),
+    /// Publish the laptop speech engine (5).
     pub const field0: u32 = 1710;
     /// dev0 + row: "Use" this microphone.
     pub const dev0: u32 = 1720;
@@ -38,6 +39,12 @@ pub const Action = union(enum) {
     set_auto: bool,
     /// "Learn from my voice" on / off (applies at once, saved).
     set_learning: bool,
+    /// "Share voice improvements with devices" on / off (applies at
+    /// once, saved).
+    set_share: bool,
+    /// "Publish the laptop speech engine" on / off (saved; the next
+    /// `zig build release` reads it).
+    set_publish_engine: bool,
     /// What the Instruct button does now (applies at once, saved).
     set_instruct_mode: InstructMode,
     /// Use row i's microphone (manual mode).
@@ -77,6 +84,14 @@ pub const View = struct {
     speech_bad: bool = false,
     /// The microphone thread's last error ("" none).
     mic_error: []const u8 = "",
+    /// The last adapter shared with devices ("Your voice v7 published to
+    /// devices", or why it was not; "" nothing to say).
+    shared: []const u8 = "",
+    shared_bad: bool = false,
+    /// The last release's word on the laptop engine ("Laptop speech
+    /// engine: stt-local 0.1.0+3 published; ...", or why it was not).
+    engine: []const u8 = "",
+    engine_tone: frame.Tone = .muted,
 };
 
 pub const TestState = enum { idle, recording, transcribing, done, failed };
@@ -89,6 +104,10 @@ pub const Ui = struct {
     instruct_mode: InstructMode = .auto,
     /// "Learn from my voice" (default on).
     learning: bool = true,
+    /// "Share voice improvements with devices" (default on).
+    share: bool = true,
+    /// "Publish the laptop speech engine" (default on).
+    publish_engine: bool = true,
     test_state: TestState = .idle,
     test_buf: [600]u8 = undefined,
     test_len: usize = 0,
@@ -100,9 +119,9 @@ pub const Ui = struct {
     pub const Bufs = struct {
         rows: [max_rows]frame.PanelRow = undefined,
         row_text: [max_rows][200]u8 = undefined,
-        lines: [4]frame.PanelText = undefined,
+        lines: [6]frame.PanelText = undefined,
         line_text: [3][240]u8 = undefined,
-        fields: [4]frame.PanelField = undefined,
+        fields: [6]frame.PanelField = undefined,
         after: [1]frame.PanelText = undefined,
         buttons: [4]frame.PanelButton = undefined,
     };
@@ -155,9 +174,9 @@ pub const Ui = struct {
 
     // ------------------------------------------------------- focus
 
-    /// Focus order: Automatic, the model field, Instruct, Learn, the rows,
-    /// Test, Save, Reload limits, Close.
-    const n_fields = 4;
+    /// Focus order: Automatic, the model field, Instruct, Learn, Share,
+    /// Publish the engine, the rows, Test, Save, Reload limits, Close.
+    const n_fields = 6;
     fn focusCount(ui: *const Ui) u8 {
         return n_fields + ui.n_rows + 4;
     }
@@ -194,7 +213,7 @@ pub const Ui = struct {
             .tab => if (mods.shift) ui.focus.prev() else ui.focus.next(),
             .up => ui.focus.prev(),
             .down => ui.focus.next(),
-            .left, .right => if (ui.focus.index == 0) return ui.toggleAuto() else if (ui.focus.index == 2) return ui.cycleInstruct() else if (ui.focus.index == 3) return ui.toggleLearning(),
+            .left, .right => if (ui.focus.index == 0) return ui.toggleAuto() else if (ui.focus.index == 2) return ui.cycleInstruct() else if (ui.focus.index == 3) return ui.toggleLearning() else if (ui.focus.index == 4) return ui.toggleShare() else if (ui.focus.index == 5) return ui.togglePublishEngine(),
             .backspace => if (ui.focus.index == 1) ui.model.backspace(),
             .enter => return ui.activate(),
             else => {},
@@ -236,6 +255,14 @@ pub const Ui = struct {
                 ui.focus.index = 3;
                 return ui.toggleLearning();
             },
+            id.field0 + 4 => {
+                ui.focus.index = 4;
+                return ui.toggleShare();
+            },
+            id.field0 + 5 => {
+                ui.focus.index = 5;
+                return ui.togglePublishEngine();
+            },
             id.dev0...id.dev0 + max_rows - 1 => if (b - id.dev0 < ui.n_rows) {
                 ui.auto = false;
                 return .{ .use = b - id.dev0 };
@@ -255,6 +282,16 @@ pub const Ui = struct {
         return .{ .set_learning = ui.learning };
     }
 
+    fn toggleShare(ui: *Ui) Action {
+        ui.share = !ui.share;
+        return .{ .set_share = ui.share };
+    }
+
+    fn togglePublishEngine(ui: *Ui) Action {
+        ui.publish_engine = !ui.publish_engine;
+        return .{ .set_publish_engine = ui.publish_engine };
+    }
+
     fn cycleInstruct(ui: *Ui) Action {
         ui.instruct_mode = ui.instruct_mode.next();
         return .{ .set_instruct_mode = ui.instruct_mode };
@@ -272,6 +309,8 @@ pub const Ui = struct {
         if (ui.focus.index == 1) return .save_model;
         if (ui.focus.index == 2) return ui.cycleInstruct();
         if (ui.focus.index == 3) return ui.toggleLearning();
+        if (ui.focus.index == 4) return ui.toggleShare();
+        if (ui.focus.index == 5) return ui.togglePublishEngine();
         if (ui.focusedRow()) |r| {
             ui.auto = false;
             return .{ .use = r };
@@ -290,6 +329,14 @@ pub const Ui = struct {
         else
             .{ .text = v.speech, .tone = if (v.speech_bad) .bad else .warn };
         nl += 1;
+        if (v.shared.len > 0) {
+            b.lines[nl] = .{ .text = v.shared, .tone = if (v.shared_bad) .bad else .good };
+            nl += 1;
+        }
+        if (v.engine.len > 0) {
+            b.lines[nl] = .{ .text = v.engine, .tone = v.engine_tone };
+            nl += 1;
+        }
         if (v.rows.len == 0) {
             b.lines[nl] = .{ .text = "No microphone found. Connect one; it shows up here.", .tone = .warn };
             nl += 1;
@@ -350,6 +397,20 @@ pub const Ui = struct {
             .value = if (ui.learning) "On (corrections and clips train your model)" else "Off (transcribe only, nothing kept)",
             .id = id.field0 + 3,
             .focused = ui.focus.index == 3,
+            .choice = true,
+        };
+        b.fields[4] = .{
+            .label = "Share voice improvements with devices",
+            .value = if (ui.share) "On (each new version of your voice goes to your devices)" else "Off (nothing is published)",
+            .id = id.field0 + 4,
+            .focused = ui.focus.index == 4,
+            .choice = true,
+        };
+        b.fields[5] = .{
+            .label = "Publish the laptop speech engine",
+            .value = if (ui.publish_engine) "On (each zig build release publishes stt-local and the model when they changed)" else "Off (releases publish neither)",
+            .id = id.field0 + 5,
+            .focused = ui.focus.index == 5,
             .choice = true,
         };
         var na: usize = 0;
@@ -467,4 +528,40 @@ test "audio panel: the model field takes text and Enter saves" {
     const p = ui.panel(&b, .{ .speech = "Speech model not found: D:\\m.bi", .speech_bad = true }).?;
     try testing.expectEqual(frame.Tone.bad, p.lines[0].tone);
     try testing.expect(std.mem.indexOf(u8, p.lines[1].text, "No microphone") != null);
+}
+
+test "audio panel: Share voice improvements, on by default, toggles; the last publish is shown" {
+    var ui: Ui = .{};
+    ui.show(true, "", .auto);
+    try testing.expect(ui.share);
+    try testing.expect(!ui.button(id.field0 + 4).set_share);
+    try testing.expect(ui.key(.right, .{}).set_share);
+    try testing.expect(ui.char(' ', .{}) == .set_share);
+    var b: Ui.Bufs = .{};
+    const p = ui.panel(&b, .{ .shared = "Your voice v7 published to devices" }).?;
+    try testing.expectEqualStrings("Share voice improvements with devices", p.fields[4].label);
+    try testing.expectEqualStrings("Off (nothing is published)", p.fields[4].value);
+    try testing.expectEqualStrings("Your voice v7 published to devices", p.lines[1].text);
+    try testing.expectEqual(frame.Tone.good, p.lines[1].tone);
+    // Room for every line at once.
+    const rows = [_]Row{.{ .name = "m", .kind = "k" }};
+    const q = ui.panel(&b, .{ .rows = &rows, .fell_back = true, .mic_error = "e", .shared = "x", .shared_bad = true, .engine = "y", .engine_tone = .bad }).?;
+    try testing.expectEqual(@as(usize, 6), q.lines.len);
+}
+
+test "audio panel: Publish the laptop speech engine, on by default, toggles; the last release's word is shown" {
+    var ui: Ui = .{};
+    ui.show(true, "", .auto);
+    try testing.expect(ui.publish_engine);
+    try testing.expect(!ui.button(id.field0 + 5).set_publish_engine);
+    try testing.expect(ui.key(.left, .{}).set_publish_engine);
+    try testing.expect(ui.char(' ', .{}) == .set_publish_engine);
+    var b: Ui.Bufs = .{};
+    const p = ui.panel(&b, .{ .engine = "The laptop speech engine was NOT published: the build failed.", .engine_tone = .bad }).?;
+    try testing.expectEqualStrings("Publish the laptop speech engine", p.fields[5].label);
+    try testing.expectEqualStrings("Off (releases publish neither)", p.fields[5].value);
+    try testing.expectEqual(frame.Tone.bad, p.lines[1].tone);
+    // Focus runs on past it to the buttons.
+    _ = ui.key(.tab, .{});
+    try testing.expect(ui.key(.enter, .{}) == .test_clip);
 }

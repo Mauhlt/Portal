@@ -218,6 +218,10 @@ const usage =
     \\      the device, every version. Nothing is ever run automatically.
     \\  portalctl publish --list
     \\  portalctl unpublish <package> <version>
+    \\  portalctl voice-publish <folder> | --not-built <why>
+    \\      What `zig build release` runs: publishes the laptop's stt-local
+    \\      and stt-model from `zig build voice-packages`, each only when it
+    \\      changed, the newest 3 kept (off: the Audio panel's switch).
     \\  portalctl sync subscribe|unsubscribe <device> <package>
     \\  portalctl sync subscriptions
     \\      Which device receives which package.
@@ -308,10 +312,11 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "connect")) fatal("the remote viewer is a window: run `portal connect` (portal.exe)", .{});
     if (std.mem.eql(u8, cmd, "ca")) return cmdCa(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "show")) std.process.exit(@import("show.zig").main(gpa, io, args[1..]));
-    if (std.mem.eql(u8, cmd, "sync") or std.mem.eql(u8, cmd, "publish") or std.mem.eql(u8, cmd, "unpublish")) {
+    if (std.mem.eql(u8, cmd, "sync") or std.mem.eql(u8, cmd, "publish") or std.mem.eql(u8, cmd, "unpublish") or std.mem.eql(u8, cmd, "voice-publish")) {
         const paths = try devicePaths(gpa, io, init.environ_map);
         defer gpa.free(paths.dir);
         const sp: sync.Paths = .{ .dir = paths.dir };
+        if (cmd[0] == 'v') return sync_cli.cmdVoicePublish(gpa, io, sp, args[1..], portal_version);
         if (cmd[0] == 's') return sync_cli.cmdSync(gpa, io, sp, args[1..]);
         if (cmd[0] == 'p') return sync_cli.cmdPublish(gpa, io, sp, args[1..]);
         return sync_cli.cmdUnpublish(io, sp, args[1..]);
@@ -335,6 +340,8 @@ fn guiMain(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
     if (std.mem.eql(u8, cmd, "connect")) {
         const client = @import("client");
         client.report_fn = messageBox;
+        // Dictation on this device: stt-local from the desk (devicespeech.zig).
+        @import("devicespeech.zig").install(gpa, io);
         client.main(gpa, io, "portal connect", args[1..]);
     }
     if (std.mem.eql(u8, cmd, "show")) {
@@ -829,6 +836,8 @@ const StoreWatch = struct {
             sw.srv.storeUnreadable(err);
             return err;
         };
+        retainSpeech(sw.srv, &st);
+        sw.autoSubscribe(&st);
         sw.applier.apply(sw.srv, sw.tun, &st) catch |err| {
             sw.srv.log.print("ERROR: the tunnel's peer table could not be updated ({t}); the addresses of changed devices stay refused until it is", .{err});
             if (!sw.tunnel_failed.swap(true, .acq_rel)) sw.srv.storeChanged();
@@ -838,6 +847,57 @@ const StoreWatch = struct {
             sw.srv.log.print("the tunnel's peer table is up to date again", .{});
             sw.srv.storeChanged();
         }
+    }
+
+    /// Every paired device gets the voice packages that run on it
+    /// (sync.autoSubscribe: a new pairing, and devices paired before this
+    /// build on its first start), except any the owner unsubscribed it
+    /// from. Its platform is what it said this run (web.PlatformTable):
+    /// unknown until then, the adapter alone; platformReported adds the rest.
+    fn autoSubscribe(sw: *StoreWatch, st: *const devices.Store) void {
+        var devs: [devices.max_devices]sync.AutoDevice = undefined;
+        var n: usize = 0;
+        for (&st.devices) |*d| if (d.*) |*dev| {
+            devs[n] = .{ .name = dev.name.get(), .platform = sw.srv.platforms.get(sw.io, dev.name.get()) };
+            n += 1;
+        };
+        if (n == 0) return;
+        sw.subscribeLogged(devs[0..n]);
+    }
+
+    fn subscribeLogged(sw: *StoreWatch, devs: []const sync.AutoDevice) void {
+        const added = sync.autoSubscribe(sw.gpa, sw.io, .{ .dir = sw.paths.dir }, devs) catch |err| {
+            sw.srv.log.print("sync: could not subscribe paired devices to the voice packages ({t})", .{err});
+            return;
+        };
+        if (added > 0) sw.srv.log.print("sync: {d} voice package subscription(s) added for paired devices", .{added});
+    }
+
+    /// web.Server.platform_notify_fn: a device said its platform (news for
+    /// this run): subscribe it to what runs there. Event-driven, once per
+    /// device per run; the device is the WebSocket's authenticated one.
+    /// No `mutex`: a reload holding it may wait for this device's
+    /// connections to end; the subscriptions file's own lock serializes
+    /// the write (sync.withSubs).
+    fn platformReported(ctx: *anyopaque, device: []const u8, p: web.PlatformTable.Platform) void {
+        const sw: *StoreWatch = @ptrCast(@alignCast(ctx));
+        sw.subscribeLogged(&.{.{ .name = device, .platform = p }});
+    }
+
+    /// The speech inbox follows the store: an unpaired or replaced
+    /// device's speech limits and queued training bundle go.
+    fn retainSpeech(srv: *web.Server, st: *const devices.Store) void {
+        const ib = srv.cfg.speech_inbox orelse return;
+        comptime std.debug.assert(speech.limits.max_devices >= devices.max_devices);
+        comptime std.debug.assert(speech.limits.max_device_name >= devices.max_name);
+        var members: [devices.max_devices]speech.inbox.Member = undefined;
+        var n: usize = 0;
+        for (&st.devices) |*d| if (d.*) |*dev| {
+            members[n] = .{ .name = dev.name.get(), .id = &dev.id };
+            n += 1;
+        };
+        const gone = ib.retain(members[0..n]);
+        if (gone > 0) srv.log.print("speech: dropped what {d} unpaired or replaced device(s) left in the training inbox", .{gone});
     }
 
     /// Re-arms the change watch; if that fails, re-opens it once. Losing
@@ -1958,6 +2018,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .io = io,
         .gpa = gpa,
     };
+    // A device saying its platform subscribes it to what runs there.
+    server.platform_notify_ctx = &store_watch;
+    server.platform_notify_fn = StoreWatch.platformReported;
     // A change between prepare's read and the watch opening signalled
     // nobody: read once more now that the watch is open (a failure is
     // logged and shown by reload; the next change retries).
@@ -2132,6 +2195,7 @@ test {
     _ = @import("panic.zig");
     _ = @import("conpty.zig");
     _ = @import("gui.zig");
+    _ = @import("devicespeech.zig");
     _ = @import("localgrid.zig");
     _ = @import("localinput.zig");
     _ = @import("workdir.zig");
@@ -2171,6 +2235,7 @@ test {
     _ = @import("tls/pki.zig");
     _ = @import("sync.zig");
     _ = @import("sync_cli.zig");
+    _ = @import("voiceshare.zig");
     _ = @import("fsutil.zig");
     _ = @import("bucket.zig");
     _ = @import("ratelimit.zig");

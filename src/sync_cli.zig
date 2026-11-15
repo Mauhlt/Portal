@@ -5,6 +5,7 @@
 //!     portalctl publish <package> <folder> --kind data|executable [--version V] [--min-client V]
 //!     portalctl publish --list
 //!     portalctl unpublish <package> <version>
+//!     portalctl voice-publish <folder> | --not-built <why>   (zig build release)
 //!     portalctl sync subscribe <device> <package>
 //!     portalctl sync unsubscribe <device> <package>
 //!     portalctl sync subscriptions
@@ -24,6 +25,11 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const sync = @import("sync.zig");
 const devices = @import("devices.zig");
+const settings = @import("settings.zig");
+const voiceshare = @import("voiceshare.zig");
+const speech = @import("speech");
+/// What portal-release and portalctl agree on (voice_off_exit).
+const releases_lib = @import("tools/releases_lib.zig");
 const client = @import("client");
 const manifest = client.sync.manifest;
 
@@ -163,6 +169,71 @@ fn listPublished(gpa: Allocator, io: Io, paths: sync.Paths) !void {
             p, v.m.version, v.m.sequence, v.m.kind, v.m.files.len, v.m.totalSize(),
         });
     }
+}
+
+/// `portalctl voice-publish <folder>`: the laptop's speech engine and model
+/// from `zig build voice-packages` (<folder>\stt-local, <folder>\stt-model),
+/// each published only when its content changed (voiceshare.publishFolder):
+/// stt-local as `<portal_version>+<sequence>` (executable), stt-model as
+/// `<the pin's SHA-256, 16 hex>+<sequence>` (data); the newest 3 of each
+/// stay published. `portalctl voice-publish --not-built <why>` records
+/// that the release could not build them; `--enabled` only checks the
+/// Audio panel's switch (exit releases_lib.voice_off_exit when off, which is recorded
+/// too). Either way the result is the
+/// one-line status the desk shows (voiceshare.engine_status_file). Run by
+/// `zig build release` after the desk's own release is promoted; exit 1
+/// when nothing could be published (the release still succeeded).
+pub fn cmdVoicePublish(gpa: Allocator, io: Io, paths: sync.Paths, args: []const []const u8, portal_version: []const u8) !void {
+    const usage = "usage: portalctl voice-publish <folder with stt-local and stt-model> | --not-built <why> | --enabled";
+    if (args.len == 0 or args.len > 2) fatal("{s}", .{usage});
+    var line_buf: [voiceshare.max_status]u8 = undefined;
+    const saved = settings.load(gpa, io, paths.dir);
+    if (!(saved.speech_publish_engine orelse true)) {
+        voiceStatus(gpa, io, paths, .off, "Publishing the laptop speech engine is off (Audio panel): the release published neither stt-local nor stt-model.");
+        std.process.exit(releases_lib.voice_off_exit);
+    }
+    // `--enabled`: only the switch (the release builds nothing when off).
+    if (std.mem.eql(u8, args[0], "--enabled")) return;
+    if (std.mem.eql(u8, args[0], "--not-built")) {
+        if (args.len != 2) fatal("{s}", .{usage});
+        voiceStatus(gpa, io, paths, .failed, std.fmt.bufPrint(&line_buf, "The laptop speech engine was NOT published: {s}. Devices keep the version they have.", .{args[1]}) catch "The laptop speech engine was NOT published.");
+        std.process.exit(1);
+    }
+    if (args.len != 1) fatal("{s}", .{usage});
+    _ = sync.ensureKey(gpa, io, paths) catch |err| {
+        voiceStatus(gpa, io, paths, .failed, std.fmt.bufPrint(&line_buf, "The laptop speech engine was NOT published: no release key ({s}).", .{describe(err)}) catch "");
+        std.process.exit(1);
+    };
+    const now = nowUnix(io);
+    var out: Io.Writer = .fixed(&line_buf);
+    var failed = false;
+    for (voiceshare.engine_packages, 0..) |e, i| {
+        var fb: [1100]u8 = undefined;
+        const folder = std.fmt.bufPrint(&fb, "{s}\\{s}", .{ args[0], e.package }) catch fatal("folder path too long", .{});
+        const base = if (e.kind == .executable) portal_version else speech.model_pin.sha256_hex[0..16];
+        var problem: [300]u8 = @splat(0);
+        if (i > 0) out.writeAll("; ") catch {};
+        const got = voiceshare.publishFolder(gpa, io, paths, e.package, e.kind, folder, base, now, &problem) catch |err| {
+            failed = true;
+            const why = std.mem.sliceTo(&problem, 0);
+            out.print("{s} NOT published ({s})", .{ e.package, if (why.len > 0) why else describe(err) }) catch {};
+            continue;
+        };
+        if (got) |g| {
+            out.print("{s} {s} published", .{ e.package, g.p.version() }) catch {};
+            if (g.pruned > 0) out.print(" ({d} older unpublished)", .{g.pruned}) catch {};
+        } else out.print("{s} unchanged", .{e.package}) catch {};
+    }
+    const tone: voiceshare.Tone = if (failed) .failed else .ok;
+    var sb: [voiceshare.max_status]u8 = undefined;
+    voiceStatus(gpa, io, paths, tone, std.fmt.bufPrint(&sb, "Laptop speech engine: {s}.", .{out.buffered()}) catch out.buffered());
+    if (failed) std.process.exit(1);
+}
+
+fn voiceStatus(gpa: Allocator, io: Io, paths: sync.Paths, tone: voiceshare.Tone, text: []const u8) void {
+    std.debug.print("{s}\n", .{text});
+    voiceshare.writeEngineStatus(gpa, io, paths, tone, text) catch |err|
+        std.debug.print("portalctl: could not record it for the desk ({s}): {t}\n", .{ voiceshare.engine_status_file, err });
 }
 
 pub fn cmdUnpublish(io: Io, paths: sync.Paths, args: []const []const u8) !void {

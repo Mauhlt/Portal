@@ -337,10 +337,8 @@ fn frame(ctx: *anyopaque, sh: *ui.Shell) void {
     // use, once home has trained one (what to check after a training run).
     sh.mic_label = if (s.recording)
         mic.inputName(&s.mic_buf)
-    else if (adapter_version > 0)
-        std.fmt.bufPrint(&s.mic_buf, "your voice v{d}", .{adapter_version}) catch ""
     else
-        "";
+        ui.dictation.voiceLabel(&s.mic_buf, adapter_version);
     const denied = mic.cachedPermission() == .denied;
     sh.speech_off = if (denied)
         startNote(error.NotAllowed)
@@ -629,7 +627,7 @@ fn applyAdapter(s: *State, busy: bool) void {
     s.mutex.unlock(s.io);
     if (std.mem.eql(u8, dir, s.applied_buf[0..s.applied_len])) return;
     var pb: [1100]u8 = undefined;
-    const file = adapterFile(s.io, dir, &pb) orelse {
+    const file = speech_mod.adapter_pkg.file(s.io, dir, &pb) orelse {
         std.log.err("speech: stt-adapter {s} has no update.bin or adapter.bin", .{ver});
         return;
     };
@@ -638,7 +636,7 @@ fn applyAdapter(s: *State, busy: bool) void {
         return;
     };
     defer s.gpa.free(bytes);
-    if (std.mem.startsWith(u8, bytes, "STTUPD01")) {
+    if (speech_mod.adapter_pkg.isUpdate(bytes)) {
         const v = if (s.local) |l| l.importUpdate(s.gpa, bytes) catch |err| {
             std.log.err("speech: adapter update {s}: {t}", .{ ver, err });
             return;
@@ -654,7 +652,7 @@ fn applyAdapter(s: *State, busy: bool) void {
         if (s.local) |l| setAdapterVersion(s, l.adapterVersion());
     } else {
         // A raw adapter: its version is the package's version number.
-        const v = std.fmt.parseInt(u32, ver, 10) catch {
+        const v = speech_mod.adapter_pkg.rawVersion(ver) orelse {
             std.log.err("speech: stt-adapter {s}: a raw adapter needs a numeric package version", .{ver});
             return;
         };
@@ -667,16 +665,6 @@ fn applyAdapter(s: *State, busy: bool) void {
     @memcpy(s.applied_buf[0..dir.len], dir);
     s.applied_len = dir.len;
     if (s.reload_pending and !busy) unload(s);
-}
-
-/// update.bin (an stt update) or adapter.bin in a package folder.
-fn adapterFile(io: std.Io, dir: []const u8, buf: []u8) ?[]const u8 {
-    for ([_][]const u8{ "update.bin", "adapter.bin" }) |name| {
-        const p = std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, name }) catch return null;
-        std.Io.Dir.cwd().access(io, p, .{}) catch continue;
-        return p;
-    }
-    return null;
 }
 
 fn setAdapterVersion(s: *State, v: u32) void {

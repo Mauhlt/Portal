@@ -68,6 +68,9 @@ const Ctx = struct {
     io: Io,
     env: *const std.process.Environ.Map,
     releases: []const u8,
+    /// PORTAL_RELEASES_DIR is in effect (testing): the real data folder is
+    /// not touched (no voice packages published).
+    testing_override: bool = false,
 
     fn path(ctx: Ctx, name: []const u8) ![]u8 {
         return std.fs.path.join(ctx.gpa, &.{ ctx.releases, name });
@@ -112,7 +115,7 @@ pub fn main(init: std.process.Init) !void {
     Io.Dir.cwd().createDirPath(io, releases) catch |err|
         fatal(cmd, "cannot create {s}: {t}", .{ releases, err });
 
-    const ctx: Ctx = .{ .gpa = gpa, .io = io, .env = env, .releases = releases };
+    const ctx: Ctx = .{ .gpa = gpa, .io = io, .env = env, .releases = releases, .testing_override = override != null };
 
     if (std.mem.eql(u8, cmd, "release")) {
         var zig_arg: ?[]const u8 = null;
@@ -471,6 +474,10 @@ fn cmdRelease(ctx: Ctx, zig_arg: ?[]const u8, repo_arg: ?[]const u8) !void {
     installLauncher(ctx, stage, bin_dir, now.stamp);
     Io.Dir.cwd().deleteTree(io, stage) catch |err| warn("could not remove {s}: {t}", .{ stage, err });
 
+    // The laptop speech engine and its model: published by the new
+    // release's portalctl when they changed. Never fails the release.
+    const voice = publishVoice(ctx, zig_exe, repo, dest);
+
     // Prune only when the known-good release is certain: if known-good.txt
     // exists but cannot be read or validated, deleting old releases could
     // delete the very release it names.
@@ -498,6 +505,49 @@ fn cmdRelease(ctx: Ctx, zig_arg: ?[]const u8, repo_arg: ?[]const u8) !void {
     if (!pathListContains(ctx.env.get("PATH") orelse "", bin_dir))
         std.debug.print("release: add {s} to your PATH to run `portal`.\n", .{bin_dir});
     std.debug.print("release: restart any running portal to pick it up.\n", .{});
+    if (lib.voiceLine(voice)) |l| std.debug.print("release: {s}\n", .{l});
+}
+
+/// `zig build voice-packages` (the QAIRT SDK fetch and the aarch64 cross-
+/// build of stt-local, and the pinned model) into <releases>\_voice, then
+/// the new release's `portalctl voice-publish`, which publishes each
+/// package only when it changed and records the result for the desk. A
+/// failed build is recorded too (`--not-built`). Every failure is a
+/// warning: the desk's release is promoted already.
+fn publishVoice(ctx: Ctx, zig_exe: []const u8, repo: []const u8, dest: []const u8) lib.VoiceOutcome {
+    const gpa = ctx.gpa;
+    const io = ctx.io;
+    if (ctx.testing_override) return lib.voiceOutcome(true, false, false);
+    const ctl = std.fs.path.join(gpa, &.{ dest, "portalctl.exe" }) catch return .publish_failed;
+    defer gpa.free(ctl);
+    // The Audio panel's "Publish the laptop speech engine": off, nothing
+    // is built (portalctl says so and records it for the desk).
+    if (runInherit(io, &.{ ctl, "voice-publish", "--enabled" }, repo)) |code| {
+        if (code == lib.voice_off_exit) return .off;
+        if (code != 0) return .publish_failed;
+    } else |err| {
+        warn("cannot run {s}: {t}", .{ ctl, err });
+        return .publish_failed;
+    }
+    const out = ctx.path(lib.voice_dir) catch return .build_failed;
+    defer gpa.free(out);
+    defer Io.Dir.cwd().deleteTree(io, out) catch {};
+    Io.Dir.cwd().deleteTree(io, out) catch {};
+
+    std.debug.print("release: building the laptop speech engine (zig build voice-packages)...\n", .{});
+    var why_buf: [200]u8 = undefined;
+    const why: ?[]const u8 = if (runInherit(io, &.{ zig_exe, "build", "voice-packages", "--prefix", out }, repo)) |code|
+        (if (code == 0) null else lib.notBuiltReason(&why_buf, code, null))
+    else |err|
+        lib.notBuiltReason(&why_buf, null, @errorName(err));
+    const folder = std.fs.path.join(gpa, &.{ out, "voice" }) catch return .build_failed;
+    defer gpa.free(folder);
+    const argv: []const []const u8 = if (why) |reason| &.{ ctl, "voice-publish", "--not-built", reason } else &.{ ctl, "voice-publish", folder };
+    const published = if (runInherit(io, argv, repo)) |code| code == 0 else |err| blk: {
+        warn("cannot run {s}: {t}", .{ ctl, err });
+        break :blk false;
+    };
+    return lib.voiceOutcome(false, why == null, published);
 }
 
 fn pathListContains(path_var: []const u8, dir: []const u8) bool {

@@ -129,6 +129,12 @@ pub const Settings = struct {
     mic: Str(max_mic) = .{},
     /// "Learn from my voice" (null: on).
     speech_learning: ?bool = null,
+    /// "Share voice improvements with devices": publish each new trained
+    /// adapter as the stt-adapter package (null: on).
+    speech_share: ?bool = null,
+    /// "Publish the laptop speech engine": `zig build release` publishes
+    /// stt-local and stt-model when they changed (null: on).
+    speech_publish_engine: ?bool = null,
     /// `speech.*` lines this Portal doesn't know (a newer one wrote them, or
     /// a typo): kept as they are and written back, never dropped.
     speech_extra: [8]Str(160) = @splat(.{}),
@@ -226,6 +232,10 @@ pub const Settings = struct {
                 s.instruct_mode = @import("portal_ui").shell.InstructMode.parse(val);
             } else if (std.mem.eql(u8, key, "speech_learning")) {
                 if (std.ascii.eqlIgnoreCase(val, "on")) s.speech_learning = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.speech_learning = false;
+            } else if (std.mem.eql(u8, key, "speech_share")) {
+                if (std.ascii.eqlIgnoreCase(val, "on")) s.speech_share = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.speech_share = false;
+            } else if (std.mem.eql(u8, key, "speech_publish_engine")) {
+                if (std.ascii.eqlIgnoreCase(val, "on")) s.speech_publish_engine = true else if (std.ascii.eqlIgnoreCase(val, "off")) s.speech_publish_engine = false;
             } else if (std.mem.startsWith(u8, key, "speech.")) {
                 const name = key["speech.".len..];
                 if (!s.speech.set(name, val) and !removedSpeechKey(name) and s.n_speech_extra < s.speech_extra.len) {
@@ -269,6 +279,8 @@ pub const Settings = struct {
         if (s.mic.get()) |v| try out.print("mic = {s}\r\n", .{v});
         if (s.instruct_mode) |m| try out.print("instruct_mode = {s}\r\n", .{m.text()});
         if (s.speech_learning) |v| try out.print("speech_learning = {s}\r\n", .{if (v) "on" else "off"});
+        if (s.speech_share) |v| try out.print("speech_share = {s}\r\n", .{if (v) "on" else "off"});
+        if (s.speech_publish_engine) |v| try out.print("speech_publish_engine = {s}\r\n", .{if (v) "on" else "off"});
         try s.speech.format(out);
         for (s.speech_extra[0..s.n_speech_extra]) |*x| if (x.get()) |l| try out.print("{s}\r\n", .{l});
         for (s.colors[0..s.n_colors]) |*c| {
@@ -459,7 +471,7 @@ test "settings: speech model and microphone" {
 }
 
 test "settings: speech_learning; unknown speech.* lines survive a save" {
-    const s = Settings.parse("speech_learning = off\r\nspeech.from_the_future = 7\r\nspeech.transcribe_per_day = 9\r\n");
+    const s = Settings.parse("speech_learning = off\r\nspeech_share = off\r\nspeech_publish_engine = off\r\nspeech.from_the_future = 7\r\nspeech.transcribe_per_day = 9\r\n");
     try testing.expect(!s.speech_learning.?);
     var buf: [2048]u8 = undefined;
     var out: Io.Writer = .fixed(&buf);
@@ -468,6 +480,12 @@ test "settings: speech_learning; unknown speech.* lines survive a save" {
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech.transcribe_per_day = 9") != null);
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech_learning = off") != null);
     try testing.expect(Settings.parse("").speech_learning == null);
+    try testing.expect(!s.speech_share.?);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech_share = off") != null);
+    try testing.expect(Settings.parse("").speech_share == null);
+    try testing.expect(!s.speech_publish_engine.?);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "speech_publish_engine = off") != null);
+    try testing.expect(Settings.parse("").speech_publish_engine == null);
 }
 
 test "settings: removed speech limits are ignored on load and dropped on save" {

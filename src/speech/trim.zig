@@ -3,7 +3,9 @@
 //! chew on, and a training sample without the dead air around the words.
 //! Energy per 20 ms frame against the clip's own loudest frame, so a quiet
 //! microphone is not cut away; 200 ms of margin is kept on each side so no
-//! word loses its edges. Pure (16 kHz mono f32, as stt takes it).
+//! word loses its edges. Pure: 16 kHz mono, f32 (as stt.Local takes it,
+//! the iPhone) or s16 (as WASAPI records it and stt-local takes it, the
+//! laptop).
 
 const std = @import("std");
 
@@ -16,9 +18,12 @@ const relative = 0.05;
 /// a hiss-only clip stay unvoiced.
 const floor = 0.002;
 
-fn rms(s: []const f32) f32 {
+fn rms(comptime T: type, s: []const T) f32 {
     var e: f32 = 0;
-    for (s) |x| e += x * x;
+    for (s) |raw| {
+        const x: f32 = if (T == i16) @as(f32, @floatFromInt(raw)) / 32768.0 else raw;
+        e += x * x;
+    }
     return @sqrt(e / @as(f32, @floatFromInt(s.len)));
 }
 
@@ -26,14 +31,23 @@ fn rms(s: []const f32) f32 {
 /// the margin; the whole clip when it is shorter than a frame; an empty
 /// slice when nothing in it is voiced.
 pub fn voiced(samples: []const f32) []const f32 {
+    return voicedOf(f32, samples);
+}
+
+/// `voiced` for s16 samples.
+pub fn voiced16(samples: []const i16) []const i16 {
+    return voicedOf(i16, samples);
+}
+
+fn voicedOf(comptime T: type, samples: []const T) []const T {
     if (samples.len < frame) return samples;
     const n = samples.len / frame;
     var peak: f32 = 0;
-    for (0..n) |i| peak = @max(peak, rms(samples[i * frame ..][0..frame]));
+    for (0..n) |i| peak = @max(peak, rms(T, samples[i * frame ..][0..frame]));
     const threshold = @max(peak * relative, floor);
     var first: ?usize = null;
     var last: usize = 0;
-    for (0..n) |i| if (rms(samples[i * frame ..][0..frame]) > threshold) {
+    for (0..n) |i| if (rms(T, samples[i * frame ..][0..frame]) > threshold) {
         if (first == null) first = i;
         last = i;
     };
@@ -66,4 +80,15 @@ test "all quiet: nothing voiced; a quiet microphone is kept; short clips untouch
     try testing.expectEqual(quiet.len, voiced(&quiet).len);
     const short = [_]f32{ 0, 0, 0 };
     try testing.expectEqual(@as(usize, 3), voiced(&short).len);
+}
+
+test "s16 clips are cut the same way" {
+    var buf: [sample_rate * 3]i16 = @splat(0);
+    for (&buf, 0..) |*x, i| {
+        if (i >= sample_rate and i < 2 * sample_rate) x.* = @intFromFloat(9000 * @sin(@as(f32, @floatFromInt(i)) * 0.2));
+    }
+    const v = voiced16(&buf);
+    try testing.expectEqual(@as(usize, (sample_rate - margin) * @sizeOf(i16)), @intFromPtr(v.ptr) - @intFromPtr(&buf));
+    try testing.expectEqual(@as(usize, sample_rate + 2 * margin), v.len);
+    try testing.expectEqual(@as(usize, 0), voiced16(buf[0..sample_rate]).len);
 }

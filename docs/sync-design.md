@@ -106,7 +106,20 @@ overlapping/overwriting".
   files, signs the manifest and stores the version under
   `%LOCALAPPDATA%\Portal\publish\<package>\<version>\`.
 * **Device subscription:** the owner chooses per device which packages it
-  receives (e.g. `stt-npu-test` only to the laptop).
+  receives (e.g. `stt-npu-test` only to the laptop). **Voice packages are
+  automatic (owner decision, 2026-11-14):** every paired device is
+  subscribed to `stt-adapter` at pairing, and devices paired earlier on
+  the first start of a build that has this (`sync.autoSubscribe`, on every
+  device store read). A device says its platform after each hello
+  (`d:platform`, kept in memory, web.PlatformTable); the first time this
+  run it says `windows-aarch64` it is subscribed to `stt-local` and
+  `stt-model` too (main.zig `StoreWatch.platformReported`). Until it says,
+  and on any other platform, it gets the adapter alone. The desk publishes
+  the voice packages itself: the adapter after training, `stt-local` and
+  `stt-model` with each `zig build release` when they changed
+  (docs/stt-sync-contract.md). Unsubscribing a device
+  (Devices panel or `portalctl sync unsubscribe`) records an opt-out that
+  automatic subscription never undoes; subscribing again clears it.
 * **Event-driven delivery:** an `{"t":"updates", ...}` message on the
   interactive WebSocket announces new versions to subscribed devices.
   Devices fetch manifests and files on the bulk WebSocket (`/ws/bulk`, its
@@ -222,10 +235,16 @@ end
   version names are never reused, even after `unpublish`. The default
   version is the sequence number.
 * `portalctl publish --list`, `portalctl unpublish <pkg> <version>`.
+* `portalctl voice-publish <folder>` (run by `zig build release`): the same
+  publish for `stt-local` and `stt-model`, skipped for a package whose
+  files match the newest version's manifest (`sync.sameAsLatest`); names
+  `<base>+<sequence>`; newest 3 kept (docs/stt-sync-contract.md).
 * Subscriptions: `%LOCALAPPDATA%\Portal\sync-subscriptions.txt` (locked
   read-modify-write, flushed temp file, MoveFileEx WRITE_THROUGH), via
   `portalctl sync subscribe|unsubscribe <device> <pkg>`, `portalctl sync
-  subscriptions`, or the Devices panel (P on a device row).
+  subscriptions`, or the Devices panel (P on a device row). Lines are
+  `sub <device> <pkg>` and `optout <device> <pkg>` (an unsubscribe, which
+  automatic voice subscription respects).
 * The server serves the stores as they are and does not need the key: it
   parses manifests strictly to build the index (a manifest that does not
   parse, e.g. one naming `../x`, is never listed or served) but the
@@ -374,10 +393,14 @@ mutates the store, so a rollback can't race an install or prune.
 
 ### Deferred
 
-* Running installed programs (e.g. launching `npu-probe` from Packages):
-  nothing runs packages yet.
-* Self-update of `portal-client` through sync, and publishing from the
-  desk window (publishing is `portalctl publish` only).
+* Running installed programs other than stt-local (e.g. `npu-probe` from
+  Packages). stt-local runs as the laptop's speech engine
+  (docs/stt-sync-contract.md, "Portal's side on the laptop").
+* Self-update of `portal-client` through sync, and publishing other
+  packages from the desk window (`portalctl publish`; the exceptions are
+  the voice packages, which the desk publishes by itself, newest 3 kept:
+  the trained `stt-adapter`, and `stt-local` and `stt-model` after
+  `zig build release`: docs/stt-sync-contract.md).
 * Quotas are fixed (8 GiB per version, 32 GiB per desktop); no setting yet.
 * Approvals given in the app are kept in memory for the run (an
   approved manifest installs at once, so nothing more is needed); a

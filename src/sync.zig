@@ -129,7 +129,11 @@ pub const PublishOptions = struct {
     package: []const u8,
     folder: []const u8,
     kind: manifest.Kind,
+    /// The version name; null: the sequence number ("7").
     version: ?[]const u8 = null,
+    /// With no `version`: the name is `<version_base>+<sequence>` (e.g.
+    /// "0.1.0+7"), unique because sequences are never reused.
+    version_base: ?[]const u8 = null,
     min_client: []const u8 = default_min_client,
     now: i64,
 };
@@ -183,12 +187,12 @@ fn readHistory(gpa: Allocator, io: Io, file_path: []const u8) !History {
 }
 
 /// Copies one file into the store while hashing it (what is stored is
-/// what is hashed).
-fn copyHashed(io: Io, from: []const u8, to: []const u8, max: u64) !struct { size: u64, sha: [32]u8 } {
+/// what is hashed); with `to` null it only hashes.
+fn copyHashed(io: Io, from: []const u8, to: ?[]const u8, max: u64) !struct { size: u64, sha: [32]u8 } {
     const src = try Io.Dir.cwd().openFile(io, from, .{});
     defer src.close(io);
-    const dst = try Io.Dir.cwd().createFile(io, to, .{ .exclusive = true });
-    defer dst.close(io);
+    const dst: ?Io.File = if (to) |t| try Io.Dir.cwd().createFile(io, t, .{ .exclusive = true }) else null;
+    defer if (dst) |d| d.close(io);
     var h: Sha256 = .init(.{});
     var buf: [64 * 1024]u8 = undefined;
     var total: u64 = 0;
@@ -201,31 +205,21 @@ fn copyHashed(io: Io, from: []const u8, to: []const u8, max: u64) !struct { size
         total += n;
         if (total > max) return error.TooLarge;
         h.update(buf[0..n]);
-        try dst.writeStreamingAll(io, buf[0..n]);
+        if (dst) |d| try d.writeStreamingAll(io, buf[0..n]);
     }
-    try dst.sync(io);
+    if (dst) |d| try d.sync(io);
     var d: [32]u8 = undefined;
     h.final(&d);
     return .{ .size = total, .sha = d };
 }
 
-/// Hashes and signs `opts.folder` as a new version of `opts.package`.
-/// `problem` gets a description of a refused file path.
-pub fn publish(gpa: Allocator, io: Io, paths: Paths, opts: PublishOptions, problem: *[300]u8) !Published {
-    if (!manifest.validPackageId(opts.package)) return error.BadPackageId;
-    if (opts.version) |v| if (!manifest.validVersion(v)) return error.BadVersion;
-    if (!manifest.validClientVersion(opts.min_client)) return error.BadClientVersion;
-    var key = (try loadKey(gpa, io, paths)) orelse return error.NoSyncKey;
-    defer key.wipe();
-
-    // Every regular file under the folder, relative paths with '/'.
+/// Every regular file under `folder`, as relative paths with '/', sorted:
+/// what publish packages, in manifest order. Free with freeFolderFiles.
+fn folderFiles(gpa: Allocator, io: Io, folder: []const u8, problem: *[300]u8) !std.ArrayList([]u8) {
     var rels: std.ArrayList([]u8) = .empty;
-    defer {
-        for (rels.items) |r| gpa.free(r);
-        rels.deinit(gpa);
-    }
+    errdefer freeFolderFiles(gpa, &rels);
     {
-        var dir = try Io.Dir.cwd().openDir(io, opts.folder, .{ .iterate = true });
+        var dir = try Io.Dir.cwd().openDir(io, folder, .{ .iterate = true });
         defer dir.close(io);
         var walker = try dir.walk(gpa);
         defer walker.deinit();
@@ -252,6 +246,59 @@ pub fn publish(gpa: Allocator, io: Io, paths: Paths, opts: PublishOptions, probl
         }
     }
     if (rels.items.len == 0) return error.EmptyFolder;
+    std.mem.sort([]u8, rels.items, {}, struct {
+        fn lt(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return rels;
+}
+
+fn freeFolderFiles(gpa: Allocator, rels: *std.ArrayList([]u8)) void {
+    for (rels.items) |r| gpa.free(r);
+    rels.deinit(gpa);
+}
+
+/// `folder`\`rel`, rel's '/' as '\'.
+fn folderPath(buf: []u8, folder: []const u8, rel: []const u8) ![]const u8 {
+    var w: Io.Writer = .fixed(buf);
+    w.writeAll(folder) catch return error.NameTooLong;
+    w.writeAll("\\") catch return error.NameTooLong;
+    for (rel) |c| w.writeByte(if (c == '/') '\\' else c) catch return error.NameTooLong;
+    return w.buffered();
+}
+
+/// Whether `folder` holds exactly the files of the newest published
+/// version of `package` (the same paths, sizes and SHA-256: the content its
+/// signed manifest names), so publishing it would add a version that
+/// changes nothing. False when nothing is published yet.
+pub fn sameAsLatest(gpa: Allocator, io: Io, paths: Paths, package: []const u8, folder: []const u8) !bool {
+    var v = (try latest(gpa, io, paths, package)) orelse return false;
+    defer v.deinit(gpa);
+    var problem: [300]u8 = undefined;
+    var rels = try folderFiles(gpa, io, folder, &problem);
+    defer freeFolderFiles(gpa, &rels);
+    if (rels.items.len != v.m.files.len) return false;
+    for (rels.items, v.m.files) |rel, f| {
+        if (!std.mem.eql(u8, rel, f.path)) return false;
+        var sb: [1400]u8 = undefined;
+        const c = try copyHashed(io, try folderPath(&sb, folder, rel), null, manifest.max_package_bytes);
+        if (c.size != f.size or !std.mem.eql(u8, &c.sha, &f.sha256)) return false;
+    }
+    return true;
+}
+
+/// Hashes and signs `opts.folder` as a new version of `opts.package`.
+/// `problem` gets a description of a refused file path.
+pub fn publish(gpa: Allocator, io: Io, paths: Paths, opts: PublishOptions, problem: *[300]u8) !Published {
+    if (!manifest.validPackageId(opts.package)) return error.BadPackageId;
+    if (opts.version) |v| if (!manifest.validVersion(v)) return error.BadVersion;
+    if (!manifest.validClientVersion(opts.min_client)) return error.BadClientVersion;
+    var key = (try loadKey(gpa, io, paths)) orelse return error.NoSyncKey;
+    defer key.wipe();
+
+    var rels = try folderFiles(gpa, io, opts.folder, problem);
+    defer freeFolderFiles(gpa, &rels);
 
     var pb: [1024]u8 = undefined;
     const pkg_dir = try paths.join(&pb, &.{ "publish", opts.package });
@@ -266,7 +313,11 @@ pub fn publish(gpa: Allocator, io: Io, paths: Paths, opts: PublishOptions, probl
     defer gpa.free(hist.text);
     const seq = hist.last_sequence + 1;
     var out: Published = .{ .sequence = seq };
-    const ver = opts.version orelse (std.fmt.bufPrint(&out.version_buf, "{d}", .{seq}) catch unreachable);
+    const ver = opts.version orelse if (opts.version_base) |base|
+        (std.fmt.bufPrint(&out.version_buf, "{s}+{d}", .{ base, seq }) catch return error.BadVersion)
+    else
+        (std.fmt.bufPrint(&out.version_buf, "{d}", .{seq}) catch unreachable);
+    if (!manifest.validVersion(ver)) return error.BadVersion;
     if (opts.version) |v| @memcpy(out.version_buf[0..v.len], v);
     out.version_len = ver.len;
     const version = out.version();
@@ -289,25 +340,16 @@ pub fn publish(gpa: Allocator, io: Io, paths: Paths, opts: PublishOptions, probl
     var placed = false;
     defer if (!placed) Io.Dir.cwd().deleteTree(io, tmp) catch {};
 
-    // Sort first: file n in the store is file n of the manifest.
-    std.mem.sort([]u8, rels.items, {}, struct {
-        fn lt(_: void, a: []u8, b: []u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lt);
+    // Sorted by folderFiles: file n in the store is file n of the manifest.
     const files = try gpa.alloc(manifest.File, rels.items.len);
     defer gpa.free(files);
     var total: u64 = 0;
     for (rels.items, 0..) |rel, i| {
         var sb: [1400]u8 = undefined;
-        var src_w: Io.Writer = .fixed(&sb);
-        src_w.writeAll(opts.folder) catch return error.NameTooLong;
-        src_w.writeAll("\\") catch return error.NameTooLong;
-        for (rel) |c| src_w.writeByte(if (c == '/') '\\' else c) catch return error.NameTooLong;
         var db: [1200]u8 = undefined;
         var nb: [16]u8 = undefined;
         const dst = try joinBuf(&db, &.{ tmp, "files", try std.fmt.bufPrint(&nb, "{d}", .{i}) });
-        const c = try copyHashed(io, src_w.buffered(), dst, manifest.max_package_bytes - total);
+        const c = try copyHashed(io, try folderPath(&sb, opts.folder, rel), dst, manifest.max_package_bytes - total);
         total += c.size;
         files[i] = .{ .path = rel, .size = c.size, .sha256 = c.sha };
     }
@@ -429,6 +471,44 @@ pub fn latest(gpa: Allocator, io: Io, paths: Paths, package: []const u8) !?Versi
     return best;
 }
 
+/// Unpublishes every version of `package` but the `keep` newest (by
+/// sequence), so superseded versions are not served for ever (devices
+/// keep what they installed; sequences and names stay used). A version
+/// that can't be removed now (a file of it open, e.g. being served) is
+/// left for the next prune. Returns how many went.
+pub fn prune(gpa: Allocator, io: Io, paths: Paths, package: []const u8, keep: usize) !usize {
+    if (!manifest.validPackageId(package)) return error.BadPackageId;
+    const Seen = struct { seq: u64, name: [manifest.max_version]u8, len: usize };
+    var seen: std.ArrayList(Seen) = .empty;
+    defer seen.deinit(gpa);
+    {
+        var pb: [1024]u8 = undefined;
+        var dir = Io.Dir.cwd().openDir(io, try paths.join(&pb, &.{ "publish", package }), .{ .iterate = true }) catch return 0;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |e| {
+            if (e.kind != .directory or !manifest.validVersion(e.name)) continue;
+            var v = readVersion(gpa, io, paths, package, e.name) catch continue;
+            defer v.deinit(gpa);
+            var s: Seen = .{ .seq = v.m.sequence, .name = undefined, .len = e.name.len };
+            @memcpy(s.name[0..e.name.len], e.name);
+            try seen.append(gpa, s);
+        }
+    }
+    if (seen.items.len <= keep) return 0;
+    std.mem.sort(Seen, seen.items, {}, struct {
+        fn newer(_: void, a: Seen, b: Seen) bool {
+            return a.seq > b.seq;
+        }
+    }.newer);
+    var gone: usize = 0;
+    for (seen.items[keep..]) |*s| {
+        unpublish(io, paths, package, s.name[0..s.len]) catch continue;
+        gone += 1;
+    }
+    return gone;
+}
+
 /// The stored file `n` of a published version: its path and the size the
 /// manifest promises.
 pub fn filePath(paths: Paths, buf: []u8, package: []const u8, version: []const u8, n: usize) ![]const u8 {
@@ -469,6 +549,42 @@ pub const Sub = struct {
 pub const Subs = struct {
     items: [max_subscriptions]Sub = undefined,
     n: usize = 0,
+    /// Packages the owner unsubscribed a device from ("optout" lines):
+    /// automatic subscription (`autoSubscribe`) never adds them back.
+    optouts: [max_subscriptions]Sub = undefined,
+    n_optouts: usize = 0,
+
+    pub fn optedOut(s: *const Subs, device: []const u8, package: []const u8) bool {
+        return indexOf(s.optouts[0..s.n_optouts], device, package) != null;
+    }
+
+    fn indexOf(list: []const Sub, device: []const u8, package: []const u8) ?usize {
+        for (list, 0..) |x, i| {
+            if (std.mem.eql(u8, x.device.get(), device) and std.mem.eql(u8, x.package.get(), package)) return i;
+        }
+        return null;
+    }
+
+    /// Records (or clears) the owner's explicit opt-out. True if it changed.
+    pub fn setOptOut(s: *Subs, device: []const u8, package: []const u8, on: bool) !bool {
+        if (!devices.validName(device)) return error.BadName;
+        if (!manifest.validPackageId(package)) return error.BadPackageId;
+        const at = indexOf(s.optouts[0..s.n_optouts], device, package);
+        if (!on) {
+            const i = at orelse return false;
+            s.optouts[i] = s.optouts[s.n_optouts - 1];
+            s.n_optouts -= 1;
+            return true;
+        }
+        if (at != null) return false;
+        if (s.n_optouts == s.optouts.len) return error.TooManySubscriptions;
+        var x: Sub = .{};
+        x.device.set(device);
+        x.package.set(package);
+        s.optouts[s.n_optouts] = x;
+        s.n_optouts += 1;
+        return true;
+    }
 
     pub fn has(s: *const Subs, device: []const u8, package: []const u8) bool {
         for (s.items[0..s.n]) |x| {
@@ -520,11 +636,15 @@ pub const Subs = struct {
         if (!std.mem.eql(u8, it.next() orelse "", subs_header)) return error.BadSubscriptionFile;
         while (it.next()) |line| {
             var f = std.mem.tokenizeScalar(u8, line, ' ');
-            if (!std.mem.eql(u8, f.next() orelse "", "sub")) return error.BadSubscriptionFile;
+            const kind = f.next() orelse "";
+            const optout = std.mem.eql(u8, kind, "optout");
+            if (!optout and !std.mem.eql(u8, kind, "sub")) return error.BadSubscriptionFile;
             const d = f.next() orelse return error.BadSubscriptionFile;
             const p = f.next() orelse return error.BadSubscriptionFile;
             if (f.next() != null) return error.BadSubscriptionFile;
-            _ = s.add(d, p) catch return error.BadSubscriptionFile;
+            if (optout) {
+                _ = s.setOptOut(d, p, true) catch return error.BadSubscriptionFile;
+            } else _ = s.add(d, p) catch return error.BadSubscriptionFile;
         }
         return s;
     }
@@ -532,6 +652,7 @@ pub const Subs = struct {
     pub fn format(s: *const Subs, gpa: Allocator, out: *std.ArrayList(u8)) !void {
         try out.appendSlice(gpa, subs_header ++ "\n");
         for (s.items[0..s.n]) |x| try out.print(gpa, "sub {s} {s}\n", .{ x.device.get(), x.package.get() });
+        for (s.optouts[0..s.n_optouts]) |x| try out.print(gpa, "optout {s} {s}\n", .{ x.device.get(), x.package.get() });
     }
 };
 
@@ -584,10 +705,52 @@ pub fn subscribe(gpa: Allocator, io: Io, paths: Paths, device: []const u8, packa
     try withSubs(gpa, io, paths, Ctx{ .d = device, .p = package, .on = on, .changed = &changed }, struct {
         fn op(c: Ctx, s: *Subs) !bool {
             c.changed.* = if (c.on) try s.add(c.d, c.p) else s.remove(c.d, c.p);
-            return c.changed.*;
+            // The owner's choice sticks: an unsubscribe is an opt-out that
+            // automatic subscription respects; subscribing clears it.
+            const opt = try s.setOptOut(c.d, c.p, !c.on);
+            return c.changed.* or opt;
         }
     }.op);
     return changed;
+}
+
+/// A device's OS and CPU as it said (`d:platform`, shared/platform.zig;
+/// the desk keeps it in memory, web.PlatformTable); null until it says.
+pub const Platform = @import("shared").platform.Platform;
+
+/// The packages a device is subscribed to automatically: the trained
+/// adapter for every device; the laptop speech engine and its model too
+/// for an aarch64 Windows device (the only build of stt-local). A device
+/// that has not said its platform yet gets the adapter alone; it gets the
+/// rest when it says (main.zig StoreWatch.platformReported).
+pub fn autoPackages(p: ?Platform) []const []const u8 {
+    const all = if (p) |x| x == .windows_aarch64 else false;
+    return if (all) &manifest.voice_packages else &.{"stt-adapter"};
+}
+
+/// A paired device and what the desk knows of its platform.
+pub const AutoDevice = struct { name: []const u8, platform: ?Platform = null };
+
+/// Subscribes each device to its automatic packages (autoPackages), except
+/// those it is subscribed to already or the owner opted it out of. Runs on
+/// every device store read (main.zig StoreWatch: a new pairing, and
+/// devices paired earlier on the first start that runs it) and when a
+/// device says its platform. Idempotent: the file is written only when
+/// something is added; nothing is ever removed here. Returns how many were
+/// added.
+pub fn autoSubscribe(gpa: Allocator, io: Io, paths: Paths, devs: []const AutoDevice) !usize {
+    var added: usize = 0;
+    const Ctx = struct { devs: []const AutoDevice, added: *usize };
+    try withSubs(gpa, io, paths, Ctx{ .devs = devs, .added = &added }, struct {
+        fn op(c: Ctx, s: *Subs) !bool {
+            for (c.devs) |d| for (autoPackages(d.platform)) |p| {
+                if (s.optedOut(d.name, p)) continue;
+                if (try s.add(d.name, p)) c.added.* += 1;
+            };
+            return c.added.* > 0;
+        }
+    }.op);
+    return added;
 }
 
 // ------------------------------------------------------------------ index
@@ -726,4 +889,101 @@ test "subscriptions file is strict" {
     const s = try Subs.parse(subs_header ++ "\nsub laptop stt-model\nsub laptop npu-probe\n");
     var b: [4][]const u8 = undefined;
     try testing.expectEqual(@as(usize, 2), s.forDevice("laptop", &b).len);
+}
+
+test "prune: keeps the newest by sequence (not by name); nothing published, nothing to do" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [512]u8 = undefined;
+    const paths = try tmpPaths(&tmp, &pb);
+    _ = try initKey(gpa, io, paths, false);
+    try testing.expectEqual(@as(usize, 0), try prune(gpa, io, paths, "stt-adapter", 2));
+    var fb: [1024]u8 = undefined;
+    try Io.Dir.cwd().createDirPath(io, try paths.join(&fb, &.{"src"}));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try paths.join(&fb, &.{ "src", "a.bin" }), .data = "a" });
+    var sb: [1024]u8 = undefined;
+    const src = try paths.join(&sb, &.{"src"});
+    var problem: [300]u8 = undefined;
+    for ([_][]const u8{ "9", "10", "b", "a" }) |v| _ = try publish(gpa, io, paths, .{ .package = "stt-adapter", .folder = src, .kind = .data, .version = v, .now = 1 }, &problem);
+    try testing.expectEqual(@as(usize, 2), try prune(gpa, io, paths, "stt-adapter", 2));
+    try testing.expectError(error.NotPublished, readVersion(gpa, io, paths, "stt-adapter", "9"));
+    try testing.expectError(error.NotPublished, readVersion(gpa, io, paths, "stt-adapter", "10"));
+    var l = (try latest(gpa, io, paths, "stt-adapter")).?;
+    defer l.deinit(gpa);
+    try testing.expectEqualStrings("a", l.m.version);
+    try testing.expectEqual(@as(usize, 0), try prune(gpa, io, paths, "stt-adapter", 2));
+    try testing.expectError(error.BadPackageId, prune(gpa, io, paths, "../x", 2));
+}
+
+test "auto-subscribe: new and existing devices get their voice packages once; an opt-out sticks across restarts" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [512]u8 = undefined;
+    const paths = try tmpPaths(&tmp, &pb);
+    const arm: AutoDevice = .{ .name = "laptop", .platform = .windows_aarch64 };
+    const phone: AutoDevice = .{ .name = "phone", .platform = .windows_aarch64 };
+    // Devices paired before this build: subscribed on the first start.
+    try testing.expectEqual(@as(usize, 6), try autoSubscribe(gpa, io, paths, &.{ arm, phone }));
+    // The next start (or store change) adds nothing.
+    try testing.expectEqual(@as(usize, 0), try autoSubscribe(gpa, io, paths, &.{ arm, phone }));
+    var s = try readSubs(gpa, io, paths);
+    for (manifest.voice_packages) |p| try testing.expect(s.has("laptop", p) and s.has("phone", p));
+    // The owner unsubscribes the phone from stt-model: it stays off, also
+    // after a restart (read back from the file).
+    try testing.expect(try subscribe(gpa, io, paths, "phone", "stt-model", false));
+    try testing.expectEqual(@as(usize, 0), try autoSubscribe(gpa, io, paths, &.{ arm, phone }));
+    s = try readSubs(gpa, io, paths);
+    try testing.expect(!s.has("phone", "stt-model"));
+    try testing.expect(s.optedOut("phone", "stt-model"));
+    // A new pairing gets subscribed; the opt-out is untouched.
+    try testing.expectEqual(@as(usize, 3), try autoSubscribe(gpa, io, paths, &.{ arm, phone, .{ .name = "surface", .platform = .windows_aarch64 } }));
+    s = try readSubs(gpa, io, paths);
+    try testing.expect(s.has("surface", "stt-local") and !s.has("phone", "stt-model"));
+    // Subscribing by hand clears the opt-out.
+    try testing.expect(try subscribe(gpa, io, paths, "phone", "stt-model", true));
+    s = try readSubs(gpa, io, paths);
+    try testing.expect(!s.optedOut("phone", "stt-model"));
+}
+
+test "auto-subscribe follows the reported platform: aarch64 Windows all three, others and unknown the adapter; the rest once it says" {
+    try testing.expectEqual(@as(usize, 3), autoPackages(.windows_aarch64).len);
+    for ([_]?Platform{ null, .windows_x86_64, .linux_x86_64, .linux_aarch64, .macos_aarch64, .ios_aarch64 }) |p| {
+        const one = autoPackages(p);
+        try testing.expectEqual(@as(usize, 1), one.len);
+        try testing.expectEqualStrings("stt-adapter", one[0]);
+    }
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [512]u8 = undefined;
+    const paths = try tmpPaths(&tmp, &pb);
+    // Paired, platform not said yet: the adapter alone.
+    try testing.expectEqual(@as(usize, 2), try autoSubscribe(gpa, io, paths, &.{ .{ .name = "mac", .platform = .macos_aarch64 }, .{ .name = "laptop" } }));
+    var s = try readSubs(gpa, io, paths);
+    try testing.expect(s.has("mac", "stt-adapter") and !s.has("mac", "stt-local"));
+    try testing.expect(s.has("laptop", "stt-adapter") and !s.has("laptop", "stt-local") and !s.has("laptop", "stt-model"));
+    // The laptop says windows-aarch64: the engine and the model follow.
+    try testing.expectEqual(@as(usize, 2), try autoSubscribe(gpa, io, paths, &.{.{ .name = "laptop", .platform = .windows_aarch64 }}));
+    s = try readSubs(gpa, io, paths);
+    try testing.expect(s.has("laptop", "stt-local") and s.has("laptop", "stt-model"));
+    // An opt-out made before it said is respected when it says.
+    _ = try subscribe(gpa, io, paths, "surface", "stt-local", false);
+    try testing.expectEqual(@as(usize, 2), try autoSubscribe(gpa, io, paths, &.{.{ .name = "surface", .platform = .windows_aarch64 }}));
+    s = try readSubs(gpa, io, paths);
+    try testing.expect(!s.has("surface", "stt-local") and s.has("surface", "stt-model") and s.has("surface", "stt-adapter"));
+}
+
+test "subscriptions file: optout lines round-trip; any other line is refused" {
+    const s = try Subs.parse(subs_header ++ "\nsub laptop stt-model\noptout laptop stt-local\n");
+    try testing.expect(s.optedOut("laptop", "stt-local"));
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try s.format(testing.allocator, &out);
+    try testing.expectEqualStrings(subs_header ++ "\nsub laptop stt-model\noptout laptop stt-local\n", out.items);
+    try testing.expectError(error.BadSubscriptionFile, Subs.parse(subs_header ++ "\nnope laptop x\n"));
 }

@@ -20,11 +20,16 @@ const std = @import("std");
 const speech = @import("speech");
 const ui = @import("portal_ui");
 const settings = @import("settings.zig");
+const voiceshare = @import("voiceshare.zig");
+const Log = @import("log.zig").Log;
 
 const capture = speech.capture;
 const mics = speech.mics;
 const audio_panel = ui.panels.audio;
 const Engine = if (speech.has_home) speech.home.Engine else void;
+const home_status = if (speech.has_home) speech.home else struct {
+    pub const Shared = struct { version: u32 = 0, failed: ?[]const u8 = null };
+};
 
 /// Where the model is looked for when the settings name none.
 pub fn defaultModel(gpa: std.mem.Allocator, data_dir: []const u8) ![]u8 {
@@ -62,6 +67,23 @@ pub const DeskSpeech = struct {
     recording_seq: u32 = 0,
     /// "Learn from my voice" (settings.txt speech_learning, default on).
     learning: bool = true,
+    /// "Share voice improvements with devices" (settings.txt speech_share,
+    /// default on): each new trained adapter is published as the signed
+    /// stt-adapter package (voiceshare.zig, on the engine's thread).
+    share: bool = true,
+    share_ctx: voiceshare.Share = undefined,
+    /// "Publish the laptop speech engine" (settings.txt
+    /// speech_publish_engine, default on): read by `zig build release`.
+    publish_engine: bool = true,
+    /// The last release's word on the laptop engine
+    /// (voiceshare.engine_status_file), read when Audio opens.
+    engine_buf: [voiceshare.max_status + 16]u8 = undefined,
+    engine_status: ?voiceshare.Status = null,
+    /// The desk's log (publishes are logged there).
+    log: ?*Log = null,
+    /// The engine's last publish as of the last poll (redraw on change).
+    last_shared: home_status.Shared = .{},
+    shared_buf: [160]u8 = undefined,
     /// A model change: the old engine stops on a thread of its own (Home
     /// closing can take a moment), which wakes the window when done; the
     /// new one starts then. Meanwhile: "Stopping speech…".
@@ -98,6 +120,12 @@ pub const DeskSpeech = struct {
         s.limits = saved.speech;
         s.instruct_mode = saved.instruct_mode orelse .auto;
         s.learning = saved.speech_learning orelse true;
+        s.share = saved.speech_share orelse true;
+        s.publish_engine = saved.speech_publish_engine orelse true;
+        s.share_ctx = .{ .gpa = s.gpa, .io = s.io, .paths = .{ .dir = s.data_dir }, .log = s.log };
+        // What the last `zig build release` did with the laptop engine.
+        s.engine_status = voiceshare.readEngineStatus(s.io, .{ .dir = s.data_dir }, &s.engine_buf);
+        if (s.log) |l| if (s.engine_status) |st| l.print("{s}speech: {s}", .{ if (st.tone == .failed) "ERROR: " else "", st.text });
         if (s.inbox) |ib| ib.setLimits(s.limits);
         const model = saved.speech_model.get();
         s.startEngine(model);
@@ -114,6 +142,8 @@ pub const DeskSpeech = struct {
         e.notify_fn = s.notify_fn;
         e.setLimits(s.limits);
         if (!s.learning) e.setLearning(false);
+        e.publisher = s.share_ctx.publisher(speech.home.Publisher);
+        if (!s.share) e.setShare(false);
         e.start() catch {
             e.destroy();
             return;
@@ -328,6 +358,8 @@ pub const DeskSpeech = struct {
             }
             const st = e.getStatus();
             if (@backingInt(st.state) != s.last_state or st.busy != s.last_busy) changed = true;
+            if (st.shared.version != s.last_shared.version or (st.shared.failed == null) != (s.last_shared.failed == null)) changed = true;
+            s.last_shared = st.shared;
             s.last_state = @backingInt(st.state);
             s.last_busy = st.busy;
         };
@@ -447,6 +479,9 @@ pub const DeskSpeech = struct {
     pub fn openPanel(s: *DeskSpeech) void {
         s.panel.show(s.snap.automatic, s.model_path, s.instruct_mode);
         s.panel.learning = s.learning;
+        s.panel.share = s.share;
+        s.panel.publish_engine = s.publish_engine;
+        s.engine_status = voiceshare.readEngineStatus(s.io, .{ .dir = s.data_dir }, &s.engine_buf);
         // The meter runs exactly while the panel is open.
         s.mic.setMeter(true);
     }
@@ -470,12 +505,32 @@ pub const DeskSpeech = struct {
             .speech = state,
             .speech_bad = bad,
             .mic_error = s.snap.err(),
+            .shared = s.sharedText(),
+            .shared_bad = speech.has_home and s.last_shared.failed != null,
+            .engine = if (s.engine_status) |st| st.text else "",
+            .engine_tone = if (s.engine_status) |st| switch (st.tone) {
+                .ok => .good,
+                .failed => .bad,
+                .off => .muted,
+            } else .muted,
         };
+    }
+
+    /// The Audio panel's line about the adapter shared with devices.
+    fn sharedText(s: *DeskSpeech) []const u8 {
+        if (!speech.has_home) return "";
+        const sh = s.last_shared;
+        if (sh.failed) |why| {
+            if (!s.share) return "";
+            return std.fmt.bufPrint(&s.shared_buf, "Your new voice could not be published to devices ({s}; see the log).", .{why}) catch "";
+        }
+        if (sh.version == 0) return "";
+        return std.fmt.bufPrint(&s.shared_buf, "Your voice v{d} published to devices.", .{sh.version}) catch "";
     }
 
     /// What an Audio panel action changes in the settings (the window
     /// saves them): the microphone choice or the model path.
-    pub const Saved = union(enum) { none, mic: ?[]const u8, model: []const u8, reload, instruct_mode: ui.shell.InstructMode, learning: bool };
+    pub const Saved = union(enum) { none, mic: ?[]const u8, model: []const u8, reload, instruct_mode: ui.shell.InstructMode, learning: bool, share: bool, publish_engine: bool };
 
     /// New speech limits (settings.txt reloaded at the desk): applied live.
     pub fn setLimits(s: *DeskSpeech, c: speech.limits.Config) void {
@@ -492,6 +547,17 @@ pub const DeskSpeech = struct {
                 s.learning = on;
                 if (speech.has_home) if (s.engine) |e| e.setLearning(on);
                 return .{ .learning = on };
+            },
+            .set_share => |on| {
+                s.share = on;
+                if (speech.has_home) if (s.engine) |e| e.setShare(on);
+                if (s.log) |l| l.print("speech: sharing voice improvements with devices {s}", .{if (on) "on" else "off"});
+                return .{ .share = on };
+            },
+            .set_publish_engine => |on| {
+                s.publish_engine = on;
+                if (s.log) |l| l.print("speech: publishing the laptop speech engine on release {s}", .{if (on) "on" else "off"});
+                return .{ .publish_engine = on };
             },
             .set_instruct_mode => |m| {
                 s.instruct_mode = m;

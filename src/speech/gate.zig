@@ -13,8 +13,10 @@
 //!   feedback(device, now) / bundle(device, bytes, clips, now)
 //!       the per-device limits (limits.DeviceBuckets).
 //!   end(ticket)             always, when the request is done.
-//!   retain(paired names)    when the device store changes: unpaired
-//!       devices' entries are reused.
+//!   retain(paired names) / drop(name)    when the device store changes:
+//!       an unpaired (or replaced) device's entry is freed for reuse; one
+//!       with a request in flight is marked stale (its requests refused,
+//!       the name busy) and freed when the last one ends.
 //!
 //! The desk's own microphone never goes through here (it has its own
 //! limits in home.Engine). Pure state: the caller holds one lock around it
@@ -51,6 +53,9 @@ pub const Gate = struct {
     per_device: limits.DeviceBuckets = .{},
     /// Requests in flight per device, and payload bytes over all.
     inflight: [limits.max_devices]u16 = @splat(0),
+    /// Unpaired or replaced while a request was in flight: freed when the
+    /// last one ends.
+    stale: [limits.max_devices]bool = @splat(false),
     payload: u64 = 0,
 
     /// New limits (live): counts and tickets are kept.
@@ -72,18 +77,40 @@ pub const Gate = struct {
     }
 
     /// Frees the entries of devices the device store no longer has (call
-    /// when it changes: unpairing). Entries with a request in flight stay
-    /// until it ends.
+    /// when it changes: unpairing). Entries with a request in flight are
+    /// marked stale and freed when it ends.
     pub fn retain(g: *Gate, paired: []const []const u8) void {
         const t = &g.per_device;
         for (0..t.n) |k| {
-            if (t.lens[k] == 0 or g.inflight[k] > 0) continue;
+            if (t.lens[k] == 0) continue;
             const name = t.names[k][0..t.lens[k]];
             const still = for (paired) |p| {
                 if (std.mem.eql(u8, p, name)) break true;
             } else false;
-            if (!still) t.free(k);
+            if (!still) g.dropSlot(k);
         }
+    }
+
+    /// `device`'s entry goes (it was unpaired, or replaced by a new
+    /// pairing under the same name: the new device starts afresh).
+    pub fn drop(g: *Gate, device: []const u8) void {
+        if (g.per_device.find(device)) |k| g.dropSlot(k);
+    }
+
+    fn dropSlot(g: *Gate, k: usize) void {
+        if (g.inflight[k] > 0) {
+            g.stale[k] = true;
+            return;
+        }
+        g.stale[k] = false;
+        g.per_device.free(k);
+    }
+
+    /// The device's entry was dropped while its request was in flight:
+    /// that request must not be stored.
+    pub fn isStale(g: *const Gate, device: []const u8) bool {
+        const k = g.per_device.find(device) orelse return false;
+        return g.stale[k];
     }
 
     fn budget(g: *const Gate) u64 {
@@ -93,6 +120,8 @@ pub const Gate = struct {
     pub fn begin(g: *Gate, device: []const u8, declared_bytes: u64, now: i64) Begin {
         const i = g.slot(device) orelse return .refused;
         if (declared_bytes > g.budget()) return .too_large;
+        // The name's previous device is still finishing a request.
+        if (g.stale[i]) return .{ .busy = now + busy_retry_ms };
         if (g.inflight[i] >= g.cfg.device_inflight) return .{ .busy = now + busy_retry_ms };
         if (g.inflight[i] == 0 and g.busyDevices() >= g.cfg.concurrent_devices) return .{ .busy = now + busy_retry_ms };
         if (g.payload + declared_bytes > g.budget()) return .{ .busy = now + busy_retry_ms };
@@ -105,6 +134,7 @@ pub const Gate = struct {
     pub fn end(g: *Gate, t: Ticket) void {
         g.inflight[t.device] -|= 1;
         g.payload -|= t.bytes;
+        if (g.stale[t.device] and g.inflight[t.device] == 0) g.dropSlot(t.device);
     }
 
     /// A correction or discard from `device`.
@@ -164,16 +194,30 @@ test "feedback and bundles go to the per-device limits" {
     try testing.expect(g.bundle("laptop", 1024, 10, 0) == .ok);
 }
 
-test "retain: unpaired devices' entries are reused; in flight stays" {
+test "retain: unpaired devices' entries are reused; in flight is stale until it ends" {
     var g: Gate = .{};
     try testing.expect(g.feedback("old", 0) == .ok);
     const t = g.begin("busy", 1, 0).ok;
     g.retain(&.{"laptop"});
     try testing.expect(g.per_device.find("old") == null);
     try testing.expect(g.per_device.find("busy") != null);
+    try testing.expect(g.isStale("busy"));
+    // Its name is busy meanwhile (a new pairing under it waits).
+    try testing.expect(g.begin("busy", 1, 0) == .busy);
     g.end(t);
-    g.retain(&.{"laptop"});
+    // Freed by the end itself, no further store change needed.
     try testing.expect(g.per_device.find("busy") == null);
+    try testing.expect(!g.isStale("busy"));
+    try testing.expect(g.begin("busy", 1, 0) == .ok);
+}
+
+test "drop: a replaced device starts afresh" {
+    var g: Gate = .{};
+    for (0..limits.feedback_burst) |_| try testing.expect(g.feedback("laptop", 0) == .ok);
+    try testing.expect(g.feedback("laptop", 0) == .limited);
+    g.drop("laptop");
+    try testing.expect(g.feedback("laptop", 0) == .ok);
+    g.drop("never-seen"); // nothing to do
 }
 
 test "never more names than paired devices; bad names refused, no panic" {

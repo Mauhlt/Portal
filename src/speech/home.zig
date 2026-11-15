@@ -86,10 +86,32 @@ pub const Status = struct {
     why_buf: [160]u8 = undefined,
     why_len: usize = 0,
     training: stt.schedule.Status = .{},
+    /// The last adapter publish to devices (`Publisher`).
+    shared: Shared = .{},
 
     pub fn why(s: *const Status) []const u8 {
         return s.why_buf[0..s.why_len];
     }
+};
+
+/// The last publish of a trained adapter to devices.
+pub const Shared = struct {
+    /// The version published (0: none yet in this run).
+    version: u32 = 0,
+    /// Why the last attempt failed (an error name), null if it didn't.
+    failed: ?[]const u8 = null,
+};
+
+/// "Share voice improvements with devices": where a new adapter version
+/// goes (the desk's signed stt-adapter package, src/voiceshare.zig). Both
+/// calls run on the engine's thread.
+pub const Publisher = struct {
+    ctx: *anyopaque,
+    /// The adapter version devices already get (0: none).
+    published: *const fn (ctx: *anyopaque) u32,
+    /// Publishes stt's update (Home.exportUpdate's bytes): the version
+    /// published, null if it was published already, or why not.
+    publish: *const fn (ctx: *anyopaque, update: []const u8) anyerror!?u32,
 };
 
 pub const Config = struct {
@@ -161,6 +183,13 @@ pub const Engine = struct {
     import_job: ?struct { bytes: []u8, device: [limits.max_device_name]u8, device_len: usize, done: ?*Done = null } = null,
     export_job: ?u32 = null,
     sync_result: ?SyncResult = null,
+    /// Set before `start` (null: adapters are never published).
+    publisher: ?Publisher = null,
+    /// "Share voice improvements with devices" (default on), and a
+    /// publish check waiting for the engine's thread (a run finished,
+    /// Home opened, or sharing was switched on).
+    share: bool = true,
+    publish_job: bool = false,
     deadline: ?i64 = null,
     /// Ticks run, wakeups received, results / feedback dropped (tests, the log).
     ticks: u64 = 0,
@@ -304,6 +333,18 @@ pub const Engine = struct {
         defer e.lock.unlock();
         e.learning = on;
         e.learning_job = on;
+        _ = sys.SetEvent(e.job_ev);
+    }
+
+    /// "Share voice improvements with devices": off, no adapter is
+    /// published; on, the current one is published if devices don't have
+    /// it yet (on the engine's thread).
+    pub fn setShare(e: *Engine, on: bool) void {
+        e.lock.lock();
+        defer e.lock.unlock();
+        e.share = on;
+        if (!on) return;
+        e.publish_job = true;
         _ = sys.SetEvent(e.job_ev);
     }
 
@@ -477,6 +518,19 @@ pub const Engine = struct {
         }
     }
 
+    /// `device` was unpaired or replaced (speech/inbox.zig, `retain`): its
+    /// bundle still queued is dropped and its waiter told it failed, so
+    /// the device keeps those samples. One already importing finishes.
+    /// True if one was dropped.
+    pub fn dropImport(e: *Engine, device: []const u8) bool {
+        e.lock.lock();
+        defer e.lock.unlock();
+        const j = e.import_job orelse return false;
+        if (!std.mem.eql(u8, j.device[0..j.device_len], device)) return false;
+        e.failImport();
+        return true;
+    }
+
     fn queueImport(e: *Engine, device: []const u8, bytes: []u8, done: ?*Done) SyncError!void {
         var keep = false;
         defer if (!keep) e.gpa.free(bytes);
@@ -565,7 +619,12 @@ pub const Engine = struct {
         };
         e.lock.lock();
         e.status.training = st;
+        // A run finished: its adapter may be a new version for devices
+        // (checked on the engine's thread; this may be the training one).
+        const check = ev == .finished;
+        if (check) e.publish_job = true;
         e.lock.unlock();
+        if (check) _ = sys.SetEvent(e.job_ev);
         e.notify();
     }
 
@@ -594,7 +653,11 @@ pub const Engine = struct {
         e.lock.lock();
         e.status.state = .ready;
         e.status.training = home.trainingStatus();
+        // An adapter trained before this run (or while sharing was off,
+        // or a publish cut short) reaches devices now.
+        e.publish_job = true;
         e.lock.unlock();
+        _ = sys.SetEvent(e.job_ev);
         e.notify();
 
         while (true) {
@@ -640,6 +703,8 @@ pub const Engine = struct {
             var clip: ?Clip = null;
             var imp: @TypeOf(e.import_job) = null;
             var exp: ?u32 = null;
+            var publisher: ?Publisher = null;
+            var publish_check = false;
             const learn = e.learning_job;
             e.learning_job = null;
             // Order: feedback (cheap), the desk's transcription, then
@@ -655,6 +720,12 @@ pub const Engine = struct {
             } else if (e.export_job) |v| {
                 exp = v;
                 e.export_job = null;
+            } else if (e.publish_job) {
+                // Last: nothing a person waits for. Sharing off: dropped
+                // (switching it on asks again).
+                e.publish_job = false;
+                publish_check = true;
+                publisher = if (e.share) e.publisher else null;
             }
             e.lock.unlock();
             // A learning change first, then whatever was taken with it in
@@ -677,6 +748,10 @@ pub const Engine = struct {
             if (fb) |f| {
                 defer e.gpa.free(f.text);
                 _ = home.feedback(f.id, f.text, f.ok) catch {};
+                continue;
+            }
+            if (publish_check) {
+                if (publisher) |p| e.publishAdapter(home, p);
                 continue;
             }
             const c = clip orelse return;
@@ -723,6 +798,25 @@ pub const Engine = struct {
             e.lock.unlock();
             e.notify();
         }
+    }
+
+    /// The adapter devices get, if Home has a newer one: its update
+    /// (adapter, rules, vocabulary) handed to the publisher. Unchanged:
+    /// nothing at all (exportUpdate answers null).
+    fn publishAdapter(e: *Engine, home: anytype, p: Publisher) void {
+        const have = p.published(p.ctx);
+        const update = (home.exportUpdate(e.gpa, have) catch |err| return e.setShared(null, @errorName(err))) orelse return;
+        defer e.gpa.free(update);
+        const v = p.publish(p.ctx, update) catch |err| return e.setShared(null, @errorName(err));
+        if (v) |ver| e.setShared(ver, null);
+    }
+
+    fn setShared(e: *Engine, version: ?u32, failed: ?[]const u8) void {
+        e.lock.lock();
+        if (version) |v| e.status.shared.version = v;
+        e.status.shared.failed = failed;
+        e.lock.unlock();
+        e.notify();
     }
 
     fn setSync(e: *Engine, r: SyncResult) void {
@@ -905,6 +999,9 @@ test "create: no leak when the allocator fails part-way" {
 
 /// stt.Home's methods drain uses, recorded (no GPU).
 const FakeHome = struct {
+    /// The adapter version Home holds (exportUpdate's answer).
+    version: u32 = 0,
+    exports: usize = 0,
     learning: ?bool = null,
     transcribed: usize = 0,
     feedbacks: usize = 0,
@@ -922,10 +1019,117 @@ const FakeHome = struct {
     fn importBundle(h: *FakeHome, _: std.mem.Allocator, _: []const u8) !void {
         h.imports += 1;
     }
-    fn exportUpdate(_: *FakeHome, _: std.mem.Allocator, _: u32) !?[]u8 {
-        return null;
+    fn exportUpdate(h: *FakeHome, gpa: std.mem.Allocator, device_version: u32) !?[]u8 {
+        h.exports += 1;
+        if (h.version <= device_version) return null;
+        return try std.fmt.allocPrint(gpa, "update v{d}", .{h.version});
     }
 };
+
+/// A publisher that records what it was given (the store is the fake's
+/// `have`, like voiceshare's newest published version).
+const FakePublisher = struct {
+    have: u32 = 0,
+    published: usize = 0,
+    fail: bool = false,
+    last: [32]u8 = undefined,
+    last_len: usize = 0,
+
+    fn of(ctx: *anyopaque) *FakePublisher {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn latest(ctx: *anyopaque) u32 {
+        return of(ctx).have;
+    }
+    fn publish(ctx: *anyopaque, update: []const u8) anyerror!?u32 {
+        const p = of(ctx);
+        if (p.fail) return error.NoSyncKey;
+        p.published += 1;
+        p.last_len = @min(update.len, p.last.len);
+        @memcpy(p.last[0..p.last_len], update[0..p.last_len]);
+        p.have += 1;
+        return p.have;
+    }
+    fn hook(p: *FakePublisher) Publisher {
+        return .{ .ctx = p, .published = latest, .publish = publish };
+    }
+};
+
+test "auto-publish: a finished run with a new adapter is published; an unchanged one is not" {
+    const e = try bare();
+    defer e.destroy();
+    var h: FakeHome = .{ .version = 1 };
+    var p: FakePublisher = .{};
+    e.publisher = p.hook();
+    // A run finished (the hook may fire on the training thread: it only
+    // queues the check).
+    Engine.onTraining(e, .{ .finished = .{} });
+    try testing.expect(e.publish_job);
+    try testing.expectEqual(@as(usize, 0), p.published);
+    e.drain(&h);
+    try testing.expectEqual(@as(usize, 1), p.published);
+    try testing.expectEqualStrings("update v1", p.last[0..p.last_len]);
+    try testing.expectEqual(@as(u32, 1), e.getStatus().shared.version);
+    try testing.expect(!e.publish_job);
+    // Finished again, the same version (nothing new trained): not published.
+    Engine.onTraining(e, .{ .finished = .{} });
+    e.drain(&h);
+    try testing.expectEqual(@as(usize, 1), p.published);
+    // Progress or a failed run asks nothing.
+    Engine.onTraining(e, .{ .failed = .{} });
+    try testing.expect(!e.publish_job);
+    // A newer one: published.
+    h.version = 2;
+    Engine.onTraining(e, .{ .finished = .{} });
+    e.drain(&h);
+    try testing.expectEqual(@as(usize, 2), p.published);
+    try testing.expectEqual(@as(u32, 2), e.getStatus().shared.version);
+    // A failure is shown, the version kept.
+    h.version = 3;
+    p.fail = true;
+    Engine.onTraining(e, .{ .finished = .{} });
+    e.drain(&h);
+    try testing.expectEqualStrings("NoSyncKey", e.getStatus().shared.failed.?);
+    try testing.expectEqual(@as(u32, 2), e.getStatus().shared.version);
+}
+
+test "auto-publish: sharing off publishes nothing; switching it on publishes what devices lack" {
+    const e = try bare();
+    defer e.destroy();
+    var h: FakeHome = .{ .version = 5 };
+    var p: FakePublisher = .{ .have = 4 };
+    e.publisher = p.hook();
+    e.setShare(false);
+    Engine.onTraining(e, .{ .finished = .{} });
+    e.drain(&h);
+    try testing.expectEqual(@as(usize, 0), p.published);
+    try testing.expectEqual(@as(usize, 0), h.exports); // not even exported
+    try testing.expect(!e.publish_job);
+    e.setShare(true);
+    e.drain(&h);
+    try testing.expectEqual(@as(usize, 1), p.published);
+    // No publisher (not the desk's engine): nothing either.
+    const f = try bare();
+    defer f.destroy();
+    Engine.onTraining(f, .{ .finished = .{} });
+    f.drain(&h);
+    try testing.expectEqual(@as(usize, 1), p.published);
+}
+
+test "dropImport: an unpaired device's queued bundle goes, its waiter hears it failed" {
+    const e = try bare();
+    defer e.destroy();
+    const ev = sys.CreateEventW(null, 1, 0, null).?;
+    defer _ = sys.CloseHandle(ev);
+    var done: Done = .{ .ev = ev, .ok = true };
+    try e.queueImport("laptop", try testing.allocator.dupe(u8, "bundle"), &done);
+    try testing.expect(!e.dropImport("iphone"));
+    try testing.expect(e.import_job != null);
+    try testing.expect(e.dropImport("laptop"));
+    try testing.expectEqual(sys.WAIT_OBJECT_0, sys.WaitForSingleObject(ev, 0));
+    try testing.expect(!done.ok);
+    try testing.expect(e.import_job == null);
+}
 
 test "drain: a learning change and a queued clip in one pass are both handled; not Busy after" {
     const e = try bare();

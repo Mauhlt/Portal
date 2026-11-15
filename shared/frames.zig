@@ -47,6 +47,9 @@ pub const Prefix = enum(u8) {
     /// device frame can change, request or influence the desk's port or
     /// endpoint.
     moved = 'm',
+    /// `d:platform <name>`: what kind of machine the device is, once after
+    /// `hello` (platform.zig). Not answered.
+    device = 'd',
 };
 
 /// `m:<seq>` for announcement `seq`.

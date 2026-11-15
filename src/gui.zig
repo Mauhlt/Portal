@@ -311,7 +311,7 @@ pub const LocalHost = struct {
         h.desk.?.desk_check = tunnelnet.checkCode(&d.desk_public);
         h.p.setBackgroundArt(d.saved.background_art orelse true);
         const s = h.gpa.create(deskspeech.DeskSpeech) catch return;
-        s.* = .{ .gpa = h.gpa, .io = h.io, .data_dir = d.paths.dir, .notify_ctx = h, .notify_fn = notifyThunk, .mic = undefined, .inbox = d.srv.cfg.speech_inbox };
+        s.* = .{ .gpa = h.gpa, .io = h.io, .data_dir = d.paths.dir, .notify_ctx = h, .notify_fn = notifyThunk, .mic = undefined, .inbox = d.srv.cfg.speech_inbox, .log = d.srv.log };
         s.start(&h.desk.?.saved);
         h.speech = s;
         h.shell.dictation = s.hooks();
@@ -1186,6 +1186,8 @@ pub const LocalHost = struct {
                 h.shell.instruct_mode = m; // live
             },
             .learning => |on| st.speech_learning = on,
+            .share => |on| st.speech_share = on,
+            .publish_engine => |on| st.speech_publish_engine = on,
         }
         settings.save(h.gpa, h.io, d.paths.dir, &st) catch |err|
             return s.panel.setNote(.bad, "Could not save the settings: {t}.", .{err});

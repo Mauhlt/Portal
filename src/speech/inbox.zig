@@ -12,6 +12,12 @@
 //!       so a "stored" answer means the device may delete those samples.
 //!   end(ticket)   always.
 //!
+//!   retain(paired)   on every device store change (main.zig StoreWatch,
+//!       after each read): a device unpaired, or replaced by a new pairing
+//!       under its name, loses its entry (limits) and its bundle still
+//!       queued for import (it keeps those samples); a body being read
+//!       for it is refused when it arrives.
+//!
 //! The desk's window attaches its engine (`attach`) when it starts one and
 //! detaches it before stopping it; `detach` waits for imports in flight.
 //! Without an engine (no NVIDIA GPU, not the x86_64 desk build, speech
@@ -55,6 +61,11 @@ pub const Verdict = enum {
     }
 };
 
+/// A paired device as the device store has it: its name and its pairing's
+/// identity (an opaque id issued at pairing; a new pairing under the same
+/// name has another).
+pub const Member = struct { name: []const u8, id: []const u8 };
+
 pub const Inbox = struct {
     io: std.Io,
     mutex: std.Io.Mutex = .init,
@@ -63,6 +74,12 @@ pub const Inbox = struct {
     engine: ?*Engine = null,
     /// Imports in flight on `engine` (detach waits for none).
     users: u32 = 0,
+    /// The paired devices at the last `retain` (a name and its pairing id,
+    /// hashed): a name whose id changed was paired again.
+    known_names: [limits.max_devices][limits.max_device_name]u8 = undefined,
+    known_lens: [limits.max_devices]u8 = @splat(0),
+    known_ids: [limits.max_devices]u64 = @splat(0),
+    known_n: usize = 0,
 
     pub fn attach(ib: *Inbox, e: *Engine) void {
         ib.mutex.lockUncancelable(ib.io);
@@ -86,11 +103,48 @@ pub const Inbox = struct {
         ib.gate.setLimits(c);
     }
 
-    /// The paired devices (when the device store changes).
-    pub fn retain(ib: *Inbox, paired: []const []const u8) void {
+    /// The paired devices, on every device store change: an unpaired or
+    /// replaced device's entry goes, and its bundle still queued for
+    /// import with it. Returns how many devices went.
+    pub fn retain(ib: *Inbox, paired: []const Member) usize {
         ib.mutex.lockUncancelable(ib.io);
         defer ib.mutex.unlock(ib.io);
-        ib.gate.retain(paired);
+        var gone: usize = 0;
+        for (0..ib.known_n) |k| {
+            const name = ib.known_names[k][0..ib.known_lens[k]];
+            const now_id: ?u64 = for (paired) |m| {
+                if (std.mem.eql(u8, m.name, name)) break idHash(m.id);
+            } else null;
+            if (now_id == ib.known_ids[k]) continue;
+            // Unpaired, or paired again (another device now): what the
+            // old one left is dropped.
+            ib.gate.drop(name);
+            if (options.home) if (ib.engine) |e| {
+                _ = e.dropImport(name);
+            };
+            gone += 1;
+        }
+        // Entries for names no longer paired at all (also ones the store
+        // never listed while this ran).
+        var names: [limits.max_devices][]const u8 = undefined;
+        var n: usize = 0;
+        ib.known_n = 0;
+        for (paired) |m| {
+            if (m.name.len == 0 or m.name.len > limits.max_device_name or n == names.len) continue;
+            names[n] = m.name;
+            n += 1;
+            const k = ib.known_n;
+            @memcpy(ib.known_names[k][0..m.name.len], m.name);
+            ib.known_lens[k] = @intCast(m.name.len);
+            ib.known_ids[k] = idHash(m.id);
+            ib.known_n += 1;
+        }
+        ib.gate.retain(names[0..n]);
+        return gone;
+    }
+
+    fn idHash(id: []const u8) u64 {
+        return std.hash.Wyhash.hash(0, id);
     }
 
     /// Before reading a body of `declared` bytes (monotonic ms).
@@ -116,6 +170,8 @@ pub const Inbox = struct {
         const e = blk: {
             ib.mutex.lockUncancelable(ib.io);
             defer ib.mutex.unlock(ib.io);
+            // Unpaired or replaced while its body was on the way.
+            if (ib.gate.isStale(device)) return .unavailable;
             const e = ib.engine orelse return .unavailable;
             switch (ib.gate.bundle(device, bytes.len, clips, now)) {
                 .ok => {},
@@ -197,4 +253,41 @@ test "inbox: no engine means unavailable (the device keeps its samples); limits 
     ib.end(c);
     ib.detach(); // nothing in flight: returns at once
     try testing.expectEqual(@as(u16, 503), Verdict.busy.code());
+}
+
+test "retain: an unpaired or replaced device's entry goes; a body on the way for it is refused" {
+    var ib: Inbox = .{ .io = testing.io };
+    try testing.expectEqual(@as(usize, 0), ib.retain(&.{ .{ .name = "laptop", .id = "A" }, .{ .name = "iphone", .id = "B" } }));
+    // Both have used their limits a little.
+    ib.mutex.lockUncancelable(ib.io);
+    for (0..limits.feedback_burst) |_| try testing.expect(ib.gate.feedback("laptop", 0) == .ok);
+    try testing.expect(ib.gate.feedback("iphone", 0) == .ok);
+    ib.mutex.unlock(ib.io);
+    // The same store again: nothing goes.
+    try testing.expectEqual(@as(usize, 0), ib.retain(&.{ .{ .name = "laptop", .id = "A" }, .{ .name = "iphone", .id = "B" } }));
+    try testing.expect(ib.gate.feedback("laptop", 0) == .limited);
+    // "laptop" paired again (a new id): its old entry goes, the new
+    // device starts afresh.
+    try testing.expectEqual(@as(usize, 1), ib.retain(&.{ .{ .name = "laptop", .id = "C" }, .{ .name = "iphone", .id = "B" } }));
+    try testing.expect(ib.gate.feedback("laptop", 0) == .ok);
+    // "iphone" sends a bundle, and is unpaired while its body is read.
+    const t = ib.begin("iphone", 100, 0).ok;
+    try testing.expectEqual(@as(usize, 1), ib.retain(&.{.{ .name = "laptop", .id = "C" }}));
+    var b: [64]u8 = undefined;
+    const body = try testing.allocator.dupe(u8, testBundle(&b, "iphone", 2));
+    try testing.expectEqual(Verdict.unavailable, ib.store(testing.allocator, "iphone", body, 0));
+    ib.end(t);
+    // Its entry is gone once the request ended.
+    try testing.expect(ib.gate.per_device.find("iphone") == null);
+    // Names never paired with a request are freed too (the table never
+    // fills with names of the past).
+    var names: [limits.max_devices][8]u8 = undefined;
+    ib.mutex.lockUncancelable(ib.io);
+    for (0..limits.max_devices) |i| {
+        const n = std.fmt.bufPrint(&names[i], "d{d}", .{i}) catch unreachable;
+        _ = ib.gate.feedback(n, 0);
+    }
+    ib.mutex.unlock(ib.io);
+    _ = ib.retain(&.{.{ .name = "laptop", .id = "C" }});
+    try testing.expect(ib.begin("surface", 1, 0) == .ok);
 }

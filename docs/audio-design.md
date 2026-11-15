@@ -99,15 +99,25 @@ the active input where the platform reports it.
   Home.setLearning(false). Desk: Audio panel and settings.txt
   `speech_learning = on|off`, applied live. Every device (laptop, Surface,
   iPhone) gets the same switch, default on, with the device speech work.
+* "Share voice improvements with devices", default ON (desk only: Audio
+  panel, settings.txt `speech_share = on|off`): each new adapter training
+  produces is published as the signed `stt-adapter` package
+  (docs/stt-sync-contract.md); off, nothing is published.
+* "Publish the laptop speech engine", default ON (desk only: Audio panel,
+  settings.txt `speech_publish_engine = on|off`): each `zig build release`
+  builds stt-local and the pinned model and publishes each one that
+  changed (docs/stt-sync-contract.md); off, releases build and publish
+  neither. A separate switch, since the engine is not a voice improvement.
+  The panel shows the last release's result line (voice-engine.txt).
 * Future device routes: call `speech.gate.Gate` (begin / feedback /
   bundle / end, `retain` with the device store's names when it
   changes) and `home.Engine.deviceFeedback`, whose entries can take at
   most half the feedback queue, so they never evict the desk's.
 * `zig build mic-check -- <seconds>` records from the real microphone and
   prints the transcript (manual check, never part of `test`).
-* Not yet: the training banner, the laptop's stt-local client, the
-  device-facing /sync bundle and update routes (they must call
-  `speech.gate.Gate`, see below).
+* Not yet: the training banner. The laptop's stt-local client is built
+  (src/speech/local.zig, src/devicespeech.zig); its samples come home on
+  the bulk channel's `put bundle`, like the iPhone's.
 
 ## Limits (src/speech/limits.zig `Config`; settings.txt `speech.<name>`)
 
