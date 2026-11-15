@@ -22,6 +22,9 @@ const Instanced2D = Renderer.Instanced2D;
 /// Instanced2D's shaders (shaders/quad_*.zig, compiled by the build).
 const quad_vert align(4) = @embedFile("quad_vert.spv").*;
 const quad_frag align(4) = @embedFile("quad_frag.spv").*;
+/// The native text field types into a terminal: no smart punctuation or
+/// capitals, a dark keyboard, Return labelled Send.
+const native_traits: Window.TextTraits = .{ .smart_quotes = .off, .smart_dashes = .off, .smart_insert_delete = .off, .capitalization = .none, .keyboard_appearance = .dark, .return_key = .send };
 const Window = @import("Window");
 const Font = @import("Font");
 const ui = @import("portal_ui");
@@ -661,6 +664,7 @@ fn syncNativeField(p: *Presenter) void {
         .fg = ui.theme.ui.text,
         .bg = ui.theme.ui.field,
         .focus = moved,
+        .traits = native_traits,
     })) {
         p.native_supported = false;
         return;
