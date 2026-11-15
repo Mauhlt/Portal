@@ -507,6 +507,42 @@ pub const Sub = struct {
 pub const Subs = struct {
     items: [max_subscriptions]Sub = undefined,
     n: usize = 0,
+    /// Packages the owner unsubscribed a device from ("optout" lines):
+    /// automatic subscription (`autoSubscribe`) never adds them back.
+    optouts: [max_subscriptions]Sub = undefined,
+    n_optouts: usize = 0,
+
+    pub fn optedOut(s: *const Subs, device: []const u8, package: []const u8) bool {
+        return indexOf(s.optouts[0..s.n_optouts], device, package) != null;
+    }
+
+    fn indexOf(list: []const Sub, device: []const u8, package: []const u8) ?usize {
+        for (list, 0..) |x, i| {
+            if (std.mem.eql(u8, x.device.get(), device) and std.mem.eql(u8, x.package.get(), package)) return i;
+        }
+        return null;
+    }
+
+    /// Records (or clears) the owner's explicit opt-out. True if it changed.
+    pub fn setOptOut(s: *Subs, device: []const u8, package: []const u8, on: bool) !bool {
+        if (!devices.validName(device)) return error.BadName;
+        if (!manifest.validPackageId(package)) return error.BadPackageId;
+        const at = indexOf(s.optouts[0..s.n_optouts], device, package);
+        if (!on) {
+            const i = at orelse return false;
+            s.optouts[i] = s.optouts[s.n_optouts - 1];
+            s.n_optouts -= 1;
+            return true;
+        }
+        if (at != null) return false;
+        if (s.n_optouts == s.optouts.len) return error.TooManySubscriptions;
+        var x: Sub = .{};
+        x.device.set(device);
+        x.package.set(package);
+        s.optouts[s.n_optouts] = x;
+        s.n_optouts += 1;
+        return true;
+    }
 
     pub fn has(s: *const Subs, device: []const u8, package: []const u8) bool {
         for (s.items[0..s.n]) |x| {
@@ -558,11 +594,15 @@ pub const Subs = struct {
         if (!std.mem.eql(u8, it.next() orelse "", subs_header)) return error.BadSubscriptionFile;
         while (it.next()) |line| {
             var f = std.mem.tokenizeScalar(u8, line, ' ');
-            if (!std.mem.eql(u8, f.next() orelse "", "sub")) return error.BadSubscriptionFile;
+            const kind = f.next() orelse "";
+            const optout = std.mem.eql(u8, kind, "optout");
+            if (!optout and !std.mem.eql(u8, kind, "sub")) return error.BadSubscriptionFile;
             const d = f.next() orelse return error.BadSubscriptionFile;
             const p = f.next() orelse return error.BadSubscriptionFile;
             if (f.next() != null) return error.BadSubscriptionFile;
-            _ = s.add(d, p) catch return error.BadSubscriptionFile;
+            if (optout) {
+                _ = s.setOptOut(d, p, true) catch return error.BadSubscriptionFile;
+            } else _ = s.add(d, p) catch return error.BadSubscriptionFile;
         }
         return s;
     }
@@ -570,6 +610,7 @@ pub const Subs = struct {
     pub fn format(s: *const Subs, gpa: Allocator, out: *std.ArrayList(u8)) !void {
         try out.appendSlice(gpa, subs_header ++ "\n");
         for (s.items[0..s.n]) |x| try out.print(gpa, "sub {s} {s}\n", .{ x.device.get(), x.package.get() });
+        for (s.optouts[0..s.n_optouts]) |x| try out.print(gpa, "optout {s} {s}\n", .{ x.device.get(), x.package.get() });
     }
 };
 
@@ -622,10 +663,50 @@ pub fn subscribe(gpa: Allocator, io: Io, paths: Paths, device: []const u8, packa
     try withSubs(gpa, io, paths, Ctx{ .d = device, .p = package, .on = on, .changed = &changed }, struct {
         fn op(c: Ctx, s: *Subs) !bool {
             c.changed.* = if (c.on) try s.add(c.d, c.p) else s.remove(c.d, c.p);
-            return c.changed.*;
+            // The owner's choice sticks: an unsubscribe is an opt-out that
+            // automatic subscription respects; subscribing clears it.
+            const opt = try s.setOptOut(c.d, c.p, !c.on);
+            return c.changed.* or opt;
         }
     }.op);
     return changed;
+}
+
+/// What the desk knows of a device's platform. The device record has no
+/// field for it (pairing gives a name and a key, nothing else), so the
+/// desk passes `unknown` today.
+pub const Platform = enum { unknown, windows_aarch64, other };
+
+/// The packages a device is subscribed to automatically: the trained
+/// adapter for every device; the laptop speech engine and its model too
+/// for a Windows aarch64 device, or one whose platform the desk can't tell
+/// (its own engine then says if it has none for its architecture; the
+/// iPhone's sync fetches stt-adapter alone whatever it is offered).
+pub fn autoPackages(p: Platform) []const []const u8 {
+    return switch (p) {
+        .unknown, .windows_aarch64 => &manifest.voice_packages,
+        .other => &.{"stt-adapter"},
+    };
+}
+
+/// Subscribes each device to its automatic packages, except those it is
+/// subscribed to already or the owner opted it out of. Runs on every
+/// device store read (main.zig StoreWatch): a new pairing, and devices
+/// paired earlier on the first start that runs it. Idempotent: the file is
+/// written only when something is added. Returns how many were added.
+pub fn autoSubscribe(gpa: Allocator, io: Io, paths: Paths, devs: []const []const u8, platform: Platform) !usize {
+    var added: usize = 0;
+    const Ctx = struct { devs: []const []const u8, pkgs: []const []const u8, added: *usize };
+    try withSubs(gpa, io, paths, Ctx{ .devs = devs, .pkgs = autoPackages(platform), .added = &added }, struct {
+        fn op(c: Ctx, s: *Subs) !bool {
+            for (c.devs) |d| for (c.pkgs) |p| {
+                if (s.optedOut(d, p)) continue;
+                if (try s.add(d, p)) c.added.* += 1;
+            };
+            return c.added.* > 0;
+        }
+    }.op);
+    return added;
 }
 
 // ------------------------------------------------------------------ index
@@ -790,4 +871,60 @@ test "prune: keeps the newest by sequence (not by name); nothing published, noth
     try testing.expectEqualStrings("a", l.m.version);
     try testing.expectEqual(@as(usize, 0), try prune(gpa, io, paths, "stt-adapter", 2));
     try testing.expectError(error.BadPackageId, prune(gpa, io, paths, "../x", 2));
+}
+
+test "auto-subscribe: new and existing devices get the voice packages once; an opt-out sticks across restarts" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [512]u8 = undefined;
+    const paths = try tmpPaths(&tmp, &pb);
+    // Devices paired before this build: subscribed on the first start.
+    try testing.expectEqual(@as(usize, 6), try autoSubscribe(gpa, io, paths, &.{ "laptop", "phone" }, .unknown));
+    // The next start (or store change) adds nothing.
+    try testing.expectEqual(@as(usize, 0), try autoSubscribe(gpa, io, paths, &.{ "laptop", "phone" }, .unknown));
+    var s = try readSubs(gpa, io, paths);
+    for (manifest.voice_packages) |p| try testing.expect(s.has("laptop", p) and s.has("phone", p));
+    // The owner unsubscribes the phone from stt-model: it stays off, also
+    // after a restart (read back from the file).
+    try testing.expect(try subscribe(gpa, io, paths, "phone", "stt-model", false));
+    try testing.expectEqual(@as(usize, 0), try autoSubscribe(gpa, io, paths, &.{ "laptop", "phone" }, .unknown));
+    s = try readSubs(gpa, io, paths);
+    try testing.expect(!s.has("phone", "stt-model"));
+    try testing.expect(s.optedOut("phone", "stt-model"));
+    // A new pairing gets subscribed; the opt-out is untouched.
+    try testing.expectEqual(@as(usize, 3), try autoSubscribe(gpa, io, paths, &.{ "laptop", "phone", "surface" }, .unknown));
+    s = try readSubs(gpa, io, paths);
+    try testing.expect(s.has("surface", "stt-local") and !s.has("phone", "stt-model"));
+    // Subscribing by hand clears the opt-out.
+    try testing.expect(try subscribe(gpa, io, paths, "phone", "stt-model", true));
+    s = try readSubs(gpa, io, paths);
+    try testing.expect(!s.optedOut("phone", "stt-model"));
+}
+
+test "auto-subscribe: aarch64 Windows (or unknown) gets all three voice packages, others only the adapter" {
+    try testing.expectEqual(@as(usize, 3), autoPackages(.windows_aarch64).len);
+    try testing.expectEqual(@as(usize, 3), autoPackages(.unknown).len);
+    const other = autoPackages(.other);
+    try testing.expectEqual(@as(usize, 1), other.len);
+    try testing.expectEqualStrings("stt-adapter", other[0]);
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [512]u8 = undefined;
+    const paths = try tmpPaths(&tmp, &pb);
+    try testing.expectEqual(@as(usize, 1), try autoSubscribe(gpa, testing.io, paths, &.{"mac"}, .other));
+    const s = try readSubs(gpa, testing.io, paths);
+    try testing.expect(s.has("mac", "stt-adapter") and !s.has("mac", "stt-local"));
+}
+
+test "subscriptions file: optout lines round-trip; any other line is refused" {
+    const s = try Subs.parse(subs_header ++ "\nsub laptop stt-model\noptout laptop stt-local\n");
+    try testing.expect(s.optedOut("laptop", "stt-local"));
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try s.format(testing.allocator, &out);
+    try testing.expectEqualStrings(subs_header ++ "\nsub laptop stt-model\noptout laptop stt-local\n", out.items);
+    try testing.expectError(error.BadSubscriptionFile, Subs.parse(subs_header ++ "\nnope laptop x\n"));
 }

@@ -317,9 +317,8 @@ Rules:
     is refused even when signed), files verified in staging, installed
     read-only in the per-desktop store. No approval panels, no voice
     offer, nothing else is fetched. A pass runs on every connect and on
-    the desk's `{"t":"updates"}` (subscribe the phone at the desk:
-    Devices, P on its row, `stt-adapter`; or `portalctl sync subscribe
-    <phone> stt-adapter`). The package holds `update.bin` (stt's update:
+    the desk's `{"t":"updates"}` (the desk subscribes every paired device
+    to `stt-adapter` by itself: docs/sync-design.md). The package holds `update.bin` (stt's update:
     adapter + rules + vocabulary, from `Home.exportUpdate`) or a raw
     `adapter.bin` whose package version is the adapter version (the
     desk publishes both after each training run: src/voiceshare.zig).

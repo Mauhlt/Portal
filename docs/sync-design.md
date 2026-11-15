@@ -106,7 +106,17 @@ overlapping/overwriting".
   files, signs the manifest and stores the version under
   `%LOCALAPPDATA%\Portal\publish\<package>\<version>\`.
 * **Device subscription:** the owner chooses per device which packages it
-  receives (e.g. `stt-npu-test` only to the laptop).
+  receives (e.g. `stt-npu-test` only to the laptop). **Voice packages are
+  automatic (owner decision, 2026-11-14):** every paired device is
+  subscribed to `stt-adapter`, `stt-model` and `stt-local` at pairing, and
+  devices paired earlier on the first start of a build that has this
+  (`sync.autoSubscribe`, on every device store read). The rule is
+  all three for a Windows aarch64 device, the adapter alone for others;
+  the desk has no record of a device's platform, so today every device
+  gets all three (a device without an engine for its architecture says
+  so; the iPhone fetches `stt-adapter` alone). Unsubscribing a device
+  (Devices panel or `portalctl sync unsubscribe`) records an opt-out that
+  automatic subscription never undoes; subscribing again clears it.
 * **Event-driven delivery:** an `{"t":"updates", ...}` message on the
   interactive WebSocket announces new versions to subscribed devices.
   Devices fetch manifests and files on the bulk WebSocket (`/ws/bulk`, its
@@ -225,7 +235,9 @@ end
 * Subscriptions: `%LOCALAPPDATA%\Portal\sync-subscriptions.txt` (locked
   read-modify-write, flushed temp file, MoveFileEx WRITE_THROUGH), via
   `portalctl sync subscribe|unsubscribe <device> <pkg>`, `portalctl sync
-  subscriptions`, or the Devices panel (P on a device row).
+  subscriptions`, or the Devices panel (P on a device row). Lines are
+  `sub <device> <pkg>` and `optout <device> <pkg>` (an unsubscribe, which
+  automatic voice subscription respects).
 * The server serves the stores as they are and does not need the key: it
   parses manifests strictly to build the index (a manifest that does not
   parse, e.g. one naming `../x`, is never listed or served) but the

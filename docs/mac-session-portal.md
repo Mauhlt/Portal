@@ -197,9 +197,9 @@ for Portal.
 The phone runs the adapter the desk trains from every device's
 corrections. To check the whole loop:
 
-1. At the desk, subscribe the phone to the adapter: Devices, P on the
-   phone's row, Subscribe `stt-adapter` (or `portalctl sync subscribe
-   <phone> stt-adapter`).
+1. At the desk, check the phone is subscribed to the adapter (Devices, P
+   on its row: `stt-adapter` is subscribed by itself once it is paired,
+   unless it was unsubscribed there before).
 2. Let home train a run: once 20 new samples have come in, training
    starts in the nightly window (02:00 to 06:00). Its adapter is
    `%LOCALAPPDATA%\Portal\stt-home\adapter.bin`. With "Share voice

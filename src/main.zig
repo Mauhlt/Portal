@@ -818,6 +818,7 @@ const StoreWatch = struct {
             return err;
         };
         retainSpeech(sw.srv, &st);
+        sw.autoSubscribe(&st);
         sw.applier.apply(sw.srv, sw.tun, &st) catch |err| {
             sw.srv.log.print("ERROR: the tunnel's peer table could not be updated ({t}); the addresses of changed devices stay refused until it is", .{err});
             if (!sw.tunnel_failed.swap(true, .acq_rel)) sw.srv.storeChanged();
@@ -827,6 +828,25 @@ const StoreWatch = struct {
             sw.srv.log.print("the tunnel's peer table is up to date again", .{});
             sw.srv.storeChanged();
         }
+    }
+
+    /// Every paired device gets the voice packages (sync.autoSubscribe:
+    /// a new pairing, and devices paired before this build on its first
+    /// start), except any the owner unsubscribed it from. The desk has no
+    /// record of a device's platform, so it is `unknown`: all three.
+    fn autoSubscribe(sw: *StoreWatch, st: *const devices.Store) void {
+        var names: [devices.max_devices][]const u8 = undefined;
+        var n: usize = 0;
+        for (&st.devices) |*d| if (d.*) |*dev| {
+            names[n] = dev.name.get();
+            n += 1;
+        };
+        if (n == 0) return;
+        const added = sync.autoSubscribe(sw.gpa, sw.io, .{ .dir = sw.paths.dir }, names[0..n], .unknown) catch |err| {
+            sw.srv.log.print("sync: could not subscribe the paired devices to the voice packages ({t})", .{err});
+            return;
+        };
+        if (added > 0) sw.srv.log.print("sync: {d} voice package subscription(s) added for paired devices (stt-adapter, stt-model, stt-local)", .{added});
     }
 
     /// The speech inbox follows the store: an unpaired or replaced
