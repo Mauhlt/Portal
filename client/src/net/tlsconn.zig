@@ -774,6 +774,14 @@ const FakeServer = struct {
                 var w = conn.writer(io, &wb);
                 w.interface.writeAll("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n") catch {};
                 w.interface.flush() catch {};
+                // Wait for the client to give up and close first: closing
+                // here with its ClientHello still unread would reset the
+                // connection (Windows), and the client could see the reset
+                // (ReadFailed) before the reply it must refuse.
+                while (true) {
+                    const got = conn.readWithControl(io, &vec, &.{}) catch break;
+                    if (got.data_len == 0) break;
+                }
             },
         }
     }

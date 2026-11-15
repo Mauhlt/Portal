@@ -189,6 +189,28 @@ Details: docs/tabs-design.md, "For you".
    ...; the full list is `childenv.user_config`), and any `CLAUDE_*` name
    you set permanently (your user or the system environment variables).
 
+## Sensitive data stays on the desk
+
+Portal makes it practical to work on projects whose data must not leave
+your desk (patient records, research data, anything confidential):
+
+* **Devices never receive files or paths.** A laptop or phone sees only
+  the scrubbed conversation, cards and the screen; the data itself stays
+  on the desk.
+* **The agent works inside the folders you approve.** Its permission
+  settings and hooks keep it to those folders and ask before anything
+  else, so you can steer feature work from anywhere without opening the
+  rest of the desk.
+* **Build remotely, process in person.** Keep the sensitive data folder
+  outside the agent's approved folders, let the agent build and test the
+  feature against sample or synthetic data, and run the real processing
+  yourself at the desk.
+
+One limit to keep in mind: whatever the agent reads becomes part of its
+conversation with the model provider. Data that must stay private should
+never be in a folder the agent may read; the boundary above is what keeps
+it out.
+
 ## Setup
 
 ### 0. A new machine
