@@ -3,8 +3,9 @@ Portal for iPhone: notices for what the app bundles
 
 Portal.app contains, besides Portal's own code:
 
-* stt/ggml-tiny.en.bin: the Whisper tiny.en speech model (OpenAI) in the
-  ggml format of the whisper.cpp project, used on the phone for dictation.
+* stt/ggml-base.en.bin: the Whisper base.en speech model (OpenAI) in the
+  ggml format of the whisper.cpp project, used on the phone for dictation
+  (the same file the desktop trains its personal adapter on).
 * Frameworks/MoltenVK: the Vulkan implementation on Metal (Khronos Group).
 
 

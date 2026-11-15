@@ -1,7 +1,7 @@
 //! `fetch_file URL SHA256 SIZE OUT`: downloads one file over HTTPS and
 //! keeps it only if its size and SHA-256 are the pinned ones. Zig's
 //! package fetcher takes archives and git repositories only, so a single
-//! file (the iPhone app's speech model, build.zig `iosModel`) comes
+//! file (the iPhone app's speech model, src/speech/model_pin.zig) comes
 //! through this build tool: run only by the steps that bundle it, cached
 //! by the build system on its arguments, never in the repository.
 

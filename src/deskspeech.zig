@@ -28,7 +28,7 @@ const Engine = if (speech.has_home) speech.home.Engine else void;
 
 /// Where the model is looked for when the settings name none.
 pub fn defaultModel(gpa: std.mem.Allocator, data_dir: []const u8) ![]u8 {
-    return std.fs.path.join(gpa, &.{ data_dir, "models", "ggml-base.en.bin" });
+    return std.fs.path.join(gpa, &.{ data_dir, "models", speech.model_pin.file_name });
 }
 
 const toast_ms: i64 = 4000;

@@ -20,6 +20,8 @@ const options = @import("speech_options");
 pub const sys = @import("sys.zig");
 /// Every speech limit (clip length, rates, sizes) in one place.
 pub const limits = @import("limits.zig");
+/// The base model every device runs (one pin: file name, URL, SHA-256).
+pub const model_pin = @import("model_pin.zig");
 /// The desktop's gate for device speech traffic (future /sync routes).
 pub const gate = @import("gate.zig");
 pub const mics = @import("mics.zig");
@@ -33,6 +35,7 @@ pub const home = if (options.home) @import("home.zig") else struct {};
 test {
     _ = sys;
     _ = limits;
+    _ = model_pin;
     _ = gate;
     _ = mics;
     _ = capture;

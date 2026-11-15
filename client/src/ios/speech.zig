@@ -2,7 +2,7 @@
 //! (connect.Platform.speech -> ui/shell.zig Dictation, the same hooks the
 //! desk's engine fills) recording with mic.zig and transcribing with stt's
 //! Core ML engine (stt.Transcriber, backend .coreml) on the bundled
-//! tiny.en model. Audio never leaves the phone.
+//! base.en model. Audio never leaves the phone.
 //!
 //!   app thread   start / stop / cancel (the shell's 🎤) and `frame`
 //!                (each frame: the transcript into the line, the 🎤's
@@ -26,14 +26,16 @@ const stt = @import("stt");
 const connect = @import("client");
 const ui = connect.ui_mod;
 const mic = @import("mic.zig");
+const speech_mod = @import("speech");
 const ios = view.Window.ios;
 const objc = ios.objc;
 const Object = objc.Object;
 const msgSend = objc.msgSend;
 const sel = objc.sel;
 
-/// The model in Portal.app (build.zig: only iOS builds bundle it).
-pub const model_name = "stt/ggml-tiny.en.bin";
+/// The model in Portal.app (build.zig: only iOS builds bundle it): the
+/// desk's own base model (src/speech/model_pin.zig).
+pub const model_name = "stt/" ++ speech_mod.model_pin.file_name;
 
 const State = struct {
     io: std.Io = undefined,

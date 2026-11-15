@@ -614,17 +614,15 @@ fn addGuiModules(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolv
 const ios_min_major = 17;
 
 /// The dictation model bundled into Portal.app (iOS builds only): the
-/// whisper.cpp project's ggml tiny.en file on Hugging Face, pinned to a
-/// commit of that repository, its size and SHA-256. Zig's package
+/// SAME base model the desk's stt.Home trains its adapter on (an adapter
+/// fits only its own base model), pinned once in src/speech/model_pin.zig
+/// (Hugging Face URL at a fixed commit, size, SHA-256). Zig's package
 /// fetcher takes only archives and git repositories, so a single file
 /// comes through src/tools/fetch_file.zig, run only by the steps that
 /// build the app (never by ios-check or test); the build cache keeps it.
-/// -Dios-model=<path> uses a local ggml file instead.
-const ios_model = .{
-    .url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.en.bin",
-    .sha256 = "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
-    .size = "77704715",
-};
+/// -Dios-model=<path> uses a local ggml file instead (it must be that
+/// same file for home's adapter to apply).
+const model_pin = @import("src/speech/model_pin.zig");
 
 /// The iPhone app: the same viewer as `portal connect` (module "client")
 /// with the iPhone section (client/src/ios) as its entry.
@@ -646,7 +644,7 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     const tunnel = b.option(bool, "ios-tunnel", "iPhone app: control the per-app WireGuard tunnel extension (needs the Network Extension entitlement, paid account)") orelse false;
     const env = &b.graph.environ_map;
     const moltenvk = b.option([]const u8, "moltenvk", "iOS MoltenVK: path to libMoltenVK.dylib or MoltenVK.framework for iOS arm64 (env MOLTENVK_PATH)") orelse env.get("MOLTENVK_PATH");
-    const model_path = b.option([]const u8, "ios-model", "iPhone app: a local ggml model to bundle for dictation instead of the pinned tiny.en download");
+    const model_path = b.option([]const u8, "ios-model", "iPhone app: a local copy of the pinned base model (src/speech/model_pin.zig) to bundle instead of downloading it");
     const sdk = b.option([]const u8, "ios-sdk", "iPhoneOS SDK path (env IOS_SDK; default: xcrun --sdk iphoneos --show-sdk-path on a Mac)") orelse env.get("IOS_SDK") orelse if (b.graph.host.result.os.tag == .macos)
         std.mem.trim(u8, b.run(&.{ "xcrun", "--sdk", "iphoneos", "--show-sdk-path" }), " \r\n")
     else
@@ -801,10 +799,10 @@ fn addIos(b: *std.Build, optimize: std.builtin.OptimizeMode, test_step: *std.Bui
     // the app bundles (docs/ios-licenses.txt).
     const model_file: std.Build.LazyPath = if (model_path) |p| .{ .cwd_relative = p } else blk: {
         const f = b.addRunArtifact(fetch_tool);
-        f.addArgs(&.{ ios_model.url, ios_model.sha256, ios_model.size });
-        break :blk f.addOutputFileArg("ggml-tiny.en.bin");
+        f.addArgs(&.{ model_pin.url, model_pin.sha256_hex, b.fmt("{d}", .{model_pin.size}) });
+        break :blk f.addOutputFileArg(model_pin.file_name);
     };
-    _ = app.addCopyFile(model_file, "Portal.app/stt/ggml-tiny.en.bin");
+    _ = app.addCopyFile(model_file, "Portal.app/stt/" ++ model_pin.file_name);
     _ = app.addCopyFile(b.path("docs/ios-licenses.txt"), "Portal.app/Licenses.txt");
     if (std.mem.endsWith(u8, std.mem.trimEnd(u8, mvk, "/"), ".framework")) {
         _ = app.addCopyDirectory(.{ .cwd_relative = mvk }, "Portal.app/Frameworks/MoltenVK.framework", .{});
@@ -991,7 +989,7 @@ fn infoPlist(b: *std.Build, bundle_id: []const u8) []const u8 {
         \\    <dict><key>CFBundlePrimaryIcon</key><dict><key>CFBundleIconFiles</key><array><string>AppIcon60x60</string></array></dict></dict>
         \\    <key>NSCameraUsageDescription</key><string>Portal scans the pairing QR code shown on your desktop.</string>
         \\    <key>NSFaceIDUsageDescription</key><string>Portal asks for Face ID before it shows your session or signs in.</string>
-        \\    <key>NSMicrophoneUsageDescription</key><string>Portal records while you dictate an instruction; the speech is transcribed on this iPhone and never leaves it.</string>
+        \\    <key>NSMicrophoneUsageDescription</key><string>Portal records while you dictate. It transcribes on this iPhone; with learning on, your corrected samples go to your own desktop through Portal's private tunnel.</string>
         \\    <key>NSLocalNetworkUsageDescription</key><string>Portal connects to the Portal running on your desktop.</string>
         \\</dict>
         \\</plist>

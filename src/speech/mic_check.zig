@@ -84,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     const arena = init.arena.allocator();
-    const model = model_arg orelse try std.fs.path.join(arena, &.{ options.stt_dir, "models", "ggml-base.en.bin" });
+    const model = model_arg orelse try std.fs.path.join(arena, &.{ options.stt_dir, "models", speech.model_pin.file_name });
     // A throwaway profile under the system temp folder.
     const tmp = init.environ_map.get("TEMP") orelse ".";
     const prof = try std.fs.path.join(arena, &.{ tmp, "portal-mic-check-stt" });
