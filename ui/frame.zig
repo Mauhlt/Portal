@@ -78,6 +78,19 @@ pub const TopBar = struct {
     /// A device's "⋯ N hidden" after the tabs, at their right end (its
     /// hidden tabs, ui/hidden_tabs.zig); null: none.
     hidden: ?HiddenButton = null,
+    /// Short of room the buttons collapse (topButtonLevel): first the view
+    /// toggle (TopButton.toggle) becomes one button, then every other
+    /// button goes behind a "⋯" button that reaches the sink as
+    /// InputSink.button(more_id) (the host's menu of them). Null: they
+    /// never go behind it.
+    more_id: ?u32 = null,
+    /// The "⋯" button's menu is open (drawn as the chosen one).
+    more_active: bool = false,
+    /// When deciding whether the buttons collapse, each tab counts as at
+    /// most this many cells (the desk: its tools stay at normal widths and
+    /// long tab names are cut instead); null: the tabs at their full width
+    /// (devices: the buttons give way first).
+    tab_need_cells: ?u16 = null,
 };
 
 /// The tab strip's hidden-tabs button: amber with a dot (`alert`) while a
@@ -117,6 +130,11 @@ pub const TopButton = struct {
     id: u32,
     /// Drawn as the chosen one (the view toggle).
     active: bool = false,
+    /// Part of the view toggle. Collapsed (TopBar.more_id), the toggle is
+    /// one button: its first member that is not active (on the desk, its
+    /// one member), labelled `short` ("Chat", "Term": the view it shows).
+    toggle: bool = false,
+    short: []const u8 = "",
 };
 
 /// One project tab in the top bar.
@@ -181,6 +199,10 @@ pub const PanelRow = struct {
     button2: ?PanelButton = null,
     /// A coloured dot before the text (a project's colour).
     dot: ?Rgb = null,
+    /// Drawn muted after `text` and a " · " (a project's folder). Short of
+    /// room it is shortened in the middle, so its end stays visible, and
+    /// dropped when even that does not fit; `text` is cut at its end.
+    detail: []const u8 = "",
 };
 
 /// A QR code to show in a panel: `size` x `size` modules, row-major, 1 =
@@ -192,7 +214,10 @@ pub const PanelQr = struct {
 
 /// A modal box drawn over everything else (pairing approval, device list,
 /// first-run settings). Layout, top to bottom: title, lines, qr, rows,
-/// fields, after, note, buttons.
+/// fields, after, note, buttons. Taller than the window, everything above
+/// the buttons scrolls (the wheel, a drag on a touch screen) and the
+/// buttons stay at the bottom of the box; newly focused fields and
+/// selected rows are scrolled into view (Frame.panel_scroll).
 pub const Panel = struct {
     title: []const u8,
     title_tone: Tone = .normal,
@@ -416,6 +441,8 @@ const Press = struct {
     /// Touch, begun over the grid: its drags scroll the rows (the last y,
     /// and rows not yet scrolled).
     pan: bool = false,
+    /// Touch, begun over a panel: its drags scroll the panel.
+    panel: bool = false,
     last_y: f32 = 0,
     pan_acc: f32 = 0,
     /// What the press began on (answer keys copied: the view's strings may
@@ -526,6 +553,22 @@ pub const Frame = struct {
     /// The glue's clock (awake ms), set before each pointer event: a long
     /// press is measured between press and release (long_press_ms).
     now_ms: i64 = 0,
+    /// The modal panel's box in the last frame (null: none), and how far
+    /// its contents are scrolled (pixels from the top; at most
+    /// `panel_max`, 0 when it fits).
+    panel_box: ?Rect = null,
+    panel_scroll: f32 = 0,
+    panel_max: f32 = 0,
+    /// Which panel (its title's hash) and which of its fields or rows
+    /// had the focus last frame: a new panel starts at the top, a newly
+    /// focused one is scrolled into view.
+    panel_key: u64 = 0,
+    panel_focus: ?u64 = null,
+    /// Where the focused field or the selected row was laid out in the
+    /// measuring pass (see panelBody).
+    focus_mark: ?FocusMark = null,
+
+    const FocusMark = struct { key: u64, y0: f32, y1: f32 };
 
     pub fn init(gpa: std.mem.Allocator, sizing: Sizing) Frame {
         return .{ .gpa = gpa, .sizing = sizing };
@@ -565,9 +608,10 @@ pub const Frame = struct {
         if (button == .right) if (f.hitFull(x, y)) |h| if (h.alt) |alt| return sink.button(alt);
         const hit = if (button == .left) f.hitFull(x, y) else null;
         if (f.touch and button == .left) {
+            const in_panel = if (f.panel_box) |b| b.contains(x, y) else false;
             const in_view = f.view_shown and f.regions.terminal.contains(x, y);
-            const pan = !in_view and f.regions.terminal.contains(x, y);
-            f.press = .{ .active = true, .x0 = x, .y0 = y, .in_view = in_view, .pan = pan, .last_y = y, .t0_ms = f.now_ms };
+            const pan = f.panel_box == null and !in_view and f.regions.terminal.contains(x, y);
+            f.press = .{ .active = true, .x0 = x, .y0 = y, .in_view = in_view, .pan = pan, .panel = in_panel, .last_y = y, .t0_ms = f.now_ms };
             if (hit) |h| f.press.setAction(h);
             if (in_view) sink.drag(.{ .phase = .down, .x = x, .y = y, .scale = f.scale });
             return;
@@ -593,6 +637,10 @@ pub const Frame = struct {
             if (!f.press.moved and @max(@abs(x - f.press.x0), @abs(y - f.press.y0)) > drag_slop * f.scale) f.press.moved = true;
             if (f.press.in_view) {
                 sink.drag(.{ .phase = .move, .x = x, .y = y, .scale = f.scale });
+            } else if (f.press.moved and f.press.panel) {
+                // Finger up: further down the panel.
+                f.scrollPanel(f.press.last_y - y);
+                f.press.last_y = y;
             } else if (f.press.moved and f.press.pan) {
                 // Touch, over the grid: finger down = earlier rows.
                 f.press.pan_acc += (y - f.press.last_y) / @max(f.cells.ch, 1);
@@ -639,11 +687,22 @@ pub const Frame = struct {
     }
 
     /// A wheel turn of `notches` (> 0: away from the user) at (x, y): scrolls
-    /// a content view under the pointer. False if nothing scrolled.
+    /// the modal panel (it takes every turn while shown), else a content
+    /// view under the pointer. False if nothing scrolled.
     pub fn wheel(f: *Frame, x: f32, y: f32, notches: f32, sink: input.InputSink) bool {
+        if (f.panel_box != null) {
+            f.scrollPanel(-notches * f.wheel_px);
+            return true;
+        }
         if (!f.view_shown or notches == 0 or !f.regions.terminal.contains(x, y)) return false;
         sink.scroll(notches * f.wheel_px);
         return true;
+    }
+
+    /// Scrolls the modal panel by `dy` pixels (> 0: further down),
+    /// within what it has to scroll.
+    pub fn scrollPanel(f: *Frame, dy: f32) void {
+        f.panel_scroll = std.math.clamp(@round(f.panel_scroll + dy), 0, @max(0, f.panel_max));
     }
 
     fn hitFull(f: *const Frame, x: f32, y: f32) ?Hit {
@@ -698,6 +757,14 @@ pub const Frame = struct {
         f.list.clear = f.term.bg;
         f.n_hits = 0;
         f.text_slot = null;
+        f.panel_box = null;
+        if (overlay.panel == null) {
+            // Closed: the next panel starts at its top.
+            f.panel_key = 0;
+            f.panel_scroll = 0;
+            f.panel_max = 0;
+            f.panel_focus = null;
+        }
         // Lay out inside the insets (all zero on desktops), then shift.
         const ins = f.insets;
         defer f.shift(ins.left, ins.top);
@@ -813,6 +880,50 @@ pub const Frame = struct {
             t.rect.x += dx;
             t.rect.y += dy;
         }
+        if (f.panel_box) |*b| {
+            b.x += dx;
+            b.y += dy;
+        }
+    }
+
+    /// Clips the draw commands from `cmd0` and the hits from `hit0` on to
+    /// `cl` (x0, y0, x1, y1): rectangles and hits are cut, text and images
+    /// get the clip, glyphs outside it are dropped.
+    fn clipDrawn(f: *Frame, cmd0: usize, hit0: usize, cl: [4]f32) void {
+        const cmds = &f.list.cmds;
+        var keep = cmd0;
+        for (cmds.items[cmd0..]) |c0| {
+            var c = c0;
+            const shown = switch (c) {
+                .rect => |*v| clipBox(&v.x, &v.y, &v.w, &v.h, cl),
+                .glyph => |v| v.x >= cl[0] and v.y >= cl[1] and v.x < cl[2] and v.y < cl[3],
+                .text => |*v| blk: {
+                    const t: [4]f32 = if (v.clip) |o| .{ @max(o[0], cl[0]), @max(o[1], cl[1]), @min(o[2], cl[2]), @min(o[3], cl[3]) } else cl;
+                    v.clip = t;
+                    const lh: f32 = @floatFromInt(f.list.fonts[v.font].cell_h);
+                    break :blk t[2] > t[0] and t[3] > t[1] and v.y < t[3] and v.y + lh > t[1];
+                },
+                .image => |*v| blk: {
+                    v.clip = .{ @max(v.clip[0], cl[0]), @max(v.clip[1], cl[1]), @min(v.clip[2], cl[2]), @min(v.clip[3], cl[3]) };
+                    break :blk v.clip[2] > v.clip[0] and v.clip[3] > v.clip[1];
+                },
+            };
+            if (!shown) continue;
+            cmds.items[keep] = c;
+            keep += 1;
+        }
+        cmds.shrinkRetainingCapacity(keep);
+        var kh = hit0;
+        for (f.hits[hit0..f.n_hits]) |h0| {
+            var h = h0;
+            if (!clipBox(&h.x, &h.y, &h.w, &h.h, cl)) continue;
+            f.hits[kh] = h;
+            kh += 1;
+        }
+        f.n_hits = kh;
+        if (f.text_slot) |*t| if (!clipBox(&t.rect.x, &t.rect.y, &t.rect.w, &t.rect.h, cl)) {
+            f.text_slot = null;
+        };
     }
 
     /// Moves the draw commands from `cmd0` and the hits from `hit0` on by
@@ -1040,15 +1151,42 @@ pub const Frame = struct {
         }
         const ty = @round((h - @as(f32, @floatFromInt(ui.cell_h))) / 2);
         var right_w: f32 = 0;
+        // Short of room for the tabs at their full width, the buttons
+        // collapse (topButtonLevel).
+        var shown: [16]TopButton = undefined;
+        const buttons = blk: {
+            const cw: f32 = @floatFromInt(ui.cell_w);
+            const gap = @round(6 * s);
+            var fixed: f32 = 0; // the right-hand text and the hidden-tabs button
+            if (tb.right.len > 0) fixed += textWidth(ui, tb.right) + (if (tb.right_badge) 3 * pad else pad);
+            if (tb.hidden) |hb| fixed += textWidth(ui, hb.label) + 2 * cw + (if (hb.alert) 2 * cw else 0) + @round(4 * s);
+            var need: f32 = 0;
+            for (tb.tabs) |t| {
+                const full = 4 * cw + (if (t.close_id != null) 2 * cw else 0) + (if (t.badge.len > 0) textWidth(ui, t.badge) + 2 * cw else 0) + textWidth(ui, t.label);
+                need += (if (tb.tab_need_cells) |c| @min(full, @as(f32, @floatFromInt(c)) * cw) else full) + @round(4 * s);
+            }
+            if (tb.add_id != null) need += 3 * cw + @round(4 * s);
+            if (tb.tabs.len == 0 and tb.add_id == null) need = @min(textWidth(ui, tb.title), 16 * cw);
+            var widths: [3]?f32 = @splat(null);
+            for (0..3) |l| {
+                const lv: u2 = @intCast(l);
+                if (!buttonLevelUsable(tb.buttons, lv, tb.more_id)) continue;
+                var w: f32 = 0;
+                for (collapseButtons(tb.buttons, lv, tb.more_id, tb.more_active, &shown)) |b| w += textWidth(ui, b.label) + 2 * cw + gap;
+                widths[l] = w;
+            }
+            const level = topButtonLevel(widths, need, W - x - 2 * pad - fixed);
+            break :blk collapseButtons(tb.buttons, level, tb.more_id, tb.more_active, &shown);
+        };
         // Buttons first (right to left), then the right-hand text left of them.
-        if (tb.buttons.len > 0) {
+        if (buttons.len > 0) {
             const bh = @round(h * 0.78);
             const by = @round((h - bh) / 2);
             var bx = W - pad;
-            var i = tb.buttons.len;
+            var i = buttons.len;
             while (i > 0) {
                 i -= 1;
-                const b = tb.buttons[i];
+                const b = buttons[i];
                 const bw = textWidth(ui, b.label) + 2 * @as(f32, @floatFromInt(ui.cell_w));
                 bx -= bw;
                 _ = f.addButton(ui, bx, by, bh, b.label, b.id, if (b.active) theme.ui.button_active else theme.ui.button);
@@ -1104,24 +1242,53 @@ pub const Frame = struct {
     /// the bar with the neon accent underline, the others text only and
     /// dimmer; a neutral count pill for background tasks, an optional
     /// close box, then the optional "+". No outlines. Tabs share the room
-    /// when it is short.
+    /// when it is short (fitTabs): the longest labels are cut first, with an
+    /// ellipsis, but every tab keeps a few characters; when not even that
+    /// fits, the strip shows the tabs around the active one and a "‹" / "›"
+    /// at an end with tabs out of view (a click switches to the next one
+    /// that way). Too short for the active tab alone, the count pills go.
     fn drawTabs(f: *Frame, ui: Metrics, tb: TopBar, x0: f32, x1: f32, h: f32, s: f32) void {
         const cw: f32 = @floatFromInt(ui.cell_w);
         const gap = @round(4 * s);
         const th = @round(h * 0.8);
         const ty = h - th;
         const add_w: f32 = if (tb.add_id != null) 3 * cw else 0;
-        const room = @max(0, x1 - x0 - add_w - gap);
-        const n: f32 = @floatFromInt(@max(tb.tabs.len, 1));
-        const max_each = @max(4 * cw, room / n - gap);
+        const room = @max(0, x1 - x0 - (if (add_w > 0) add_w + gap else 0));
+        const max_tabs = 64;
+        const tabs = tb.tabs[0..@min(tb.tabs.len, max_tabs)];
+        var nat: [max_tabs]f32 = undefined;
+        var min: [max_tabs]f32 = undefined;
+        var widths: [max_tabs]f32 = undefined;
+        var active: usize = 0;
+        for (tabs, 0..) |t, i| if (t.active) {
+            active = i;
+        };
+        const mark_w = 2 * cw;
+        // Too short for the active tab even at its minimum: without the
+        // task-count pills (the status line shows the shown tab's too).
+        var badges = true;
+        const fit = while (true) {
+            for (tabs, 0..) |t, i| {
+                const fixed = 4 * cw + (if (t.close_id != null) 2 * cw else 0) + (if (badges and t.badge.len > 0) textWidth(ui, t.badge) + 2 * cw else 0);
+                const label_w = textWidth(ui, t.label);
+                nat[i] = fixed + label_w;
+                // At least three characters and the ellipsis.
+                min[i] = fixed + @min(label_w, 4 * cw);
+            }
+            const r = fitTabs(nat[0..tabs.len], min[0..tabs.len], active, room, gap, mark_w, widths[0..tabs.len]);
+            if (!badges or tabs.len == 0 or widths[active] >= min[active]) break r;
+            badges = false;
+        };
+        const text_y = ty + @round((th - @as(f32, @floatFromInt(ui.cell_h))) / 2);
         var x = x0;
-        for (tb.tabs) |t| {
+        if (fit.more_left) {
+            f.tabMarker(ui, x, ty, mark_w, th, text_y, "\u{2039}", tabs[fit.first - 1].id);
+            x += mark_w + gap;
+        }
+        for (tabs[fit.first..fit.end], fit.first..) |t, ti| {
             const close_w: f32 = if (t.close_id != null) 2 * cw else 0;
-            const dot_w: f32 = 2 * cw;
-            const badge_w: f32 = if (t.badge.len > 0) textWidth(ui, t.badge) + 2 * cw else 0;
-            const natural = textWidth(ui, t.label) + 2 * cw + close_w + dot_w + badge_w;
-            const w = @min(natural, @max(max_each, 3 * cw));
-            if (x + w > x1) break;
+            const badge_w: f32 = if (badges and t.badge.len > 0) textWidth(ui, t.badge) + 2 * cw else 0;
+            const w = widths[ti];
             // The active tab: a pill a step lighter than the bar with a
             // neon underline; the others are text only. No outlines.
             if (t.active) {
@@ -1129,7 +1296,6 @@ pub const Frame = struct {
                 f.accentBar(x, ty + th - @max(2, @round(2 * s)), w, @max(2, @round(2 * s)));
             }
             var tx = x + cw;
-            const text_y = ty + @round((th - @as(f32, @floatFromInt(ui.cell_h))) / 2);
             // The project's dot; in the warm sun colour while its program
             // waits for an answer.
             const dot: Rgb = if (t.attention) theme.ui.attention else if (t.active) t.color else mixBy(t.color, theme.ui.bar, 0.35);
@@ -1137,9 +1303,10 @@ pub const Frame = struct {
             tx += 2 * cw;
             const label_room = @max(0, x + w - cw - close_w - badge_w - tx);
             const fg: Rgb = if (t.active) theme.ui.tab_text else theme.ui.tab_text_inactive;
-            _ = f.text(ui, tx, text_y, clipText(ui, t.label, label_room, false), fg, t.active);
+            var lb: [256]u8 = undefined;
+            _ = f.text(ui, tx, text_y, fitText(ui, t.label, label_room, .end, &lb), fg, t.active);
             f.addHit(.{ .x = x, .y = ty, .w = w - close_w - badge_w, .h = th, .action = .{ .button = t.id }, .alt = t.menu_id });
-            if (t.badge.len > 0) {
+            if (badge_w > 0) {
                 // A filled pill left of the close box: the tab's running
                 // background tasks.
                 const bx = x + w - close_w - badge_w + @round(cw / 4);
@@ -1157,12 +1324,24 @@ pub const Frame = struct {
             }
             x += w + gap;
         }
+        if (fit.more_right) {
+            f.tabMarker(ui, x, ty, mark_w, th, text_y, "\u{203A}", tabs[fit.end].id);
+            x += mark_w + gap;
+        }
         if (tb.add_id) |aid| if (x + add_w <= x1 + gap) {
             f.rect(x, ty, add_w, th, theme.ui.button);
-            const text_y = ty + @round((th - @as(f32, @floatFromInt(ui.cell_h))) / 2);
             _ = f.text(ui, x + cw, text_y, "+", theme.ui.button_text, true);
             f.registerButton(x, ty, add_w, th, aid);
         };
+    }
+
+    /// A "‹" / "›" at an end of the tab strip with tabs out of view; a
+    /// click switches to tab `id` (the next one that way).
+    fn tabMarker(f: *Frame, ui: Metrics, x: f32, ty: f32, w: f32, th: f32, text_y: f32, glyph: []const u8, id: u32) void {
+        const cw: f32 = @floatFromInt(ui.cell_w);
+        f.rect(x, ty, w, th, theme.ui.button);
+        _ = f.text(ui, x + @round(cw / 2), text_y, glyph, theme.ui.button_text, true);
+        f.registerButton(x, ty, w, th, id);
     }
 
     // ------------------------------------------------------------ terminal
@@ -1293,16 +1472,17 @@ pub const Frame = struct {
         return any;
     }
 
+    /// A centred notice: the title, its lines and the detail word-wrapped
+    /// to the width (less a margin each side), every line centred.
     fn drawMessage(f: *Frame, ui: Metrics, msg: Message, W: f32, y0: f32, H: f32, s: f32) void {
         const big = f.fonts.metrics(@round(20 * s));
         const lh: f32 = @floatFromInt(ui.cell_h);
+        const max_w = @max(1, W - 2 * @round(16 * s));
         var y = y0 + @round(H * 0.28);
-        _ = f.text(big, centreX(W, textWidth(big, msg.title)), y, msg.title, toneColor(msg.title_tone), true);
-        y += @as(f32, @floatFromInt(big.cell_h)) + lh;
-        for (msg.lines) |l| {
-            _ = f.text(ui, centreX(W, textWidth(ui, l)), y, l, toneColor(.muted), false);
-            y += lh * 1.4;
-        }
+        const big_h: f32 = @floatFromInt(big.cell_h);
+        y = f.centredLines(big, W, y, max_w, msg.title, toneColor(msg.title_tone), true, @round(big_h * 1.25));
+        y += lh - @round(big_h * 0.25);
+        for (msg.lines) |l| y = f.centredLines(ui, W, y, max_w, l, toneColor(.muted), false, lh * 1.4);
         if (msg.button) |b| {
             y += lh;
             const bh = @round(lh * 2.2);
@@ -1310,7 +1490,22 @@ pub const Frame = struct {
             _ = f.addButton(ui, centreX(W, bw), y, bh, b.label, b.id, theme.ui.button);
             y += bh + lh;
         }
-        if (msg.detail.len > 0) _ = f.text(ui, centreX(W, textWidth(ui, msg.detail)), y, msg.detail, toneColor(msg.detail_tone), false);
+        if (msg.detail.len > 0) _ = f.centredLines(ui, W, y, max_w, msg.detail, toneColor(msg.detail_tone), false, lh * 1.4);
+    }
+
+    /// `s` word-wrapped to `max_w`, each line centred in `W`, `step` apart
+    /// from `y0`; returns the y under the last line.
+    fn centredLines(f: *Frame, m: Metrics, W: f32, y0: f32, max_w: f32, s: []const u8, c: Rgb, bold: bool, step: f32) f32 {
+        var y = y0;
+        var rest = s;
+        while (rest.len > 0) {
+            const n = wrapLen(m.cell_w, rest, max_w);
+            const line = std.mem.trimEnd(u8, rest[0..n], " ");
+            _ = f.text(m, centreX(W, textWidth(m, line)), y, line, c, bold);
+            y += step;
+            rest = std.mem.trimStart(u8, rest[n..], " ");
+        }
+        return y;
     }
 
     // ------------------------------------------------------------ bottom
@@ -1376,20 +1571,33 @@ pub const Frame = struct {
         if (fill > 0) f.rect(x, y, fill, h, usageColor(tone, false));
     }
 
+    /// The status line: a dot in the tone, the label, the extra and the
+    /// tasks left to right, `right` at the right end. Short of room they
+    /// never overlap: lower-priority items are cut or dropped (packStatus).
     fn drawStatus(f: *Frame, ui: Metrics, st: StatusLine, y: f32, W: f32, h: f32, s: f32) void {
         f.rect(0, y, W, h, theme.ui.bar);
         const ty = y + @round((h - @as(f32, @floatFromInt(ui.cell_h))) / 2);
         const pad = @round(8 * s);
         const dot = @round(@as(f32, @floatFromInt(ui.cell_h)) * 0.45);
+        const cw: f32 = @floatFromInt(ui.cell_w);
         f.rect(pad, y + @round((h - dot) / 2), dot, dot, toneColor(st.tone));
         var x = pad + dot + pad;
-        x = f.text(ui, x, ty, st.label, theme.ui.text, true);
-        if (st.extra.len > 0) {
-            x = f.text(ui, x, ty, "  \u{00B7}  ", toneColor(.muted), false);
-            x = f.text(ui, x, ty, st.extra, toneColor(st.extra_tone), false);
+        const sep = "  \u{00B7}  ";
+        const sep_w = textWidth(ui, sep);
+        const got = packStatus(
+            .{ textWidth(ui, st.label), textWidth(ui, st.extra), textWidth(ui, st.tasks), textWidth(ui, st.right) },
+            .{ 0, sep_w, sep_w, 2 * cw },
+            W - pad - x,
+            6 * cw,
+        );
+        var buf: [256]u8 = undefined;
+        if (got[0] > 0) x = f.text(ui, x, ty, fitText(ui, st.label, got[0], .end, &buf), theme.ui.text, true);
+        if (got[1] > 0) {
+            x = f.text(ui, x, ty, sep, toneColor(.muted), false);
+            x = f.text(ui, x, ty, fitText(ui, st.extra, got[1], .end, &buf), toneColor(st.extra_tone), false);
         }
-        if (st.tasks.len > 0) {
-            x = f.text(ui, x, ty, "  \u{00B7}  ", toneColor(.muted), false);
+        if (got[2] > 0) {
+            x = f.text(ui, x, ty, sep, toneColor(.muted), false);
             const x0 = x;
             x = f.text(ui, x, ty, st.tasks, theme.ui.focus, true);
             if (st.tasks_id) |tid| {
@@ -1397,7 +1605,10 @@ pub const Frame = struct {
                 f.registerButton(x0, y, x - x0, h, tid);
             }
         }
-        if (st.right.len > 0) _ = f.text(ui, W - pad - textWidth(ui, st.right), ty, st.right, toneColor(.muted), false);
+        if (got[3] > 0) {
+            const r = fitText(ui, st.right, got[3], .end, &buf);
+            _ = f.text(ui, W - pad - textWidth(ui, r), ty, r, toneColor(.muted), false);
+        }
     }
 
     /// A boxed line right-aligned just above `bottom` (no hit area).
@@ -1530,8 +1741,10 @@ pub const Frame = struct {
     }
 
     /// One layout pass over the panel's contents, inside the box at (x, y0)
-    /// with inner width `w`. Returns the height used. Measuring and drawing
-    /// share this code so they always agree.
+    /// with inner width `w`, without its buttons (panelButtons). Returns
+    /// the height used. Measuring and drawing share this code so they
+    /// always agree; measuring notes where the focused field or the
+    /// selected row is (focus_mark).
     fn panelBody(f: *Frame, ui: Metrics, big: Metrics, p: Panel, x: f32, y0: f32, w: f32, s: f32, paint: bool) f32 {
         var y = y0;
         const lh: f32 = @floatFromInt(ui.cell_h);
@@ -1543,8 +1756,9 @@ pub const Frame = struct {
         if (p.rows.len > 0) {
             y += @round(lh * 0.4);
             const rh = @round(lh * 1.9);
-            for (p.rows) |r| {
+            for (p.rows, 0..) |r, ri| {
                 if (paint and r.selected) f.rect(x - @round(4 * s), y, w + @round(8 * s), rh, theme.ui.selected_row);
+                if (!paint and r.selected) f.focus_mark = .{ .key = (1 << 32) | ri, .y0 = y - y0, .y1 = y - y0 + rh };
                 var tw = w;
                 const bh = @round(rh * 0.8);
                 for ([_]?PanelButton{ r.button, r.button2 }) |ob| if (ob) |b| {
@@ -1560,14 +1774,16 @@ pub const Frame = struct {
                     tx += 2 * cw;
                     tw = @max(0, tw - 2 * cw);
                 }
-                if (paint) _ = f.text(ui, tx, y + @round((rh - lh) / 2), clipText(ui, r.text, tw, false), toneColor(r.tone), false);
+                if (paint) f.rowText(ui, tx, y + @round((rh - lh) / 2), tw, r);
                 y += rh;
             }
         }
         // Fields: a label above a boxed value.
         if (p.fields.len > 0) y += @round(lh * 0.5);
         for (p.fields) |fl| {
-            if (paint) _ = f.text(ui, x, y, fl.label, toneColor(.normal), true);
+            if (!paint and fl.focused) f.focus_mark = .{ .key = fl.id, .y0 = y - y0, .y1 = y - y0 + @round(lh * 1.3) + @round(lh * 1.9) };
+            var lb: [256]u8 = undefined;
+            if (paint) _ = f.text(ui, x, y, fitText(ui, fl.label, w, .end, &lb), toneColor(.normal), true);
             y += @round(lh * 1.3);
             const fh = @round(lh * 1.9);
             if (paint) {
@@ -1580,7 +1796,7 @@ pub const Frame = struct {
                 if (fl.choice) {
                     var buf: [96]u8 = undefined;
                     const v = std.fmt.bufPrint(&buf, "\u{2039} {s} \u{203A}", .{fl.value}) catch fl.value;
-                    _ = f.text(ui, tx, ty, v, theme.ui.text, true);
+                    _ = f.text(ui, tx, ty, fitText(ui, v, inner, .end, &lb), theme.ui.text, true);
                 } else if (fl.value.len == 0 and !fl.focused) {
                     _ = f.text(ui, tx, ty, clipText(ui, fl.hint, inner, false), toneColor(.muted), false);
                 } else {
@@ -1598,18 +1814,35 @@ pub const Frame = struct {
             y += @round(lh * 0.3);
             y += f.wrapped(ui, x, y, w, p.note, paint);
         }
-        // Buttons, right-aligned on one row.
-        if (p.buttons.len > 0) {
-            y += @round(lh * 0.8);
-            const bh = @round(lh * 2.1);
-            const gap = @round(8 * s);
-            var total: f32 = 0;
-            for (p.buttons) |b| total += f.panelButton(ui, 0, 0, bh, b, s, false) + gap;
-            var bx = x + w - total + gap;
-            for (p.buttons) |b| bx += f.panelButton(ui, bx, y, bh, b, s, paint) + gap;
-            y += bh;
-        }
         return y - y0;
+    }
+
+    /// The panel's buttons, right-aligned on one row under a gap, at
+    /// (x, y0) in `w`; returns the height used (0 without buttons).
+    fn panelButtons(f: *Frame, ui: Metrics, p: Panel, x: f32, y0: f32, w: f32, s: f32, paint: bool) f32 {
+        if (p.buttons.len == 0) return 0;
+        const lh: f32 = @floatFromInt(ui.cell_h);
+        const y = y0 + @round(lh * 0.8);
+        const bh = @round(lh * 2.1);
+        const gap = @round(8 * s);
+        var total: f32 = 0;
+        for (p.buttons) |b| total += f.panelButton(ui, 0, 0, bh, b, s, false) + gap;
+        var bx = x + w - total + gap;
+        for (p.buttons) |b| bx += f.panelButton(ui, bx, y, bh, b, s, paint) + gap;
+        return y + bh - y0;
+    }
+
+    /// A panel row's text in `tw` from (x, y): `text`, then its muted
+    /// detail (see PanelRow.detail), shortened with an ellipsis to fit.
+    fn rowText(f: *Frame, ui: Metrics, x: f32, y: f32, tw: f32, r: PanelRow) void {
+        var buf: [512]u8 = undefined;
+        const sep = "  \u{00B7}  ";
+        const cw: f32 = @floatFromInt(ui.cell_w);
+        const fit = rowFit(textWidth(ui, r.text), textWidth(ui, sep), textWidth(ui, r.detail), tw, cw);
+        const end = f.text(ui, x, y, fitText(ui, r.text, fit[0], .end, &buf), toneColor(r.tone), false);
+        if (fit[1] <= 0) return;
+        const dx = f.text(ui, end, y, sep, toneColor(.muted), false);
+        _ = f.text(ui, dx, y, fitText(ui, r.detail, fit[1], .middle, &buf), toneColor(.muted), false);
     }
 
     fn drawPanel(f: *Frame, ui: Metrics, p: Panel, W: f32, H: f32, s: f32) void {
@@ -1618,16 +1851,50 @@ pub const Frame = struct {
         const big = f.fonts.metrics(@round(17 * s));
         const pad = @round(20 * s);
         const margin = @round(16 * s);
+        const lh: f32 = @floatFromInt(ui.cell_h);
         const max_inner: f32 = @floatFromInt(ui.cell_w * 78);
         const w = @max(1, @min(W - 2 * margin - 2 * pad, max_inner));
-        const h = f.panelBody(ui, big, p, 0, 0, w, s, false);
+        f.focus_mark = null;
+        const body_h = f.panelBody(ui, big, p, 0, 0, w, s, false);
+        const mark = f.focus_mark;
+        const btn_h = f.panelButtons(ui, p, 0, 0, w, s, false);
         const bw = w + 2 * pad;
-        const bh = h + 2 * pad;
         const bx = @round(@max(0, (W - bw) / 2));
+        const key = std.hash.Wyhash.hash(0, p.title);
+        if (key != f.panel_key) {
+            f.panel_key = key;
+            f.panel_scroll = 0;
+            f.panel_focus = null;
+        }
+        const sc = panelScroll(body_h, btn_h, pad, H - 2 * margin, f.panel_scroll, if (mark) |m| (if (f.panel_focus != m.key) [2]f32{ m.y0, m.y1 } else null) else null, @round(lh / 2));
+        f.panel_focus = if (mark) |m| m.key else null;
+        f.panel_scroll = sc.scroll;
+        f.panel_max = sc.max;
+        const bh = sc.box_h;
         const by = @round(@max(0, (H - bh) / 2));
+        f.panel_box = .{ .x = bx, .y = by, .w = bw, .h = bh };
         f.rect(bx, by, bw, bh, theme.ui.panel);
-        f.outline(bx, by, bw, bh, @max(1, @round(s)), theme.ui.border);
-        _ = f.panelBody(ui, big, p, bx + pad, by + pad, w, s, true);
+        const edge = @max(1, @round(s));
+        f.outline(bx, by, bw, bh, edge, theme.ui.border);
+        const c0 = f.list.cmds.items.len;
+        const h0 = f.n_hits;
+        _ = f.panelBody(ui, big, p, bx + pad, by + pad - sc.scroll, w, s, true);
+        if (sc.max > 0) {
+            // Scrolled: the contents clipped above the buttons, a slim
+            // scroll bar at the box's right edge.
+            const view_y0 = by + @round(pad / 2);
+            const view_y1 = by + pad + sc.view_h + @round(lh * 0.4);
+            f.clipDrawn(c0, h0, .{ bx + edge, view_y0, bx + bw - edge, view_y1 });
+            f.rect(bx + edge, view_y1, bw - 2 * edge, edge, theme.ui.border);
+            const tw = @max(2, @round(3 * s));
+            const tx = bx + bw - @round(pad / 2) - @round(tw / 2);
+            const track_y = by + pad;
+            f.rect(tx, track_y, tw, sc.view_h, theme.ui.bar);
+            const thumb_h = @max(@round(lh), @round(sc.view_h * sc.view_h / body_h));
+            const thumb_y = track_y + @round((sc.view_h - thumb_h) * sc.scroll / sc.max);
+            f.rect(tx, thumb_y, tw, thumb_h, theme.ui.dim);
+        }
+        _ = f.panelButtons(ui, p, bx + pad, by + pad + sc.view_h, w, s, true);
     }
 };
 
@@ -1904,6 +2171,247 @@ pub fn clipText(m: Metrics, s: []const u8, max_w: f32, keep_end: bool) []const u
         start += std.unicode.utf8ByteSequenceLength(s[start]) catch 1;
     }
     return s[@min(start, s.len)..];
+}
+
+/// Where `fitText` shortens text that does not fit: at the end (names,
+/// labels), in the middle or at the start (paths: their end stays).
+pub const Elide = enum { end, middle, start };
+
+pub const ellipsis = "\u{2026}";
+
+/// `s` fitted to `max_w` pixels: `s` itself when it fits, else shortened
+/// with an ellipsis where `how` says (built in `buf`; spaces next to the
+/// ellipsis dropped). "" when not even the ellipsis fits.
+pub fn fitText(m: Metrics, s: []const u8, max_w: f32, how: Elide, buf: []u8) []const u8 {
+    if (textWidth(m, s) <= max_w) return s;
+    const cw: f32 = @floatFromInt(m.cell_w);
+    const room = max_w - textWidth(m, ellipsis);
+    if (room < 0 or cw <= 0) return "";
+    var head: []const u8 = "";
+    var tail: []const u8 = "";
+    switch (how) {
+        .end => head = s[0..fitLen(m.cell_w, s, room)],
+        .start => tail = clipText(m, s, room, true),
+        .middle => {
+            // A third for the start, the rest for the end.
+            head = s[0..fitLen(m.cell_w, s, @floor(room / 3 / cw) * cw)];
+            tail = clipText(m, s[head.len..], room - textWidth(m, head), true);
+        },
+    }
+    head = std.mem.trimEnd(u8, head, " ");
+    tail = std.mem.trimStart(u8, tail, " ");
+    if (head.len + ellipsis.len + tail.len > buf.len) return clipText(m, s, max_w, how != .end);
+    @memcpy(buf[0..head.len], head);
+    @memcpy(buf[head.len..][0..ellipsis.len], ellipsis);
+    @memcpy(buf[head.len + ellipsis.len ..][0..tail.len], tail);
+    return buf[0 .. head.len + ellipsis.len + tail.len];
+}
+
+/// Cuts the box (x, y, w, h) to `cl` (x0, y0, x1, y1); false when nothing
+/// of it is left.
+fn clipBox(x: *f32, y: *f32, w: *f32, h: *f32, cl: [4]f32) bool {
+    const x0 = @max(x.*, cl[0]);
+    const y0 = @max(y.*, cl[1]);
+    const x1 = @min(x.* + w.*, cl[2]);
+    const y1 = @min(y.* + h.*, cl[3]);
+    if (!(x1 > x0 and y1 > y0)) return false;
+    x.* = x0;
+    y.* = y0;
+    w.* = x1 - x0;
+    h.* = y1 - y0;
+    return true;
+}
+
+/// A panel row's widths for its text and its detail in `tw` (0: no
+/// detail): both when they fit; else the detail keeps up to 12 cells and
+/// the text the rest; with less than 4 cells for either, the text alone.
+pub fn rowFit(text_w: f32, sep_w: f32, detail_w: f32, tw: f32, cw: f32) [2]f32 {
+    if (detail_w <= 0) return .{ tw, 0 };
+    if (text_w + sep_w + detail_w <= tw) return .{ text_w, detail_w };
+    const text_room = @min(text_w, @max(0, tw - sep_w - @min(detail_w, 12 * cw)));
+    const detail_room = tw - text_room - sep_w;
+    if (text_room < @min(text_w, 4 * cw) or detail_room < @min(detail_w, 4 * cw)) return .{ tw, 0 };
+    return .{ text_room, detail_room };
+}
+
+/// A modal panel's box (see Panel): `body_h` of contents and `btn_h` of
+/// buttons inside `pad`, in at most `max_h`. Fitting: all of it, no
+/// scrolling. Taller: `max_h`, the contents scrolled by `scroll` (clamped)
+/// in a `view_h` view above the buttons; `reveal` (a newly focused field's
+/// top and bottom in the contents) is brought into view with `margin`.
+pub fn panelScroll(body_h: f32, btn_h: f32, pad: f32, max_h: f32, scroll: f32, reveal: ?[2]f32, margin: f32) struct { box_h: f32, view_h: f32, scroll: f32, max: f32 } {
+    const full = body_h + btn_h + 2 * pad;
+    if (full <= max_h or !(max_h > 0)) return .{ .box_h = full, .view_h = body_h, .scroll = 0, .max = 0 };
+    const view_h = @max(0, max_h - 2 * pad - btn_h);
+    const max = body_h - view_h;
+    var sc = scroll;
+    if (reveal) |r| {
+        if (r[0] < sc) {
+            sc = r[0] - margin;
+        } else if (r[1] > sc + view_h) {
+            sc = r[1] - view_h + margin;
+        }
+    }
+    return .{ .box_h = max_h, .view_h = view_h, .scroll = std.math.clamp(@round(sc), 0, max), .max = max };
+}
+
+/// The status line's items, by index: 0 label, 1 extra, 2 tasks, 3 right.
+/// Each wants `want` pixels plus `cost` (its separator or gap). They get
+/// room in the order label, tasks, right, extra; one that does not fit is
+/// dropped, except that the label, extra and right are cut (with an
+/// ellipsis) when at least `min_cut` is left for them. Returns each one's
+/// width (0: not shown); the label always gets what there is.
+pub fn packStatus(want: [4]f32, cost: [4]f32, avail: f32, min_cut: f32) [4]f32 {
+    var got: [4]f32 = @splat(0);
+    var left = @max(0, avail);
+    for ([_]usize{ 0, 2, 3, 1 }) |i| {
+        if (want[i] <= 0) continue;
+        if (i == 0) {
+            got[0] = @min(want[0], left);
+            left -= got[0];
+            continue;
+        }
+        const need = want[i] + cost[i];
+        if (need <= left) {
+            got[i] = want[i];
+            left -= need;
+        } else if (i != 2 and left - cost[i] >= min_cut) {
+            got[i] = left - cost[i];
+            left = 0;
+        }
+    }
+    return got;
+}
+
+/// Whether the top bar's buttons can collapse to `level` (see
+/// collapseButtons): 1 needs a view toggle with a short label, 2 a "⋯"
+/// (`more_id`) and a button to put behind it.
+pub fn buttonLevelUsable(buttons: []const TopButton, level: u2, more_id: ?u32) bool {
+    return switch (level) {
+        0 => true,
+        1 => for (buttons) |b| {
+            if (b.toggle and b.short.len > 0) break true;
+        } else false,
+        else => more_id != null and for (buttons) |b| {
+            if (!b.toggle) break true;
+        } else false,
+    };
+}
+
+/// The top bar's buttons collapsed to `level`: 0 as they are; 1 the view
+/// toggle as one button (its first member that is not active, else its
+/// first, labelled `short`) where the toggle was; 2 that button and a "⋯"
+/// (`more_id`, chosen while `more_active`) for all the others. In `out`
+/// (level 0: `buttons` itself).
+pub fn collapseButtons(buttons: []const TopButton, level: u2, more_id: ?u32, more_active: bool, out: []TopButton) []const TopButton {
+    if (level == 0 or !buttonLevelUsable(buttons, level, more_id)) return buttons;
+    var pick: ?TopButton = null;
+    for (buttons) |b| if (b.toggle and (pick == null or (pick.?.active and !b.active))) {
+        pick = b;
+    };
+    if (pick) |*p| {
+        if (p.short.len > 0) p.label = p.short;
+        p.active = false;
+    }
+    var n: usize = 0;
+    var placed = false;
+    for (buttons) |b| {
+        if (n + 2 > out.len) break;
+        if (b.toggle) {
+            if (!placed) if (pick) |p| {
+                out[n] = p;
+                n += 1;
+                placed = true;
+            };
+        } else if (level == 1) {
+            out[n] = b;
+            n += 1;
+        }
+    }
+    if (level == 2) if (more_id) |id| {
+        out[n] = .{ .label = more_label, .id = id, .active = more_active };
+        n += 1;
+    };
+    return out[0..n];
+}
+
+/// The "more" button's label (and the hidden-tabs button's): three bullets
+/// (U+22EF draws as a short dash at the chrome's size).
+pub const more_label = "\u{2022}\u{2022}\u{2022}";
+
+/// How far the top bar's buttons collapse: the first level (0 full, 1
+/// the view toggle as one button, 2 also the "⋯") whose buttons, `w[level]`
+/// wide (null: not possible), leave `need` (the tabs at their full width)
+/// of `room`; the last possible one when none does.
+pub fn topButtonLevel(w: [3]?f32, need: f32, room: f32) u2 {
+    var last: u2 = 0;
+    for (w, 0..) |ow, l| if (ow) |bw| {
+        last = @intCast(l);
+        if (bw + need <= room) return last;
+    };
+    return last;
+}
+
+/// Which tabs the strip shows (`first` .. `end`), and whether a marker at
+/// either end stands for tabs out of view.
+pub const TabFit = struct { first: usize, end: usize, more_left: bool, more_right: bool };
+
+/// Fits tabs of natural widths `nat` (each at least `min`) into `room`,
+/// `gap` apart: all at their natural width when they fit; else the widest
+/// shrink first, none below its minimum; when not even the minimums fit,
+/// as many tabs around `active` as do, with a `mark_w` marker at each end
+/// that hides tabs. Widths in `out` (same index as `nat`).
+pub fn fitTabs(nat: []const f32, min: []const f32, active: usize, room: f32, gap: f32, mark_w: f32, out: []f32) TabFit {
+    const n = nat.len;
+    if (n == 0) return .{ .first = 0, .end = 0, .more_left = false, .more_right = false };
+    const a = @min(active, n - 1);
+    const Need = struct {
+        fn of(mins: []const f32, first: usize, end: usize, count: usize, g: f32, mw: f32) f32 {
+            var t: f32 = 0;
+            for (mins[first..end]) |v| t += v;
+            t += g * @as(f32, @floatFromInt(end - first - 1));
+            if (first > 0) t += mw + g;
+            if (end < count) t += mw + g;
+            return t;
+        }
+    };
+    var first: usize = 0;
+    var end: usize = n;
+    if (Need.of(min, 0, n, n, gap, mark_w) > room) {
+        // A run around the active tab, grown right, then left, while it fits.
+        first = a;
+        end = a + 1;
+        while (true) {
+            var grew = false;
+            if (end < n and Need.of(min, first, end + 1, n, gap, mark_w) <= room) {
+                end += 1;
+                grew = true;
+            }
+            if (first > 0 and Need.of(min, first - 1, end, n, gap, mark_w) <= room) {
+                first -= 1;
+                grew = true;
+            }
+            if (!grew) break;
+        }
+    }
+    var avail = room - gap * @as(f32, @floatFromInt(end - first - 1));
+    if (first > 0) avail -= mark_w + gap;
+    if (end < n) avail -= mark_w + gap;
+    // The widest give way first: every width is min(nat, max(min, level))
+    // for the largest level that fits.
+    var lo: f32 = 0;
+    var hi: f32 = 0;
+    for (nat[first..end]) |v| hi = @max(hi, v);
+    for (0..32) |_| {
+        const mid = (lo + hi) / 2;
+        var t: f32 = 0;
+        for (first..end) |i| t += @min(nat[i], @max(min[i], mid));
+        if (t <= avail) lo = mid else hi = mid;
+    }
+    for (first..end) |i| out[i] = @floor(@min(nat[i], @max(min[i], lo)));
+    // Not even the active tab's minimum fits: it gets what there is.
+    if (end - first == 1 and out[a] > @max(0, avail)) out[a] = @max(0, @floor(avail));
+    return .{ .first = first, .end = end, .more_left = first > 0, .more_right = end < n };
 }
 
 /// Bytes of `s` whose text fits `max_w` pixels.
@@ -2273,7 +2781,7 @@ test "tab strip: the hidden button's hit, a tab's menu by right-click and by lon
         .{ .label = "Alpha", .color = .{ 0x33, 0x66, 0xCC }, .active = true, .id = 1000, .menu_id = 1780 },
         .{ .label = "Beta", .color = .{ 0x10, 0xB9, 0x81 }, .id = 1001, .menu_id = 1781 },
     };
-    const o: Overlay = .{ .top_bar = .{ .tabs = &tabs_, .hidden = .{ .label = "\u{22EF} 3 hidden", .alert = true, .id = 1700 } } };
+    const o: Overlay = .{ .top_bar = .{ .tabs = &tabs_, .hidden = .{ .label = "\u{2022}\u{2022}\u{2022} 3 hidden", .alert = true, .id = 1700 } } };
     f.build(&fs, .{ 1200, 800 }, 1, &g, o);
     try expectHits(&f, &.{ 1000, 1001, 1700 }, &.{ 1780, 1781 });
     // The hidden button sits right of the last tab.
@@ -2380,4 +2888,393 @@ test "panel: a disabled button has no hit; a row's dot" {
     const buttons = [_]PanelButton{ .{ .label = "Hide this tab", .id = 1702 }, .{ .label = "Close (desk only)", .id = 1703, .disabled = true } };
     f.build(&fs, .{ 800, 600 }, 1, &g, .{ .panel = .{ .title = "Beta", .rows = &rows, .buttons = &buttons } });
     try expectHits(&f, &.{ 1711, 1702 }, &.{1703});
+}
+
+test "fitText: fits untouched; cut at the end, in the middle or at the start with an ellipsis" {
+    const m: Metrics = .{ .em = 13, .cell_w = 8, .cell_h = 16, .baseline = 12, .underline_y = 14, .stroke = 1 };
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("showcase", fitText(m, "showcase", 64, .end, &buf));
+    try std.testing.expectEqualStrings("show\u{2026}", fitText(m, "showcase", 40, .end, &buf));
+    try std.testing.expectEqualStrings("\u{2026}case", fitText(m, "showcase", 40, .start, &buf));
+    // Paths: a third for the start, the end kept.
+    const p = fitText(m, "C:\\Users\\name\\code\\website", 8 * 16, .middle, &buf);
+    try std.testing.expectEqualStrings("C:\\Us\u{2026}de\\website", p);
+    try std.testing.expect(textWidth(m, p) <= 8 * 16);
+    // Spaces next to the ellipsis go; nothing fits: "".
+    try std.testing.expectEqualStrings("ab\u{2026}", fitText(m, "ab  cd ef", 32, .end, &buf));
+    try std.testing.expectEqualStrings("", fitText(m, "showcase", 7, .end, &buf));
+    try std.testing.expectEqualStrings("\u{2026}", fitText(m, "showcase", 8, .end, &buf));
+    // Wide characters count two cells and are never split.
+    const wide = fitText(m, "\u{4F60}\u{597D}\u{4E16}\u{754C}", 48, .end, &buf);
+    try std.testing.expectEqualStrings("\u{4F60}\u{597D}\u{2026}", wide);
+    // A buffer too small: cut without the ellipsis.
+    var tiny: [2]u8 = undefined;
+    try std.testing.expectEqualStrings("showc", fitText(m, "showcase", 40, .end, &tiny));
+}
+
+test "rowFit: text and detail share a short row; the detail goes first" {
+    // Both fit.
+    try std.testing.expectEqual([2]f32{ 80, 200 }, rowFit(80, 40, 200, 400, 8));
+    // Short: the detail keeps 12 cells, the text the rest.
+    try std.testing.expectEqual([2]f32{ 64, 96 }, rowFit(80, 40, 300, 200, 8));
+    // A short text stays whole, the detail gets the rest.
+    try std.testing.expectEqual([2]f32{ 40, 220 }, rowFit(40, 40, 400, 300, 8));
+    // Not even 4 cells for the detail: the text alone.
+    try std.testing.expectEqual([2]f32{ 90, 0 }, rowFit(80, 40, 300, 90, 8));
+    // No detail: all of it for the text.
+    try std.testing.expectEqual([2]f32{ 100, 0 }, rowFit(300, 40, 0, 100, 8));
+}
+
+test "packStatus: items never overlap; tasks before right before extra" {
+    const sep: f32 = 40;
+    const cost = [4]f32{ 0, sep, sep, 16 };
+    const want = [4]f32{ 72, 96, 152, 104 };
+    // Everything fits.
+    try std.testing.expectEqual(want, packStatus(want, cost, 600, 48));
+    // The phone: the extra is cut, then dropped.
+    const got = packStatus(want, cost, 430, 48);
+    try std.testing.expectEqual([4]f32{ 72, 0, 152, 104 }, got);
+    var used: f32 = 0;
+    for (got, cost) |g, c| used += if (g > 0) g + c else 0;
+    try std.testing.expect(used <= 430);
+    try std.testing.expectEqual([4]f32{ 72, 50, 152, 104 }, packStatus(want, cost, 474, 48));
+    // Narrower: the tasks summary is never cut, only dropped; right is cut.
+    try std.testing.expectEqual([4]f32{ 72, 0, 152, 60 }, packStatus(want, cost, 340, 48));
+    try std.testing.expectEqual([4]f32{ 72, 0, 0, 104 }, packStatus(want, cost, 200, 48));
+    // Only the label, cut to what there is; empty items take nothing.
+    try std.testing.expectEqual([4]f32{ 50, 0, 0, 0 }, packStatus(want, cost, 50, 48));
+    try std.testing.expectEqual([4]f32{ 72, 0, 0, 104 }, packStatus(.{ 72, 0, 0, 104 }, cost, 300, 48));
+}
+
+test "fitTabs: natural widths, the widest shrink first, then a run around the active tab" {
+    var out: [4]f32 = undefined;
+    // Room for all.
+    var r = fitTabs(&.{ 100, 60 }, &.{ 64, 60 }, 0, 300, 4, 16, &out);
+    try std.testing.expectEqual(TabFit{ .first = 0, .end = 2, .more_left = false, .more_right = false }, r);
+    try std.testing.expectEqual([2]f32{ 100, 60 }, out[0..2].*);
+    // Short: the wide one gives way, never below its minimum.
+    r = fitTabs(&.{ 200, 60 }, &.{ 64, 60 }, 1, 200, 4, 16, &out);
+    try std.testing.expectEqual(@as(usize, 2), r.end - r.first);
+    try std.testing.expectEqual([2]f32{ 136, 60 }, out[0..2].*);
+    r = fitTabs(&.{ 200, 200 }, &.{ 64, 64 }, 0, 140, 4, 16, &out);
+    try std.testing.expectEqual([2]f32{ 68, 68 }, out[0..2].*);
+    // Not even the minimums: the active tab and its neighbours, markers
+    // for the rest.
+    r = fitTabs(&.{ 200, 200, 200, 200 }, &.{ 64, 64, 64, 64 }, 2, 180, 4, 16, &out);
+    try std.testing.expectEqual(TabFit{ .first = 2, .end = 4, .more_left = true, .more_right = false }, r);
+    try std.testing.expectEqual([2]f32{ 78, 78 }, out[2..4].*);
+    var out5: [5]f32 = undefined;
+    r = fitTabs(&.{ 200, 200, 200, 200, 200 }, &.{ 64, 64, 64, 64, 64 }, 2, 160, 4, 16, &out5);
+    try std.testing.expectEqual(TabFit{ .first = 2, .end = 3, .more_left = true, .more_right = true }, r);
+    try std.testing.expectEqual(@as(f32, 120), out5[2]);
+    r = fitTabs(&.{ 200, 200 }, &.{ 64, 64 }, 1, 100, 4, 16, &out);
+    try std.testing.expectEqual(TabFit{ .first = 1, .end = 2, .more_left = true, .more_right = false }, r);
+    try std.testing.expectEqual(@as(f32, 80), out[1]);
+    // Too narrow for even one: it gets what there is.
+    r = fitTabs(&.{ 200, 200 }, &.{ 64, 64 }, 0, 40, 4, 16, &out);
+    try std.testing.expectEqual(@as(f32, 20), out[0]);
+    try std.testing.expectEqual(TabFit{ .first = 0, .end = 0, .more_left = false, .more_right = false }, fitTabs(&.{}, &.{}, 0, 100, 4, 16, &out));
+}
+
+test "panelScroll: fits; too tall scrolls above the buttons; a newly focused field is brought into view" {
+    // Fits.
+    var p = panelScroll(300, 50, 20, 800, 99, null, 8);
+    try std.testing.expectEqual(@as(f32, 390), p.box_h);
+    try std.testing.expectEqual(@as(f32, 0), p.max);
+    try std.testing.expectEqual(@as(f32, 0), p.scroll);
+    // Too tall: the box is the window less its margins.
+    p = panelScroll(1000, 50, 20, 768, 0, null, 8);
+    try std.testing.expectEqual(@as(f32, 768), p.box_h);
+    try std.testing.expectEqual(@as(f32, 678), p.view_h);
+    try std.testing.expectEqual(@as(f32, 322), p.max);
+    // Clamped both ways.
+    try std.testing.expectEqual(@as(f32, 322), panelScroll(1000, 50, 20, 768, 5000, null, 8).scroll);
+    try std.testing.expectEqual(@as(f32, 0), panelScroll(1000, 50, 20, 768, -40, null, 8).scroll);
+    // A field below the view: scrolled to just show it; above: to its top.
+    try std.testing.expectEqual(@as(f32, 900 - 678 + 8), panelScroll(1000, 50, 20, 768, 0, .{ 860, 900 }, 8).scroll);
+    try std.testing.expectEqual(@as(f32, 92), panelScroll(1000, 50, 20, 768, 300, .{ 100, 140 }, 8).scroll);
+    // Already in view: left alone.
+    try std.testing.expectEqual(@as(f32, 120), panelScroll(1000, 50, 20, 768, 120, .{ 300, 340 }, 8).scroll);
+}
+
+test "a panel taller than the window: the wheel scrolls it, its buttons stay reachable, the focused field is shown" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    var fields: [14]PanelField = undefined;
+    for (&fields, 0..) |*fl, i| fl.* = .{ .label = "A setting", .value = "value", .id = @intCast(2000 + i) };
+    const buttons = [_]PanelButton{ .{ .label = "Save", .id = 2100 }, .{ .label = "Cancel", .id = 2101 } };
+    var o: Overlay = .{ .panel = .{ .title = "Settings", .fields = &fields, .buttons = &buttons } };
+    f.build(&fs, .{ 1200, 600 }, 1, &g, o);
+    try std.testing.expect(f.panel_max > 0);
+    const box = f.panel_box.?;
+    try std.testing.expect(box.y >= 0 and box.y + box.h <= 600);
+    // The buttons are on screen and hit; the last field is not (scrolled out).
+    try expectHits(&f, &.{ 2100, 2101, 2000 }, &.{2013});
+    for (f.hits[0..f.n_hits]) |h| try std.testing.expect(h.y >= box.y and h.y + h.h <= box.y + box.h);
+    // The wheel scrolls it (towards the user: further down), and nothing else.
+    var r: TapRec = .{};
+    const sink: input.InputSink = .{ .ctx = &r, .vtable = &TapRec.vt };
+    try std.testing.expect(f.wheel(10, 10, -100, sink));
+    try std.testing.expectEqual(@as(f32, 0), r.scrolled);
+    try std.testing.expectEqual(f.panel_max, f.panel_scroll);
+    f.build(&fs, .{ 1200, 600 }, 1, &g, o);
+    try expectHits(&f, &.{ 2100, 2101, 2013 }, &.{2000});
+    // Back to the top; then focusing the last field scrolls it into view.
+    try std.testing.expect(f.wheel(10, 10, 100, sink));
+    f.build(&fs, .{ 1200, 600 }, 1, &g, o);
+    try expectHits(&f, &.{2000}, &.{2013});
+    fields[13].focused = true;
+    f.build(&fs, .{ 1200, 600 }, 1, &g, o);
+    try expectHits(&f, &.{ 2013, 2100 }, &.{2000});
+    try std.testing.expect(f.text_slot != null);
+    // The focus stays put: the wheel may move away from it.
+    try std.testing.expect(f.wheel(10, 10, 100, sink));
+    f.build(&fs, .{ 1200, 600 }, 1, &g, o);
+    try std.testing.expectEqual(@as(f32, 0), f.panel_scroll);
+    try std.testing.expect(f.text_slot == null);
+    // Touch: a drag over the panel scrolls it.
+    f.touch = true;
+    const by = f.panel_box.?.y;
+    f.pointerDown(600, by + 300, .left, .{}, sink);
+    f.pointerMove(600, by + 200, sink);
+    f.pointerMove(600, by + 100, sink);
+    f.pointerUp(600, by + 100, .left, sink);
+    try std.testing.expectEqual(@as(f32, 200), f.panel_scroll);
+    f.touch = false;
+    // Closed: the next one starts at the top; one that fits does not scroll.
+    o.panel = null;
+    f.build(&fs, .{ 1200, 600 }, 1, &g, o);
+    try std.testing.expect(f.panel_box == null);
+    try std.testing.expect(!f.wheel(10, 10, 1, sink));
+    o.panel = .{ .title = "Settings", .fields = fields[0..2], .buttons = &buttons };
+    f.build(&fs, .{ 1200, 600 }, 1, &g, o);
+    try std.testing.expectEqual(@as(f32, 0), f.panel_max);
+    try expectHits(&f, &.{ 2000, 2001, 2100 }, &.{});
+}
+
+test "status line at phone width: the items never overlap" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    const o: Overlay = .{ .status = .{ .label = "connected", .extra = "instructions", .tasks = "1 shell \u{00B7} 1 monitor", .tasks_id = 912, .right = "10.8.0.1:8420" } };
+    for ([_]u32{ 1200, 430, 300, 200 }) |w| {
+        f.build(&fs, .{ w, 860 }, 1, &g, o);
+        // Text runs in the status line, left to right, none overlapping.
+        var last_end: f32 = 0;
+        const sy = f.regions.status.y;
+        for (f.list.cmds.items) |c| switch (c) {
+            .text => |t| if (t.y >= sy) {
+                const m = f.list.fonts[t.font];
+                try std.testing.expect(t.x >= last_end);
+                last_end = t.x + textWidth(m, f.list.textOf(t));
+                try std.testing.expect(last_end <= @as(f32, @floatFromInt(w)));
+            },
+            else => {},
+        };
+    }
+}
+
+test "tab strip at phone width: every tab keeps a few characters and an ellipsis, or a marker stands for it" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    const buttons = [_]TopButton{ .{ .label = "Projects", .id = 900 }, .{ .label = "Terminal", .id = 901 }, .{ .label = "Conversation", .id = 902, .active = true }, .{ .label = "Usage", .id = 903 } };
+    var tabs_ = [_]TopTab{
+        .{ .label = "showcase-foryou", .color = .{ 0x33, 0x66, 0xCC }, .active = true, .id = 1000 },
+        .{ .label = "website", .color = .{ 0x10, 0xB9, 0x81 }, .id = 1001, .badge = "2", .badge_id = 1201 },
+    };
+    // One tab: its label cut with an ellipsis.
+    f.build(&fs, .{ 430, 860 }, 1, &g, .{ .top_bar = .{ .tabs = tabs_[0..1], .buttons = &buttons } });
+    var saw = false;
+    for (f.list.cmds.items) |c| switch (c) {
+        .text => |t| {
+            const s = f.list.textOf(t);
+            if (std.mem.startsWith(u8, s, "show")) {
+                try std.testing.expect(std.mem.endsWith(u8, s, "\u{2026}"));
+                saw = true;
+            }
+        },
+        else => {},
+    };
+    try std.testing.expect(saw);
+    // Two: each shows a label (at least three characters), or the strip
+    // scrolls to the active one with a marker that switches to the other.
+    f.build(&fs, .{ 430, 860 }, 1, &g, .{ .top_bar = .{ .tabs = &tabs_, .buttons = &buttons } });
+    try expectHits(&f, &.{ 1000, 1001, 900, 903 }, &.{});
+    var labels: usize = 0;
+    for (f.list.cmds.items) |c| switch (c) {
+        .text => |t| {
+            const s = f.list.textOf(t);
+            if (std.mem.startsWith(u8, s, "sho") or std.mem.startsWith(u8, s, "web")) labels += 1;
+            if (std.mem.eql(u8, s, "\u{203A}")) labels += 1;
+        },
+        else => {},
+    };
+    try std.testing.expect(labels >= 2);
+    // The other one active, with a task count: the label keeps its
+    // characters (the count pill gives way first).
+    tabs_[0].active = false;
+    tabs_[1].active = true;
+    f.build(&fs, .{ 430, 860 }, 1, &g, .{ .top_bar = .{ .tabs = &tabs_, .buttons = &buttons } });
+    try expectHits(&f, &.{ 1000, 1001, 900 }, &.{});
+    saw = false;
+    for (f.list.cmds.items) |c| switch (c) {
+        .text => |t| if (std.mem.startsWith(u8, f.list.textOf(t), "web")) {
+            saw = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw);
+}
+
+test "a centred notice wraps to the width" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    const lines = [_][]const u8{"Portal shows the conversation of agent sessions; this tab runs something else, so its terminal is the way to follow it."};
+    f.build(&fs, .{ 430, 860 }, 1, &g, .{ .screen = .{ .message = .{ .title = "No conversation log for this tab \u{2014} use Terminal", .lines = &lines } } });
+    var n: usize = 0;
+    for (f.list.cmds.items) |c| switch (c) {
+        .text => |t| {
+            n += 1;
+            try std.testing.expect(t.x >= 0 and t.x + textWidth(f.list.fonts[t.font], f.list.textOf(t)) <= 430);
+        },
+        else => {},
+    };
+    try std.testing.expect(n >= 4);
+}
+
+test "top bar buttons: full labels, then the view toggle as one button, then that and a ⋯" {
+    const all = [_]TopButton{
+        .{ .label = "Projects", .id = 916 },
+        .{ .label = "Terminal", .id = 905, .active = true, .toggle = true, .short = "Term" },
+        .{ .label = "Conversation", .id = 906, .toggle = true, .short = "Chat" },
+        .{ .label = "Usage", .id = 913 },
+    };
+    var out: [8]TopButton = undefined;
+    // Level 0: as they are.
+    try std.testing.expectEqual(@as(usize, 4), collapseButtons(&all, 0, 1960, false, &out).len);
+    // Level 1: the toggle shows the other view, where the toggle was.
+    const one = collapseButtons(&all, 1, 1960, false, &out);
+    try std.testing.expectEqual(@as(usize, 3), one.len);
+    try std.testing.expectEqualStrings("Projects", one[0].label);
+    try std.testing.expectEqualStrings("Chat", one[1].label);
+    try std.testing.expectEqual(@as(u32, 906), one[1].id);
+    try std.testing.expect(!one[1].active);
+    try std.testing.expectEqualStrings("Usage", one[2].label);
+    // Level 2: the toggle and the ⋯.
+    const two = collapseButtons(&all, 2, 1960, true, &out);
+    try std.testing.expectEqual(@as(usize, 2), two.len);
+    try std.testing.expectEqualStrings("Chat", two[0].label);
+    try std.testing.expectEqualStrings(more_label, two[1].label);
+    try std.testing.expectEqual(@as(u32, 1960), two[1].id);
+    try std.testing.expect(two[1].active);
+    // The conversation shown: "Term".
+    var conv = all;
+    conv[1].active = false;
+    conv[2].active = true;
+    try std.testing.expectEqualStrings("Term", collapseButtons(&conv, 1, 1960, false, &out)[1].label);
+    // The desk: its one toggle button, active or not, with its short label.
+    const desk = [_]TopButton{ .{ .label = "Settings", .id = 11 }, .{ .label = "Conversation", .id = 906, .active = true, .toggle = true, .short = "Term" } };
+    const d2 = collapseButtons(&desk, 2, 1960, false, &out);
+    try std.testing.expectEqualStrings("Term", d2[0].label);
+    try std.testing.expectEqualStrings(more_label, d2[1].label);
+    // Levels that cannot happen: no toggle, no ⋯ id, nothing to put behind it.
+    try std.testing.expect(!buttonLevelUsable(desk[0..1], 1, 1960));
+    try std.testing.expect(!buttonLevelUsable(&all, 2, null));
+    try std.testing.expect(!buttonLevelUsable(all[1..3], 2, 1960));
+    // The level: the first that leaves the tabs their room.
+    try std.testing.expectEqual(@as(u2, 0), topButtonLevel(.{ 300, 200, 100 }, 200, 600));
+    try std.testing.expectEqual(@as(u2, 1), topButtonLevel(.{ 300, 200, 100 }, 300, 520));
+    try std.testing.expectEqual(@as(u2, 2), topButtonLevel(.{ 300, 200, 100 }, 300, 420));
+    try std.testing.expectEqual(@as(u2, 2), topButtonLevel(.{ 300, 200, 100 }, 900, 420));
+    try std.testing.expectEqual(@as(u2, 1), topButtonLevel(.{ 300, 200, null }, 900, 420));
+    try std.testing.expectEqual(@as(u2, 0), topButtonLevel(.{ 300, null, null }, 900, 420));
+}
+
+test "top bar at phone width: both tabs, the view toggle and ⋯; wide: unchanged" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    const buttons = [_]TopButton{
+        .{ .label = "Projects", .id = 916 },
+        .{ .label = "Terminal", .id = 905, .toggle = true, .short = "Term" },
+        .{ .label = "Conversation", .id = 906, .active = true, .toggle = true, .short = "Chat" },
+        .{ .label = "Usage", .id = 913 },
+    };
+    const tabs_ = [_]TopTab{
+        .{ .label = "showcase-foryou", .color = .{ 0x33, 0x66, 0xCC }, .active = true, .id = 1000 },
+        .{ .label = "website", .color = .{ 0x10, 0xB9, 0x81 }, .id = 1001, .badge = "2", .badge_id = 1201 },
+    };
+    const tb: TopBar = .{ .tabs = &tabs_, .buttons = &buttons, .more_id = 1960 };
+    f.build(&fs, .{ 430, 860 }, 1, &g, .{ .top_bar = tb });
+    // Both tabs, "Term" (the conversation shows), the ⋯; nothing else.
+    try expectHits(&f, &.{ 1000, 1001, 905, 1960 }, &.{ 916, 906, 913 });
+    var labels: usize = 0;
+    for (f.list.cmds.items) |c| switch (c) {
+        .text => |t| {
+            const s = f.list.textOf(t);
+            if (std.mem.startsWith(u8, s, "sho") or std.mem.startsWith(u8, s, "web")) labels += 1;
+            try std.testing.expect(!std.mem.eql(u8, s, "\u{2039}") and !std.mem.eql(u8, s, "\u{203A}"));
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), labels);
+    // Wide: every button as it is.
+    f.build(&fs, .{ 1200, 800 }, 1, &g, .{ .top_bar = tb });
+    try expectHits(&f, &.{ 1000, 1001, 916, 905, 906, 913 }, &.{1960});
+}
+
+test "top bar on the desk: tabs count at most 12 cells, so the tools stay and long names are cut" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    const tools = [_]TopButton{
+        .{ .label = "Pair a device\u{2026}", .id = 1 },
+        .{ .label = "Devices", .id = 2 },
+        .{ .label = "Export certificate\u{2026}", .id = 3 },
+        .{ .label = "Settings", .id = 4 },
+        .{ .label = "Audio", .id = 5 },
+        .{ .label = "Projects", .id = 6 },
+        .{ .label = "Conversation", .id = 906, .toggle = true, .short = "Chat" },
+        .{ .label = "Usage", .id = 913 },
+    };
+    const tabs_ = [_]TopTab{
+        .{ .label = "showcase-foryou", .color = .{ 0x33, 0x66, 0xCC }, .active = true, .id = 1000, .close_id = 1100 },
+        .{ .label = "website \u{00B7} started by laptop", .color = .{ 0x10, 0xB9, 0x81 }, .id = 1001, .close_id = 1101, .badge = "2", .badge_id = 1201 },
+    };
+    var tb: TopBar = .{ .tabs = &tabs_, .add_id = 1400, .buttons = &tools, .right = "1 REMOTE VIEWER WATCHING", .right_badge = true, .more_id = 1960, .tab_need_cells = 12 };
+    f.build(&fs, .{ 1184, 761 }, 1, &g, .{ .top_bar = tb });
+    try expectHits(&f, &.{ 1, 2, 3, 4, 5, 6, 906, 913, 1000, 1001 }, &.{1960});
+    var cut = false;
+    for (f.list.cmds.items) |c| switch (c) {
+        .text => |t| if (std.mem.startsWith(u8, f.list.textOf(t), "web") and std.mem.endsWith(u8, f.list.textOf(t), "\u{2026}")) {
+            cut = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(cut);
+    // Counting the tabs at full width (a device's rule), the tools would go.
+    tb.tab_need_cells = null;
+    f.build(&fs, .{ 1184, 761 }, 1, &g, .{ .top_bar = tb });
+    try expectHits(&f, &.{ 906, 1960 }, &.{ 1, 913 });
 }

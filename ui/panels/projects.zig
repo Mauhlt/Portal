@@ -162,11 +162,14 @@ pub const Panel = struct {
         const n = @min(v.rows.len, projects.max_projects);
         for (v.rows[0..n], 0..) |r, i| {
             const at: u32 = @intCast(i);
-            const text = std.fmt.bufPrint(&b.row_txt[i], "{s}  \u{00B7}  {s}{s}{s}", .{
-                r.name, r.folder, if (r.state.len > 0) "  \u{00B7}  " else "", r.state,
+            // The folder last, as the row's detail: short of room its
+            // middle goes, so its end (the folder's name) stays.
+            const text = std.fmt.bufPrint(&b.row_txt[i], "{s}{s}{s}", .{
+                r.name, if (r.state.len > 0) "  \u{00B7}  " else "", r.state,
             }) catch r.name;
             b.rows[i] = .{
                 .text = text,
+                .detail = r.folder,
                 .selected = i == p.sel,
                 .dot = theme.fromU32(r.color),
                 .button = .{ .label = "Remove", .id = id.remove0 + at },
@@ -221,6 +224,8 @@ test "projects panel: rows, keys, buttons" {
     const fp = p.panel(v, &b);
     try testing.expectEqual(@as(usize, 2), fp.rows.len);
     try testing.expect(std.mem.indexOf(u8, fp.rows[0].text, "started by iPhone") != null);
+    try testing.expectEqualStrings("C:\\code\\acme", fp.rows[0].detail);
+    try testing.expectEqualStrings("notes", fp.rows[1].text);
     try testing.expectEqualStrings("Ask", fp.rows[0].button2.?.label);
     try testing.expectEqualStrings("Plan", fp.rows[1].button2.?.label);
     // Enter flips the chosen row's mode.

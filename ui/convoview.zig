@@ -5,7 +5,9 @@
 //!
 //!   user       the owner's prompt: a tinted bubble, right-aligned
 //!   assistant  full width, word-wrapped; ``` fenced code in a monospaced
-//!              block on the panel colour, not wrapped but clipped
+//!              block on the panel colour, not wrapped but clipped; inline
+//!              `code` spans in the code colour, their backticks hidden
+//!              (`CodeSpans`; every item's text, not only the agent's)
 //!   tool       a small dim one-liner after a "▸"
 //!   error      red, after a "×"
 //!   status     small, dim, italic, centred
@@ -142,6 +144,110 @@ pub const Blocks = struct {
             return .{ .kind = .fence, .line = line };
         }
         return .{ .kind = if (b.in_code) .code else .text, .line = line };
+    }
+};
+
+/// The inline code spans of one line of text (Markdown: a run of
+/// backticks up to the next run of as many; a run without a partner is
+/// plain text): the backtick runs, which are not drawn, as byte ranges in
+/// order, opening and closing ones alternating. Lines with more spans
+/// than fit keep the rest as plain text.
+pub const CodeSpans = struct {
+    marks: [max * 2][2]usize = undefined,
+    n: usize = 0,
+
+    pub const max = 32;
+
+    pub fn init(line: []const u8) CodeSpans {
+        var c: CodeSpans = .{};
+        var i: usize = 0;
+        while (i < line.len) {
+            if (line[i] != '`') {
+                i += 1;
+                continue;
+            }
+            const k = runAt(line, i);
+            // The next run of exactly k backticks closes it.
+            var j = i + k;
+            const close: ?usize = while (j < line.len) {
+                if (line[j] != '`') {
+                    j += 1;
+                    continue;
+                }
+                const k2 = runAt(line, j);
+                if (k2 == k) break j;
+                j += k2;
+            } else null;
+            if (close) |cl| if (cl > i + k and c.n + 2 <= c.marks.len) {
+                c.marks[c.n] = .{ i, i + k };
+                c.marks[c.n + 1] = .{ cl, cl + k };
+                c.n += 2;
+                i = cl + k;
+                continue;
+            };
+            i += k;
+        }
+        return c;
+    }
+
+    fn runAt(line: []const u8, i: usize) usize {
+        var k: usize = 0;
+        while (i + k < line.len and line[i + k] == '`') k += 1;
+        return k;
+    }
+
+    /// The mark covering byte `i`, if any.
+    fn markAt(c: *const CodeSpans, i: usize) ?[2]usize {
+        for (c.marks[0..c.n]) |m| if (i >= m[0] and i < m[1]) return m;
+        return null;
+    }
+
+    /// Byte length from `start` of the next wrapped line in `max_w`
+    /// pixels: frame.wrapLen's rule (after the last space that fits, or
+    /// mid-word), the backtick runs taking no room.
+    pub fn wrapLen(c: *const CodeSpans, cell_w: u32, line: []const u8, start: usize, max_w: f32) usize {
+        var used: f32 = 0;
+        var last_space: ?usize = null;
+        var i = start;
+        while (i < line.len) {
+            if (c.markAt(i)) |m| {
+                i = m[1];
+                continue;
+            }
+            const n = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
+            const end = @min(i + n, line.len);
+            const cp = std.unicode.utf8Decode(line[i..end]) catch 0xFFFD;
+            const cw: f32 = @floatFromInt(Font.wcwidth.of(cp) * cell_w);
+            if (used + cw > max_w and used > 0) return (last_space orelse i) - start;
+            if (cp == ' ') last_space = end;
+            used += cw;
+            i = end;
+        }
+        return line.len - start;
+    }
+
+    /// Whether byte `i` (not in a mark) is inside a code span.
+    fn inCode(c: *const CodeSpans, i: usize) bool {
+        var k: usize = 0;
+        while (k < c.n) : (k += 2) {
+            if (i >= c.marks[k][1] and i < c.marks[k + 1][0]) return true;
+        }
+        return false;
+    }
+
+    /// The next run of `line[a..b]` of one kind (plain or code), the
+    /// backtick runs skipped; null at the end. Advances `a`.
+    pub fn nextRun(c: *const CodeSpans, line: []const u8, a: *usize, b: usize) ?struct { str: []const u8, code: bool } {
+        while (a.* < b) if (c.markAt(a.*)) |m| {
+            a.* = m[1];
+        } else break;
+        if (a.* >= b) return null;
+        const code = c.inCode(a.*);
+        var e = a.*;
+        while (e < b and c.markAt(e) == null) e += 1;
+        const s = line[a.*..e];
+        a.* = e;
+        return .{ .str = s, .code = code };
     }
 };
 
@@ -786,14 +892,24 @@ pub const View = struct {
                     y += @round(lh * 0.5);
                     continue;
                 }
-                var rest = std.mem.trimEnd(u8, b.line, " ");
-                while (rest.len > 0) {
-                    const n = frame.wrapLen(m.cell_w, rest, width);
-                    const seg = std.mem.trimEnd(u8, rest[0..n], " ");
-                    e.lines.append(v.gpa, .{ .str = seg, .x = x0, .y = y, .font = sel, .color = color, .italic = italic }) catch {};
-                    max_w = @max(max_w, textWidth(m, seg));
+                // Wrapped rows; inline code spans in the code colour,
+                // without their backticks (a row is one run per kind).
+                const line = std.mem.trimEnd(u8, b.line, " ");
+                const spans = CodeSpans.init(line);
+                var at: usize = 0;
+                while (at < line.len) {
+                    const n = spans.wrapLen(m.cell_w, line, at, width);
+                    const seg_end = at + std.mem.trimEnd(u8, line[at..][0..n], " ").len;
+                    var x = x0;
+                    var a = at;
+                    while (spans.nextRun(line, &a, seg_end)) |r| {
+                        e.lines.append(v.gpa, .{ .str = r.str, .x = x, .y = y, .font = sel, .color = if (r.code) colors.code_fg else color, .italic = italic }) catch {};
+                        x += textWidth(m, r.str);
+                    }
+                    max_w = @max(max_w, x - x0);
                     y += lh;
-                    rest = std.mem.trimStart(u8, rest[n..], " ");
+                    at += n;
+                    while (at < line.len and line[at] == ' ') at += 1;
                 }
             },
         };
@@ -839,9 +955,18 @@ pub const View = struct {
                 e.height = v.layoutText(e, f, g, e.text, icon_w, 0, @max(1, W - icon_w), c, sel, false).h;
             },
             .status => {
-                const first = e.lines.items.len;
                 e.height = v.layoutText(e, f, g, e.text, 0, 0, W, theme.ui.dim, .small, true).h;
-                for (e.lines.items[first..]) |*l| l.x = @round((W - textWidth(f.small, l.str)) / 2);
+                // Each row centred (its runs move together).
+                var i: usize = 0;
+                const ls = e.lines.items;
+                while (i < ls.len) {
+                    var j = i + 1;
+                    while (j < ls.len and ls[j].y == ls[i].y) j += 1;
+                    const row_w = ls[j - 1].x + textWidth(f.small, ls[j - 1].str);
+                    const dx = @round((W - row_w) / 2);
+                    for (ls[i..j]) |*l| l.x += dx;
+                    i = j;
+                }
             },
             .question => v.layoutQuestion(e, f, g),
         }
@@ -1553,6 +1678,48 @@ test "wrapping: words, wide characters, code lines unwrapped and clipped" {
     v.prepare(.{ .w = 400, .h = 300 }, tm.fonts);
     try testing.expect(v.entries.items[0].lines.items.len < e.lines.items.len + 1);
     try testing.expectEqualStrings("the quick brown fox jumps over the lazy dog", v.entries.items[0].lines.items[0].str);
+}
+
+test "inline code: in the code colour without its backticks; unpaired backticks stay" {
+    const gpa = testing.allocator;
+    var c: convo.Conversation = .{};
+    defer c.deinit(gpa);
+    // 20 cells of 8 px.
+    try testConvo(gpa, &c, true, &.{
+        .{ .n = 1, .kind = .assistant, .text = "Run `zig build e2e` to check it." },
+        .{ .n = 2, .kind = .assistant, .text = "a ``c ` d`` e `f" },
+        .{ .n = 3, .kind = .status, .text = "`x` done" },
+    });
+    var v = View.init(gpa);
+    defer v.deinit();
+    v.sync(&c);
+    v.prepare(.{ .w = 160 + 28, .h = 400 }, tm.fonts);
+    const e = v.entries.items[0];
+    var code: ?Line = null;
+    var row0: usize = 0;
+    for (e.lines.items) |l| {
+        try testing.expect(std.mem.indexOfScalar(u8, l.str, '`') == null);
+        if (l.color[0] == colors.code_fg[0] and l.color[1] == colors.code_fg[1] and l.color[2] == colors.code_fg[2]) code = l;
+        if (l.y == e.lines.items[0].y) row0 += 1;
+        // Every row fits the column.
+        try testing.expect(l.x + textWidth(tm.body, l.str) <= 160);
+    }
+    try testing.expectEqualStrings("zig build e2e", code.?.str);
+    // Right after "Run ", where the backtick would have been: no gap.
+    try testing.expectEqual(@as(f32, 4 * 8), code.?.x);
+    try testing.expect(row0 >= 2);
+    // An unpaired single backtick is text; a double run pairs with a
+    // double run, holding a single one.
+    const odd = v.entries.items[1];
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(gpa);
+    for (odd.lines.items) |l| try all.appendSlice(gpa, l.str);
+    try testing.expectEqualStrings("a c ` d e `f", all.items);
+    // A centred status row moves with its runs.
+    const st = v.entries.items[2].lines.items;
+    try testing.expectEqualStrings("x", st[0].str);
+    try testing.expectEqual(st[0].x + textWidth(tm.small, "x"), st[1].x);
+    try testing.expect(st[0].x > 0);
 }
 
 test "user prompts are right-aligned bubbles; tool, error, status styles" {

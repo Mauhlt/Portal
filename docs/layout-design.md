@@ -141,7 +141,8 @@ keeps the terminal. In the Conversation view the window is minimal:
 │                       ┌──────────────────┐ │  the owner's prompt: bubble
 │                       │ fix the tests    │ │
 │                       └──────────────────┘ │
-│ Assistant text, word-wrapped, full width   │
+│ Assistant text, word-wrapped, full width;  │  `inline code` in the code
+│ inline code in the code colour             │  colour, backticks hidden
 │ ┌────────────────────────────────────────┐ │  ``` code: monospaced, panel
 │ │ zig build test                         │ │  colour, clipped not wrapped
 │ └────────────────────────────────────────┘ │
@@ -262,7 +263,7 @@ line, on a phone directly under the system's clock and status line
 ┌────────────────────────────────────────────┐
 │ Week 62% · resets Mon                      │  the usage strip: one line
 │ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬───────────────│  and a slim meter
-│ ● Portal  ● WireGuard          [⋯ 3 hidden]│  top bar (tabs)
+│ ● Portal  ● WireGuard        [••• 3 hidden]│  top bar (tabs)
 ├────────────────────────────────────────────┤
 ```
 
@@ -293,7 +294,7 @@ hidden tab still gets every message.
   shown. Hiding the tab shown switches to the next visible one; a hidden
   tab that is shown (the desk's choice on a first connect) stays in the bar
   until the user switches away. Ctrl+Tab skips hidden tabs.
-* The bar then ends in "⋯ N hidden" (the open tabs hidden). It turns
+* The bar then ends in "••• N hidden" (the open tabs hidden). It turns
   amber with a dot while a hidden tab is waiting for an answer (the tab
   state `waiting`) or has For-you items that need the desk.
 * It opens the sheet "Hidden on this device": each hidden tab's colour
@@ -328,6 +329,29 @@ The desk itself keeps a fixed font and sizes the PTY to its terminal slice.
   line; a modal panel layer over all of them; a single focus owner per host.
   The feed: `client/src/dataview.zig`, used by `portal connect` and the
   desk window (src/gui.zig).
+* A modal panel taller than the window keeps its buttons at the bottom of
+  the box and scrolls the rest (the wheel, a drag on a touch screen, a slim
+  bar at its right edge); a newly focused field or chosen row is scrolled
+  into view (`frame.panelScroll`).
+* Text that does not fit is shortened with an ellipsis (`frame.fitText`):
+  labels at their end, folder paths in a panel row in the middle so their
+  end stays (`PanelRow.detail`). Short of room, tabs give up the longest
+  labels first but keep three characters each; when even that does not
+  fit, the bar shows the tabs around the active one with a "‹" / "›" that
+  switches to the next tab out of view (`frame.fitTabs`). The status line
+  never overlaps: the label, then the tab's tasks, then the right-hand
+  text, then the extra get room, cut or dropped in that order
+  (`frame.packStatus`).
+* The top bar's buttons, short of room for the tabs (on devices at their
+  full width; on the desk each counted as at most 12 cells, so the desk
+  keeps its tools at normal widths and long tab names are cut instead:
+  `TopBar.tab_need_cells`), collapse only as far as needed
+  (`frame.topButtonLevel`): first the view
+  toggle becomes one button named after the other view ("Chat" while the
+  terminal shows, "Term" while the conversation does), then every other
+  button (a device's Projects and Usage, the desk's tools) goes behind
+  "•••", which opens a small menu of them (`ui/more_menu.zig`; Up / Down,
+  Enter, Esc). A choice does exactly what its button does.
 * Data frames reuse the image path ('I'/'P'), plus later typed data frames
   with explicit size limits.
 * Interaction is one manner on every device: the input policy, the key
