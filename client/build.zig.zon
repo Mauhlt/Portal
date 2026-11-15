@@ -10,8 +10,8 @@
         //
         // The owner's Renderer (Font, Window, Instanced2D).
         .Renderer = .{
-            .url = "git+https://github.com/Mauhlt/Renderer?ref=main#d00fe703f1805ffe058626dfc16b9c6c596787ed",
-            .hash = "Renderer-0.0.0-ulFoWsbpTQCADnCiy0P3cwR5W_r0drjTcY8VO8GUDpRB",
+            .url = "git+https://github.com/Mauhlt/Renderer?ref=main#e82a12d0497d1bab2a1dcd51b2548a88e3b17511",
+            .hash = "Renderer-0.0.0-ulFoWr7_CQD6w-EOodATZfjEDh6pA4qTG7ea8mnbAygg",
         },
         // The owner's Image package (Image.check + PNG decoder).
         .Image = .{
