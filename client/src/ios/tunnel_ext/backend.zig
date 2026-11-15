@@ -26,8 +26,9 @@
 //! The four calls come from different queues (the provider's, the packet
 //! flow's): a backend serialises them itself; deliver() after (or
 //! during) stop() drops the packet, never touches freed state, and a
-//! start() after stop() does nothing until the next configure(). IPv4 only for now (Portal's tunnel
-//! addresses are IPv4; IPv6 settings are a TODO in docs/ios-native.md).
+//! start() after stop() does nothing until the next configure(). IPv4
+//! tunnel addresses only: the desk hands out no IPv6 ones (docs/ios-native.md,
+//! "IPv6 inside the tunnel").
 
 const std = @import("std");
 const wg = @import("WireGuard");

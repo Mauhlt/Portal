@@ -104,12 +104,29 @@ fn describe(err: Error, bytes: []const u8, buf: []u8) []const u8 {
 
 const Hit = struct { needle: []const u8, offset: usize };
 
-/// Case-insensitive, so `users\` or `c:\` are caught too.
+/// Case-insensitive, so `users\` or `c:\` are caught too. Only as text: a
+/// needle counts when the bytes around it are a printable string (at
+/// least `min_text` path characters after it), so machine code or data
+/// that happens to contain "D:\" is not a build path.
 fn findForbidden(bytes: []const u8) ?Hit {
     for (forbidden) |needle| {
-        if (std.ascii.findIgnoreCase(bytes, needle)) |offset| return .{ .needle = needle, .offset = offset };
+        var from: usize = 0;
+        while (std.ascii.findIgnoreCasePos(bytes, from, needle)) |offset| {
+            if (looksLikeText(bytes, offset, needle.len)) return .{ .needle = needle, .offset = offset };
+            from = offset + 1;
+        }
     }
     return null;
+}
+
+const min_text = 4;
+
+fn looksLikeText(bytes: []const u8, offset: usize, len: usize) bool {
+    const after = bytes[offset + len ..];
+    if (after.len < min_text) return false;
+    for (after[0..min_text]) |c| if (c < 0x21 or c > 0x7e) return false;
+    // A string starts at the needle (or the previous byte is text too).
+    return offset == 0 or bytes[offset - 1] == 0 or (bytes[offset - 1] >= 0x20 and bytes[offset - 1] <= 0x7e);
 }
 
 const Reader = struct {
@@ -157,6 +174,8 @@ test "stripped arm64 passes; debug info, build paths and other files fail" {
     try testing.expectError(error.DebugSection, check(fake(&b, "__TEXT", "__debug_line", "")));
     try testing.expectError(error.BuildPath, check(fake(&b, "__TEXT", "__text", "x/Users/someone/src/Portal/main.zig")));
     try testing.expectError(error.BuildPath, check(fake(&b, "__TEXT", "__text", "c:\\Code\\Portal")));
+    // The bytes of "D:\" inside binary data are not a path.
+    _ = try check(fake(&b, "__TEXT", "__text", "\x9aD:\\\x01\xff\x10\x00"));
     var x = b;
     std.mem.writeInt(u32, x[4..8], 7, .little);
     try testing.expectError(error.NotArm64, check(x[0..300]));
