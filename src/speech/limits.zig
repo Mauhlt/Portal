@@ -324,9 +324,10 @@ pub const Limiter = struct {
 
 /// Per paired device, keyed on the device name from the session (never
 /// from the request): its feedback rate, its bundle bytes and its kept
-/// clips (rolling day). Entries live for the process, so a reconnect or
-/// re-pairing finds its old counts; at most max_devices names (a name
-/// beyond that is refused); `free` reuses an unpaired device's entry.
+/// clips (rolling day). Entries live while the device stays paired, so a
+/// reconnect finds its old counts; at most max_devices names (a name
+/// beyond that is refused); `free` reuses an unpaired or replaced
+/// device's entry (Gate.retain / Gate.drop, from the device store).
 pub const DeviceBuckets = struct {
     names: [max_devices][max_device_name]u8 = undefined,
     lens: [max_devices]u8 = @splat(0),

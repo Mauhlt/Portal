@@ -817,6 +817,7 @@ const StoreWatch = struct {
             sw.srv.storeUnreadable(err);
             return err;
         };
+        retainSpeech(sw.srv, &st);
         sw.applier.apply(sw.srv, sw.tun, &st) catch |err| {
             sw.srv.log.print("ERROR: the tunnel's peer table could not be updated ({t}); the addresses of changed devices stay refused until it is", .{err});
             if (!sw.tunnel_failed.swap(true, .acq_rel)) sw.srv.storeChanged();
@@ -826,6 +827,22 @@ const StoreWatch = struct {
             sw.srv.log.print("the tunnel's peer table is up to date again", .{});
             sw.srv.storeChanged();
         }
+    }
+
+    /// The speech inbox follows the store: an unpaired or replaced
+    /// device's speech limits and queued training bundle go.
+    fn retainSpeech(srv: *web.Server, st: *const devices.Store) void {
+        const ib = srv.cfg.speech_inbox orelse return;
+        comptime std.debug.assert(speech.limits.max_devices >= devices.max_devices);
+        comptime std.debug.assert(speech.limits.max_device_name >= devices.max_name);
+        var members: [devices.max_devices]speech.inbox.Member = undefined;
+        var n: usize = 0;
+        for (&st.devices) |*d| if (d.*) |*dev| {
+            members[n] = .{ .name = dev.name.get(), .id = &dev.id };
+            n += 1;
+        };
+        const gone = ib.retain(members[0..n]);
+        if (gone > 0) srv.log.print("speech: dropped what {d} unpaired or replaced device(s) left in the training inbox", .{gone});
     }
 
     /// Re-arms the change watch; if that fails, re-opens it once. Losing

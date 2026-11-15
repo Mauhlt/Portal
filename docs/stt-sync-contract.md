@@ -58,8 +58,12 @@ home.setWakeup(.{ .ctx = portal, .onWakeup = onWakeup });   // fn (ctx, deadline
   * Portal's loop: one waiter sleeps until the latest deadline, calls
     `tick()`, then sleeps until tick's return value (null = until the next
     event). Nothing wakes on a fixed interval.
-* **Unpairing never deletes samples** (owner decision): pending bundles from
-  an unpaired laptop are still imported.
+* **Unpairing never deletes samples** (owner decision): what the desk
+  stored from an unpaired laptop stays in the profile. A bundle not stored
+  yet (still queued for import, or its body on the way) when its device is
+  unpaired or replaced by a new pairing under its name is refused instead
+  (src/speech/inbox.zig `retain`, from the device store watch); the device
+  never got its "ok", so it never deleted those samples.
 
 ## Laptop: `stt-local`, proto 1 (SpeechToText src/local_main.zig)
 
