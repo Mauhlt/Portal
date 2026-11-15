@@ -57,6 +57,7 @@ const activity_wire = @import("shared").activity;
 const sysinfo = @import("shared").sysinfo;
 const status_panels = @import("panels/status.zig");
 const hidden_tabs = @import("hidden_tabs.zig");
+const more_menu = @import("more_menu.zig");
 const usage_strip = @import("usage_strip.zig");
 const planusage = @import("shared").planusage;
 const projects_wire = @import("shared").projects;
@@ -66,7 +67,8 @@ pub const Device = enum { desk, viewer };
 
 /// Ids of the shell's own controls, clear of the panels' ranges (desk
 /// panels 1-13, 100-279; setup 1-101; sync 301-699; status panels
-/// 1500-1521; content view 1300-1399; hidden tabs 1900-1949). Ids it doesn't know
+/// 1500-1521; content view 1300-1399; hidden tabs 1900-1949; the top
+/// bar's "⋯" menu 1960-1985). Ids it doesn't know
 /// go to the host (Command.button), e.g. the desk tools.
 pub const ids = struct {
     pub const line: u32 = 900;
@@ -521,6 +523,8 @@ pub const Shell = struct {
     /// loads and stores it: Command.hidden_changed), and the sheet open
     /// (the list, or a tab's menu).
     hidden: hidden_tabs.List = .{},
+    /// The top bar's "⋯" menu (ui/more_menu.zig).
+    more: more_menu.Menu = .{},
     sheet: hidden_tabs.Sheet = .none,
     /// The plan-usage strip (its detail, its toasts), and the value it
     /// last saw.
@@ -553,6 +557,7 @@ pub const Shell = struct {
         tasks: [64]u8 = undefined,
         info: status_panels.Bufs = .{},
         hidden: hidden_tabs.Bufs = .{},
+        more: more_menu.Bufs = .{},
         hidden_label: [32]u8 = undefined,
         projects: projects_sheet.Bufs = .{},
     };
@@ -577,7 +582,7 @@ pub const Shell = struct {
     }
 
     pub fn focus(sh: *const Shell) Focus {
-        if (sh.modalActive() != null or sh.info != .none or sh.sheet != .none or sh.proj_sheet.open) return .panel;
+        if (sh.modalActive() != null or sh.info != .none or sh.sheet != .none or sh.proj_sheet.open or sh.more.open) return .panel;
         // A sub-tab: its conversation (scrolling), nothing reaches a
         // terminal or a line.
         if (sh.sub_at != null and sh.conversation != null) return .view;
@@ -773,6 +778,13 @@ pub const Shell = struct {
         };
         if (sh.sub_at) |i| sh.subOverlay(st, st.subs[i], &o);
         sh.view_shown = o.screen == .view;
+        // Short of room the top bar's buttons go behind "⋯" (the frame
+        // decides); its menu lists them.
+        if (o.top_bar) |*tb| {
+            tb.more_id = more_menu.ids.button;
+            tb.more_active = sh.more.open;
+            sh.more.set(tb.buttons);
+        } else sh.more.open = false;
         // The usage strip, wherever the tabs are (a device: connected).
         if (!usageEql(st.usage, sh.usage_seen)) {
             sh.usage.update(st.usage, st.now_ms, st.now, st.utc_offset_s);
@@ -789,6 +801,7 @@ pub const Shell = struct {
             tb.hidden = .{ .label = hidden_tabs.buttonLabel(hidden, &sh.bufs.hidden_label), .alert = hidden.alert, .id = hidden_tabs.ids.button };
         };
         o.panel = st.panel;
+        if (o.panel == null) o.panel = sh.more.panel(&sh.bufs.more);
         if (o.panel == null) o.panel = hidden_tabs.panel(sh.sheet, &sh.hidden, st.tabs, st.needs_desk, &sh.bufs.hidden);
         if (o.panel == null and sh.proj_sheet.open) if (sh.projInput(st)) |in| {
             o.panel = sh.proj_sheet.panel(in, &sh.bufs.projects);
@@ -830,7 +843,7 @@ pub const Shell = struct {
     /// `focus` as of `st` (without asking the modal: the glue may hold its
     /// lock while building the overlay).
     fn focusFor(sh: *const Shell, st: State) Focus {
-        if (st.panel != null or sh.info != .none or sh.sheet != .none or sh.proj_sheet.open) return .panel;
+        if (st.panel != null or sh.info != .none or sh.sheet != .none or sh.proj_sheet.open or sh.more.open) return .panel;
         if (sh.sub_at != null and sh.conversation != null) return .view;
         return switch (sh.device) {
             .desk => if (sh.line_focus) .line else sh.deskMain(),
@@ -1091,7 +1104,7 @@ pub const Shell = struct {
         var nt = @min(d.tools.len, sh.bufs.desk_tools.len - 1);
         @memcpy(sh.bufs.desk_tools[0..nt], d.tools[0..nt]);
         if (sh.conversation != null and st.current != null) {
-            sh.bufs.desk_tools[nt] = .{ .label = "Conversation", .id = ids.view_conversation, .active = sh.main == .conversation };
+            sh.bufs.desk_tools[nt] = .{ .label = "Conversation", .id = ids.view_conversation, .active = sh.main == .conversation, .toggle = true, .short = if (sh.main == .conversation) "Term" else "Chat" };
             nt += 1;
         }
         const conversation = sh.deskMain() == .view and st.current != null;
@@ -1240,8 +1253,8 @@ pub const Shell = struct {
                 toggle[0] = .{ .label = "Projects", .id = ids.projects, .active = sh.proj_sheet.open };
                 nt = 1;
             }
-            toggle[nt] = .{ .label = "Terminal", .id = ids.view_terminal, .active = sh.main == .terminal };
-            toggle[nt + 1] = .{ .label = "Conversation", .id = ids.view_conversation, .active = sh.main == .conversation };
+            toggle[nt] = .{ .label = "Terminal", .id = ids.view_terminal, .active = sh.main == .terminal, .toggle = true, .short = "Term" };
+            toggle[nt + 1] = .{ .label = "Conversation", .id = ids.view_conversation, .active = sh.main == .conversation, .toggle = true, .short = "Chat" };
             o.top_bar = .{ .tabs = sh.tabBar(st, false), .buttons = sh.statusButtons(st, toggle[0 .. nt + 2]) };
             o.status.tasks = sh.shownTasks(st);
             o.status.tasks_id = ids.tasks;
@@ -1342,6 +1355,11 @@ pub const Shell = struct {
     fn onKey(ctx: *anyopaque, key: input.Key, mods: input.Mods) void {
         const sh = self(ctx);
         if (sh.modalActive()) |m| return m.key(m.ctx, key, mods);
+        // The "⋯" menu: its keys; Enter does what the chosen button does.
+        if (sh.more.open) {
+            if (sh.more.key(key)) |id| onButton(ctx, id);
+            return;
+        }
         // The hidden-tabs sheet or a tab's menu: Esc closes it.
         if (sh.sheet != .none) {
             if (key == .escape) sh.sheet = .none;
@@ -1470,7 +1488,7 @@ pub const Shell = struct {
 
     fn onAnswer(ctx: *anyopaque, key: []const u8) void {
         const sh = self(ctx);
-        if (sh.modalActive() != null or sh.info != .none or sh.proj_sheet.open) return;
+        if (sh.modalActive() != null or sh.info != .none or sh.proj_sheet.open or sh.more.open) return;
         sh.select.active = false;
         sh.host.vtable.answer(sh.host.ctx, key);
     }
@@ -1524,6 +1542,13 @@ pub const Shell = struct {
             ids.system => sh.toggleInfo(.system, null),
             ids.tasks => sh.toggleInfo(.tasks, if (sh.shown) |i| sh.tab_ids[i] else null),
             ids.usage_strip => sh.usage.toggle(),
+            more_menu.ids.button => {
+                sh.setInfo(.none);
+                sh.proj_sheet.close();
+                sh.sheet = .none;
+                sh.more.toggle();
+            },
+            more_menu.ids.close, more_menu.ids.item0...more_menu.ids.item0 + more_menu.max_items - 1 => if (sh.more.button(id)) |to| onButton(ctx, to),
             hidden_tabs.ids.button => if (sh.device == .viewer) {
                 sh.setInfo(.none);
                 sh.proj_sheet.close();
@@ -2415,6 +2440,55 @@ test "status panels: open from a badge, the status line or the top bar; Esc clos
     Shell.onButton(&sh, ids.usage);
     _ = sh.overlay(.{ .viewer = .{ .status = .retrying, .host = "h", .has_grid = true }, .activity = &a });
     try testing.expectEqual(status_panels.Screen.none, sh.info);
+}
+
+test "the top bar's ⋯ menu: lists the buttons but the view toggle; a choice does what its button does" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .viewer, r.host());
+    defer sh.deinit();
+    var list: [2]tabs_wire.Entry = undefined;
+    var a: activity_wire.Activity = undefined;
+    activityFixture(&list, &a);
+    const v: Viewer = .{ .status = .connected, .mode = .instruct, .host = "h", .has_grid = true };
+    const st: State = .{ .viewer = v, .tabs = &list, .current = @splat(2), .activity = &a };
+    var o = sh.overlay(st);
+    const tb = o.top_bar.?;
+    try testing.expectEqual(@as(?u32, more_menu.ids.button), tb.more_id);
+    // The view toggle collapses to the other view's name.
+    try testing.expect(tb.buttons[0].toggle and tb.buttons[1].toggle);
+    try testing.expectEqualStrings("Chat", tb.buttons[1].short);
+    Shell.onButton(&sh, more_menu.ids.button);
+    o = sh.overlay(st);
+    try testing.expectEqualStrings("More", o.panel.?.title);
+    try testing.expectEqualStrings("Usage", o.panel.?.rows[0].text);
+    try testing.expectEqual(Focus.panel, sh.focus());
+    try testing.expect(o.top_bar.?.more_active);
+    // Enter opens the chosen one (Usage) and the menu closes.
+    Shell.onKey(&sh, .enter, .{});
+    o = sh.overlay(st);
+    try testing.expectEqualStrings("Usage", o.panel.?.title);
+    try testing.expect(!sh.more.open);
+    Shell.onKey(&sh, .escape, .{});
+    // Esc closes it; a click on an item does the same as Enter.
+    Shell.onButton(&sh, more_menu.ids.button);
+    _ = sh.overlay(st);
+    Shell.onKey(&sh, .escape, .{});
+    try testing.expect(sh.overlay(st).panel == null);
+    Shell.onButton(&sh, more_menu.ids.button);
+    _ = sh.overlay(st);
+    Shell.onButton(&sh, more_menu.ids.item0);
+    try testing.expectEqualStrings("Usage", sh.overlay(st).panel.?.title);
+    // The desk: a tool behind ⋯ reaches the host like its button.
+    var desk = Shell.init(testing.allocator, .desk, r.host());
+    defer desk.deinit();
+    const tools = [_]frame.TopButton{.{ .label = "Devices", .id = 11 }};
+    const dst: State = .{ .tabs = &list, .current = @splat(1), .activity = &a, .desk = .{ .tools = &tools } };
+    _ = desk.overlay(dst);
+    Shell.onButton(&desk, more_menu.ids.button);
+    _ = desk.overlay(dst);
+    Shell.onButton(&desk, more_menu.ids.item0);
+    try testing.expectEqual(@as(u32, 11), r.cmds[r.n_cmds - 1].button);
+    try testing.expect(desk.overlay(dst).panel == null);
 }
 
 test "desk: Open /usage types into that tab (desk only), from the Usage panel" {

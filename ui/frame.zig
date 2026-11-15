@@ -78,6 +78,14 @@ pub const TopBar = struct {
     /// A device's "⋯ N hidden" after the tabs, at their right end (its
     /// hidden tabs, ui/hidden_tabs.zig); null: none.
     hidden: ?HiddenButton = null,
+    /// Short of room the buttons collapse (topButtonLevel): first the view
+    /// toggle (TopButton.toggle) becomes one button, then every other
+    /// button goes behind a "⋯" button that reaches the sink as
+    /// InputSink.button(more_id) (the host's menu of them). Null: they
+    /// never go behind it.
+    more_id: ?u32 = null,
+    /// The "⋯" button's menu is open (drawn as the chosen one).
+    more_active: bool = false,
 };
 
 /// The tab strip's hidden-tabs button: amber with a dot (`alert`) while a
@@ -117,6 +125,11 @@ pub const TopButton = struct {
     id: u32,
     /// Drawn as the chosen one (the view toggle).
     active: bool = false,
+    /// Part of the view toggle. Collapsed (TopBar.more_id), the toggle is
+    /// one button: its first member that is not active (on the desk, its
+    /// one member), labelled `short` ("Chat", "Term": the view it shows).
+    toggle: bool = false,
+    short: []const u8 = "",
 };
 
 /// One project tab in the top bar.
@@ -1133,15 +1146,39 @@ pub const Frame = struct {
         }
         const ty = @round((h - @as(f32, @floatFromInt(ui.cell_h))) / 2);
         var right_w: f32 = 0;
+        // Short of room for the tabs at their full width, the buttons
+        // collapse (topButtonLevel).
+        var shown: [16]TopButton = undefined;
+        const buttons = blk: {
+            const cw: f32 = @floatFromInt(ui.cell_w);
+            const gap = @round(6 * s);
+            var fixed: f32 = 0; // the right-hand text and the hidden-tabs button
+            if (tb.right.len > 0) fixed += textWidth(ui, tb.right) + (if (tb.right_badge) 3 * pad else pad);
+            if (tb.hidden) |hb| fixed += textWidth(ui, hb.label) + 2 * cw + (if (hb.alert) 2 * cw else 0) + @round(4 * s);
+            var need: f32 = 0;
+            for (tb.tabs) |t| need += 4 * cw + (if (t.close_id != null) 2 * cw else 0) + (if (t.badge.len > 0) textWidth(ui, t.badge) + 2 * cw else 0) + textWidth(ui, t.label) + @round(4 * s);
+            if (tb.add_id != null) need += 3 * cw + @round(4 * s);
+            if (tb.tabs.len == 0 and tb.add_id == null) need = @min(textWidth(ui, tb.title), 16 * cw);
+            var widths: [3]?f32 = @splat(null);
+            for (0..3) |l| {
+                const lv: u2 = @intCast(l);
+                if (!buttonLevelUsable(tb.buttons, lv, tb.more_id)) continue;
+                var w: f32 = 0;
+                for (collapseButtons(tb.buttons, lv, tb.more_id, tb.more_active, &shown)) |b| w += textWidth(ui, b.label) + 2 * cw + gap;
+                widths[l] = w;
+            }
+            const level = topButtonLevel(widths, need, W - x - 2 * pad - fixed);
+            break :blk collapseButtons(tb.buttons, level, tb.more_id, tb.more_active, &shown);
+        };
         // Buttons first (right to left), then the right-hand text left of them.
-        if (tb.buttons.len > 0) {
+        if (buttons.len > 0) {
             const bh = @round(h * 0.78);
             const by = @round((h - bh) / 2);
             var bx = W - pad;
-            var i = tb.buttons.len;
+            var i = buttons.len;
             while (i > 0) {
                 i -= 1;
-                const b = tb.buttons[i];
+                const b = buttons[i];
                 const bw = textWidth(ui, b.label) + 2 * @as(f32, @floatFromInt(ui.cell_w));
                 bx -= bw;
                 _ = f.addButton(ui, bx, by, bh, b.label, b.id, if (b.active) theme.ui.button_active else theme.ui.button);
@@ -2238,6 +2275,75 @@ pub fn packStatus(want: [4]f32, cost: [4]f32, avail: f32, min_cut: f32) [4]f32 {
     return got;
 }
 
+/// Whether the top bar's buttons can collapse to `level` (see
+/// collapseButtons): 1 needs a view toggle with a short label, 2 a "⋯"
+/// (`more_id`) and a button to put behind it.
+pub fn buttonLevelUsable(buttons: []const TopButton, level: u2, more_id: ?u32) bool {
+    return switch (level) {
+        0 => true,
+        1 => for (buttons) |b| {
+            if (b.toggle and b.short.len > 0) break true;
+        } else false,
+        else => more_id != null and for (buttons) |b| {
+            if (!b.toggle) break true;
+        } else false,
+    };
+}
+
+/// The top bar's buttons collapsed to `level`: 0 as they are; 1 the view
+/// toggle as one button (its first member that is not active, else its
+/// first, labelled `short`) where the toggle was; 2 that button and a "⋯"
+/// (`more_id`, chosen while `more_active`) for all the others. In `out`
+/// (level 0: `buttons` itself).
+pub fn collapseButtons(buttons: []const TopButton, level: u2, more_id: ?u32, more_active: bool, out: []TopButton) []const TopButton {
+    if (level == 0 or !buttonLevelUsable(buttons, level, more_id)) return buttons;
+    var pick: ?TopButton = null;
+    for (buttons) |b| if (b.toggle and (pick == null or (pick.?.active and !b.active))) {
+        pick = b;
+    };
+    if (pick) |*p| {
+        if (p.short.len > 0) p.label = p.short;
+        p.active = false;
+    }
+    var n: usize = 0;
+    var placed = false;
+    for (buttons) |b| {
+        if (n + 2 > out.len) break;
+        if (b.toggle) {
+            if (!placed) if (pick) |p| {
+                out[n] = p;
+                n += 1;
+                placed = true;
+            };
+        } else if (level == 1) {
+            out[n] = b;
+            n += 1;
+        }
+    }
+    if (level == 2) if (more_id) |id| {
+        out[n] = .{ .label = more_label, .id = id, .active = more_active };
+        n += 1;
+    };
+    return out[0..n];
+}
+
+/// The "⋯" button's label: three bullets (U+22EF draws as a short dash at
+/// the chrome's size).
+pub const more_label = "\u{2022}\u{2022}\u{2022}";
+
+/// How far the top bar's buttons collapse: the first level (0 full, 1
+/// the view toggle as one button, 2 also the "⋯") whose buttons, `w[level]`
+/// wide (null: not possible), leave `need` (the tabs at their full width)
+/// of `room`; the last possible one when none does.
+pub fn topButtonLevel(w: [3]?f32, need: f32, room: f32) u2 {
+    var last: u2 = 0;
+    for (w, 0..) |ow, l| if (ow) |bw| {
+        last = @intCast(l);
+        if (bw + need <= room) return last;
+    };
+    return last;
+}
+
 /// Which tabs the strip shows (`first` .. `end`), and whether a marker at
 /// either end stands for tabs out of view.
 pub const TabFit = struct { first: usize, end: usize, more_left: bool, more_right: bool };
@@ -3041,4 +3147,88 @@ test "a centred notice wraps to the width" {
         else => {},
     };
     try std.testing.expect(n >= 4);
+}
+
+test "top bar buttons: full labels, then the view toggle as one button, then that and a ⋯" {
+    const all = [_]TopButton{
+        .{ .label = "Projects", .id = 916 },
+        .{ .label = "Terminal", .id = 905, .active = true, .toggle = true, .short = "Term" },
+        .{ .label = "Conversation", .id = 906, .toggle = true, .short = "Chat" },
+        .{ .label = "Usage", .id = 913 },
+    };
+    var out: [8]TopButton = undefined;
+    // Level 0: as they are.
+    try std.testing.expectEqual(@as(usize, 4), collapseButtons(&all, 0, 1960, false, &out).len);
+    // Level 1: the toggle shows the other view, where the toggle was.
+    const one = collapseButtons(&all, 1, 1960, false, &out);
+    try std.testing.expectEqual(@as(usize, 3), one.len);
+    try std.testing.expectEqualStrings("Projects", one[0].label);
+    try std.testing.expectEqualStrings("Chat", one[1].label);
+    try std.testing.expectEqual(@as(u32, 906), one[1].id);
+    try std.testing.expect(!one[1].active);
+    try std.testing.expectEqualStrings("Usage", one[2].label);
+    // Level 2: the toggle and the ⋯.
+    const two = collapseButtons(&all, 2, 1960, true, &out);
+    try std.testing.expectEqual(@as(usize, 2), two.len);
+    try std.testing.expectEqualStrings("Chat", two[0].label);
+    try std.testing.expectEqualStrings(more_label, two[1].label);
+    try std.testing.expectEqual(@as(u32, 1960), two[1].id);
+    try std.testing.expect(two[1].active);
+    // The conversation shown: "Term".
+    var conv = all;
+    conv[1].active = false;
+    conv[2].active = true;
+    try std.testing.expectEqualStrings("Term", collapseButtons(&conv, 1, 1960, false, &out)[1].label);
+    // The desk: its one toggle button, active or not, with its short label.
+    const desk = [_]TopButton{ .{ .label = "Settings", .id = 11 }, .{ .label = "Conversation", .id = 906, .active = true, .toggle = true, .short = "Term" } };
+    const d2 = collapseButtons(&desk, 2, 1960, false, &out);
+    try std.testing.expectEqualStrings("Term", d2[0].label);
+    try std.testing.expectEqualStrings(more_label, d2[1].label);
+    // Levels that cannot happen: no toggle, no ⋯ id, nothing to put behind it.
+    try std.testing.expect(!buttonLevelUsable(desk[0..1], 1, 1960));
+    try std.testing.expect(!buttonLevelUsable(&all, 2, null));
+    try std.testing.expect(!buttonLevelUsable(all[1..3], 2, 1960));
+    // The level: the first that leaves the tabs their room.
+    try std.testing.expectEqual(@as(u2, 0), topButtonLevel(.{ 300, 200, 100 }, 200, 600));
+    try std.testing.expectEqual(@as(u2, 1), topButtonLevel(.{ 300, 200, 100 }, 300, 520));
+    try std.testing.expectEqual(@as(u2, 2), topButtonLevel(.{ 300, 200, 100 }, 300, 420));
+    try std.testing.expectEqual(@as(u2, 2), topButtonLevel(.{ 300, 200, 100 }, 900, 420));
+    try std.testing.expectEqual(@as(u2, 1), topButtonLevel(.{ 300, 200, null }, 900, 420));
+    try std.testing.expectEqual(@as(u2, 0), topButtonLevel(.{ 300, null, null }, 900, 420));
+}
+
+test "top bar at phone width: both tabs, the view toggle and ⋯; wide: unchanged" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    const buttons = [_]TopButton{
+        .{ .label = "Projects", .id = 916 },
+        .{ .label = "Terminal", .id = 905, .toggle = true, .short = "Term" },
+        .{ .label = "Conversation", .id = 906, .active = true, .toggle = true, .short = "Chat" },
+        .{ .label = "Usage", .id = 913 },
+    };
+    const tabs_ = [_]TopTab{
+        .{ .label = "showcase-foryou", .color = .{ 0x33, 0x66, 0xCC }, .active = true, .id = 1000 },
+        .{ .label = "website", .color = .{ 0x10, 0xB9, 0x81 }, .id = 1001, .badge = "2", .badge_id = 1201 },
+    };
+    const tb: TopBar = .{ .tabs = &tabs_, .buttons = &buttons, .more_id = 1960 };
+    f.build(&fs, .{ 430, 860 }, 1, &g, .{ .top_bar = tb });
+    // Both tabs, "Term" (the conversation shows), the ⋯; nothing else.
+    try expectHits(&f, &.{ 1000, 1001, 905, 1960 }, &.{ 916, 906, 913 });
+    var labels: usize = 0;
+    for (f.list.cmds.items) |c| switch (c) {
+        .text => |t| {
+            const s = f.list.textOf(t);
+            if (std.mem.startsWith(u8, s, "sho") or std.mem.startsWith(u8, s, "web")) labels += 1;
+            try std.testing.expect(!std.mem.eql(u8, s, "\u{2039}") and !std.mem.eql(u8, s, "\u{203A}"));
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), labels);
+    // Wide: every button as it is.
+    f.build(&fs, .{ 1200, 800 }, 1, &g, .{ .top_bar = tb });
+    try expectHits(&f, &.{ 1000, 1001, 916, 905, 906, 913 }, &.{1960});
 }

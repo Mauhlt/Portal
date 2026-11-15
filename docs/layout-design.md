@@ -342,6 +342,13 @@ The desk itself keeps a fixed font and sizes the PTY to its terminal slice.
   never overlaps: the label, then the tab's tasks, then the right-hand
   text, then the extra get room, cut or dropped in that order
   (`frame.packStatus`).
+* The top bar's buttons, short of room for the tabs at their full width,
+  collapse only as far as needed (`frame.topButtonLevel`): first the view
+  toggle becomes one button named after the other view ("Chat" while the
+  terminal shows, "Term" while the conversation does), then every other
+  button (a device's Projects and Usage, the desk's tools) goes behind
+  "•••", which opens a small menu of them (`ui/more_menu.zig`; Up / Down,
+  Enter, Esc). A choice does exactly what its button does.
 * Data frames reuse the image path ('I'/'P'), plus later typed data frames
   with explicit size limits.
 * Interaction is one manner on every device: the input policy, the key

@@ -27,6 +27,7 @@
 //!   convoview  the Conversation view (a frame.ContentView): the items as a
 //!              scrollable list, question cards, Yes/No swipe cards
 //!   hidden_tabs a device's hidden tabs: the list, the sheet and the menu
+//!   more_menu the top bar's "⋯" menu (its buttons, short of room)
 //!   usage_strip the plan-usage strip above the top bar, its toasts
 //!   foryou     the For-you panel under the latest reply (its rows swipe
 //!              with convoview's gesture) and the device's store of cards
@@ -57,6 +58,7 @@ pub const foryou = @import("foryou.zig");
 pub const projects_sheet = @import("projects_sheet.zig");
 pub const dictation = @import("dictation.zig");
 pub const hidden_tabs = @import("hidden_tabs.zig");
+pub const more_menu = @import("more_menu.zig");
 pub const usage_strip = @import("usage_strip.zig");
 pub const theme = @import("shared").theme;
 pub const panels = struct {
@@ -85,6 +87,7 @@ test {
     _ = convo;
     _ = convoview;
     _ = hidden_tabs;
+    _ = more_menu;
     _ = usage_strip;
     _ = foryou;
     _ = projects_sheet;
