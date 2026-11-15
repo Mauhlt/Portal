@@ -23,6 +23,7 @@ pub const AgentHooks = P.AgentHooks;
 pub const cyclePolicy = P.cyclePolicy;
 pub const policyLabel = P.policyLabel;
 pub const ago = P.ago;
+pub const endpointWarning = P.endpointWarning;
 
 // ------------------------------------------------------------------ tests
 
@@ -175,7 +176,7 @@ test "settings: Show system monitor is a fifth choice (not on the first run), of
     try testing.expect(!s.setup.sysmon);
     var b2: Ui.Bufs = .{};
     const p = s.panel(&b2, .{}).?;
-    try testing.expectEqual(@as(usize, 9), p.fields.len);
+    try testing.expectEqual(@as(usize, 10), p.fields.len);
     try testing.expectEqualStrings("Off", p.fields[4].value);
     // A click focuses it, a second click flips it; Left/Right and space too.
     _ = s.button(id.field0 + 4);
@@ -188,7 +189,9 @@ test "settings: Show system monitor is a fifth choice (not on the first run), of
     try testing.expect(s.setup.sysmon);
     try testing.expectEqual(rules.Policy.keys, s.setup.input); // the policy is untouched
     // Enter: on to "Background art", "Claude Code integration", "Admin
-    // prompts at the desk", the tunnel endpoint, then submit.
+    // prompts at the desk", the tunnel endpoint, "Windows Firewall", then
+    // submit.
+    try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.none, s.key(.enter, .{}));
     try testing.expectEqual(Action.none, s.key(.enter, .{}));
@@ -249,7 +252,7 @@ test "settings: admin prompts at the desk is a choice next to the agent integrat
     s.openSetup(false, "a", "b", "c", .keys);
     var b: Ui.Bufs = .{};
     var p = s.panel(&b, .{}).?;
-    try testing.expectEqual(@as(usize, 9), p.fields.len);
+    try testing.expectEqual(@as(usize, 10), p.fields.len);
     try testing.expect(p.fields[7].choice);
     try testing.expect(std.mem.startsWith(u8, p.fields[7].value, "Allowed"));
     try testing.expect(!s.setup.block_elevation);
@@ -273,6 +276,63 @@ test "settings: admin prompts at the desk is a choice next to the agent integrat
     typeText(&s, "home.example.org:51820");
     try testing.expectEqualStrings("home.example.org:51820", s.setup.tunnel_endpoint.text());
     try testing.expectEqual(Action.setup_submit, s.button(id.save));
+}
+
+test "settings: Windows Firewall is the row after the endpoint; it acts at once" {
+    var s: Ui = .{};
+    s.openSetup(false, "51820", "b", "c", .keys);
+    s.setFirewall("No rule for UDP 51820: [Add rule] (one administrator prompt)", false);
+    var b: Ui.Bufs = .{};
+    const p = s.panel(&b, .{ .tunnel_port = 51820 }).?;
+    try testing.expect(p.fields[9].choice);
+    try testing.expect(std.mem.startsWith(u8, p.fields[9].label, "Windows Firewall"));
+    try testing.expect(std.mem.indexOf(u8, p.fields[9].value, "Add rule") != null);
+    // The first click focuses it, the second asks the glue; keys too.
+    try testing.expectEqual(Action.none, s.button(id.field0 + 9));
+    try testing.expectEqual(Action.firewall_rule, s.button(id.field0 + 9));
+    try testing.expectEqual(Action.firewall_rule, s.key(.right, .{}));
+    try testing.expectEqual(Action.firewall_rule, s.char(' ', .{}));
+    // Nothing else changed.
+    try testing.expect(!s.setup.sysmon and s.setup.bg_art and !s.setup.block_elevation);
+    // Not on the first run.
+    var f: Ui = .{};
+    f.openSetup(true, "a", "b", "c", .keys);
+    try testing.expectEqual(@as(usize, 4), f.panel(&b, .{}).?.fields.len);
+}
+
+test "settings: with no tunnel endpoint the router steps show, with the port; none once it is set" {
+    var s: Ui = .{};
+    s.openSetup(false, "51999", "b", "c", .keys);
+    var b: Ui.Bufs = .{};
+    var p = s.panel(&b, .{ .tunnel_port = 51999 }).?;
+    var forward = false;
+    var cgnat = false;
+    var reservation = false;
+    var no_lookup = false;
+    for (p.after) |t| {
+        forward = forward or std.mem.indexOf(u8, t.text, "Forward UDP 51999") != null;
+        cgnat = cgnat or std.mem.indexOf(u8, t.text, "CGNAT") != null;
+        reservation = reservation or std.mem.indexOf(u8, t.text, "DHCP reservation") != null;
+        no_lookup = no_lookup or std.mem.indexOf(u8, t.text, "never looks it up") != null;
+    }
+    try testing.expect(forward and cgnat and reservation and no_lookup);
+    s.setup.tunnel_endpoint.set("home.example.org:51999");
+    p = s.panel(&b, .{ .tunnel_port = 51999 }).?;
+    for (p.after) |t| try testing.expect(std.mem.indexOf(u8, t.text, "Forward UDP") == null);
+}
+
+test "settings: an endpoint devices cannot reach is warned about" {
+    try testing.expect(endpointWarning("home.example.org:51820") == null);
+    try testing.expect(endpointWarning("203.0.113.7:51820") == null);
+    try testing.expect(endpointWarning("") == null);
+    try testing.expect(std.mem.indexOf(u8, endpointWarning("192.168.1.20:51820").?, "your own network") != null);
+    try testing.expect(endpointWarning("10.0.0.2:51820") != null);
+    try testing.expect(endpointWarning("172.20.1.1:51820") != null);
+    try testing.expect(endpointWarning("172.32.1.1:51820") == null);
+    try testing.expect(std.mem.indexOf(u8, endpointWarning("100.70.1.2:51820").?, "CGNAT") != null);
+    try testing.expect(endpointWarning("100.128.1.2:51820") == null);
+    try testing.expect(endpointWarning("127.0.0.1:51820") != null);
+    try testing.expect(endpointWarning("1.2.3:51820") == null);
 }
 
 test "setup: the button says Start on first run and Save in Settings" {

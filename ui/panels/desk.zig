@@ -93,6 +93,10 @@ pub fn Panels(comptime devices: type) type {
             /// settings.json, or remove them when installed
             /// (src/agenthooks.zig); the glue sets `ui.setup.agent`.
             agent_hooks,
+            /// "Windows Firewall": add the tunnel port's rule, or replace it
+            /// after a port move (one administrator prompt, src/firewall.zig);
+            /// the glue then calls setFirewall.
+            firewall_rule,
         };
 
         /// What the desk found in the agent's settings.json.
@@ -166,6 +170,11 @@ pub fn Panels(comptime devices: type) type {
             /// `block_elevation_desk`; the agent's hook reads it each time,
             /// so it applies as soon as it is saved.
             block_elevation: bool = false,
+            /// "Windows Firewall" (Settings only): the rule's state for the
+            /// tunnel port, as the glue describes it (setFirewall).
+            firewall_buf: [200]u8 = undefined,
+            firewall_len: usize = 0,
+            firewall_ok: bool = false,
         };
 
         pub const Ui = struct {
@@ -272,6 +281,14 @@ pub fn Panels(comptime devices: type) type {
                 @memcpy(ui.move.rows[0..n], rows[0..n]);
                 ui.move.n_rows = n;
                 if (ui.screen != .move_result) ui.show(.move_result);
+            }
+
+            /// Settings, "Windows Firewall": the rule's state in a line.
+            pub fn setFirewall(ui: *Ui, text: []const u8, ok: bool) void {
+                const n = @min(text.len, ui.setup.firewall_buf.len);
+                @memcpy(ui.setup.firewall_buf[0..n], text[0..n]);
+                ui.setup.firewall_len = n;
+                ui.setup.firewall_ok = ok;
             }
 
             /// "Pair a device…".
@@ -399,7 +416,7 @@ pub fn Panels(comptime devices: type) type {
             /// Fields of the current screen, in focus order (fields come first).
             fn fieldCount(ui: *const Ui) u8 {
                 return switch (ui.screen) {
-                    .setup => if (ui.setup.first_run) 4 else 9,
+                    .setup => if (ui.setup.first_run) 4 else 10,
                     .pair_name => 2,
                     else => 0,
                 };
@@ -534,6 +551,8 @@ pub fn Panels(comptime devices: type) type {
                             return .agent_hooks;
                         } else if (ui.screen == .setup and ui.focus.index == 7) {
                             ui.setup.block_elevation = !ui.setup.block_elevation;
+                        } else if (ui.screen == .setup and ui.focus.index == 9) {
+                            return .firewall_rule;
                         } else if (ui.focusedField() == null) {
                             if (k == .left) ui.focus.prev() else ui.focus.next();
                         }
@@ -563,6 +582,7 @@ pub fn Panels(comptime devices: type) type {
                         .text => |t| _ = t.insert_cp(t.ctx, cp),
                         .choice => if (cp == ' ') {
                             if (ui.focus.index == 6) return .agent_hooks;
+                            if (ui.focus.index == 9) return .firewall_rule;
                             switch (ui.focus.index) {
                                 4 => ui.setup.sysmon = !ui.setup.sysmon,
                                 5 => ui.setup.bg_art = !ui.setup.bg_art,
@@ -591,7 +611,12 @@ pub fn Panels(comptime devices: type) type {
                     if (ui.screen == .setup and i == 4 and ui.focus.index == 4) ui.setup.sysmon = !ui.setup.sysmon;
                     if (ui.screen == .setup and i == 5 and ui.focus.index == 5) ui.setup.bg_art = !ui.setup.bg_art;
                     if (ui.screen == .setup and i == 7 and ui.focus.index == 7) ui.setup.block_elevation = !ui.setup.block_elevation;
-                    const act: Action = if (ui.screen == .setup and i == 6 and ui.focus.index == 6) .agent_hooks else .none;
+                    const act: Action = if (ui.screen == .setup and i == 6 and ui.focus.index == 6)
+                        .agent_hooks
+                    else if (ui.screen == .setup and i == 9 and ui.focus.index == 9)
+                        .firewall_rule
+                    else
+                        .none;
                     ui.focus.index = i;
                     return act;
                 }
@@ -704,11 +729,11 @@ pub fn Panels(comptime devices: type) type {
 
             pub const Bufs = struct {
                 lines: [6 + devices.max_devices]frame.PanelText = undefined,
-                after: [8 + devices.max_devices]frame.PanelText = undefined,
+                after: [16 + devices.max_devices]frame.PanelText = undefined,
                 rows: [@max(devices.max_devices, max_pkgs)]frame.PanelRow = undefined,
-                fields: [9]frame.PanelField = undefined,
+                fields: [10]frame.PanelField = undefined,
                 buttons: [4]frame.PanelButton = undefined,
-                txt: [14 + devices.max_devices][200]u8 = undefined,
+                txt: [22 + devices.max_devices][240]u8 = undefined,
                 row_txt: [@max(devices.max_devices, max_pkgs)][120]u8 = undefined,
                 n_txt: usize = 0,
                 /// The pairing code's QR (shared/pairqr.zig v2) for the
@@ -803,7 +828,11 @@ pub fn Panels(comptime devices: type) type {
                             bufs.fields[6] = .{ .label = "Claude Code integration (Left/Right or click to install or remove; applies now)", .value = agentLabel(ui.setup.agent), .id = id.field0 + 6, .focused = f == 6, .choice = true };
                             bufs.fields[7] = .{ .label = "Admin prompts at the desk (Left/Right to change; applies now)", .value = if (ui.setup.block_elevation) "Refused: also refuse admin-prompt commands in projects started at the desk" else "Allowed: they run, and the tab asks for you at the desk", .id = id.field0 + 7, .focused = f == 7, .choice = true };
                             bufs.fields[8] = .{ .label = "Tunnel endpoint for devices (HOST:PORT)", .value = ui.setup.tunnel_endpoint.text(), .hint = "your public IP or dynamic-DNS name, and the port the router forwards, e.g. home.example.org:51820", .id = id.field0 + 8, .focused = f == 8 };
-                            p.fields = bufs.fields[0..9];
+                            bufs.fields[9] = .{ .label = "Windows Firewall (Left/Right or click: add the rule, or replace it after a port move; one administrator prompt)", .value = if (ui.setup.firewall_len > 0) ui.setup.firewall_buf[0..ui.setup.firewall_len] else "Not checked", .id = id.field0 + 9, .focused = f == 9, .choice = true };
+                            p.fields = bufs.fields[0..10];
+                            if (std.mem.trim(u8, ui.setup.tunnel_endpoint.text(), " ").len == 0) routerSteps(bufs, &na, c.tunnel_port);
+                            if (endpointWarning(ui.setup.tunnel_endpoint.text())) |warn| L.add(&bufs.after, &na, .{ .text = warn, .tone = .bad });
+                            if (ui.setup.firewall_len > 0 and !ui.setup.firewall_ok) L.add(&bufs.after, &na, .{ .text = "Without the firewall rule, devices cannot reach this desk from outside your network.", .tone = .warn });
                             ui.tunnelLines(bufs, &na, c);
                         }
                         L.add(&bufs.after, &na, .{ .text = policyHelp(ui.setup.input), .tone = if (ui.setup.input == .text) .bad else .muted });
@@ -922,6 +951,28 @@ pub fn Panels(comptime devices: type) type {
                 return p;
             }
 
+            /// First-run desk guidance (Settings while the tunnel endpoint is
+            /// unset): the router steps, then where devices reach the desk.
+            /// Portal never asks a service on the internet for the public
+            /// address: the router's own status page shows it.
+            fn routerSteps(bufs: *Bufs, n: *usize, port: u16) void {
+                const add = struct {
+                    fn f(a: []frame.PanelText, k: *usize, t: frame.PanelText) void {
+                        if (k.* < a.len) {
+                            a[k.*] = t;
+                            k.* += 1;
+                        }
+                    }
+                }.f;
+                const arr = &bufs.after;
+                add(arr, n, .{ .text = "Where do devices reach this desk? Once, on your router:", .tone = .warn, .bold = true });
+                add(arr, n, .{ .text = bufs.fmt("1. Forward UDP {d} to this desktop, and nothing else. Turn UPnP off.", .{port}) });
+                add(arr, n, .{ .text = "2. Give this desktop a DHCP reservation, so its address on your network stays the same." });
+                add(arr, n, .{ .text = "3. Check the router's WAN (internet) address on its status page. If it starts with 100.64-100.127, 10., 172.16-172.31 or 192.168., the router is behind CGNAT and forwarding cannot work: ask your ISP for a public address." });
+                add(arr, n, .{ .text = bufs.fmt("4. Enter that public address, or better a dynamic-DNS name, with the port, under Tunnel endpoint for devices: e.g. home.example.org:{d}. Portal never looks it up on the internet.", .{port}) });
+                add(arr, n, .{ .text = "5. Allow the port in Windows Firewall (the Windows Firewall row; one administrator prompt)." });
+            }
+
             /// Settings' tunnel section: this desktop's key and port, and
             /// its peers (the paired devices, `ui.devs`).
             fn tunnelLines(ui: *const Ui, bufs: *Bufs, n: *usize, c: Ctx) void {
@@ -941,6 +992,28 @@ pub fn Panels(comptime devices: type) type {
                 for (ui.devs[0..ui.n_devs]) |d| add(arr, n, .{ .text = bufs.fmt("Peer {s: <16} {s: <10} key {s}", .{ d.name.get(), d.ip.get(), d.key.get() }) });
             }
         };
+
+        /// A warning when the endpoint's host is an address devices on the
+        /// internet cannot reach: private (RFC 1918), CGNAT (100.64/10) or
+        /// loopback; null otherwise (a DNS name, a public address, nothing).
+        pub fn endpointWarning(endpoint: []const u8) ?[]const u8 {
+            const e = std.mem.trim(u8, endpoint, " ");
+            const colon = std.mem.lastIndexOfScalar(u8, e, ':') orelse e.len;
+            const host = e[0..colon];
+            var it = std.mem.splitScalar(u8, host, '.');
+            var o: [4]u8 = undefined;
+            var i: usize = 0;
+            while (it.next()) |part| : (i += 1) {
+                if (i == 4) return null;
+                o[i] = std.fmt.parseInt(u8, part, 10) catch return null;
+            }
+            if (i != 4) return null;
+            const private = o[0] == 10 or (o[0] == 172 and o[1] >= 16 and o[1] <= 31) or (o[0] == 192 and o[1] == 168);
+            if (private) return "That is an address on your own network: devices outside it cannot reach it. Use the router's public (WAN) address or a dynamic-DNS name.";
+            if (o[0] == 100 and o[1] >= 64 and o[1] <= 127) return "That is a CGNAT address (100.64-100.127): port forwarding cannot work behind it. Ask your ISP for a public address.";
+            if (o[0] == 127) return "That is this computer only (loopback): devices cannot reach it.";
+            return null;
+        }
 
         pub fn cyclePolicy(p: rules.Policy, forward: bool) rules.Policy {
             const all = [_]rules.Policy{ .none, .keys, .instruct, .text };

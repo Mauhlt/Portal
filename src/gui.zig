@@ -175,6 +175,7 @@ pub const Ended = enum { window_closed, finished };
 
 const title = @import("title.zig");
 const win32 = @import("win32.zig");
+const firewall = @import("firewall");
 const windowLabel = title.windowLabel;
 const windowTitle = title.windowTitle;
 const max_project_bytes = title.max_project_bytes;
@@ -229,6 +230,15 @@ pub const LocalHost = struct {
     move_old_ep_len: usize = 0,
     move_outcome: portmove.Outcome = .{},
     move_done: std.atomic.Value(bool) = .init(false),
+    /// Settings, "Windows Firewall": the elevated `portalctl firewall add`
+    /// runs on its own thread (it waits for the administrator prompt and
+    /// the program); its outcome, then `fw_done`.
+    fw_running: bool = false,
+    fw_port: u16 = 0,
+    fw_exe: [1024]u8 = undefined,
+    fw_exe_len: usize = 0,
+    fw_outcome: firewall.Elevated = .declined,
+    fw_done: std.atomic.Value(bool) = .init(false),
     /// Whether the OS touch keyboard was last asked to show.
     keyboard_shown: bool = false,
     /// Every tab's background tasks and usage, as of hub.activity_gen.
@@ -453,6 +463,7 @@ pub const LocalHost = struct {
     fn checkPairing(h: *LocalHost) bool {
         if (h.desk == null) return false;
         if (h.moveFinished()) return true;
+        if (h.firewallFinished()) return true;
         if (!h.pair_dirty.swap(false, .acq_rel)) return false;
         // The device list (and Settings' peers) follow the store (pairing,
         // `portalctl unpair`, a device forgetting this desktop).
@@ -758,6 +769,7 @@ pub const LocalHost = struct {
             },
             .setup_cancel => {},
             .agent_hooks => h.agentHooks(),
+            .firewall_rule => h.firewallRule(),
             .check_key => {
                 const k = tunneldesk.tunnel.keys.parsePublic(h.ui.key_text.text()) orelse
                     return h.ui.setNote(.bad, "That is not a WireGuard public key: 44 characters ending in =, exactly as the device shows it.", .{});
@@ -936,6 +948,67 @@ pub const LocalHost = struct {
         // As the hook reads it now (the file may have been edited by hand).
         h.ui.setup.block_elevation = (settings.loadOrNull(h.gpa, h.io, d.paths.dir) orelse s.*).block_elevation_desk orelse false;
         h.ui.setup.agent = h.agentStatus(false);
+        h.firewallStatus();
+        // No endpoint yet: the router steps show; start on that field.
+        if (s.tunnel_endpoint.get() == null) h.ui.focus.index = 8;
+    }
+
+    /// Settings, "Windows Firewall": whether the rule allows the port the
+    /// tunnel listens on now (read-only, no administrator).
+    fn firewallStatus(h: *LocalHost) void {
+        if (h.fw_running) return;
+        const d = h.desk orelse return;
+        const port = d.livePort();
+        const st = firewall.status(port);
+        var b: [200]u8 = undefined;
+        h.ui.setFirewall(firewall.describe(st, port, &b), st == .present);
+    }
+
+    /// Settings, "Windows Firewall": add the rule for the live port, or
+    /// replace it after a port move, through this release's portalctl run
+    /// as administrator (one prompt). Nothing to do when it is right.
+    fn firewallRule(h: *LocalHost) void {
+        const d = h.desk orelse return;
+        if (h.fw_running) return;
+        const port = d.livePort();
+        if (firewall.status(port) == .present) return h.firewallStatus();
+        var self_buf: [1024]u8 = undefined;
+        const me = firewall.selfExe(&self_buf) orelse return h.ui.setNote(.bad, "Cannot find portalctl.exe next to Portal.", .{});
+        const dir = std.fs.path.dirname(me) orelse return;
+        const exe = std.fmt.bufPrint(&h.fw_exe, "{s}\\portalctl.exe", .{dir}) catch return;
+        h.fw_exe_len = exe.len;
+        h.fw_port = port;
+        h.fw_running = true;
+        h.ui.setFirewall("Waiting for the administrator prompt\u{2026}", false);
+        const t = std.Thread.spawn(.{}, firewallThread, .{h}) catch {
+            h.fw_running = false;
+            return h.ui.setNote(.bad, "Could not start the firewall step.", .{});
+        };
+        t.detach();
+    }
+
+    fn firewallThread(h: *LocalHost) void {
+        var pb: [64]u8 = undefined;
+        h.fw_outcome = firewall.runElevated(h.fw_exe[0..h.fw_exe_len], firewall.elevatedParams(&pb, .add, h.fw_port), h.p.nativeHandle());
+        h.fw_done.store(true, .release);
+        notifyThunk(h);
+    }
+
+    /// UI thread: the firewall step ended. True if the panels changed.
+    fn firewallFinished(h: *LocalHost) bool {
+        if (!h.fw_done.swap(false, .acq_rel)) return false;
+        h.fw_running = false;
+        h.firewallStatus();
+        var mb: [240]u8 = undefined;
+        switch (h.fw_outcome) {
+            .exited => |code| if (code == firewall.exit.ok) {
+                if (h.desk) |d| d.srv.log.print("settings: firewall rule for UDP {d} added (administrator approved)", .{h.fw_port});
+                h.ui.setNote(.good, "Windows Firewall now allows UDP {d}.", .{h.fw_port});
+            } else h.ui.setNote(.bad, "The firewall rule could not be changed (exit code {d}).", .{code}),
+            .declined => h.ui.setNote(.warn, "Not changed: the administrator prompt was declined. Later, in an administrator PowerShell: {s}", .{firewall.manualAdd(&mb, h.fw_port)}),
+            .failed => |e| h.ui.setNote(.bad, "Could not ask for an administrator (error {d}).", .{e}),
+        }
+        return true;
     }
 
     /// The agent's settings.json and the hook command: the installed
