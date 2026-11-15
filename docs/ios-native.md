@@ -91,7 +91,8 @@ Rules:
 | 3 | Third-party keyboards refused | Renderer `Window/ios.zig` (`application:shouldAllowExtensionPointIdentifier:` on the runtime app delegate), `AppOptions.block_keyboard_extensions` | done |
 | 4 | Lock on leave: cover before the app-switcher snapshot, cover while `UIScreen.isCaptured`, drop the connection in the background, Face ID before showing anything on return | Renderer `Window/ios.zig` (cover, lock, `.background`), shared `Presenter.isSuspended` -> `Client.setPaused`, `client/src/ios/device.zig` (LocalAuthentication) | done |
 | 5 | QR pairing: the phone shows its key and check code, the desk pairs it, then shows the pairing code (address, CA SHA-256, endpoint, desk key) as a QR the phone scans and pins | `shared/pairqr.zig` (text format), `ui/qr.zig` (Zig QR encoder, `portal_ui.qr`), `ui/panels/desk.zig` (Pair panel), `ui/frame.zig` `Panel.qr`, `ui/panels/setup.zig` (Scan QR code), `client/src/ios/scan.zig` (AVFoundation) | done |
-| 6 | Per-app tunnel on the owner's own Zig WireGuard (../WireGuard) | `client/src/ios/tunnel_ext` (extension), `client/src/ios/tunnel.zig` (app side), `client/src/ios/wgkey.zig` | extension + app side done; the key reaches the desk by desk-approved pairing (docs/pairing.md) |
+| 6 | Per-app tunnel on the owner's own Zig WireGuard (../WireGuard) | `client/src/ios/tunnel_ext` (extension), `client/src/ios/tunnel.zig` + `tunnel_note.zig` (app side), `devicelink.wgQuick` | done: configured from pairing and every later launch, started on screen, stopped in the background; unverified on device |
+| 7 | Dictation on the phone itself: stt's Core ML engine, the bundled tiny.en model, the shared input line's 🎤 | `client/src/ios/speech.zig`, `client/src/ios/mic.zig`, `connect.Platform.speech` | done, compile-checked only |
 
 ### 4. Lock on leave, in detail
 
@@ -177,7 +178,29 @@ Rules:
   Apple ID build without it: the app then runs the same tunnel in its own
   process (client/src/tunnel, as `portal connect` does), while it is on
   screen.
-* **Keys:** the phone generates its X25519 pair (wgkey.zig); the private
+* **Wiring (connect.Platform.system_tunnel):** once the pairing code is
+  known (right after pairing, and on every later launch from the stored
+  code), connect.zig builds the same tunnel as wg-quick text
+  (`devicelink.wgQuick`: this phone at its 10.8.0.x/32, the desk as the
+  one peer with AllowedIPs 10.8.0.1/32, the endpoint from the code and
+  the 25 s keepalive) and offers it to the device. With
+  `-Dios-tunnel=true` `tunnel.configure` takes it and the viewer dials
+  10.8.0.1:8420 with plain OS sockets (iOS routes them into the
+  extension's tunnel). Without it, or when the key cannot be put in the
+  Keychain, it says no and the viewer starts the in-process tunnel as
+  before. The VPN configuration is saved only when it changed
+  (`tunnel_note.needsSave`), so a normal launch does not rewrite the
+  system's VPN preferences; a DNS-name endpoint is resolved by the
+  extension's WireGuard (zwg's `PeerConfig.fromConfig`, as the in-process
+  tunnel does), and looked up again while the desk is silent.
+* **Status line (connect.Platform.note):** every completion handler and
+  NEVPNStatusDidChangeNotification (main queue, no polling) sets a short
+  note that the shared status line shows (`Viewer.note`): connecting, not
+  allowed ("reopen Portal and tap Allow"), turned off by another VPN,
+  the extension did not start, or the system's own error text. It is
+  empty while the tunnel is up and while Portal is in the background.
+* **Keys:** the phone's key is the device key every Portal device has
+  (client/src/tunnel/keys.zig, in the Keychain behind Face ID); the private
   key never leaves it. `tunnel.configure` takes it out of the wg-quick
   text before the VPN configuration is saved (that lives in the system's
   VPN preferences, which can reach backups and diagnostics) and stores it
@@ -193,7 +216,16 @@ Rules:
   shows its public key and check code, the owner pairs it at the desk
   (which adds it to the desk's in-process tunnel), and the pairing code
   carries the desk's key, endpoint and the phone's tunnel address back.
-* **Not done yet:** IPv6 tunnel addresses (NEIPv6Settings).
+* **IPv6 inside the tunnel: not done, on purpose.** The desk hands out
+  IPv4 tunnel addresses only (shared/tunnelnet.zig: 10.8.0.0/24, the desk
+  10.8.0.1, the pairing code's device address is a dotted quad), and every
+  Portal service is on 10.8.0.1. The owner's WireGuard netstack can carry
+  fd0a:8::/64, but using it would need an IPv6 address on the desk's
+  in-process tunnel, IPv6 AllowedIPs per device, a new pairing code
+  version and IPv6 in the client's dialing, for no reachable service.
+  The **outer** connection is not affected: the desk's endpoint may be an
+  IPv6 address or a name that resolves to one, which works today
+  (NEIPv6Settings only concern addresses inside the tunnel).
 
 ## Implementation: seams
 
@@ -218,8 +250,8 @@ Rules:
 * **Credential store:** `credstore.zig`'s `impl` switch; iOS shares the
   Apple Keychain code with macOS, with the Face ID access control.
 * **Device hooks:** `connect.Platform` (sync on/off, suspend/resume,
-  QR scan). The iPhone section (`client/src/ios`) fills them; everything
-  they drive is shared.
+  QR scan, `system_tunnel`, the status `note`, `speech`). The iPhone
+  section (`client/src/ios`) fills them; everything they drive is shared.
 * **Shared UI** (module `portal_ui`, ui/): layout inside `Frame.insets`,
   the focused field as `Frame.text_slot` (`frame.textEdit` turns the
   native field's edits into Backspace/characters, Return = Enter),
@@ -229,6 +261,75 @@ Rules:
   each present, `.background`/`.foreground` -> no drawing (`isSuspended`,
   which connect.zig turns into `Client.setPaused`), `.scroll` (a drag on
   the phone) -> `scrollRows`.
+
+## Dictation on the phone (stt Core ML)
+
+* **Seam:** `connect.Platform.speech` gives the shared input line the
+  same `ui.shell.Dictation` hooks the desk's engine fills (start, stop,
+  cancel), plus a per-frame `frame` that hands a finished transcript to
+  `Shell.dictated` and sets the 🎤's state (`transcribing`, `mic_label`,
+  `speech_off`, `setSpeechReady`). So the 🎤 Dictate / Listening /
+  Transcribing row, the hint text and the line work as on the desk; no
+  stt feedback (the desk's learning) on the phone.
+* **Microphone (client/src/ios/mic.zig):** AVAudioSession (category
+  Record, Bluetooth hands-free allowed) and an AVAudioEngine tap on the
+  input node, event-driven (the tap's callback). The input is chosen with
+  the desk's headset-first rule: the session's available inputs mapped
+  by `mics.fromApplePort` into src/speech/mics.zig and `mics.choose`.
+  The tap keeps the first channel at the hardware rate; stop resamples
+  to 16 kHz mono f32 with `stt.audio.resample` (stt's own resampler).
+  120 s at most (stt's limit): then the 🎤 goes off by itself.
+  Permission: NSMicrophoneUsageDescription; iOS 17's AVAudioApplication
+  asks on the first Dictate; a denial becomes the 🎤's hint.
+  The desk's `capture.Backend` is not reused below this level: it is
+  shaped around Win32 events (WaitForMultipleObjects) and the WASAPI
+  device list; the shared parts are the selection rule, the limits and
+  the input-line API.
+* **Engine (client/src/ios/speech.zig):** one worker thread (never the
+  UIKit main thread, never the app thread), asleep on an Io.Condition.
+  The first Dictate starts loading in parallel with the recording:
+  `stt.Model.load` of `Portal.app/stt/ggml-tiny.en.bin`, then
+  `stt.Transcriber.init` with `.coreml` (`cpu_and_neural_engine`, cache
+  `Library/Caches/stt-coreml`). The first launch generates and compiles
+  the Core ML programs (seconds); later ones load them from the cache.
+  "Transcribing (cancel)" drops the result (stt cannot stop mid-clip).
+* **Off screen:** `onSuspend` stops and drops a recording, drops a
+  pending result, and releases the transcriber and the model: iOS
+  reclaims memory from background apps first, and the programs reload
+  from Caches on the next Dictate.
+* **Model:** the whisper.cpp project's `ggml-tiny.en.bin` on Hugging Face,
+  pinned to a commit of that repository, with its size (77,704,715 bytes)
+  and SHA-256 (build.zig `ios_model`). Zig's package fetcher accepts only
+  archives and git repositories, so the single file is fetched by
+  src/tools/fetch_file.zig, which keeps it only if size and hash match.
+  Only the steps that build the app run it (`ios`, `ios-sign`,
+  `ios-kit`), never `ios-check` or `test`, and the build cache keeps it;
+  it is never in git. `-Dios-model=<file>` bundles a local ggml file
+  instead. Its MIT notices are in `Portal.app/Licenses.txt`
+  (docs/ios-licenses.txt).
+* **One Objective-C binding:** the window (the Renderer's IosObjC) and
+  stt's Core ML backend (TranslateCoreML) both build on the MacOS
+  package's types and its `msgSend` signature builder. They asked for it
+  with different optimize modes, which gave two "MacOS" modules over the
+  same files, and Zig refuses that. build.zig `iosStt` gives the Core ML
+  module the Renderer's MacOS, so the app has one. Portal's own iOS
+  files use that binding through `view.Window.ios.objc` (IosObjC).
+
+## iOS 17
+
+The deployment target (build.zig `ios_min_major`) and both Info.plists'
+`MinimumOSVersion` are iOS 17: the dictation engine's Core ML programs
+target iOS 17 (stt's `mil.Target.ios17`), and the microphone permission
+uses iOS 17's AVAudioApplication.
+
+## Release build check
+
+A release build (`-Doptimize=ReleaseSafe` or another non-Debug mode)
+strips the app's and the extension's executables, and
+src/tools/machocheck.zig checks them before `zig build ios` / `ios-kit`
+finish: a 64-bit arm64 Mach-O, no __DWARF segment, no __debug_*
+section, no debug-map (stab) symbols, and no absolute path of the build
+machine (the same kind of check as ZVC's check-dist).
 
 ## Zig on iOS: the stock lib dir
 
@@ -243,12 +344,13 @@ handler.
 
 ## Build, sign, install (owner's Mac)
 
-Prerequisites: Xcode (iOS SDK), the Zig build in build.zig.zon, the
-sibling checkouts Portal builds against (../Renderer, ../Vulkan,
-../Image, ../MacOS, ../Windows, ../Wayland, ../WireGuard), with the
-Renderer's iOS Window backend (branch `ios-window`) and the Vulkan
-package's MoltenVK loader (branch `moltenvk`, generated by TranslateVulkan
-`moltenvk`) merged into those checkouts.
+The owner's step-by-step session (what to enter, what success looks
+like) is docs/mac-session-portal.md; this section is the reference.
+
+Prerequisites: Xcode (iOS SDK) and the Zig in build.zig.zon. The sibling
+repos are pinned URL dependencies (build.zig.zon), fetched by the build;
+`--fork=<checkout>` builds against a local one. The first app build also
+downloads the dictation model (77.7 MB, build.zig `ios_model`).
 
 1. **MoltenVK for iOS** (not committed): either the LunarG Vulkan SDK for
    macOS (`<SDK>/MoltenVK/dynamic/dylib/iOS/libMoltenVK.dylib`, or the
@@ -348,7 +450,9 @@ only runs `zig build`.
 ## To verify on the phone
 
 Touch mapping (tap vs pan scroll), keyboard insets, dictation into the
-native field, the background hand-off (no GPU use after `.background`),
+native field (Apple's keyboard dictation) and Portal's own 🎤 (stt on
+Core ML), the background tunnel (VPN prompt, up on screen, down in the
+background), the background hand-off (no GPU use after `.background`),
 the cover in the app switcher and during screen recording, Face ID +
 Keychain single prompt, QR scanning, the font file CoreText names for
 Menlo (Renderer `Font/fontset.zig`; a failure reports the paths tried),
@@ -358,7 +462,4 @@ account the tunnel extension against the desk.
 
 ## What is left (ordered)
 
-1. Run on the iPhone; fix what the list above finds.
-2. WireGuard key delivery + desk confirm step (section 6), then
-   `tunnel.configure` from pairing.
-3. Flip build.zig.zon back to ../Renderer when `ios-window` is merged.
+1. Run on the iPhone (docs/mac-session-portal.md); fix what it finds.

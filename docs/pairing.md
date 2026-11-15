@@ -67,10 +67,24 @@ For the Surface, the name `surface`; it gets `10.8.0.4`.
 
 ## 3. iPhone (10.8.0.3)
 
-The Portal app runs the same in-process tunnel. On its first-run screen it
-shows its key and check code; pair it at the desk as above (name
-`iphone`), then tap **Scan QR code** and point it at the pairing code's QR
-on the desk, compare the desk's check code, and tap **Connect**.
+Needs iOS 17 or newer. Build, sign and install: docs/mac-session-portal.md.
+
+1. Open Portal and unlock with Face ID. The first-run screen shows the
+   phone's tunnel key and check code.
+2. At the desk: **Pair a device**, name `iphone`, enter the key, and
+   compare the check code with the phone.
+3. On the phone: tap **Scan QR code**, point it at the pairing code's QR
+   on the desk, compare the desk's check code, and tap **Connect**.
+4. The tunnel:
+   * Built **without** the tunnel extension (free Apple ID): the app runs
+     the same in-process tunnel as the laptop, while it is on screen.
+   * Built **with** it (`-Dios-tunnel=true`, paid account): the app hands
+     the tunnel to its packet tunnel extension. iOS asks once to **Allow**
+     the VPN configuration "Portal". The phone's private key goes to the
+     Keychain, not into that configuration. The tunnel comes up whenever
+     Portal is on screen and goes down in the background. If it cannot
+     come up, the status line says why. If the key cannot be put in the
+     Keychain, the app falls back to the in-process tunnel and says so.
 
 ## Afterwards
 
