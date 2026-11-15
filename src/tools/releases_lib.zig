@@ -16,6 +16,8 @@ pub const current_file = "current.txt";
 pub const known_good_file = "known-good.txt";
 pub const history_file = "history.txt";
 pub const staging_dir = "_staging";
+/// `zig build voice-packages --prefix <releases>\_voice` (removed after).
+pub const voice_dir = "_voice";
 pub const deleting_suffix = ".deleting";
 
 const zig_marker = "_zig-";
@@ -711,4 +713,73 @@ test "isOldLauncherName" {
     try testing.expectEqualStrings("portal-launcher.exe", launcherFor("portal.exe"));
     try testing.expectEqualStrings("portal-launcher-console.exe", launcherFor("portalctl.exe"));
     try testing.expectEqualStrings("portal-launcher-console.exe", launcherFor("portal-show.exe"));
+}
+
+// ------------------------------------------------- the laptop speech engine
+
+/// What `release` did about the laptop speech engine (stt-local and
+/// stt-model) after the desk's own release was promoted. None of these
+/// fails the release: the desk is live by then.
+pub const VoiceOutcome = enum {
+    /// PORTAL_RELEASES_DIR testing override: the real data folder is not
+    /// touched.
+    skipped_testing,
+    /// `zig build voice-packages` (the QAIRT SDK fetch, the aarch64 cross-
+    /// build or the model download) failed or could not run.
+    build_failed,
+    /// `portalctl voice-publish` said not everything was published (or
+    /// could not run).
+    publish_failed,
+    /// The Audio panel's "Publish the laptop speech engine" is off: nothing
+    /// built or published (portalctl said so).
+    off,
+    /// Published, or unchanged: portalctl printed which.
+    done,
+};
+
+/// `portalctl voice-publish`'s exit code when "Publish the laptop speech
+/// engine" is off (also `--enabled`'s): nothing is built or published.
+pub const voice_off_exit: u8 = 3;
+
+pub fn voiceOutcome(testing_override: bool, build_ok: bool, publish_ok: bool) VoiceOutcome {
+    if (testing_override) return .skipped_testing;
+    if (!build_ok) return .build_failed;
+    if (!publish_ok) return .publish_failed;
+    return .done;
+}
+
+/// The release's closing line about it: plain about what was not published.
+pub fn voiceLine(o: VoiceOutcome) ?[]const u8 {
+    return switch (o) {
+        .skipped_testing => "laptop speech engine: not built or published (testing override)",
+        .build_failed => "WARNING: the laptop speech engine was NOT published: `zig build voice-packages` failed (see above). The desk's release is fine; devices keep the engine they have.",
+        .publish_failed => "WARNING: the laptop speech engine was NOT (fully) published (see portalctl's line above). The desk's release is fine; devices keep the engine they have.",
+        .off => "laptop speech engine: not built or published (switched off in the desk's Audio panel)",
+        .done => null,
+    };
+}
+
+/// `portalctl voice-publish --not-built <why>`: why, in a few words.
+pub fn notBuiltReason(buf: []u8, exit_code: ?u32, err_name: ?[]const u8) []const u8 {
+    if (err_name) |e| return std.fmt.bufPrint(buf, "zig build voice-packages could not run ({s})", .{e}) catch "zig build voice-packages could not run";
+    return std.fmt.bufPrint(buf, "zig build voice-packages failed (exit code {d}: the QAIRT SDK fetch, the aarch64 build or the model download)", .{exit_code orelse 1}) catch "zig build voice-packages failed";
+}
+
+test "voice outcome: any failure is a warning that names what was not published, never a failed release" {
+    try testing.expectEqual(VoiceOutcome.done, voiceOutcome(false, true, true));
+    try testing.expectEqual(VoiceOutcome.build_failed, voiceOutcome(false, false, true));
+    try testing.expectEqual(VoiceOutcome.build_failed, voiceOutcome(false, false, false));
+    try testing.expectEqual(VoiceOutcome.publish_failed, voiceOutcome(false, true, false));
+    try testing.expectEqual(VoiceOutcome.skipped_testing, voiceOutcome(true, false, false));
+    for ([_]VoiceOutcome{ .build_failed, .publish_failed }) |o| {
+        const l = voiceLine(o).?;
+        try testing.expect(std.mem.startsWith(u8, l, "WARNING: the laptop speech engine was NOT"));
+        try testing.expect(std.mem.indexOf(u8, l, "desk's release is fine") != null);
+    }
+    try testing.expect(voiceLine(.done) == null);
+    var b: [200]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, notBuiltReason(&b, 1, null), "exit code 1") != null);
+    try testing.expect(std.mem.indexOf(u8, notBuiltReason(&b, null, "FileNotFound"), "FileNotFound") != null);
+    // Not a release id: pruning never takes it for one.
+    try testing.expect(!isValidId(voice_dir));
 }

@@ -1037,10 +1037,12 @@ fn speechModuleWith(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
 ///       the QAIRT SDK (or -Dsdk / QNN_SDK_ROOT)
 ///   zig-out/voice/stt-model/<model_pin.file_name>   the pinned base model,
 ///       the desk's own file (downloaded and checked like the iPhone's)
-/// Publishing stays a step of its own (portalctl publish), so a rebuild
-/// never asks the laptop to approve a new version.
+/// `zig build release` runs it after the desk's release and publishes both
+/// with `portalctl voice-publish`, each only when its content changed, so
+/// a rebuild of the same engine never asks the laptop to approve a new
+/// version (src/tools/release.zig; a failure here never fails the release).
 fn addVoicePackages(b: *std.Build, sdk: ?[]const u8) void {
-    const step = b.step("voice-packages", "Build the laptop's stt-local (aarch64 Windows) and the pinned model into zig-out/voice, to publish with portalctl");
+    const step = b.step("voice-packages", "Build the laptop's stt-local (aarch64 Windows) and the pinned model into zig-out/voice (zig build release publishes them)");
     const t = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .windows });
     const exe = b.dependency("stt", .{ .target = t, .optimize = .fast, .sdk = sdk }).artifact("stt-local");
     step.dependOn(&b.addInstallArtifact(exe, .{

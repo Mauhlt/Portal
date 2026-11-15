@@ -125,6 +125,65 @@ pub const Share = struct {
     }
 };
 
+// ------------------------------------------------- the laptop speech engine
+
+/// The laptop's speech engine and its model, as `zig build voice-packages`
+/// lays them out (<folder>\stt-local\, <folder>\stt-model\). The desk's
+/// release flow publishes them (`zig build release` runs `portalctl
+/// voice-publish`; docs/stt-sync-contract.md), each only when its content
+/// changed, signed with the release key like every package.
+pub const EnginePackage = struct { package: []const u8, kind: Kind };
+const Kind = @import("client").sync.manifest.Kind;
+pub const engine_packages = [_]EnginePackage{
+    .{ .package = "stt-local", .kind = .executable },
+    .{ .package = "stt-model", .kind = .data },
+};
+
+/// The last release's word on the engine (one line, shown in the desk's
+/// Audio panel and logged when Portal starts).
+pub const engine_status_file = "voice-engine.txt";
+pub const max_status = 300;
+
+pub const FolderPublished = struct { p: sync.Published, pruned: usize };
+
+/// Publishes `folder` as the next version of `package`, named
+/// `<version_base>+<sequence>`, unless it holds exactly what the newest
+/// published version holds (sync.sameAsLatest: null, nothing published).
+/// Then only the newest keep_versions stay published.
+pub fn publishFolder(gpa: Allocator, io: Io, paths: sync.Paths, pkg: []const u8, kind: Kind, folder: []const u8, version_base: []const u8, now: i64, problem: *[300]u8) !?FolderPublished {
+    if (try sync.sameAsLatest(gpa, io, paths, pkg, folder)) return null;
+    const p = try sync.publish(gpa, io, paths, .{ .package = pkg, .folder = folder, .kind = kind, .version_base = version_base, .now = now }, problem);
+    const pruned = sync.prune(gpa, io, paths, pkg, keep_versions) catch 0;
+    return .{ .p = p, .pruned = pruned };
+}
+
+pub const Tone = enum { ok, failed, off };
+
+/// Replaces the status line ("<tone> <text>").
+pub fn writeEngineStatus(gpa: Allocator, io: Io, paths: sync.Paths, tone: Tone, text: []const u8) !void {
+    var lb: [max_status + 16]u8 = undefined;
+    const line = std.fmt.bufPrint(&lb, "{t} {s}\n", .{ tone, text[0..@min(text.len, max_status)] }) catch unreachable;
+    var pb: [1024]u8 = undefined;
+    try sync.writeAtomic(gpa, io, try paths.join(&pb, &.{engine_status_file}), line);
+}
+
+pub const Status = struct { tone: Tone, text: []const u8 };
+
+/// The status line, if there is a well-formed one; its text is cut to
+/// `buf` and anything but printable ASCII becomes '?' (it is shown as is).
+pub fn readEngineStatus(io: Io, paths: sync.Paths, buf: *[max_status + 16]u8) ?Status {
+    var pb: [1024]u8 = undefined;
+    const raw = Io.Dir.cwd().readFile(io, paths.join(&pb, &.{engine_status_file}) catch return null, buf) catch return null;
+    const line = std.mem.trimEnd(u8, raw, "\r\n");
+    const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
+    const tone = std.meta.stringToEnum(Tone, line[0..sp]) orelse return null;
+    const text = buf[sp + 1 .. line.len];
+    for (text) |*c| if (c.* < 0x20 or c.* > 0x7e) {
+        c.* = '?';
+    };
+    return .{ .tone = tone, .text = text };
+}
+
 // ------------------------------------------------------------------ tests
 
 const testing = std.testing;
@@ -216,4 +275,74 @@ test "publish: with no release key nothing is published (an error the caller log
     var b: [64]u8 = undefined;
     try testing.expectError(error.NoSyncKey, publish(gpa, testing.io, paths, testUpdate(&b, 2, "v2"), 1));
     try testing.expectEqual(@as(u32, 0), latestVersion(gpa, testing.io, paths));
+}
+
+fn writeFolder(paths: sync.Paths, sub: []const u8, name: []const u8, data: []const u8) !void {
+    var fb: [1024]u8 = undefined;
+    try Io.Dir.cwd().createDirPath(testing.io, try paths.join(&fb, &.{sub}));
+    try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try paths.join(&fb, &.{ sub, name }), .data = data });
+}
+
+test "engine: unchanged content is not published again; a changed engine is; versions <base>+<sequence>; the newest 3 kept" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [512]u8 = undefined;
+    const paths = try tmpPaths(&tmp, &pb);
+    _ = try sync.initKey(gpa, io, paths, false);
+    var sb: [1024]u8 = undefined;
+    const src = try paths.join(&sb, &.{"voice-stt-local"});
+    var problem: [300]u8 = undefined;
+    try writeFolder(paths, "voice-stt-local", "stt-local.exe", "MZ engine 1");
+    const p1 = (try publishFolder(gpa, io, paths, "stt-local", .executable, src, "0.1.0", 1, &problem)).?;
+    try testing.expectEqualStrings("0.1.0+1", p1.p.version());
+    // Rebuilt but byte for byte the same: no new version.
+    try writeFolder(paths, "voice-stt-local", "stt-local.exe", "MZ engine 1");
+    try testing.expect((try publishFolder(gpa, io, paths, "stt-local", .executable, src, "0.1.0", 2, &problem)) == null);
+    // A changed engine is published; so is an added file.
+    try writeFolder(paths, "voice-stt-local", "stt-local.exe", "MZ engine 2");
+    const p2 = (try publishFolder(gpa, io, paths, "stt-local", .executable, src, "0.1.0", 3, &problem)).?;
+    try testing.expectEqualStrings("0.1.0+2", p2.p.version());
+    try writeFolder(paths, "voice-stt-local", "QnnHtp.dll", "dll");
+    const p3 = (try publishFolder(gpa, io, paths, "stt-local", .executable, src, "0.2.0", 4, &problem)).?;
+    try testing.expectEqualStrings("0.2.0+3", p3.p.version());
+    try testing.expect((try publishFolder(gpa, io, paths, "stt-local", .executable, src, "0.2.0", 5, &problem)) == null);
+    {
+        var v = (try sync.latest(gpa, io, paths, "stt-local")).?;
+        defer v.deinit(gpa);
+        try testing.expectEqual(.executable, v.m.kind);
+        try testing.expectEqual(@as(usize, 2), v.m.files.len);
+    }
+    // Retention: a fourth version unpublishes the first.
+    try writeFolder(paths, "voice-stt-local", "stt-local.exe", "MZ engine 3");
+    const p4 = (try publishFolder(gpa, io, paths, "stt-local", .executable, src, "0.2.0", 6, &problem)).?;
+    try testing.expectEqual(@as(usize, 1), p4.pruned);
+    try testing.expectError(error.NotPublished, sync.readVersion(gpa, io, paths, "stt-local", "0.1.0+1"));
+
+    // The model: the same file under a new release is not published again.
+    var mb: [1024]u8 = undefined;
+    const msrc = try paths.join(&mb, &.{"voice-stt-model"});
+    try writeFolder(paths, "voice-stt-model", "ggml-base.en.bin", "weights");
+    const m1 = (try publishFolder(gpa, io, paths, "stt-model", .data, msrc, "a03779c86df33230", 7, &problem)).?;
+    try testing.expectEqualStrings("a03779c86df33230+1", m1.p.version());
+    try testing.expect((try publishFolder(gpa, io, paths, "stt-model", .data, msrc, "a03779c86df33230", 8, &problem)) == null);
+}
+
+test "engine status: written and read back; malformed or missing is none; shown text is printable" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [512]u8 = undefined;
+    const paths = try tmpPaths(&tmp, &pb);
+    var buf: [max_status + 16]u8 = undefined;
+    try testing.expect(readEngineStatus(io, paths, &buf) == null);
+    try writeEngineStatus(gpa, io, paths, .failed, "The laptop speech engine was not published: the build failed\x07");
+    const s = readEngineStatus(io, paths, &buf).?;
+    try testing.expectEqual(Tone.failed, s.tone);
+    try testing.expectEqualStrings("The laptop speech engine was not published: the build failed?", s.text);
+    var fb: [1024]u8 = undefined;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try paths.join(&fb, &.{engine_status_file}), .data = "great stuff\n" });
+    try testing.expect(readEngineStatus(io, paths, &buf) == null);
 }

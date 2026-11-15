@@ -207,6 +207,10 @@ const usage =
     \\      the device, every version. Nothing is ever run automatically.
     \\  portalctl publish --list
     \\  portalctl unpublish <package> <version>
+    \\  portalctl voice-publish <folder> | --not-built <why>
+    \\      What `zig build release` runs: publishes the laptop's stt-local
+    \\      and stt-model from `zig build voice-packages`, each only when it
+    \\      changed, the newest 3 kept (off: the Audio panel's switch).
     \\  portalctl sync subscribe|unsubscribe <device> <package>
     \\  portalctl sync subscriptions
     \\      Which device receives which package.
@@ -296,10 +300,11 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "connect")) fatal("the remote viewer is a window: run `portal connect` (portal.exe)", .{});
     if (std.mem.eql(u8, cmd, "ca")) return cmdCa(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "show")) std.process.exit(@import("show.zig").main(gpa, io, args[1..]));
-    if (std.mem.eql(u8, cmd, "sync") or std.mem.eql(u8, cmd, "publish") or std.mem.eql(u8, cmd, "unpublish")) {
+    if (std.mem.eql(u8, cmd, "sync") or std.mem.eql(u8, cmd, "publish") or std.mem.eql(u8, cmd, "unpublish") or std.mem.eql(u8, cmd, "voice-publish")) {
         const paths = try devicePaths(gpa, io, init.environ_map);
         defer gpa.free(paths.dir);
         const sp: sync.Paths = .{ .dir = paths.dir };
+        if (cmd[0] == 'v') return sync_cli.cmdVoicePublish(gpa, io, sp, args[1..], portal_version);
         if (cmd[0] == 's') return sync_cli.cmdSync(gpa, io, sp, args[1..]);
         if (cmd[0] == 'p') return sync_cli.cmdPublish(gpa, io, sp, args[1..]);
         return sync_cli.cmdUnpublish(io, sp, args[1..]);

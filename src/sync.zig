@@ -129,7 +129,11 @@ pub const PublishOptions = struct {
     package: []const u8,
     folder: []const u8,
     kind: manifest.Kind,
+    /// The version name; null: the sequence number ("7").
     version: ?[]const u8 = null,
+    /// With no `version`: the name is `<version_base>+<sequence>` (e.g.
+    /// "0.1.0+7"), unique because sequences are never reused.
+    version_base: ?[]const u8 = null,
     min_client: []const u8 = default_min_client,
     now: i64,
 };
@@ -183,12 +187,12 @@ fn readHistory(gpa: Allocator, io: Io, file_path: []const u8) !History {
 }
 
 /// Copies one file into the store while hashing it (what is stored is
-/// what is hashed).
-fn copyHashed(io: Io, from: []const u8, to: []const u8, max: u64) !struct { size: u64, sha: [32]u8 } {
+/// what is hashed); with `to` null it only hashes.
+fn copyHashed(io: Io, from: []const u8, to: ?[]const u8, max: u64) !struct { size: u64, sha: [32]u8 } {
     const src = try Io.Dir.cwd().openFile(io, from, .{});
     defer src.close(io);
-    const dst = try Io.Dir.cwd().createFile(io, to, .{ .exclusive = true });
-    defer dst.close(io);
+    const dst: ?Io.File = if (to) |t| try Io.Dir.cwd().createFile(io, t, .{ .exclusive = true }) else null;
+    defer if (dst) |d| d.close(io);
     var h: Sha256 = .init(.{});
     var buf: [64 * 1024]u8 = undefined;
     var total: u64 = 0;
@@ -201,31 +205,21 @@ fn copyHashed(io: Io, from: []const u8, to: []const u8, max: u64) !struct { size
         total += n;
         if (total > max) return error.TooLarge;
         h.update(buf[0..n]);
-        try dst.writeStreamingAll(io, buf[0..n]);
+        if (dst) |d| try d.writeStreamingAll(io, buf[0..n]);
     }
-    try dst.sync(io);
+    if (dst) |d| try d.sync(io);
     var d: [32]u8 = undefined;
     h.final(&d);
     return .{ .size = total, .sha = d };
 }
 
-/// Hashes and signs `opts.folder` as a new version of `opts.package`.
-/// `problem` gets a description of a refused file path.
-pub fn publish(gpa: Allocator, io: Io, paths: Paths, opts: PublishOptions, problem: *[300]u8) !Published {
-    if (!manifest.validPackageId(opts.package)) return error.BadPackageId;
-    if (opts.version) |v| if (!manifest.validVersion(v)) return error.BadVersion;
-    if (!manifest.validClientVersion(opts.min_client)) return error.BadClientVersion;
-    var key = (try loadKey(gpa, io, paths)) orelse return error.NoSyncKey;
-    defer key.wipe();
-
-    // Every regular file under the folder, relative paths with '/'.
+/// Every regular file under `folder`, as relative paths with '/', sorted:
+/// what publish packages, in manifest order. Free with freeFolderFiles.
+fn folderFiles(gpa: Allocator, io: Io, folder: []const u8, problem: *[300]u8) !std.ArrayList([]u8) {
     var rels: std.ArrayList([]u8) = .empty;
-    defer {
-        for (rels.items) |r| gpa.free(r);
-        rels.deinit(gpa);
-    }
+    errdefer freeFolderFiles(gpa, &rels);
     {
-        var dir = try Io.Dir.cwd().openDir(io, opts.folder, .{ .iterate = true });
+        var dir = try Io.Dir.cwd().openDir(io, folder, .{ .iterate = true });
         defer dir.close(io);
         var walker = try dir.walk(gpa);
         defer walker.deinit();
@@ -252,6 +246,59 @@ pub fn publish(gpa: Allocator, io: Io, paths: Paths, opts: PublishOptions, probl
         }
     }
     if (rels.items.len == 0) return error.EmptyFolder;
+    std.mem.sort([]u8, rels.items, {}, struct {
+        fn lt(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return rels;
+}
+
+fn freeFolderFiles(gpa: Allocator, rels: *std.ArrayList([]u8)) void {
+    for (rels.items) |r| gpa.free(r);
+    rels.deinit(gpa);
+}
+
+/// `folder`\`rel`, rel's '/' as '\'.
+fn folderPath(buf: []u8, folder: []const u8, rel: []const u8) ![]const u8 {
+    var w: Io.Writer = .fixed(buf);
+    w.writeAll(folder) catch return error.NameTooLong;
+    w.writeAll("\\") catch return error.NameTooLong;
+    for (rel) |c| w.writeByte(if (c == '/') '\\' else c) catch return error.NameTooLong;
+    return w.buffered();
+}
+
+/// Whether `folder` holds exactly the files of the newest published
+/// version of `package` (the same paths, sizes and SHA-256: the content its
+/// signed manifest names), so publishing it would add a version that
+/// changes nothing. False when nothing is published yet.
+pub fn sameAsLatest(gpa: Allocator, io: Io, paths: Paths, package: []const u8, folder: []const u8) !bool {
+    var v = (try latest(gpa, io, paths, package)) orelse return false;
+    defer v.deinit(gpa);
+    var problem: [300]u8 = undefined;
+    var rels = try folderFiles(gpa, io, folder, &problem);
+    defer freeFolderFiles(gpa, &rels);
+    if (rels.items.len != v.m.files.len) return false;
+    for (rels.items, v.m.files) |rel, f| {
+        if (!std.mem.eql(u8, rel, f.path)) return false;
+        var sb: [1400]u8 = undefined;
+        const c = try copyHashed(io, try folderPath(&sb, folder, rel), null, manifest.max_package_bytes);
+        if (c.size != f.size or !std.mem.eql(u8, &c.sha, &f.sha256)) return false;
+    }
+    return true;
+}
+
+/// Hashes and signs `opts.folder` as a new version of `opts.package`.
+/// `problem` gets a description of a refused file path.
+pub fn publish(gpa: Allocator, io: Io, paths: Paths, opts: PublishOptions, problem: *[300]u8) !Published {
+    if (!manifest.validPackageId(opts.package)) return error.BadPackageId;
+    if (opts.version) |v| if (!manifest.validVersion(v)) return error.BadVersion;
+    if (!manifest.validClientVersion(opts.min_client)) return error.BadClientVersion;
+    var key = (try loadKey(gpa, io, paths)) orelse return error.NoSyncKey;
+    defer key.wipe();
+
+    var rels = try folderFiles(gpa, io, opts.folder, problem);
+    defer freeFolderFiles(gpa, &rels);
 
     var pb: [1024]u8 = undefined;
     const pkg_dir = try paths.join(&pb, &.{ "publish", opts.package });
@@ -266,7 +313,11 @@ pub fn publish(gpa: Allocator, io: Io, paths: Paths, opts: PublishOptions, probl
     defer gpa.free(hist.text);
     const seq = hist.last_sequence + 1;
     var out: Published = .{ .sequence = seq };
-    const ver = opts.version orelse (std.fmt.bufPrint(&out.version_buf, "{d}", .{seq}) catch unreachable);
+    const ver = opts.version orelse if (opts.version_base) |base|
+        (std.fmt.bufPrint(&out.version_buf, "{s}+{d}", .{ base, seq }) catch return error.BadVersion)
+    else
+        (std.fmt.bufPrint(&out.version_buf, "{d}", .{seq}) catch unreachable);
+    if (!manifest.validVersion(ver)) return error.BadVersion;
     if (opts.version) |v| @memcpy(out.version_buf[0..v.len], v);
     out.version_len = ver.len;
     const version = out.version();
@@ -289,25 +340,16 @@ pub fn publish(gpa: Allocator, io: Io, paths: Paths, opts: PublishOptions, probl
     var placed = false;
     defer if (!placed) Io.Dir.cwd().deleteTree(io, tmp) catch {};
 
-    // Sort first: file n in the store is file n of the manifest.
-    std.mem.sort([]u8, rels.items, {}, struct {
-        fn lt(_: void, a: []u8, b: []u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lt);
+    // Sorted by folderFiles: file n in the store is file n of the manifest.
     const files = try gpa.alloc(manifest.File, rels.items.len);
     defer gpa.free(files);
     var total: u64 = 0;
     for (rels.items, 0..) |rel, i| {
         var sb: [1400]u8 = undefined;
-        var src_w: Io.Writer = .fixed(&sb);
-        src_w.writeAll(opts.folder) catch return error.NameTooLong;
-        src_w.writeAll("\\") catch return error.NameTooLong;
-        for (rel) |c| src_w.writeByte(if (c == '/') '\\' else c) catch return error.NameTooLong;
         var db: [1200]u8 = undefined;
         var nb: [16]u8 = undefined;
         const dst = try joinBuf(&db, &.{ tmp, "files", try std.fmt.bufPrint(&nb, "{d}", .{i}) });
-        const c = try copyHashed(io, src_w.buffered(), dst, manifest.max_package_bytes - total);
+        const c = try copyHashed(io, try folderPath(&sb, opts.folder, rel), dst, manifest.max_package_bytes - total);
         total += c.size;
         files[i] = .{ .path = rel, .size = c.size, .sha256 = c.sha };
     }
