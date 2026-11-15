@@ -75,8 +75,8 @@ deferred: Window.Queue = .{},
 /// until `.foreground` (a GPU submit in the background gets an iOS app
 /// killed).
 suspended: bool = false,
-/// The id of the frame's text slot the native field last showed (focus
-/// moves raise the keyboard).
+/// The id of the frame's text slot the native field last showed, null
+/// while it is hidden (see raisesKeyboard).
 native_id: ?u32 = null,
 /// What the native field is known to contain (the last text exchanged
 /// with it), to turn its edits into key presses for the host.
@@ -296,6 +296,13 @@ pub fn pollEvents(p: *Presenter, sink: input.InputSink) bool {
             // pointer; elsewhere grid rows that do not fit (handleViewEvent).
             // (iOS drags arrive as the pointer: Frame.touch.)
             .scroll => |w| if (!p.frame.wheel(w.x, w.y, w.dy, sink)) p.handleViewEvent(e),
+            // The window turned or was resized: a finger still down began
+            // in the old layout (a swipe would read the new space's points
+            // as a fling); it is cancelled before its next move.
+            .resize => |r| {
+                p.frame.layoutChanged(.{ r.width, r.height }, sink);
+                p.handleViewEvent(e);
+            },
             else => p.handleViewEvent(e),
         }
         p.dirty = true;
@@ -380,6 +387,13 @@ pub fn present(p: *Presenter) void {
         p.art_uploaded = true;
     }
     p.img.clearUploads();
+    // The swapchain follows the size this frame was laid out for: the
+    // window can change size again after its last .resize was handled (an
+    // iPhone turning lays out more than once), and a frame drawn into the
+    // old extent would stay stretched until the next event. Unchanged,
+    // this does nothing (Instanced2D.resize).
+    const built = p.frame.fb;
+    if (built[0] > 0 and built[1] > 0) renderer.resize(built[0], built[1]);
     const bg = p.frame.list.clear;
     renderer.drawFrame(.{
         @as(f32, @floatFromInt(bg[0])) / 255,
@@ -646,7 +660,7 @@ fn syncNativeField(p: *Presenter) void {
         p.native_id = null;
         return;
     };
-    const moved = p.native_id != null and p.native_id.? != slot.id;
+    const raise = raisesKeyboard(p.native_id, slot.id);
     if (!p.window.showTextInput(.{
         .x = slot.rect.x,
         .y = slot.rect.y,
@@ -655,17 +669,30 @@ fn syncNativeField(p: *Presenter) void {
         .font_px = slot.font_px,
         .fg = ui.theme.ui.text,
         .bg = ui.theme.ui.field,
-        .focus = moved,
+        .focus = raise,
     })) {
         p.native_supported = false;
         return;
     }
-    if (moved or p.native_id == null or !std.mem.eql(u8, slot.value(), p.native_buf[0..p.native_len])) {
+    if (raise or !std.mem.eql(u8, slot.value(), p.native_buf[0..p.native_len])) {
         p.window.setTextInputText(slot.value());
         @memcpy(p.native_buf[0..slot.value_len], slot.value());
         p.native_len = slot.value_len;
     }
     p.native_id = slot.id;
+}
+
+/// The UI's focused field takes the keyboard when it appears (the first
+/// time too: nothing was shown before it) or the focus moved to another
+/// field; not again while the same field stays on screen.
+fn raisesKeyboard(shown: ?u32, id: u32) bool {
+    return if (shown) |s| s != id else true;
+}
+
+test "the native field takes the keyboard when it first appears, reappears or the focus moves" {
+    try std.testing.expect(raisesKeyboard(null, 7)); // the first show
+    try std.testing.expect(!raisesKeyboard(7, 7)); // still shown
+    try std.testing.expect(raisesKeyboard(7, 8)); // another field
 }
 
 /// The native field's text changed: hand the difference to the host as

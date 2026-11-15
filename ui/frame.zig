@@ -388,8 +388,9 @@ pub const Overlay = struct {
     status: StatusLine = .{},
     /// A modal layer over the whole layout (pairing, devices, settings).
     panel: ?Panel = null,
-    /// Touch input: finger-sized targets (tabs at least `touch_target`
-    /// logical px tall).
+    /// Touch input: finger-sized targets (tabs, the usage strip and panel
+    /// rows at least `touch_target` logical px tall; every tap target
+    /// grown to it where there is room, Frame.growTouchHits).
     touch: bool = false,
     /// A short notice over the bottom right of the main slice (a headset
     /// connected); the glue removes it at its own deadline.
@@ -401,8 +402,10 @@ pub const Toast = struct {
     tone: Tone = .normal,
 };
 
-/// Smallest height (logical px) of a tab's hit area on touch devices.
-pub const touch_target: f32 = 40;
+/// The touch minimum (logical px; on an iPhone a logical px is a point):
+/// Apple's 44 pt. Every tap target on touch is at least this tall and
+/// wide (Overlay.touch).
+pub const touch_target: f32 = 44;
 
 pub const Sizing = union(enum) {
     /// Scale the font to the host's grid (remote view): its columns fill the
@@ -452,6 +455,12 @@ const Press = struct {
     /// (Frame.now_ms).
     alt: ?u32 = null,
     t0_ms: i64 = 0,
+    /// The layout it began in (Frame.fb and Frame.origin then): when the
+    /// window turns (a rotation) or the insets move the origin, the
+    /// finger's later points are in another space; it is cancelled
+    /// (Frame.layoutChanged).
+    fb: [2]u32 = .{ 0, 0 },
+    org: [2]f32 = .{ 0, 0 },
 
     fn setAction(pr: *Press, h: Hit) void {
         pr.alt = h.alt;
@@ -530,6 +539,18 @@ pub const Frame = struct {
     cells: CellLayout = .{},
     /// Edges to keep clear, set by the window layer before build.
     insets: Insets = .{},
+    /// Where the last build's layout origin went in the window (its
+    /// insets' shift): content views lay out before the shift, so their
+    /// drags are given in that space (viewDrag).
+    origin: [2]f32 = .{ 0, 0 },
+    /// The window size of the last build (pixels).
+    fb: [2]u32 = .{ 0, 0 },
+    /// The last build's clear area (W x H) with a panel: when it changes
+    /// (a rotation, the keyboard) the focused field or row is brought
+    /// into view again.
+    panel_area: [2]f32 = .{ 0, 0 },
+    /// The last build's Overlay.touch: finger-sized targets.
+    touch_sized: bool = false,
     /// The focused text field of the last frame (see TextSlot).
     text_slot: ?TextSlot = null,
     /// Grid rows scrolled back above the followed rows (see followTop)
@@ -545,6 +566,10 @@ pub const Frame = struct {
     /// Pixels one wheel notch scrolls (three lines of the chrome font).
     wheel_px: f32 = 48,
     press: Press = .{},
+    /// A press was cancelled because the layout changed under it
+    /// (layoutChanged, pressStale): the rest of that finger's moves and
+    /// its release are dropped, not passed on as mouse input.
+    orphaned: bool = false,
     /// A touch screen (iOS; the window delivers one finger as the
     /// pointer): nothing acts on a press, every button is a tap (fires on
     /// release if the finger did not move off it or drag), and a drag over
@@ -604,6 +629,7 @@ pub const Frame = struct {
 
     pub fn pointerDown(f: *Frame, x: f32, y: f32, button: input.MouseButton, mods: input.Mods, sink: input.InputSink) void {
         f.press = .{};
+        f.orphaned = false;
         // A right-click on something with a menu (a tab): its menu.
         if (button == .right) if (f.hitFull(x, y)) |h| if (h.alt) |alt| return sink.button(alt);
         const hit = if (button == .left) f.hitFull(x, y) else null;
@@ -611,9 +637,9 @@ pub const Frame = struct {
             const in_panel = if (f.panel_box) |b| b.contains(x, y) else false;
             const in_view = f.view_shown and f.regions.terminal.contains(x, y);
             const pan = f.panel_box == null and !in_view and f.regions.terminal.contains(x, y);
-            f.press = .{ .active = true, .x0 = x, .y0 = y, .in_view = in_view, .pan = pan, .panel = in_panel, .last_y = y, .t0_ms = f.now_ms };
+            f.press = .{ .active = true, .x0 = x, .y0 = y, .in_view = in_view, .pan = pan, .panel = in_panel, .last_y = y, .t0_ms = f.now_ms, .fb = f.fb, .org = f.origin };
             if (hit) |h| f.press.setAction(h);
-            if (in_view) sink.drag(.{ .phase = .down, .x = x, .y = y, .scale = f.scale });
+            if (in_view) f.viewDrag(sink, .down, x, y);
             return;
         }
         if (hit) |h| if (!h.tap) {
@@ -624,8 +650,8 @@ pub const Frame = struct {
             return;
         };
         if (button == .left and f.view_shown and f.regions.terminal.contains(x, y)) {
-            f.press = .{ .active = true, .x0 = x, .y0 = y };
-            sink.drag(.{ .phase = .down, .x = x, .y = y, .scale = f.scale });
+            f.press = .{ .active = true, .x0 = x, .y0 = y, .fb = f.fb, .org = f.origin };
+            f.viewDrag(sink, .down, x, y);
             if (hit) |h| f.press.setAction(h);
             return;
         }
@@ -634,9 +660,10 @@ pub const Frame = struct {
 
     pub fn pointerMove(f: *Frame, x: f32, y: f32, sink: input.InputSink) void {
         if (f.press.active) {
+            if (f.pressStale()) return f.orphan(sink);
             if (!f.press.moved and @max(@abs(x - f.press.x0), @abs(y - f.press.y0)) > drag_slop * f.scale) f.press.moved = true;
             if (f.press.in_view) {
-                sink.drag(.{ .phase = .move, .x = x, .y = y, .scale = f.scale });
+                f.viewDrag(sink, .move, x, y);
             } else if (f.press.moved and f.press.panel) {
                 // Finger up: further down the panel.
                 f.scrollPanel(f.press.last_y - y);
@@ -653,14 +680,24 @@ pub const Frame = struct {
             }
             return;
         }
+        if (f.orphaned) return;
         sink.mouse(f.mouseAt(.move, .left, x, y, .{}));
     }
 
     pub fn pointerUp(f: *Frame, x: f32, y: f32, button: input.MouseButton, sink: input.InputSink) void {
+        if (f.orphaned) {
+            f.orphaned = false;
+            return;
+        }
         if (f.press.active) {
+            if (f.pressStale()) {
+                f.orphan(sink);
+                f.orphaned = false;
+                return;
+            }
             const pr = f.press;
             f.press = .{};
-            if (pr.in_view) sink.drag(.{ .phase = .up, .x = x, .y = y, .scale = f.scale });
+            if (pr.in_view) f.viewDrag(sink, .up, x, y);
             if (pr.moved) return;
             // A tap: what it began on, if the release is still on it.
             const h = f.hitFull(x, y) orelse return;
@@ -683,7 +720,29 @@ pub const Frame = struct {
     pub fn pointerCancel(f: *Frame, sink: input.InputSink) void {
         const pr = f.press;
         f.press = .{};
-        if (pr.active and pr.in_view) sink.drag(.{ .phase = .up, .x = pr.x0, .y = pr.y0, .scale = f.scale });
+        // Where it began, in the space it began in (the origin may have
+        // moved since: Press.org).
+        if (pr.active and pr.in_view) sink.drag(.{ .phase = .up, .x = pr.x0 - pr.org[0], .y = pr.y0 - pr.org[1], .scale = f.scale });
+    }
+
+    /// The window is now `fb` pixels (the window layer's resize: an iPhone
+    /// turned): a press begun at another size is cancelled at once, before
+    /// the finger's next point (in the new space) can move a swipe, scroll
+    /// or tap something else. The next build lays out for `fb`.
+    pub fn layoutChanged(f: *Frame, fb: [2]u32, sink: input.InputSink) void {
+        if (f.press.active and !std.meta.eql(f.press.fb, fb)) f.orphan(sink);
+    }
+
+    /// Cancels the press (pointerCancel) and drops the rest of it.
+    fn orphan(f: *Frame, sink: input.InputSink) void {
+        f.pointerCancel(sink);
+        f.orphaned = true;
+    }
+
+    /// The press began in a layout other than the last build's (another
+    /// window size or origin): its points no longer match what it began on.
+    fn pressStale(f: *const Frame) bool {
+        return !std.meta.eql(f.press.fb, f.fb) or !std.meta.eql(f.press.org, f.origin);
     }
 
     /// A wheel turn of `notches` (> 0: away from the user) at (x, y): scrolls
@@ -703,6 +762,12 @@ pub const Frame = struct {
     /// within what it has to scroll.
     pub fn scrollPanel(f: *Frame, dy: f32) void {
         f.panel_scroll = std.math.clamp(@round(f.panel_scroll + dy), 0, @max(0, f.panel_max));
+    }
+
+    /// A drag for the content view at window pixel (x, y), in the space
+    /// it was laid out in (before the insets' shift), like its own rects.
+    fn viewDrag(f: *const Frame, sink: input.InputSink, phase: @FieldType(input.Drag, "phase"), x: f32, y: f32) void {
+        sink.drag(.{ .phase = phase, .x = x - f.origin[0], .y = y - f.origin[1], .scale = f.scale });
     }
 
     fn hitFull(f: *const Frame, x: f32, y: f32) ?Hit {
@@ -753,17 +818,20 @@ pub const Frame = struct {
     pub fn build(f: *Frame, fonts: *const fontset.FontSet, fb: [2]u32, scale: f32, grid: *const Grid, overlay: Overlay) void {
         f.fonts = fonts;
         f.scale = scale;
+        f.fb = fb;
         f.list.reset();
         f.list.clear = f.term.bg;
         f.n_hits = 0;
         f.text_slot = null;
         f.panel_box = null;
+        f.touch_sized = overlay.touch;
         if (overlay.panel == null) {
             // Closed: the next panel starts at its top.
             f.panel_key = 0;
             f.panel_scroll = 0;
             f.panel_max = 0;
             f.panel_focus = null;
+            f.panel_area = .{ 0, 0 };
         }
         // Lay out inside the insets (all zero on desktops), then shift.
         const ins = f.insets;
@@ -779,7 +847,7 @@ pub const Frame = struct {
         // The usage strip is the first line, the top bar under it; below
         // them all is as if the top bar were that much taller. Hidden, the
         // top bar is the first line again and nothing moves.
-        const usage_h: f32 = if (overlay.usage) |u| usageHeight(ui, u, s) else 0;
+        const usage_h: f32 = if (overlay.usage) |u| usageHeight(ui, u, overlay.touch, s) else 0;
         const top_h = bar_top_h + usage_h;
         // The bottom region (interaction slice): its panes' heights, but never
         // more than half the window (the main slice and data keep the rest).
@@ -796,18 +864,42 @@ pub const Frame = struct {
             bar_h += heights[i];
         }
         const room = @max(0, H - status_h - top_h);
+        // A finger's height on touch (0 on desktops: nothing below changes).
+        const finger: f32 = if (overlay.touch) @ceil(touch_target * s) else 0;
         if (bar_h > room / 2) {
             const k = (room / 2) / bar_h;
             bar_h = 0;
+            // On touch no pane shrinks below a finger's height (its targets
+            // still reach the minimum, growTouchHits), so the bottom may
+            // take more than half.
             for (heights[0..n_panes]) |*h| {
-                h.* = @floor(h.* * k);
+                h.* = @max(@floor(h.* * k), @min(h.*, finger));
                 bar_h += h.*;
+            }
+            // Short of room even so (a phone on its side with the keyboard
+            // up): the last panes go (the instruct panel's key row before
+            // its line) while the main slice would be under a finger's
+            // height; the first always stays.
+            while (n_panes > 1 and room - bar_h < finger) {
+                n_panes -= 1;
+                bar_h -= heights[n_panes];
+            }
+            if (bar_h > room) {
+                const k2 = room / bar_h;
+                bar_h = 0;
+                for (heights[0..n_panes]) |*h| {
+                    h.* = @floor(h.* * k2);
+                    bar_h += h.*;
+                }
             }
         }
         // The main slice and the Data slice share what is left: data takes
         // its header strip, or more while it has something to show.
         const middle = @max(0, room - bar_h);
-        const data_h: f32 = if (overlay.data) |d| dataHeight(middle, dataHeaderHeight(ui), dataContentHeight(ui, d, W, s), d.collapsed) else 0;
+        const data_head = dataHeaderHeight(ui, overlay.touch, s);
+        // On touch the Data slice goes while the main slice would keep less
+        // than a finger's height beside its header.
+        const data_h: f32 = if (overlay.data) |d| (if (overlay.touch and middle < data_head + finger) 0 else dataHeight(middle, data_head, dataContentHeight(ui, d, W, s), d.collapsed)) else 0;
         const grid_h = @max(0, middle - data_h);
         f.regions = .{
             .top = .{ .y = usage_h, .w = W, .h = bar_top_h },
@@ -859,10 +951,64 @@ pub const Frame = struct {
             f.text_slot = null;
             f.drawPanel(ui, p, W, H, s);
         }
+        if (f.touch_sized) f.growTouchHits(W, H, touch_target * s);
+    }
+
+    /// Touch: tap targets smaller than `min` (a finger) grow around what
+    /// was drawn, into the free space next to them: by at most half the
+    /// gap to a neighbouring target (so two never overlap and each keeps
+    /// its own side), and never past the clear area (W x H, before the
+    /// insets' shift). What is drawn does not change.
+    fn growTouchHits(f: *Frame, W: f32, H: f32, min: f32) void {
+        var orig: @TypeOf(f.hits) = undefined;
+        const hs = f.hits[0..f.n_hits];
+        @memcpy(orig[0..hs.len], hs);
+        const os = orig[0..hs.len];
+        for (hs, 0..) |*h, i| {
+            const o = os[i];
+            // Room above / below (from targets beside it in x), then left /
+            // right (from those beside it in y).
+            var up: f32 = o.y;
+            var down: f32 = H - (o.y + o.h);
+            var left: f32 = o.x;
+            var right: f32 = W - (o.x + o.w);
+            for (os, 0..) |n, j| {
+                if (j == i) continue;
+                const beside_x = n.x < o.x + o.w and o.x < n.x + n.w;
+                const beside_y = n.y < o.y + o.h and o.y < n.y + n.h;
+                if (beside_x and beside_y) continue; // nested or overlapping: as drawn
+                if (beside_x) {
+                    if (n.y + n.h <= o.y) up = @min(up, (o.y - (n.y + n.h)) / 2);
+                    if (n.y >= o.y + o.h) down = @min(down, (n.y - (o.y + o.h)) / 2);
+                } else if (beside_y) {
+                    if (n.x + n.w <= o.x) left = @min(left, (o.x - (n.x + n.w)) / 2);
+                    if (n.x >= o.x + o.w) right = @min(right, (n.x - (o.x + o.w)) / 2);
+                }
+            }
+            const gy = grow(o.h, min, up, down);
+            const gx = grow(o.w, min, left, right);
+            h.y = o.y - gy[0];
+            h.h = o.h + gy[0] + gy[1];
+            h.x = o.x - gx[0];
+            h.w = o.w + gx[0] + gx[1];
+        }
+    }
+
+    /// How far a `len` long target grows before and after it to reach
+    /// `min`, half each way, the rest on the other side when one is short
+    /// of room (`room_a`, `room_b`).
+    fn grow(len: f32, min: f32, room_a: f32, room_b: f32) [2]f32 {
+        if (len >= min) return .{ 0, 0 };
+        const need = min - len;
+        var a = @min(need / 2, @max(0, room_a));
+        const b = @min(need - a, @max(0, room_b));
+        a = @min(need - b, @max(0, room_a));
+        return .{ a, b };
     }
 
     /// Moves everything built this frame by (dx, dy) (see Insets).
     fn shift(f: *Frame, dx: f32, dy: f32) void {
+        f.origin = .{ dx, dy };
         if (dx == 0 and dy == 0) return;
         f.shiftDrawn(0, 0, dx, dy);
         const rs = [_]*Rect{ &f.regions.top, &f.regions.terminal, &f.regions.bottom, &f.regions.status, &f.regions.data, &f.regions.usage };
@@ -888,7 +1034,8 @@ pub const Frame = struct {
 
     /// Clips the draw commands from `cmd0` and the hits from `hit0` on to
     /// `cl` (x0, y0, x1, y1): rectangles and hits are cut, text and images
-    /// get the clip, glyphs outside it are dropped.
+    /// get the clip, glyphs outside it are dropped (on touch also hits cut
+    /// below a finger's size).
     fn clipDrawn(f: *Frame, cmd0: usize, hit0: usize, cl: [4]f32) void {
         const cmds = &f.list.cmds;
         var keep = cmd0;
@@ -914,9 +1061,13 @@ pub const Frame = struct {
         }
         cmds.shrinkRetainingCapacity(keep);
         var kh = hit0;
+        const min = touch_target * f.scale;
         for (f.hits[hit0..f.n_hits]) |h0| {
             var h = h0;
             if (!clipBox(&h.x, &h.y, &h.w, &h.h, cl)) continue;
+            // On touch a target cut below a finger's size (scrolled mostly
+            // out) is none, like a content view's (Painter.clipTap).
+            if (f.touch_sized and ((h.h < h0.h and h.h < min) or (h.w < h0.w and h.w < min))) continue;
             f.hits[kh] = h;
             kh += 1;
         }
@@ -1095,7 +1246,7 @@ pub const Frame = struct {
         f.rect(r.x, r.y, r.w, @max(1, @round(s)), theme.ui.border); // the edge to the main slice
         const pad = @round(10 * s);
         const lh: f32 = @floatFromInt(ui.cell_h);
-        const head_h = @min(r.h, dataHeaderHeight(ui));
+        const head_h = @min(r.h, dataHeaderHeight(ui, f.touch_sized, s));
         const ty = r.y + @round((head_h - lh) / 2);
         const x0 = r.x + pad;
         // Header buttons, right to left; the rest of the header toggles.
@@ -1543,12 +1694,14 @@ pub const Frame = struct {
         const lh: f32 = @floatFromInt(ui.cell_h);
         const meter_h = @max(2, @round(3 * s));
         const inner = @max(0, r.w - 2 * pad);
+        // Taller than its lines (touch): they sit in the middle.
+        const extra = @max(0, r.h - usageHeight(ui, u, false, s));
         if (u.rows.len == 0) {
-            const y = r.y + @round(2 * s);
+            const y = r.y + @round(2 * s) + @round(extra / 2);
             _ = f.text(ui, pad, y, clipText(ui, u.label, inner, false), usageColor(u.tone, true), u.tone != .muted);
             f.meter(pad, y + lh + @round(3 * s), inner, meter_h, u.pct, u.tone);
         } else {
-            var y = r.y + @round(4 * s);
+            var y = r.y + @round(4 * s) + @round(extra / 2);
             const name_w: f32 = @floatFromInt(ui.cell_w * 13);
             for (u.rows) |row| {
                 const right_w = textWidth(ui, row.right);
@@ -1755,7 +1908,9 @@ pub const Frame = struct {
         // Rows: text on the left, an optional button on the right.
         if (p.rows.len > 0) {
             y += @round(lh * 0.4);
-            const rh = @round(lh * 1.9);
+            // On touch a row is at least a finger tall (its buttons then
+            // reach it with the tap targets' growth, growTouchHits).
+            const rh = if (f.touch_sized) @max(@round(lh * 1.9), @ceil(touch_target * s)) else @round(lh * 1.9);
             for (p.rows, 0..) |r, ri| {
                 if (paint and r.selected) f.rect(x - @round(4 * s), y, w + @round(8 * s), rh, theme.ui.selected_row);
                 if (!paint and r.selected) f.focus_mark = .{ .key = (1 << 32) | ri, .y0 = y - y0, .y1 = y - y0 + rh };
@@ -1866,6 +2021,13 @@ pub const Frame = struct {
             f.panel_scroll = 0;
             f.panel_focus = null;
         }
+        // Re-laid out for another area (a rotation, the keyboard): the
+        // scroll stays (clamped), the focused field or row comes into
+        // view again.
+        if (!std.meta.eql(f.panel_area, [2]f32{ W, H })) {
+            f.panel_area = .{ W, H };
+            f.panel_focus = null;
+        }
         const sc = panelScroll(body_h, btn_h, pad, H - 2 * margin, f.panel_scroll, if (mark) |m| (if (f.panel_focus != m.key) [2]f32{ m.y0, m.y1 } else null) else null, @round(lh / 2));
         f.panel_focus = if (mark) |m| m.key else null;
         f.panel_scroll = sc.scroll;
@@ -1949,14 +2111,27 @@ pub const Painter = struct {
         p.f.list.pushTextStyled(p.f.gpa, x, y, s, p.f.font(m), .{ .bold = bold, .italic = italic }, draw.rgba(c, 255), if (inside) null else cl);
         return end;
     }
+    /// A tap target's part inside the clip. On touch, a target cut below
+    /// a finger's size (scrolled mostly out of the view, under the bars)
+    /// is none: a sliver beside the top bar or the input line would take
+    /// taps meant for them, and it cannot grow (growTouchHits). Scrolling
+    /// it into view makes it a target again; drags still reach the view.
+    fn clipTap(p: *const Painter, x: f32, y: f32, w: f32, h: f32) ?Rect {
+        const r = p.clipRect(x, y, w, h) orelse return null;
+        if (p.f.touch_sized) {
+            const min = touch_target * p.s;
+            if ((r.h < h and r.h < min) or (r.w < w and r.w < min)) return null;
+        }
+        return r;
+    }
     /// A tap target that answers `key` (InputSink.answer), clipped.
     pub fn tapAnswer(p: *Painter, x: f32, y: f32, w: f32, h: f32, key: []const u8) void {
-        const r = p.clipRect(x, y, w, h) orelse return;
+        const r = p.clipTap(x, y, w, h) orelse return;
         p.f.addHit(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h, .action = .{ .answer = key }, .tap = true });
     }
     /// A tap target that reports `id` (InputSink.button), clipped.
     pub fn tapButton(p: *Painter, x: f32, y: f32, w: f32, h: f32, id: u32) void {
-        const r = p.clipRect(x, y, w, h) orelse return;
+        const r = p.clipTap(x, y, w, h) orelse return;
         p.f.addHit(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h, .action = .{ .button = id }, .tap = true });
     }
 
@@ -2008,9 +2183,11 @@ pub fn answerButtonHeight(act: Metrics) f32 {
     return @round(@round(@as(f32, @floatFromInt(act.cell_h)) * 2.6) * 0.78);
 }
 
-/// The Data slice's header strip.
-fn dataHeaderHeight(ui: Metrics) f32 {
-    return @round(@as(f32, @floatFromInt(ui.cell_h)) * 2.0);
+/// The Data slice's header strip; on touch at least a finger's height (the
+/// strip is its Show / Hide button).
+fn dataHeaderHeight(ui: Metrics, touch: bool, s: f32) f32 {
+    const h = @round(@as(f32, @floatFromInt(ui.cell_h)) * 2.0);
+    return if (touch) @max(h, @ceil(touch_target * s)) else h;
 }
 
 /// What the Data slice's items would like under its header (0: nothing to
@@ -2048,12 +2225,15 @@ pub fn fitImage(w: u32, h: u32, box_w: f32, box_h: f32) [2]f32 {
 }
 
 /// The usage strip's height: a line and the meter, or the expanded rows
-/// and note.
-fn usageHeight(ui: Metrics, u: UsageStrip, s: f32) f32 {
+/// and note; on touch at least a finger's (it is one button).
+fn usageHeight(ui: Metrics, u: UsageStrip, touch: bool, s: f32) f32 {
     const lh: f32 = @floatFromInt(ui.cell_h);
-    if (u.rows.len == 0) return @round(2 * s) + lh + @round(3 * s) + @max(2, @round(3 * s)) + @round(6 * s);
     const n: f32 = @floatFromInt(u.rows.len);
-    return @round(4 * s) + n * @round(lh * 1.4) + (if (u.note.len > 0) lh else 0) + @round(6 * s);
+    const h = if (u.rows.len == 0)
+        @round(2 * s) + lh + @round(3 * s) + @max(2, @round(3 * s)) + @round(6 * s)
+    else
+        @round(4 * s) + n * @round(lh * 1.4) + (if (u.note.len > 0) lh else 0) + @round(6 * s);
+    return if (touch) @max(h, @ceil(touch_target * s)) else h;
 }
 
 /// The usage strip's colours (shared/theme.zig): neutral (dim text, the
@@ -2519,7 +2699,7 @@ test "textEdit: append, delete, replace in the middle, multibyte" {
     try std.testing.expectEqualStrings("\u{e8}", e.insert);
 }
 
-test "touch: tabs at least 40 logical px tall" {
+test "touch: tabs at least touch_target logical px tall" {
     const m: Metrics = .{ .em = 13, .cell_w = 8, .cell_h = 16, .baseline = 12, .underline_y = 14, .stroke = 1 };
     for ([_]f32{ 1, 1.5, 2 }) |s| try std.testing.expect(@round(topBarHeight(m, true, s) * 0.8) >= touch_target * s);
     try std.testing.expectEqual(@round(16 * 1.8), topBarHeight(m, false, 1));
@@ -2656,6 +2836,90 @@ test "touch: nothing acts on a press; buttons are taps; a cancel never taps; dra
     try std.testing.expectEqual(@as(usize, 1), r.n_answers);
 }
 
+test "touch: small targets grow into the free space, half way to a neighbour, not past the edges" {
+    var f = Frame.init(std.testing.allocator, .fit_grid);
+    defer f.deinit();
+    // Two 30 px buttons 20 px apart, one 10 px from the top; a big one.
+    f.addHit(.{ .x = 100, .y = 10, .w = 200, .h = 30, .action = .{ .button = 1 } });
+    f.addHit(.{ .x = 100, .y = 60, .w = 200, .h = 30, .action = .{ .button = 2 } });
+    f.addHit(.{ .x = 0, .y = 200, .w = 400, .h = 100, .action = .{ .button = 3 } });
+    f.growTouchHits(400, 400, 60);
+    const a = f.hits[0];
+    const b = f.hits[1];
+    // The first: 10 up (the edge), 10 down (half the gap).
+    try std.testing.expectEqual(@as(f32, 0), a.y);
+    try std.testing.expectEqual(@as(f32, 50), a.h);
+    // The second: 10 up (half the gap), the rest down.
+    try std.testing.expectEqual(@as(f32, 50), b.y);
+    try std.testing.expectEqual(@as(f32, 60), b.h);
+    try std.testing.expect(a.y + a.h <= b.y);
+    // Wide and tall enough already: as drawn.
+    try std.testing.expectEqual(@as(f32, 100), f.hits[2].h);
+    try std.testing.expectEqual(@as(f32, 200), a.w);
+}
+
+test "insets: a content view's drags are in the space it was laid out in" {
+    var f = Frame.init(std.testing.allocator, .fit_grid);
+    defer f.deinit();
+    var r: TapRec = .{};
+    const sink: input.InputSink = .{ .ctx = &r, .vtable = &TapRec.vt };
+    f.view_shown = true;
+    f.touch = true;
+    // Laid out at (0, 0), shifted by the safe area's left 12 and top 177.
+    f.regions.terminal = .{ .x = 0, .y = 0, .w = 400, .h = 300 };
+    f.shift(12, 177);
+    f.pointerDown(112, 277, .left, .{}, sink);
+    try std.testing.expectEqual(@as(f32, 100), r.last_drag.x);
+    try std.testing.expectEqual(@as(f32, 100), r.last_drag.y);
+    f.pointerMove(212, 277, sink);
+    try std.testing.expectEqual(@as(f32, 200), r.last_drag.x);
+    f.pointerCancel(sink);
+    try std.testing.expectEqual(@as(f32, 100), r.last_drag.x);
+}
+
+test "turning: a press begun in another layout is cancelled where it began, the rest of it dropped" {
+    var f = Frame.init(std.testing.allocator, .fit_grid);
+    defer f.deinit();
+    var r: TapRec = .{};
+    const sink: input.InputSink = .{ .ctx = &r, .vtable = &TapRec.vt };
+    f.view_shown = true;
+    f.touch = true;
+    f.fb = .{ 400, 800 };
+    f.regions.terminal = .{ .x = 0, .y = 0, .w = 400, .h = 600 };
+    f.shift(0, 50);
+    // A drag in the view, then the window turns (the window layer's resize).
+    f.pointerDown(100, 150, .left, .{}, sink);
+    f.pointerMove(200, 150, sink);
+    try std.testing.expectEqual(@as(f32, 200), r.last_drag.x);
+    f.layoutChanged(.{ 400, 800 }, sink); // the same size: nothing
+    try std.testing.expect(f.press.active);
+    f.layoutChanged(.{ 800, 400 }, sink);
+    try std.testing.expect(!f.press.active);
+    // Released where it began, in the space it began in.
+    try std.testing.expectEqual(input.Drag{ .phase = .up, .x = 100, .y = 100, .scale = 1 }, r.last_drag);
+    // The next build moved the origin; the finger's later points do nothing.
+    f.fb = .{ 800, 400 };
+    f.shift(60, 0);
+    const drags = r.drags;
+    f.pointerMove(700, 300, sink);
+    f.pointerUp(700, 300, .left, sink);
+    try std.testing.expectEqual(drags, r.drags);
+    try std.testing.expectEqual(@as(usize, 0), r.mice);
+    try std.testing.expectEqual(@as(usize, 0), r.buttons);
+    // The same window size but another origin (the mirrored landscape):
+    // cancelled at its next point.
+    f.addHit(.{ .x = 60, .y = 0, .w = 100, .h = 100, .action = .{ .button = 7 } });
+    f.pointerDown(100, 50, .left, .{}, sink);
+    f.shift(0, 0);
+    f.pointerUp(100, 50, .left, sink);
+    try std.testing.expectEqual(@as(usize, 0), r.buttons);
+    try std.testing.expectEqual(@as(usize, 0), r.mice);
+    // A fresh press in the new layout taps.
+    f.pointerDown(100, 50, .left, .{}, sink);
+    f.pointerUp(100, 50, .left, sink);
+    try std.testing.expectEqual(@as(usize, 1), r.buttons);
+}
+
 test "hit-testing maps clicks to what the last frame drew" {
     var f = Frame.init(std.testing.allocator, .fit_grid);
     defer f.deinit();
@@ -2762,7 +3026,7 @@ const IdRec = struct {
 };
 
 /// The centre of the hit for button `id` in the last frame.
-fn hitCentre(f: *const Frame, id: u32) ?[2]f32 {
+pub fn hitCentre(f: *const Frame, id: u32) ?[2]f32 {
     for (f.hits[0..f.n_hits]) |h| switch (h.action) {
         .button => |b| if (b == id) return .{ h.x + h.w / 2, h.y + h.h / 2 },
         else => {},
@@ -3054,6 +3318,64 @@ test "a panel taller than the window: the wheel scrolls it, its buttons stay rea
     f.build(&fs, .{ 1200, 600 }, 1, &g, o);
     try std.testing.expectEqual(@as(f32, 0), f.panel_max);
     try expectHits(&f, &.{ 2000, 2001, 2100 }, &.{});
+}
+
+test "a panel re-laid out for another window (turned): the scroll stays in range, the focused field comes into view again" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .{ .fixed_em = 14 });
+    defer f.deinit();
+    var g: Grid = .{};
+    var fields: [14]PanelField = undefined;
+    for (&fields, 0..) |*fl, i| fl.* = .{ .label = "A setting", .value = "value", .id = @intCast(2000 + i) };
+    fields[13].focused = true;
+    const buttons = [_]PanelButton{.{ .label = "Save", .id = 2100 }};
+    const o: Overlay = .{ .panel = .{ .title = "Settings", .fields = &fields, .buttons = &buttons } };
+    f.build(&fs, .{ 600, 1200 }, 1, &g, o);
+    f.build(&fs, .{ 600, 1200 }, 1, &g, o);
+    try expectHits(&f, &.{2013}, &.{});
+    // Turned: shorter, it scrolls; the focused field is shown.
+    f.build(&fs, .{ 1200, 600 }, 1, &g, o);
+    try std.testing.expect(f.panel_max > 0 and f.panel_scroll <= f.panel_max);
+    try expectHits(&f, &.{ 2013, 2100 }, &.{2000});
+    // Scrolled away by the wheel: the same size keeps that.
+    var r: TapRec = .{};
+    const sink: input.InputSink = .{ .ctx = &r, .vtable = &TapRec.vt };
+    try std.testing.expect(f.wheel(10, 10, 100, sink));
+    f.build(&fs, .{ 1200, 600 }, 1, &g, o);
+    try expectHits(&f, &.{2000}, &.{2013});
+    // Turned again (another area): back in view, the scroll clamped.
+    f.build(&fs, .{ 1000, 500 }, 1, &g, o);
+    try std.testing.expect(f.panel_scroll <= f.panel_max);
+    try expectHits(&f, &.{2013}, &.{});
+}
+
+test "short of room: desktop panes share half; on touch none goes under a finger, the last ones go first" {
+    const gpa = std.testing.allocator;
+    var fs = fontset.FontSet.load(gpa, std.testing.io) catch return error.SkipZigTest;
+    defer fs.deinit();
+    var f = Frame.init(gpa, .fit_grid);
+    defer f.deinit();
+    var g: Grid = .{};
+    const bs = [_]PanelButton{.{ .label = "Close", .id = 2200 }};
+    const panes = [_]Pane{ .{ .content = .{ .buttons = &bs } }, .{ .content = .{ .buttons = &bs } }, .{ .content = .{ .buttons = &bs } } };
+    var o: Overlay = .{ .bottom = &panes, .top_bar = .{ .title = "t" } };
+    for ([_]f32{ 260, 400 }) |h| {
+        f.build(&fs, .{ 800, @intFromFloat(h) }, 1, &g, o);
+        const room = f.regions.status.y - f.regions.terminal.y;
+        try std.testing.expectEqual(@as(usize, 3), f.regions.n_panes);
+        try std.testing.expect(f.regions.bottom.h <= room / 2 + 0.5);
+    }
+    o.touch = true;
+    f.build(&fs, .{ 800, 400 }, 1, &g, o);
+    for (f.regions.panes[0..f.regions.n_panes]) |r| try std.testing.expect(r.h >= touch_target);
+    try std.testing.expect(f.regions.terminal.h >= touch_target);
+    // Shorter: the last panes go, the main slice keeps a finger.
+    f.build(&fs, .{ 800, 200 }, 1, &g, o);
+    try std.testing.expect(f.regions.n_panes < 3 and f.regions.n_panes >= 1);
+    for (f.regions.panes[0..f.regions.n_panes]) |r| try std.testing.expect(r.h >= touch_target);
+    try std.testing.expect(f.regions.terminal.h >= touch_target);
 }
 
 test "status line at phone width: the items never overlap" {

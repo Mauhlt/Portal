@@ -211,7 +211,7 @@ pub const Sheet = struct {
 
 const testing = std.testing;
 
-fn sample() projects.List {
+pub fn sample() projects.List {
     var l: projects.List = .{};
     l.items[0] = .{ .color = 0x4DA3FF, .mode = .ask, .running = true };
     l.items[0].setName("Portal");

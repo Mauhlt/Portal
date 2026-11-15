@@ -1,8 +1,10 @@
 //! The OS side of touch input for the shared UI on Windows (a Surface
 //! tablet running `portal connect`, or the desk on a touch screen): what
 //! the device offers (`query`, the shell's Touch parameter) and the
-//! on-screen touch keyboard (`setVisible`). Elsewhere both are no-ops; the
-//! iPhone app brings its own keyboard (a UITextView over the input slot).
+//! on-screen touch keyboard (`setVisible`). The iPhone always has a touch
+//! screen (`query` says so, for finger-sized targets) and brings its own
+//! keyboard (a UITextView over the input slot), so there `setVisible` is a
+//! no-op; elsewhere both are.
 //!
 //! Taps already arrive as clicks: Windows promotes touch to mouse messages
 //! for windows that do not register for touch, and the Window module turns
@@ -20,12 +22,15 @@ const builtin = @import("builtin");
 const ui = @import("portal_ui");
 
 const is_windows = builtin.os.tag == .windows;
+const is_ios = builtin.os.tag == .ios;
 
 /// What this device offers right now: touch input, and whether no hardware
 /// keyboard is attached (a convertible in slate / tablet posture), so the
 /// UI offers the on-screen one. Cheap (two GetSystemMetrics): the glue
 /// calls it per frame.
 pub fn query() ui.shell.Touch {
+    // The system keyboard comes with the native text field (the Presenter).
+    if (is_ios) return .{ .enabled = true };
     if (!is_windows) return .{};
     const touches = w.GetSystemMetrics(SM_MAXIMUMTOUCHES);
     if (touches <= 0) return .{};
@@ -115,8 +120,9 @@ const w = if (is_windows) struct {
     extern "shell32" fn ShellExecuteW(hwnd: ?*anyopaque, op: ?[*:0]const u16, file: [*:0]const u16, params: ?[*:0]const u16, dir: ?[*:0]const u16, show: i32) callconv(.winapi) ?*anyopaque;
 } else struct {};
 
-test "query off Windows / without touch is empty" {
-    if (!is_windows) try std.testing.expect(!query().enabled);
+test "query: touch on iOS (its own keyboard), none off Windows, no keyboard without touch" {
     const t = query();
+    if (is_ios) try std.testing.expect(t.enabled and !t.on_screen_keyboard);
+    if (!is_windows and !is_ios) try std.testing.expect(!t.enabled);
     if (!t.enabled) try std.testing.expect(!t.on_screen_keyboard);
 }

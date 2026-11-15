@@ -56,8 +56,10 @@ pub const Mouse = struct {
     mods: Mods = .{},
 };
 
-/// A press, move or release over a content view (window pixels; `scale`:
-/// device pixels per logical pixel), for scrolling and swiping.
+/// A press, move or release over a content view, for scrolling and
+/// swiping: in the pixels the view was drawn in (its draw rect's: the
+/// window's, less the insets' shift, Frame.origin); `scale`: device
+/// pixels per logical pixel.
 pub const Drag = struct {
     phase: enum { down, move, up },
     x: f32,

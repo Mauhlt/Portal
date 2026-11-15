@@ -97,4 +97,5 @@ test {
     _ = panels.audio;
     _ = panels.projects;
     _ = dictation;
+    _ = @import("shell_touch_tests.zig");
 }
