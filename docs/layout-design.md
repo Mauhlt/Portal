@@ -263,7 +263,7 @@ line, on a phone directly under the system's clock and status line
 ┌────────────────────────────────────────────┐
 │ Week 62% · resets Mon                      │  the usage strip: one line
 │ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬───────────────│  and a slim meter
-│ ● Portal  ● WireGuard          [••• 3 hidden]│  top bar (tabs)
+│ ● Portal  ● WireGuard        [••• 3 hidden]│  top bar (tabs)
 ├────────────────────────────────────────────┤
 ```
 
