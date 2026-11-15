@@ -72,6 +72,24 @@ pub const Bus = enum {
     }
 };
 
+/// An Apple audio input port (AVAudioSessionPortDescription.portType) as
+/// a Kind and Bus, so the iPhone picks its microphone with the same rule
+/// as the desk (`choose`): a wired or Bluetooth headset before the
+/// built-in microphone. The iPhone app fills a `List` from its session's
+/// available inputs (client/src/ios/mic.zig).
+pub const ApplePort = struct { kind: Kind, bus: Bus };
+
+pub fn fromApplePort(port_type: []const u8) ApplePort {
+    const eql = std.mem.eql;
+    if (eql(u8, port_type, "MicrophoneWired")) return .{ .kind = .headset, .bus = .other };
+    if (eql(u8, port_type, "BluetoothHFP")) return .{ .kind = .headset, .bus = .bluetooth };
+    if (eql(u8, port_type, "USBAudio")) return .{ .kind = .microphone, .bus = .usb };
+    if (eql(u8, port_type, "MicrophoneBuiltIn")) return .{ .kind = .microphone, .bus = .builtin };
+    if (eql(u8, port_type, "LineIn")) return .{ .kind = .line_in, .bus = .other };
+    if (eql(u8, port_type, "CarAudio")) return .{ .kind = .handset, .bus = .bluetooth };
+    return .{ .kind = .other, .bus = .other };
+}
+
 pub const max_id = 256;
 pub const max_name = 128;
 pub const max_endpoints = 16;
@@ -269,4 +287,20 @@ test "headset changes and labels" {
     for (0..100) |i| @memcpy(long[2 * i ..][0..2], "\u{00E9}");
     t.set(&long); // 200 bytes: cut at a code point boundary
     try testing.expect(t.len <= max_name and std.unicode.utf8ValidateSlice(t.get()));
+}
+
+test "iPhone ports: a headset (wired or Bluetooth) before the built-in microphone" {
+    var l: List = .{};
+    const ports = [_][]const u8{ "MicrophoneBuiltIn", "USBAudio", "BluetoothHFP" };
+    for (ports, 0..) |p, i| {
+        const a = fromApplePort(p);
+        var e = testEndpoint(&.{@as(u8, '0') + @as(u8, @intCast(i))}, p, a.kind, a.bus);
+        e.default_console = a.bus == .builtin;
+        l.append(e);
+    }
+    try testing.expectEqual(@as(usize, 2), choose(&l, .automatic).?.index);
+    l.len = 2; // the headset went: the built-in one (the session's default)
+    try testing.expectEqual(@as(usize, 0), choose(&l, .automatic).?.index);
+    try testing.expect(fromApplePort("MicrophoneWired").kind == .headset);
+    try testing.expect(fromApplePort("Something new").kind == .other);
 }

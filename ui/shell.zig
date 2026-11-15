@@ -211,6 +211,10 @@ pub const Viewer = struct {
     /// The desktop's input mode (hello's `input`; null before hello).
     mode: ?rules.Policy = null,
     detail: []const u8 = "",
+    /// The device's own status note (connect.Platform.note), e.g. why the
+    /// iPhone's background tunnel is not up: in the status line, ahead of
+    /// `detail`. "" for none.
+    note: []const u8 = "",
     /// The desktop's address (status line).
     host: []const u8 = "",
     /// A picture of the terminal exists.
@@ -1163,6 +1167,10 @@ pub const Shell = struct {
                 // panel (questions in the Conversation view carry their
                 // own controls). No answer bar (on the desk neither).
                 o.bottom = sh.instructBottom(mode);
+                if (v.note.len > 0) {
+                    o.status.extra = std.fmt.bufPrint(&b.extra, "{s}: {s}", .{ mode.label(), v.note }) catch mode.label();
+                    o.status.extra_tone = .warn;
+                }
                 if (mode == .instruct) {
                     const lv = sh.line.snapshot();
                     if (lv.note.len > 0) {
@@ -1171,7 +1179,7 @@ pub const Shell = struct {
                     }
                 }
             },
-            else => o.status.extra = v.detail,
+            else => o.status.extra = if (v.note.len == 0) v.detail else if (v.detail.len == 0) v.note else std.fmt.bufPrint(&b.extra, "{s} ({s})", .{ v.note, v.detail }) catch v.note,
         }
         // Certificate / pinning trouble: say so in the window, prominently,
         // instead of retrying silently behind an old picture.
@@ -1614,6 +1622,21 @@ const Rec = struct {
         return r.frames[r.n_frames - 1][0..r.lens[r.n_frames - 1]];
     }
 };
+
+test "viewer: the device's own note leads the status line, connected or not" {
+    var r: Rec = .{};
+    var sh = Shell.init(testing.allocator, .viewer, r.host());
+    defer sh.deinit();
+    const off = sh.overlay(.{ .viewer = .{ .status = .retrying, .detail = "retrying in 2 s", .note = "Background tunnel: not allowed", .host = "h", .has_grid = true } });
+    try testing.expectEqualStrings("Background tunnel: not allowed (retrying in 2 s)", off.status.extra);
+    const only = sh.overlay(.{ .viewer = .{ .status = .connecting, .note = "Background tunnel: starting", .host = "h" } });
+    try testing.expectEqualStrings("Background tunnel: starting", only.status.extra);
+    const plain = sh.overlay(.{ .viewer = .{ .status = .retrying, .detail = "refused", .host = "h", .has_grid = true } });
+    try testing.expectEqualStrings("refused", plain.status.extra);
+    const on = sh.overlay(.{ .viewer = .{ .status = .connected, .mode = .keys, .note = "in-app tunnel", .host = "h", .has_grid = true } });
+    try testing.expect(std.mem.endsWith(u8, on.status.extra, ": in-app tunnel"));
+    try testing.expect(on.status.extra_tone == .warn);
+}
 
 test "viewer: a desktop that dropped the device says so; trust errors are explained" {
     var r: Rec = .{};

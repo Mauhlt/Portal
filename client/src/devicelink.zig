@@ -142,6 +142,35 @@ pub fn startTunnel(gpa: std.mem.Allocator, io: Io, c: *const Code, key: *const t
     });
 }
 
+/// The longest `wgQuick` text (the longest endpoint and the fixed parts).
+pub const max_wg_quick = 640;
+
+/// The same tunnel as `startTunnel`, as a wg-quick configuration for a
+/// tunnel the OS runs (the iPhone's packet tunnel extension): this device
+/// at its tunnel address, the desk as the one peer, allowed only
+/// 10.8.0.1, with the keepalive. It holds the private key: the caller
+/// wipes `buf` (the iPhone app moves the key to the Keychain first,
+/// ios/tunnel_ext/keyref.zig).
+pub fn wgQuick(c: *const Code, key: *const tunnel.keys.KeyPair, buf: []u8) error{NoSpaceLeft}![]const u8 {
+    var private = wg.device.keys.encode(&key.private);
+    defer std.crypto.secureZero(u8, &private);
+    const desk = wg.device.keys.encode(&c.desk_key);
+    var ib: [tunnelnet.max_ip_text]u8 = undefined;
+    var db: [tunnelnet.max_ip_text]u8 = undefined;
+    return std.fmt.bufPrint(buf,
+        \\[Interface]
+        \\PrivateKey = {s}
+        \\Address = {s}/32
+        \\
+        \\[Peer]
+        \\PublicKey = {s}
+        \\Endpoint = {s}
+        \\AllowedIPs = {s}/32
+        \\PersistentKeepalive = {d}
+        \\
+    , .{ &private, tunnelnet.formatIp(c.device_ip, &ib), &desk, c.endpoint(), tunnelnet.formatIp(tunnelnet.desk_ip, &db), tunnelnet.persistent_keepalive_s });
+}
+
 /// How the client checks the desktop's certificate: the CA pinned for it,
 /// or (first connection after pairing) the SHA-256 from the code. `buf`
 /// holds the pinned DER.
@@ -180,4 +209,34 @@ test "pairing codes: full, typed without the fixed start, and refused ones" {
     try testing.expectError(error.BadEndpoint, parse(fp ++ " h " ++ key ++ " 10.8.0.2"));
     try testing.expectError(error.WrongServer, parse("portal-pair 2 10.8.0.9:8420 " ++ fp ++ " h:1 " ++ key ++ " 10.8.0.2"));
     try testing.expectEqualSlices(u8, &tunnelnet.checkCode(&c.desk_key), &c.deskCheck());
+}
+
+test "wg-quick text for an OS-run tunnel: parses back to the in-process tunnel's settings" {
+    const desk = "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=";
+    const fp = "00070E151C232A31383F464D545B626970777E858C939AA1A8AFB6BDC4CBD2D9";
+    const c = try parse(fp ++ " home.example.org:51820 " ++ desk ++ " 10.8.0.3");
+    var priv: tunnel.Key = undefined;
+    _ = try std.fmt.hexToBytes(&priv, "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+    const kp = tunnel.keys.KeyPair.fromPrivate(priv);
+    var buf: [max_wg_quick]u8 = undefined;
+    const text = try wgQuick(&c, &kp, &buf);
+    var diag: wg.device.config.Diagnostic = .{};
+    var cfg = try wg.device.config.parse(testing.allocator, text, &diag);
+    defer cfg.deinit();
+    try testing.expectEqualSlices(u8, &priv, &cfg.interface.private_key);
+    try testing.expectEqual(@as(usize, 1), cfg.interface.addresses.len);
+    try testing.expectEqual(@as(u8, 32), cfg.interface.addresses[0].prefix);
+    try testing.expectEqual(@as(usize, 1), cfg.peers.len);
+    const p = cfg.peers[0];
+    try testing.expectEqualSlices(u8, &c.desk_key, &p.public_key);
+    try testing.expectEqualStrings("home.example.org", p.endpoint.?.host);
+    try testing.expectEqual(@as(u16, 51820), p.endpoint.?.port);
+    try testing.expectEqual(tunnelnet.persistent_keepalive_s, p.persistent_keepalive);
+    try testing.expectEqual(@as(usize, 1), p.allowed_ips.len);
+    try testing.expect(std.mem.indexOf(u8, text, "Address = 10.8.0.3/32\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "AllowedIPs = 10.8.0.1/32\n") != null);
+    // The longest endpoint a pairing code carries still fits.
+    try testing.expect(max_wg_quick >= text.len - c.endpoint().len + pairqr.max_endpoint);
+    var small: [16]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, wgQuick(&c, &kp, &small));
 }
