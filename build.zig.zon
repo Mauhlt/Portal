@@ -43,8 +43,8 @@
         // Apple targets its Core ML backend (the iPhone's dictation), lazily
         // TranslateCoreML.
         .stt = .{
-            .url = "git+https://github.com/Mauhlt/SpeechToText?ref=packages-coreml#5026f39b54a3f5f683baa8abdae5731c418c23df",
-            .hash = "stt-0.1.0-iyO9SCunCQDNMaV_rjM-PB527BLtSiK2CAdkrI-S12NH",
+            .url = "git+https://github.com/Mauhlt/SpeechToText?ref=packages-coreml#e2014efbf593e0693c4b3889048d9e720d11c060",
+            .hash = "stt-0.1.0-iyO9SCunCQDHswHtpTv6jac-6zuT_PVcRZ2OVIOzkZTE",
         },
     },
 }
