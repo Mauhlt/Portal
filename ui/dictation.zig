@@ -19,6 +19,14 @@ const std = @import("std");
 /// Transcripts are at most 8 KiB (src/speech/limits.zig max_text).
 pub const max_text = 8 * 1024;
 
+/// What the 🎤 says once home has trained a personal adapter for this voice
+/// (every device the same: what to check after a training run); "" for
+/// none (the base model alone).
+pub fn voiceLabel(buf: []u8, adapter_version: u32) []const u8 {
+    if (adapter_version == 0) return "";
+    return std.fmt.bufPrint(buf, "your voice v{d}", .{adapter_version}) catch "";
+}
+
 pub const Decision = union(enum) {
     none,
     /// feedback(id, text, true): learn the correction.
@@ -145,4 +153,10 @@ test "a second dictation settles the first" {
     _ = t.added(3, "third", "changed", &out, &d);
     try testing.expectEqual(@as(u64, 2), d.discard);
     try testing.expectEqual(@as(u64, 3), t.id);
+}
+
+test "voiceLabel" {
+    var b: [32]u8 = undefined;
+    try testing.expectEqualStrings("your voice v3", voiceLabel(&b, 3));
+    try testing.expectEqualStrings("", voiceLabel(&b, 0));
 }
