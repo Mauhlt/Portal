@@ -245,7 +245,7 @@ fn addCheckZig(b: *std.Build) void {
 const Pin = struct { name: []const u8, repo: []const u8, branch: []const u8, client: bool };
 const pins = [_]Pin{
     .{ .name = "Renderer", .repo = "Renderer", .branch = "main", .client = true },
-    .{ .name = "Image", .repo = "Image", .branch = "neuro-formats", .client = true },
+    .{ .name = "Image", .repo = "Image", .branch = "main", .client = true },
     .{ .name = "WireGuard", .repo = "Wireguard", .branch = "master", .client = true },
     .{ .name = "stt", .repo = "SpeechToText", .branch = "main", .client = false },
 };

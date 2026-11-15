@@ -611,7 +611,7 @@ fetches every sibling repo at the commit `build.zig.zon` pins (and
 | dependency | repo (branch)                 | brings                                              |
 |------------|-------------------------------|-----------------------------------------------------|
 | Renderer   | Renderer (main)               | Vulkan, Windows, Wayland, MacOS                     |
-| Image      | Image (neuro-formats)         | Vulkan (the same commit as the Renderer's)          |
+| Image      | Image (main)                  | Vulkan (the same commit as the Renderer's)          |
 | WireGuard  | Wireguard (master)            |                                                     |
 | stt        | SpeechToText (zig-packages)   | Audio; TranslateNPU, lazily                          |
 

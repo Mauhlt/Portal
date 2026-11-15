@@ -15,8 +15,8 @@
         },
         // The owner's Image package (Image.check + PNG decoder).
         .Image = .{
-            .url = "git+https://github.com/Mauhlt/Image?ref=neuro-formats#51fbf7d1232b1cef232c84a0ea9eb2294a09c264",
-            .hash = "Image-0.0.0-0z0ITKO-nAFQZrAlL8vfiOy3GUE3E8Sy2KUaTyiVrkse",
+            .url = "git+https://github.com/Mauhlt/Image?ref=main#62f1880656fa918eb4962b99555f72ef537042e7",
+            .hash = "Image-0.0.0-0z0ITL-6nAHqYFg6xLyB_x4kQ89odqmdRwnMzZA1gAxE",
         },
         // Portal's shared protocol code (../shared/root.zig), also used by
         // the server and the e2e tests.

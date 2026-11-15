@@ -16,14 +16,14 @@
             .url = "git+https://github.com/Mauhlt/Renderer?ref=main#e82a12d0497d1bab2a1dcd51b2548a88e3b17511",
             .hash = "Renderer-0.0.0-ulFoWr7_CQD6w-EOodATZfjEDh6pA4qTG7ea8mnbAygg",
         },
-        // The owner's Image package (branch neuro-formats): Image.check
+        // The owner's Image package (main): Image.check
         // validates inline images (server and every client,
         // client/src/image/imgcheck.zig) and its PNG decoder decodes them
         // (client/src/image/imgdec.zig). It pins the same Vulkan commit as
         // the Renderer, so both share one "Vulkan" module.
         .Image = .{
-            .url = "git+https://github.com/Mauhlt/Image?ref=neuro-formats#51fbf7d1232b1cef232c84a0ea9eb2294a09c264",
-            .hash = "Image-0.0.0-0z0ITKO-nAFQZrAlL8vfiOy3GUE3E8Sy2KUaTyiVrkse",
+            .url = "git+https://github.com/Mauhlt/Image?ref=main#62f1880656fa918eb4962b99555f72ef537042e7",
+            .hash = "Image-0.0.0-0z0ITL-6nAHqYFg6xLyB_x4kQ89odqmdRwnMzZA1gAxE",
         },
         // Protocol and crypto code shared by the server, both clients and
         // the e2e tests (shared/root.zig; client/ depends on it too).
