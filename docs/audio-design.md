@@ -105,9 +105,9 @@ the active input where the platform reports it.
   most half the feedback queue, so they never evict the desk's.
 * `zig build mic-check -- <seconds>` records from the real microphone and
   prints the transcript (manual check, never part of `test`).
-* Not yet: the training banner, the laptop's stt-local client, the
-  device-facing /sync bundle and update routes (they must call
-  `speech.gate.Gate`, see below).
+* Not yet: the training banner. The laptop's stt-local client is built
+  (src/speech/local.zig, src/devicespeech.zig); its samples come home on
+  the bulk channel's `put bundle`, like the iPhone's.
 
 ## Limits (src/speech/limits.zig `Config`; settings.txt `speech.<name>`)
 

@@ -374,8 +374,9 @@ mutates the store, so a rollback can't race an install or prune.
 
 ### Deferred
 
-* Running installed programs (e.g. launching `npu-probe` from Packages):
-  nothing runs packages yet.
+* Running installed programs other than stt-local (e.g. `npu-probe` from
+  Packages). stt-local runs as the laptop's speech engine
+  (docs/stt-sync-contract.md, "Portal's side on the laptop").
 * Self-update of `portal-client` through sync, and publishing from the
   desk window (publishing is `portalctl publish` only).
 * Quotas are fixed (8 GiB per version, 32 GiB per desktop); no setting yet.

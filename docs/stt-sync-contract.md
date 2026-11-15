@@ -1,8 +1,12 @@
 # Speech-to-text: how Portal and stt fit together
 
-**Status (2026-11-12):** the stt side exists (SpeechToText repo: `stt.Home`,
-`stt.Local`, the `stt-local` program, proto 1). Portal's side is not built
-yet; this is the contract it will implement. The owner says when.
+**Status (2026-11-14):** both sides exist. The desk runs `stt.Home`
+(src/speech/home.zig), the iPhone `stt.Local` on Core ML
+(client/src/ios/speech.zig), and a Windows laptop or Surface runs the
+delivered `stt-local` as a child process (src/speech/local.zig, the
+protocol client and supervisor; src/devicespeech.zig, the 🎤 and the
+samples home). The NPU path is compile-checked only until it runs on the
+laptop.
 
 ## Who does what
 
@@ -93,6 +97,57 @@ it as a child process; see "Running delivered programs" in
   `AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, with `AUTOCONVERTPCM` to get 16 kHz;
   any conversion Windows can't do goes into `../Audio`) and sends
   `pcm_s16le_b64`.
+
+### Portal's side on the laptop (built)
+
+* **Packages:** full sync (`Platform.sync = .full`) installs `stt-local`
+  (approved on the device), `stt-model` and `stt-adapter` into this
+  desktop's sync folder. After every pass the speech glue
+  (src/devicespeech.zig) gets their folders (`SpeechSync.packages`,
+  `installed`, `checked`).
+* **Which machine:** the package has no architecture of its own. The desk
+  builds stt-local for aarch64 Windows, so the device reads the
+  program's PE header first (`speech.local.fitsThisMachine`). On an
+  x86_64 PC, or with no stt-local installed, the 🎤 says speech is
+  unavailable on this device. No CPU fallback is offered.
+* **Running it:** `speech.local.Engine` starts
+  `stt-local --model <stt-model>\ggml-base.en.bin --profile
+  <desktop folder>\data\stt-local --device-name laptop [--adapter <file>
+  --adapter-version <n>]`. Its cwd is its own read-only folder. stt-local
+  finds the QNN runtime the drivers installed (no `--qnn`). The program
+  starts when a recording starts. For a sync pass it starts only when
+  samples wait in `<profile>\samples`. It stops 60 s after the last
+  dictation, or later if stt's silence deadline is later. On exit the
+  pipe closes and it stops by itself.
+* **Supervision:** one call at a time, each with a deadline: ready 300 s
+  (the first NPU graph compile), transcribe 300 s, others 60 s. A hang is
+  killed. A crash, a `backend_lost` reply or a broken line fails the call
+  in flight. The next call starts a new program after a backoff (1 s,
+  doubling, at most 60 s). After 5 crashes in a row it gives up until a
+  new package or the next 🎤.
+* **Adapter:** an `update.bin` is sent to the running program with
+  `import_update` (a live swap). A raw `adapter.bin` is passed at the
+  next start, and the program restarts at the next idle moment. The 🎤
+  shows "your voice vN", the same text as on the iPhone
+  (`ui.dictation.voiceLabel`).
+* **Samples home:** with `speech_learning` on (the default):
+  `export_bundle` → `put bundle` → `commit_export`, only after the desk's
+  200 (`connect.sendSamples`). With it off, nothing is sent.
+
+### Publishing the laptop's engine (once, at the desk)
+
+```
+zig build voice-packages            # zig-out\voice\stt-local\stt-local.exe (aarch64 Windows; fetches the QAIRT SDK)
+                                    # zig-out\voice\stt-model\ggml-base.en.bin (the pinned model)
+portalctl publish stt-local zig-out\voice\stt-local --kind executable
+portalctl publish stt-model zig-out\voice\stt-model --kind data
+portalctl sync subscribe laptop stt-local     # and stt-model, stt-adapter; or Devices, P on its row
+```
+
+Publish again only when stt-local changes: each version must be approved
+on the laptop. The device reports its platform (`d:platform`,
+docs/protocol.md section 4), so the desk can subscribe only aarch64
+Windows devices to stt-local and stt-model.
 
 ## Device → desktop: training data
 
