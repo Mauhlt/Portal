@@ -51,8 +51,9 @@ zig build -Dtarget=x86_64-linux-gnu        # cross-compiles without any SDK
 zig build -Dtarget=aarch64-macos
 ```
 
-`build.zig.zon` points at the owner's Renderer checkout next to this repo
-(`../../Renderer`): the de-facto Renderer, no worktree, no pin.
+`build.zig.zon` pins the Renderer, Image and WireGuard commits on GitHub, the
+same ones as Portal's root `build.zig.zon` (`zig build pin` at the root bumps
+both). Local checkouts: `zig build --fork=../../Renderer --fork=../../Image`.
 
 ## Layout
 

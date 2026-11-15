@@ -5,28 +5,44 @@
     .paths = .{""},
     .fingerprint = 0xc0296c6a8828e98,
     .dependencies = .{
+        // The sibling repos are pinned commits on GitHub, so a fresh clone
+        // builds with nothing else. Build against local checkouts with
+        // `zig build --fork=../Renderer --fork=../Image ...`; re-pin after
+        // pushing a sibling with `zig build pin` (README, Development).
+        //
         // The owner's Renderer (Vulkan), used by the shared view module
         // (client/src/view) for `portal run`'s window and `portal connect`.
-        // The de-facto Renderer: the owner's main checkout next to this repo,
-        // no worktree, no pin.
-        .Renderer = .{ .path = "../Renderer" },
-        // The owner's Image package: Image.check validates inline images
-        // (server and every client, client/src/image/imgcheck.zig) and its
-        // PNG decoder decodes them (client/src/image/imgdec.zig). Its own
-        // Vulkan dependency is ../Vulkan. The de-facto Image: the owner's
-        // checkout as it stands (no pin; a break is fixed once, in Image).
-        .Image = .{ .path = "../Image" },
+        .Renderer = .{
+            .url = "git+https://github.com/Mauhlt/Renderer?ref=main#d00fe703f1805ffe058626dfc16b9c6c596787ed",
+            .hash = "Renderer-0.0.0-ulFoWsbpTQCADnCiy0P3cwR5W_r0drjTcY8VO8GUDpRB",
+        },
+        // The owner's Image package (branch neuro-formats): Image.check
+        // validates inline images (server and every client,
+        // client/src/image/imgcheck.zig) and its PNG decoder decodes them
+        // (client/src/image/imgdec.zig). It pins the same Vulkan commit as
+        // the Renderer, so both share one "Vulkan" module.
+        .Image = .{
+            .url = "git+https://github.com/Mauhlt/Image?ref=neuro-formats#51fbf7d1232b1cef232c84a0ea9eb2294a09c264",
+            .hash = "Image-0.0.0-0z0ITKO-nAFQZrAlL8vfiOy3GUE3E8Sy2KUaTyiVrkse",
+        },
         // Protocol and crypto code shared by the server, both clients and
         // the e2e tests (shared/root.zig; client/ depends on it too).
         .shared = .{ .path = "shared" },
         // The owner's pure-Zig WireGuard: the iPhone app's packet tunnel
         // extension (client/src/ios/tunnel_ext) runs it. Only iOS builds
         // and the extension's host tests compile it.
-        .WireGuard = .{ .path = "../WireGuard" },
-        // The owner's speech-to-text (read-only): stt.Home runs in-process
-        // on the desktop GPU (src/speech/home.zig); its stt-local program
-        // is the laptop's engine. stt brings ../Audio (the WAV Portal hands
-        // it is encoded there) and ../TranslateNPU.
-        .stt = .{ .path = "../SpeechToText" },
+        .WireGuard = .{
+            .url = "git+https://github.com/Mauhlt/Wireguard?ref=master#145c0c7f25967a2b94cdf736640117d8dc7bbc3a",
+            .hash = "WireGuard-0.0.0-76mJEZqQEAC4aTcvD0UjedHorvPU-PNVHVvUwYW0ssjo",
+        },
+        // The owner's speech-to-text (branch zig-packages; read-only):
+        // stt.Home runs in-process on the desktop GPU (src/speech/home.zig);
+        // its stt-local program is the laptop's engine. stt brings Audio
+        // (the WAV Portal hands it is encoded there) and, lazily, only for
+        // an aarch64-windows stt-local, TranslateNPU and the QAIRT SDK.
+        .stt = .{
+            .url = "git+https://github.com/Mauhlt/SpeechToText?ref=zig-packages#a2737c6cb392f818b6a5e68301fe7a202813d953",
+            .hash = "stt-0.1.0-iyO9SJBwCACmSRO39LPK_TXe3CdBS2PdlALDeh3ZgvP6",
+        },
     },
 }

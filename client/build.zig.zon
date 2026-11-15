@@ -4,18 +4,28 @@
     .minimum_zig_version = "0.18.0-dev.1005+75d48dfff",
     .fingerprint = 0xd9ed1b14d35f6f61,
     .dependencies = .{
-        // The owner's Renderer (Font, Window, Instanced2D): the de-facto
-        // checkout, no worktree, no pin.
-        .Renderer = .{ .path = "../../Renderer" },
-        // The owner's Image package (Image.check + PNG decoder): the de-facto
-        // checkout, no pin.
-        .Image = .{ .path = "../../Image" },
+        // Pinned commits on GitHub, the same as the root build.zig.zon's
+        // (`zig build pin` at the root updates both; local checkouts:
+        // --fork=../../Renderer ...).
+        //
+        // The owner's Renderer (Font, Window, Instanced2D).
+        .Renderer = .{
+            .url = "git+https://github.com/Mauhlt/Renderer?ref=main#d00fe703f1805ffe058626dfc16b9c6c596787ed",
+            .hash = "Renderer-0.0.0-ulFoWsbpTQCADnCiy0P3cwR5W_r0drjTcY8VO8GUDpRB",
+        },
+        // The owner's Image package (Image.check + PNG decoder).
+        .Image = .{
+            .url = "git+https://github.com/Mauhlt/Image?ref=neuro-formats#51fbf7d1232b1cef232c84a0ea9eb2294a09c264",
+            .hash = "Image-0.0.0-0z0ITKO-nAFQZrAlL8vfiOy3GUE3E8Sy2KUaTyiVrkse",
+        },
         // Portal's shared protocol code (../shared/root.zig), also used by
         // the server and the e2e tests.
         .shared = .{ .path = "../shared" },
-        // The owner's pure-Zig WireGuard (the in-process tunnel,
-        // src/tunnel): the de-facto checkout next to Portal, no pin.
-        .WireGuard = .{ .path = "../../WireGuard" },
+        // The owner's pure-Zig WireGuard (the in-process tunnel, src/tunnel).
+        .WireGuard = .{
+            .url = "git+https://github.com/Mauhlt/Wireguard?ref=master#145c0c7f25967a2b94cdf736640117d8dc7bbc3a",
+            .hash = "WireGuard-0.0.0-76mJEZqQEAC4aTcvD0UjedHorvPU-PNVHVvUwYW0ssjo",
+        },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "tools", "README.md" },
 }

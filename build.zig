@@ -206,16 +206,57 @@ pub fn build(b: *std.Build) void {
     const mic_check = b.addRunArtifact(b.addExecutable(.{ .name = "portal-mic-check", .root_module = mic_check_mod }));
     mic_check.addPassthruArgs();
     b.step("mic-check", "Record from the real microphone and transcribe it (manual check; -- <seconds> [model])").dependOn(&mic_check.step);
-    // stt-local (the laptop's engine, built from ../SpeechToText into
-    // this build's zig-out: Portal never builds inside SpeechToText).
-    // `zig build stt-local -Dtarget=aarch64-windows` for the Snapdragon X
-    // (needs the QAIRT SDK headers that ../TranslateNPU reads, nothing more).
-    const stt_local = b.dependency("stt", .{ .target = target, .optimize = .fast }).artifact("stt-local");
+    // stt-local (the laptop's engine, built from the stt package into
+    // this build's zig-out). `zig build stt-local -Dtarget=aarch64-windows`
+    // for the Snapdragon X: the only build that needs the QAIRT SDK headers
+    // (TranslateNPU's; -Dsdk=<dir> or QNN_SDK_ROOT). Any other target or
+    // step never fetches TranslateNPU or the SDK.
+    const stt_sdk = b.option([]const u8, "sdk", "stt-local for aarch64-windows: the QAIRT/QNN SDK root (else QNN_SDK_ROOT)");
+    const stt_local = b.dependency("stt", .{ .target = target, .optimize = .fast, .sdk = stt_sdk }).artifact("stt-local");
     b.step("stt-local", "Build stt-local (the laptop speech engine) into zig-out/bin").dependOn(&b.addInstallArtifact(stt_local, .{}).step);
     addE2e(b, target, optimize, gui_mods, ctl_exe, show_exe);
     addIos(b, optimize, test_step);
     addBrand(b, test_step);
     addPackage(b, test_step);
+    addPin(b);
+}
+
+/// A sibling repo pinned in build.zig.zon (and, with `client`, in
+/// client/build.zig.zon too).
+const Pin = struct { name: []const u8, repo: []const u8, branch: []const u8, client: bool };
+const pins = [_]Pin{
+    .{ .name = "Renderer", .repo = "Renderer", .branch = "main", .client = true },
+    .{ .name = "Image", .repo = "Image", .branch = "neuro-formats", .client = true },
+    .{ .name = "WireGuard", .repo = "Wireguard", .branch = "master", .client = true },
+    .{ .name = "stt", .repo = "SpeechToText", .branch = "zig-packages", .client = false },
+};
+
+/// `zig build pin [-Dpin=<name>]`: re-pins the sibling repos (or the one
+/// named) to the newest commit of their branch on GitHub, with `zig fetch
+/// --save`, in build.zig.zon and client/build.zig.zon. Push the sibling
+/// first; the deeper pins (Renderer's and Image's Vulkan, ...) are bumped
+/// in those repos the same way (README, Development).
+fn addPin(b: *std.Build) void {
+    const only = b.option([]const u8, "pin", "zig build pin: only this dependency (Renderer, Image, WireGuard or stt)");
+    const step = b.step("pin", "Re-pin the sibling repos (or -Dpin=<name>) to the newest commit of their branch on GitHub");
+    var prev: ?*std.Build.Step = null;
+    var matched = false;
+    for (pins) |p| {
+        if (only) |o| if (!std.mem.eql(u8, o, p.name)) continue;
+        matched = true;
+        const url = b.fmt("git+https://github.com/Mauhlt/{s}#{s}", .{ p.repo, p.branch });
+        const dirs: []const []const u8 = if (p.client) &.{ ".", "client" } else &.{"."};
+        for (dirs) |dir| {
+            // One at a time: each run rewrites a build.zig.zon.
+            const run = b.addSystemCommand(&.{ b.graph.zig_exe, "fetch", b.fmt("--save={s}", .{p.name}), url });
+            run.setCwd(b.path(dir));
+            run.has_side_effects = true;
+            if (prev) |s| run.step.dependOn(s);
+            prev = &run.step;
+            step.dependOn(&run.step);
+        }
+    }
+    if (!matched) step.dependOn(&b.addFail(b.fmt("zig build pin: no dependency {s} (Renderer, Image, WireGuard or stt)", .{only.?})).step);
 }
 
 /// Windows: links docs/brand/portal.ico as icon resource 1 (Explorer,

@@ -191,6 +191,21 @@ Details: docs/tabs-design.md, "For you".
 
 ## Setup
 
+### 0. A new machine
+
+Install the Zig version in `build.zig.zon`'s `minimum_zig_version`
+(0.18.0-dev.1005+75d48dfff; the owner's ZVC installs a given version), then:
+
+```powershell
+git clone https://github.com/Mauhlt/Portal
+cd Portal
+zig build
+```
+
+Every other repo comes from GitHub at a pinned commit (see Development,
+"Dependencies: pinned on GitHub"). The window needs a Vulkan driver: if there
+is none, Portal says what to install.
+
 ### 1. Build a release
 
 ```powershell
@@ -560,8 +575,52 @@ zig build          # debug build in zig-out\bin: portal.exe, portalctl.exe, port
 zig build e2e      # end-to-end tests against real portalctl processes (minutes)
 ```
 
-The build needs the owner's Renderer checkout next to this repo
-(`build.zig.zon`: `../Renderer`, the de-facto Renderer, no worktree, no pin).
 `client/` still builds the standalone `portal-client` on its own (for Linux
 and macOS laptops); its `src/view` and `src/connect.zig` are also the
 "view" and "client" modules of the root build.
+
+### Dependencies: pinned on GitHub
+
+A fresh clone builds with nothing else: `git clone
+https://github.com/Mauhlt/Portal` then `zig build`. Zig's package manager
+fetches every sibling repo at the commit `build.zig.zon` pins (and
+`client/build.zig.zon`, which pins the same ones):
+
+| dependency | repo (branch)                 | brings                                              |
+|------------|-------------------------------|-----------------------------------------------------|
+| Renderer   | Renderer (main)               | Vulkan, Windows, Wayland, MacOS                     |
+| Image      | Image (neuro-formats)         | Vulkan (the same commit as the Renderer's)          |
+| WireGuard  | Wireguard (master)            |                                                     |
+| stt        | SpeechToText (zig-packages)   | Audio; TranslateNPU, lazily                          |
+
+Vulkan's bindings are generated at build time by TranslateVulkan from the
+Khronos registry (about 3 s once per zig cache). `shared` is a folder of this
+repo. The QAIRT SDK (Qualcomm's NPU headers) is only needed for `zig build
+stt-local -Dtarget=aarch64-windows`: pass `-Dsdk=<dir>` or set
+`QNN_SDK_ROOT`. Nothing else downloads it.
+
+**Building against local checkouts** (the siblings next to this repo):
+
+```powershell
+zig build --fork=../Renderer --fork=../Image test
+zig build --fork=../Renderer --fork=../Image --fork=../Vulkan --fork=../TranslateVulkan test
+zig build --fork=../SpeechToText test-speech   # also runs the GPU speech tests with ../SpeechToText/models
+```
+
+`--fork=<path>` replaces every package of that name in the dependency tree
+with the checkout, whatever it pins, so a change in a sibling can be tried
+here before it is pushed. `zig build --print-tree` shows what is used.
+
+**Bumping a pin** after pushing a sibling change:
+
+```powershell
+zig build pin -Dpin=Renderer   # newest commit of the Renderer's branch, both build.zig.zon files
+zig build pin                  # every sibling
+zig build test                 # then commit build.zig.zon and client/build.zig.zon
+```
+
+A change deeper down is pinned bottom-up, pushing each repo before the next:
+TranslateVulkan -> Vulkan (`zig build pin` there) -> Image and Renderer
+(`zig fetch --save=Vulkan git+https://github.com/Mauhlt/Vulkan#<commit>`; keep
+the two on the same Vulkan commit, so a program using both has one Vulkan
+module) -> Portal (`zig build pin`).
