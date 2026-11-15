@@ -107,5 +107,13 @@ Needs iOS 17 or newer. Build, sign and install: docs/mac-session-portal.md.
   the desk shows that failure until a save works).
 * If the desk cannot read its device list, no device gets in (their
   pairings are kept) and the desk says so until the list reads again.
+* **The desktop's port or address changed** (Settings, Tunnel UDP port or
+  Tunnel endpoint): forward the new port on the router first; connected
+  devices are told and follow by themselves, with the same keys (no
+  pairing again; docs/wireguard.md, "Changing the port"). A device that
+  was offline shows "Desktop offline": choose **Change where this device
+  finds the desktop** there and enter the new port (or HOST:PORT). This
+  changes only where that device looks; only the desk ever changes the
+  desk's port.
 * One desktop per device for now (every desk is `10.8.0.1` inside its own
   tunnel).

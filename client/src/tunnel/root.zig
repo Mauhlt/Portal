@@ -80,7 +80,17 @@ pub const Options = struct {
     /// sets it so a device that vanished frees its connection slots
     /// without waiting for an application timeout.
     tcp_keepalive_idle_ns: ?u64 = null,
+    /// The desk: if `udp_port` is taken (`portBusy`), start anyway with no
+    /// UDP socket (`bindError` says why) and keep the peers, so the owner
+    /// can choose another port (`setUdpPort`) without restarting.
+    allow_busy_port: bool = false,
 };
+
+/// The UDP port is held by another socket (AccessDenied: Windows' answer
+/// when the holder bound it exclusively).
+pub fn portBusy(err: anyerror) bool {
+    return err == error.AddressInUse or err == error.AccessDenied;
+}
 
 pub const StartError = error{ NetstackNotReady, OutOfMemory, SystemResources, InvalidEndpoint, ThreadSpawnFailed } || Device.InitError;
 
@@ -104,6 +114,9 @@ pub const Tunnel = struct {
     /// always applies instead of being a "same list" no-op).
     peers: std.ArrayList(OwnedPeer) = .empty,
     peers_known: bool = false,
+    /// Guarded by `mutex`: why the device could not bind `udp_port`
+    /// (Options.allow_busy_port); null while it listens.
+    bind_error: ?anyerror = null,
     readiness: transport.Readiness = .{},
 
     const StackT = if (@hasDecl(wg, "netstack")) ns.Stack else opaque {};
@@ -139,8 +152,83 @@ pub const Tunnel = struct {
         t.stack.setReadyCallback(t, onReady);
         t.stack.start() catch return error.SystemResources;
         errdefer t.stack.stop();
-        try t.setPeersLocked(o.peers);
+        t.setPeersLocked(o.peers) catch |err| {
+            if (!(o.allow_busy_port and portBusy(err))) return err;
+            // No device yet: keep the peers for setUdpPort.
+            try t.keepPeersLocked(o.peers);
+            t.bind_error = err;
+        };
         return t;
+    }
+
+    /// Owns `peers` as the list a device will get, without a device.
+    fn keepPeersLocked(t: *Tunnel, peers: []const Peer) StartError!void {
+        var list: std.ArrayList(OwnedPeer) = .empty;
+        defer list.deinit(t.gpa);
+        var b: PeerConfigs = .{};
+        defer b.deinit(t.gpa);
+        try t.ownPeers(peers, &list, &b);
+        t.adoptPeers(&list);
+    }
+
+    /// Null while the UDP socket is bound; else why it is not.
+    pub fn bindError(t: *Tunnel) ?anyerror {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        return t.bind_error;
+    }
+
+    /// Moves the UDP socket to `port`, keeping the keys, the peers, their
+    /// sessions and their learned endpoints (zwg's Device.rebind; TCP
+    /// inside the tunnel is untouched). A port that cannot be bound leaves
+    /// the old one (rebound) and returns the error. While no socket is
+    /// bound (`bindError`) this starts the device on `port`.
+    pub fn setUdpPort(t: *Tunnel, port: u16) !void {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        const d = t.device orelse {
+            const old = t.udp_port;
+            t.udp_port = port;
+            var tmp: std.ArrayList(Peer) = .empty;
+            defer tmp.deinit(t.gpa);
+            try tmp.ensureTotalCapacity(t.gpa, t.peers.items.len);
+            for (t.peers.items) |*op| tmp.appendAssumeCapacity(op.peer);
+            t.setPeersLocked(tmp.items) catch |err| {
+                t.udp_port = old;
+                return err;
+            };
+            t.bind_error = null;
+            return;
+        };
+        const old = d.listen_port;
+        if (old == port) return;
+        d.stop();
+        if (t.device_thread) |th| th.join();
+        t.device_thread = null;
+        d.stop_requested.store(false, .release);
+        var result: anyerror!void = {};
+        if (d.rebind(port)) {
+            t.bind_error = null;
+        } else |err| {
+            result = err;
+            d.rebind(old) catch |e2| {
+                // Neither port: no socket until the next setUdpPort.
+                t.bind_error = e2;
+            };
+        }
+        t.udp_port = d.listen_port;
+        t.device_thread = std.Thread.spawn(.{}, runDevice, .{d}) catch {
+            t.stopDeviceDestroyLocked();
+            return error.ThreadSpawnFailed;
+        };
+        return result;
+    }
+
+    fn stopDeviceDestroyLocked(t: *Tunnel) void {
+        const d = t.device orelse return;
+        d.destroy();
+        t.device = null;
+        t.peers_known = false;
     }
 
     /// Called by the stack (any thread, its lock released) whenever a
@@ -179,6 +267,8 @@ pub const Tunnel = struct {
         t.mutex.lockUncancelable(t.io);
         defer t.mutex.unlock(t.io);
         if (t.peers_known and t.device != null and samePeers(t.peers.items, peers)) return;
+        // No socket (a busy port): only remembered for setUdpPort.
+        if (t.device == null and t.bind_error != null) return t.keepPeersLocked(peers);
         if (comptime @hasDecl(Device, "setPeers")) if (t.device) |d| {
             t.peers_known = false;
             var list: std.ArrayList(OwnedPeer) = .empty;
@@ -470,4 +560,40 @@ test "without a working netstack the tunnel refuses to start (no stub is ever re
     var k: Key = @splat(1);
     try std.testing.expectError(error.NetstackNotReady, Tunnel.start(std.testing.allocator, std.testing.io, .{ .private_key = k, .address = tunnelnet.desk_ip }));
     std.crypto.secureZero(u8, &k);
+}
+
+test "a busy UDP port: the tunnel starts without a socket, keeps its peers and binds once moved" {
+    if (!ready) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var ka = keys.KeyPair.generate(io);
+    defer ka.wipe();
+    var kb = keys.KeyPair.generate(io);
+    defer kb.wipe();
+    const a = try Tunnel.start(gpa, io, .{ .private_key = ka.private, .address = tunnelnet.desk_ip, .loopback_only = true });
+    defer a.destroy();
+    const taken = a.udpPort();
+    try std.testing.expect(a.bindError() == null);
+    // Without allow_busy_port the clash fails as before.
+    try std.testing.expectError(error.AddressInUse, Tunnel.start(gpa, io, .{ .private_key = kb.private, .address = tunnelnet.desk_ip, .udp_port = taken, .loopback_only = true }));
+    const peer: Peer = .{ .public_key = ka.public, .address = tunnelnet.deviceIp(2) };
+    const b = try Tunnel.start(gpa, io, .{ .private_key = kb.private, .address = tunnelnet.desk_ip, .udp_port = taken, .loopback_only = true, .peers = &.{peer}, .allow_busy_port = true });
+    defer b.destroy();
+    try std.testing.expect(portBusy(b.bindError().?));
+    // Peers set meanwhile are kept, not bound.
+    try b.setPeers(&.{peer});
+    try std.testing.expect(b.bindError() != null);
+    // Another busy port: still unbound, the wanted port unchanged.
+    try std.testing.expect(portBusy(if (b.setUdpPort(taken)) |_| error.Unexpected else |e| e));
+    try b.setUdpPort(0);
+    try std.testing.expect(b.bindError() == null);
+    const bp = b.udpPort();
+    try std.testing.expect(bp != 0 and bp != taken);
+    try std.testing.expectEqual(@as(usize, 1), b.peers.items.len);
+    // A bound tunnel moves; a taken port leaves it where it was.
+    try std.testing.expect(portBusy(if (a.setUdpPort(bp)) |_| error.Unexpected else |e| e));
+    try std.testing.expectEqual(taken, a.udpPort());
+    try std.testing.expect(a.bindError() == null);
+    try a.setUdpPort(0);
+    try std.testing.expect(a.udpPort() != taken);
 }

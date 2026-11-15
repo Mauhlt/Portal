@@ -210,6 +210,11 @@ const Host = struct {
     pin_fp_len: usize = 0,
     sync: *SyncState,
     sync_bufs: sync.ui.Ui.Bufs = .{},
+    /// "Change where this device finds the desktop" (the offline screen):
+    /// UI thread only.
+    follower: *devicelink.Follower,
+    find: ui.panels.finddesk.FindDesk = .{},
+    find_bufs: ui.panels.finddesk.FindDesk.Bufs = .{},
     /// Whether the OS touch keyboard was last asked to show.
     keyboard_shown: bool = false,
     /// This frame's copies of the status panels' data.
@@ -287,7 +292,7 @@ const Host = struct {
         const trust: ?[]const u8 = if (s.last_error) |err| (if (client_mod.isTrustError(err)) client_mod.describe(err) else null) else null;
         h.sync.mutex.lockUncancelable(h.client.io);
         defer h.sync.mutex.unlock(h.client.io);
-        const panel = h.sync.ui.panel(&h.sync_bufs);
+        const panel = h.find.panel(&h.find_bufs) orelse h.sync.ui.panel(&h.sync_bufs);
         // Status panels: copies, so the shell's panel text stays valid while
         // the network thread replaces Shared's.
         h.activity = s.activity;
@@ -411,7 +416,8 @@ const Host = struct {
             } else h.client.showSub(null),
             // A device opens and closes no tabs, has no selection yet, and
             // the remote grid size is the server's (the view scales to fit).
-            .close_tab, .open_tab, .copy, .paste, .button, .resized => {},
+            .button => |id| if (id == shell_mod.ids.find_desk) h.openFind(),
+            .close_tab, .open_tab, .copy, .paste, .resized => {},
             // Slash commands are never sent from a device (the panel offers
             // no such button; this is the second fence).
             .usage_slash => {},
@@ -420,6 +426,68 @@ const Host = struct {
             // This device's hidden tabs: stored next to its settings.
             .hidden_changed => saveHidden(h),
         }
+    }
+
+    // ---------------------------------------- where this device finds the desk
+
+    fn openFind(h: *Host) void {
+        const c = devicelink.load(h.client.io) orelse return;
+        h.find.show(c.endpoint());
+        h.p.wake();
+    }
+
+    /// The find panel first (it opens over everything), then sync's.
+    fn modal(h: *Host) shell_mod.Modal {
+        return .{ .ctx = h, .active = modalActive, .key = modalKey, .char = modalChar, .button = modalButton };
+    }
+    fn modalActive(ctx: *anyopaque) bool {
+        const h = self(ctx);
+        if (h.find.open) return true;
+        const m = h.sync.modal();
+        return m.active(m.ctx);
+    }
+    fn modalKey(ctx: *anyopaque, k: ui.input.Key, m: ui.input.Mods) void {
+        const h = self(ctx);
+        if (h.find.open) return h.findEvent(h.find.key(k, m));
+        const sm = h.sync.modal();
+        sm.key(sm.ctx, k, m);
+    }
+    fn modalChar(ctx: *anyopaque, cp: u21, m: ui.input.Mods) void {
+        const h = self(ctx);
+        if (h.find.open) return h.findEvent(h.find.char(cp, m));
+        const sm = h.sync.modal();
+        sm.char(sm.ctx, cp, m);
+    }
+    fn modalButton(ctx: *anyopaque, id: u32) void {
+        const h = self(ctx);
+        if (h.find.open) return h.findEvent(h.find.button(id));
+        const sm = h.sync.modal();
+        sm.button(sm.ctx, id);
+    }
+
+    fn findEvent(h: *Host, e: ui.panels.finddesk.Event) void {
+        switch (e) {
+            .none, .closed => {},
+            .paste => if (h.p.window.clipboardText(h.client.gpa, 1024)) |t| {
+                defer h.client.gpa.free(t);
+                h.find.paste(t);
+            },
+            .submit => {
+                const n = h.follower.setEndpoint(h.find.text()) catch |err| {
+                    switch (err) {
+                        error.BadEndpoint => h.find.setNote(.bad, "Enter the desktop's new tunnel port (1-65535), or HOST:PORT.", .{}),
+                        error.NotPaired => h.find.setNote(.bad, "This device has no saved desktop.", .{}),
+                        error.SaveFailed => h.find.setNote(.bad, "Could not save it on this device; nothing changed.", .{}),
+                    }
+                    h.p.wake();
+                    return;
+                };
+                std.log.info("this device now looks for the desktop at {s} (changed on this device)", .{n.endpoint()});
+                h.find.close();
+                h.client.reconnectNow();
+            },
+        }
+        h.p.wake();
     }
 
     fn saveHidden(h: *Host) void {
@@ -555,11 +623,17 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
 
     // The tunnel: the device's own (the iPhone's packet tunnel
     // extension, reached through OS sockets), or the in-process one.
+    var in_process: ?*tunnel.Tunnel = null;
     const dialer = if (systemTunnel(code, &key)) @import("shared").transport.Dialer.os else blk: {
         const tun = devicelink.startTunnel(gpa, io, code, &key) catch |err|
             fatal(prog, "cannot start this device's tunnel: {t}", .{err});
+        in_process = tun;
         break :blk tun.dialer();
     };
+    // Where the desk is: its announcements, and the owner's own change on
+    // the offline screen, move only this device's tunnel endpoint.
+    const follower = gpa.create(devicelink.Follower) catch fatal(prog, "out of memory", .{});
+    follower.* = .{ .io = io, .tun = in_process };
     key.wipe();
     const ca_buf = gpa.create([x509check.max_cert_len]u8) catch fatal(prog, "out of memory", .{});
     const trust = devicelink.trust(io, code, ca_buf);
@@ -573,6 +647,8 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     io_ptr.* = io;
     client.on_pinned = devicelink.savePin;
     client.on_pinned_ctx = io_ptr;
+    client.on_endpoint = devicelink.Follower.onEndpoint;
+    client.on_endpoint_ctx = follower;
     // First connection with this code: the sync worker pins the desktop's
     // release key once the CA is pinned (and offers voice packages).
     if (trust == .fingerprint) shared.just_paired.store(true, .release);
@@ -580,9 +656,9 @@ pub fn main(gpa: std.mem.Allocator, io: std.Io, prog: []const u8, args: []const 
     const host_ui = gpa.create(Host) catch fatal(prog, "out of memory", .{});
     const sync_state = gpa.create(SyncState) catch fatal(prog, "out of memory", .{});
     sync_state.* = .{ .client = client, .shared = shared, .code = code };
-    host_ui.* = .{ .p = tv, .shared = shared, .client = client, .sync = sync_state };
+    host_ui.* = .{ .p = tv, .shared = shared, .client = client, .sync = sync_state, .follower = follower };
     host_ui.shell = ui.Shell.init(gpa, .viewer, host_ui.uiHost());
-    host_ui.shell.modal = sync_state.modal();
+    host_ui.shell.modal = host_ui.modal();
     host_ui.convo_view = ui.convoview.View.init(gpa);
     host_ui.convo_view.clock = .{ .ctx = host_ui, .now = Host.clockNow };
     host_ui.fy_panel = ui.foryou.Panel.init(gpa);

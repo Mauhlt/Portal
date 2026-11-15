@@ -43,6 +43,7 @@ const settings = @import("settings.zig");
 const agenthooks = @import("agenthooks.zig");
 const pki = @import("tls/pki.zig");
 const tunneldesk = @import("tunneldesk.zig");
+const portmove = @import("portmove.zig");
 const tunnelnet = @import("shared").tunnelnet;
 const main = @import("main.zig");
 const web = @import("web.zig");
@@ -124,6 +125,28 @@ pub const Desk = struct {
     /// Unpair apply through it at once instead of waiting for the change
     /// watch. Null: rely on the watch.
     store: ?StoreHook = null,
+    /// Moving the tunnel (main.TunnelMove, portmove.zig); null: none.
+    tunnel: ?TunnelHook = null,
+
+    pub const TunnelHook = struct {
+        ctx: *anyopaque,
+        /// Performs a confirmed move (blocking: call it off the UI thread).
+        run: *const fn (ctx: *anyopaque, plan: portmove.Plan) portmove.Outcome,
+        /// The tunnel's port is taken (the full message), or null.
+        problem: *const fn (ctx: *anyopaque) ?[]const u8,
+        /// The UDP port the tunnel listens on (or wants, while taken).
+        port: *const fn (ctx: *anyopaque) u16,
+    };
+
+    fn livePort(d: *const Desk) u16 {
+        const t = d.tunnel orelse return d.tunnel_port;
+        return t.port(t.ctx);
+    }
+
+    fn tunnelProblem(d: *const Desk) ?[]const u8 {
+        const t = d.tunnel orelse return null;
+        return if (t.problem(t.ctx) != null) "Tunnel port taken: devices cannot connect (Settings, Tunnel UDP port)" else null;
+    }
 
     pub const StoreHook = struct {
         ctx: *anyopaque,
@@ -197,6 +220,15 @@ pub const LocalHost = struct {
     bufs: deskui.Ui.Bufs = .{},
     /// runSetup: the panel was submitted.
     setup_submitted: bool = false,
+    /// A tunnel move (startMove): its plan (with copies of its texts),
+    /// and its outcome, written by the move's thread before `move_done`.
+    move_plan: portmove.Plan = .{ .port = 0 },
+    move_plan_ep: [@import("shared").pairqr.max_endpoint]u8 = undefined,
+    move_plan_ep_len: usize = 0,
+    move_old_ep: [@import("shared").pairqr.max_endpoint]u8 = undefined,
+    move_old_ep_len: usize = 0,
+    move_outcome: portmove.Outcome = .{},
+    move_done: std.atomic.Value(bool) = .init(false),
     /// Whether the OS touch keyboard was last asked to show.
     keyboard_shown: bool = false,
     /// Every tab's background tasks and usage, as of hub.activity_gen.
@@ -284,6 +316,17 @@ pub const LocalHost = struct {
         h.speech = s;
         h.shell.dictation = s.hooks();
         h.shell.headset_mic = .{ .ctx = s, .present = headsetPresent };
+        h.showTunnelProblem();
+    }
+
+    /// The tunnel's port is taken: Settings opens with the plain message
+    /// (the port, its holder, what to do); the window keeps working.
+    fn showTunnelProblem(h: *LocalHost) void {
+        const d = h.desk orelse return;
+        const t = d.tunnel orelse return;
+        const msg = t.problem(t.ctx) orelse return;
+        h.openSettings();
+        h.ui.setNote(.bad, "{s}", .{msg});
     }
 
     /// A headset with a microphone is attached (its media button then
@@ -409,6 +452,7 @@ pub const LocalHost = struct {
     /// the panels may look different.
     fn checkPairing(h: *LocalHost) bool {
         if (h.desk == null) return false;
+        if (h.moveFinished()) return true;
         if (!h.pair_dirty.swap(false, .acq_rel)) return false;
         // The device list (and Settings' peers) follow the store (pairing,
         // `portalctl unpair`, a device forgetting this desktop).
@@ -623,7 +667,7 @@ pub const LocalHost = struct {
             .panel = audio_panel orelse h.ui.panel(&h.bufs, .{
                 .desk_key = if (d) |*x| x.desk_key_text[0..] else "",
                 .desk_check = if (d) |*x| x.desk_check[0..] else "",
-                .tunnel_port = if (d) |x| x.tunnel_port else 0,
+                .tunnel_port = if (d) |*x| x.livePort() else 0,
                 .now = h.nowUnix(),
             }) orelse h.projectsPanel(),
             .desk = .{
@@ -634,7 +678,7 @@ pub const LocalHost = struct {
                 .tools = if (d != null) &desk_tools else &.{},
                 .can_add = h.list.len < tabs.max_tabs,
                 .notes = h.projects.notes[0..h.projects.n_notes],
-                .alert = if (d) |x| x.storeProblem() orelse "" else "",
+                .alert = if (d) |*x| x.storeProblem() orelse x.tunnelProblem() orelse "" else "",
             },
             .activity = if (h.hub != null) &h.act else null,
             .sys = if (h.sys_sub and h.sys_gen != 0) &h.sys else null,
@@ -722,6 +766,7 @@ pub const LocalHost = struct {
                 h.ui.keyChecked(tunnelnet.checkCode(&k));
             },
             .approve_pair => h.approvePair(),
+            .move_tunnel => h.startMove(),
             .load_devices => h.loadDevices(),
             .unpair => |i| h.unpair(i),
             .load_subs => |i| h.loadSubs(i),
@@ -968,10 +1013,30 @@ pub const LocalHost = struct {
             return h.ui.setNote(.bad, "Enter the program to run (quotes must be closed).", .{});
         if (project.len > 0 and !validProject(project))
             return h.ui.setNote(.bad, "The project name must be 1-{d} bytes of printable text.", .{max_project_bytes});
+        // The tunnel (port, endpoint) moves only after its confirmation
+        // (portmove.zig, which saves it then); everything else is saved now.
+        const new_port = settings.parsePort(port).?;
+        const live = d.livePort();
+        const old_ep = d.saved.tunnel_endpoint.get() orelse "";
+        var follow_buf: [@import("shared").pairqr.max_endpoint]u8 = undefined;
+        const announce: []const u8 = if (!std.mem.eql(u8, endpoint, old_ep))
+            endpoint
+        else if (old_ep.len > 0)
+            portmove.followPort(old_ep, live, new_port, &follow_buf) orelse ""
+        else
+            "";
+        const bound = if (d.tunnel) |t| t.problem(t.ctx) == null else true;
+        const tunnel_moves = d.tunnel != null and (new_port != live or !bound or announce.len > 0);
         // Merged into settings.txt as it is now (hand edits stay).
         var s = settings.loadOrNull(h.gpa, h.io, d.paths.dir) orelse d.saved;
-        _ = s.tunnel_port.set(port);
-        _ = s.tunnel_endpoint.set(endpoint);
+        if (d.tunnel == null) {
+            _ = s.tunnel_port.set(port);
+            _ = s.tunnel_endpoint.set(endpoint);
+        } else if (endpoint.len == 0) {
+            // Cleared: new pairing codes get the placeholder; nothing to
+            // announce.
+            _ = s.tunnel_endpoint.set("");
+        }
         _ = s.program.set(program);
         _ = s.project.set(project);
         s.input = st.input;
@@ -988,7 +1053,59 @@ pub const LocalHost = struct {
         if (h.hub) |hub| hub.setSysmon(st.sysmon);
         h.p.setBackgroundArt(st.bg_art);
         d.srv.log.print("settings: system monitor {s}, admin prompts at the desk {s}", .{ if (st.sysmon) "on" else "off", if (st.block_elevation) "refused" else "allowed" });
+        if (tunnel_moves) return h.ui.openMoveConfirm(live, new_port, announce);
         h.ui.close();
+    }
+
+    /// The confirmed move runs on its own thread (it waits for devices'
+    /// acknowledgements); `moveFinished` shows the outcome.
+    fn startMove(h: *LocalHost) void {
+        const d = h.desk orelse return;
+        if (d.tunnel == null or h.ui.move.running) return;
+        const m = &h.ui.move;
+        h.move_plan_ep_len = m.endpoint.len;
+        @memcpy(h.move_plan_ep[0..m.endpoint.len], m.endpoint.text());
+        const old = d.saved.tunnel_endpoint.get() orelse "";
+        h.move_old_ep_len = old.len;
+        @memcpy(h.move_old_ep[0..old.len], old);
+        h.move_plan = .{
+            .port = m.port,
+            .endpoint = if (h.move_plan_ep_len > 0) h.move_plan_ep[0..h.move_plan_ep_len] else null,
+            .old_endpoint = if (h.move_old_ep_len > 0) h.move_old_ep[0..h.move_old_ep_len] else null,
+        };
+        h.ui.moveStarted();
+        const t = std.Thread.spawn(.{}, moveThread, .{h}) catch {
+            h.ui.moveDone(false, &.{});
+            h.ui.setNote(.bad, "Could not start the move.", .{});
+            return;
+        };
+        t.detach();
+    }
+
+    fn moveThread(h: *LocalHost) void {
+        const t = h.desk.?.tunnel.?;
+        h.move_outcome = t.run(t.ctx, h.move_plan);
+        h.move_done.store(true, .release);
+        notifyThunk(h);
+    }
+
+    /// UI thread: the move ended. True if the panels changed.
+    fn moveFinished(h: *LocalHost) bool {
+        if (!h.move_done.swap(false, .acq_rel)) return false;
+        const o = &h.move_outcome;
+        var rows: [devices.max_devices]deskui.MoveRow = undefined;
+        for (o.slice(), 0..) |r, i| rows[i] = .{ .name = r.name, .state = switch (r.state) {
+            .moved => .moved,
+            .not_connected => .offline,
+            .no_answer => .no_answer,
+        } };
+        h.ui.moveDone(o.port_error == null and o.seq_error == null, rows[0..o.n]);
+        if (o.port_error) |err| {
+            h.ui.setNote(.bad, "UDP {d} could not be used ({t}). The tunnel stays on UDP {d}; devices that were told were sent back.", .{ h.move_plan.port, err, h.desk.?.livePort() });
+        } else if (o.seq_error) |err| h.ui.setNote(.bad, "Nothing moved: the announcement could not be stored ({t}).", .{err});
+        const d = &h.desk.?;
+        if (settings.loadOrNull(h.gpa, h.io, d.paths.dir)) |s| d.saved = s;
+        return true;
     }
 
     // ------------------------------------------------------------ input

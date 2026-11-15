@@ -108,6 +108,42 @@ extensions. The interactive connection is dialed with the transport's
 | `item` | `op`, `result`, `id` | the answer to `i:yes` / `i:no` (section 3g) |
 | `recap` | `op`, `result`, `id` | the answer to `r:recap` (section 4b) |
 | `usage` | `week`, `five_hour`, `limit_reached` | the plan-usage bar (section 3h): on connect, at most every 5 minutes, at once on crossing 75 %, 90 % or the limit |
+| `endpoint` | `endpoint`: `"host:port"`; `seq`: a number | the desk moved (or is about to move) its tunnel: find it at `endpoint` from now on (section 3i). Exactly these three fields |
+
+### 3i. The desk moves its tunnel (`endpoint`, `m:`)
+
+Only the desk changes where it listens (Settings, Tunnel UDP port or
+Tunnel endpoint; `portalctl tunnel-port`). Before it switches, it sends
+every connected paired device
+
+    {"t":"endpoint","endpoint":"home.example.org:51821","seq":1763150000}
+
+on the interactive WebSocket (TLS to the pinned CA, inside the tunnel),
+and to a device that connects later in the same run. `seq` only ever
+grows (the desk stores the last one, `tunnel\endpoint-seq.txt`, and
+starts from the clock's seconds).
+
+The device accepts it only from that stream, only with exactly `t`,
+`endpoint` and `seq` (an unknown or repeated field refuses the message:
+it can never carry a key or an address), only a HOST:PORT that
+WireGuard's parser takes with a port 1-65535 and host characters only,
+and only with a `seq` above the one it saved (the same `seq` and endpoint
+again is acknowledged again; anything older, or another endpoint under a
+`seq` already taken, is refused). It replaces only the endpoint in its
+saved pairing code, saves it with the `seq` (atomically), then answers
+`m:<seq>` (section 4) and, about a second later, points its tunnel there.
+
+The desk waits up to 5 s for every connected device's `m:`, then moves
+its UDP socket (keys, peers and sessions stay). Its Settings shows each
+paired device as moved or "not yet" (offline, or no answer). A device
+that was away finds the desk again on its Desktop offline screen,
+"Change where this device finds the desktop": it changes only that
+device's own saved endpoint, never the desk.
+
+**Nothing a device sends can change, request or influence the desk's
+port or endpoint.** There is no such frame: `m:` is a number that only
+marks the device as moved for the desk's own current announcement; any
+other endpoint-like frame is unknown and ignored.
 
 ### 3a. Project tabs (sessions)
 
@@ -711,6 +747,7 @@ passed, so the program can't read the pair as Alt+key.
 | `p:start <name>`, `p:stop <name>` | start / stop a startable project (section 3f); answered by `project` |
 | `i:yes <id>`, `i:no <id>` | answer a For-you card (section 3g); answered by `item` |
 | `r:recap <tab id>` | ask that tab's agent for a recap (section 4b); answered by `recap` |
+| `m:<seq>` | the device saved the desk's `endpoint` announcement `seq` (section 3i): decimal digits only, no answer. It only marks the device as moved for the desk's own current announcement; it carries no endpoint and cannot move the desk |
 
 `k:`, `t:` and `l:` go to the tab the viewer last chose with `s:` (at
 first, the tab in `hello.session`); while that tab has ended or the last

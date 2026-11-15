@@ -15,6 +15,16 @@
 //! `<same>.res` with `ok` or `error: <why>`. The command waits for that
 //! answer (also event-driven) for at most `answer_timeout_ms`, then says
 //! that no Portal took the request and withdraws it.
+//!
+//! The same channel carries `portalctl tunnel-port` (the desk's own
+//! console way to move its tunnel, portmove.zig; the window's way is
+//! Settings):
+//!
+//!   portal-tunnel-v1
+//!   port=<1-65535>
+//!   endpoint=<HOST:PORT, optional>
+//!
+//! Only the desk's user can write the request folder; no device can.
 
 const std = @import("std");
 const Io = std.Io;
@@ -27,10 +37,46 @@ pub const header = "portal-open-v1";
 pub const answer_timeout_ms = 10_000;
 const max_request = 4096;
 
+pub const tunnel_header = "portal-tunnel-v1";
+
 pub const Request = struct {
     dir: []const u8,
     name: ?[]const u8,
 };
+
+/// `portalctl tunnel-port`: move the desk's tunnel (portmove.Plan).
+pub const TunnelRequest = struct {
+    port: u16,
+    endpoint: ?[]const u8,
+};
+
+pub const Any = union(enum) { open: Request, tunnel: TunnelRequest };
+
+pub fn formatTunnel(buf: []u8, r: TunnelRequest) ![]const u8 {
+    if (r.endpoint) |e| if (std.mem.indexOfAny(u8, e, "\r\n") != null) return error.BadRequest;
+    return std.fmt.bufPrint(buf, "{s}\nport={d}\nendpoint={s}\n", .{ tunnel_header, r.port, r.endpoint orelse "" });
+}
+
+pub fn parseTunnel(text: []const u8) ?TunnelRequest {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, it.next() orelse return null, "\r"), tunnel_header)) return null;
+    var port: ?u16 = null;
+    var endpoint: ?[]const u8 = null;
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (std.mem.startsWith(u8, line, "port=")) port = std.fmt.parseInt(u16, line[5..], 10) catch return null;
+        if (std.mem.startsWith(u8, line, "endpoint=")) endpoint = if (line.len > 9) line[9..] else null;
+    }
+    const p = port orelse return null;
+    if (p == 0) return null;
+    return .{ .port = p, .endpoint = endpoint };
+}
+
+pub fn parseAny(text: []const u8) ?Any {
+    if (parse(text)) |r| return .{ .open = r };
+    if (parseTunnel(text)) |r| return .{ .tunnel = r };
+    return null;
+}
 
 pub fn format(buf: []u8, r: Request) ![]const u8 {
     if (std.mem.indexOfAny(u8, r.dir, "\r\n") != null) return error.BadRequest;
@@ -93,6 +139,19 @@ pub fn command(gpa: Allocator, io: Io, data_dir: []const u8, args: []const []con
     };
     d.close(io);
 
+    var body_buf: [max_request]u8 = undefined;
+    const body = format(&body_buf, .{ .dir = abs, .name = name }) catch {
+        say("the folder name is not usable");
+        return 1;
+    };
+    var ok_buf: [1200]u8 = undefined;
+    return submit(gpa, io, data_dir, body, std.fmt.bufPrint(&ok_buf, "opened '{s}' in Portal", .{abs}) catch "opened", "Portal did not open it", say);
+}
+
+/// Writes request `body`, waits for the running Portal's answer and says
+/// it (`ok_text` for ok, `refused` before an error). The exit code.
+pub fn submit(gpa: Allocator, io: Io, data_dir: []const u8, body: []const u8, ok_text: []const u8, refused: []const u8, say: *const fn ([]const u8) void) u8 {
+    var msg: [1400]u8 = undefined;
     var pb: [1100]u8 = undefined;
     const folder = fsutil.join(&pb, &.{ data_dir, dir_name }) catch return 1;
     Io.Dir.cwd().createDirPath(io, folder) catch {
@@ -112,11 +171,6 @@ pub fn command(gpa: Allocator, io: Io, data_dir: []const u8, args: []const []con
         return 1;
     };
     defer watch.close();
-    var body_buf: [max_request]u8 = undefined;
-    const body = format(&body_buf, .{ .dir = abs, .name = name }) catch {
-        say("the folder name is not usable");
-        return 1;
-    };
     fsutil.writeAtomic(gpa, io, req_path, body) catch |err| {
         say(std.fmt.bufPrint(&msg, "cannot write the request: {t}", .{err}) catch "cannot write the request");
         return 1;
@@ -128,10 +182,10 @@ pub fn command(gpa: Allocator, io: Io, data_dir: []const u8, args: []const []con
             Io.Dir.cwd().deleteFile(io, res_path) catch {};
             const a = std.mem.trim(u8, ans, " \r\n");
             if (std.mem.eql(u8, a, "ok")) {
-                say(std.fmt.bufPrint(&msg, "opened '{s}' in Portal", .{abs}) catch "opened");
+                say(ok_text);
                 return 0;
             }
-            say(std.fmt.bufPrint(&msg, "Portal did not open it: {s}", .{a}) catch "Portal refused");
+            say(std.fmt.bufPrint(&msg, "{s}: {s}", .{ refused, a }) catch "Portal refused");
             return 1;
         } else |_| {}
         const left = deadline - Io.Clock.awake.now(io).toMilliseconds();
@@ -154,7 +208,7 @@ pub const Watch = struct {
     io: Io,
     folder: []const u8,
     ctx: *anyopaque,
-    open_fn: *const fn (ctx: *anyopaque, req: Request) ?[]const u8,
+    open_fn: *const fn (ctx: *anyopaque, req: Any) ?[]const u8,
     lost_fn: *const fn (ctx: *anyopaque, err: anyerror) void,
 
     pub fn run(wt: *Watch) void {
@@ -191,7 +245,7 @@ pub const Watch = struct {
             const text = dir.readFile(wt.io, name, &buf) catch continue;
             dir.deleteFile(wt.io, name) catch continue; // taken by someone else
             if (discard) continue;
-            const why: ?[]const u8 = if (parse(text)) |req| wt.open_fn(wt.ctx, req) else "malformed request";
+            const why: ?[]const u8 = if (parseAny(text)) |req| wt.open_fn(wt.ctx, req) else "malformed request";
             var res_name: [32]u8 = undefined;
             const stem = name[0 .. name.len - 4];
             const rn = std.fmt.bufPrint(&res_name, "{s}.res", .{stem}) catch continue;
@@ -215,4 +269,15 @@ test "request format round trip" {
     try std.testing.expect(parse("bogus\ndir=C:\\x\n") == null);
     try std.testing.expect(parse(header ++ "\nname=x\n") == null);
     try std.testing.expectError(error.BadRequest, format(&buf, .{ .dir = "C:\\a\nb", .name = null }));
+}
+
+test "tunnel request format round trip" {
+    var buf: [256]u8 = undefined;
+    const tr = parseAny(try formatTunnel(&buf, .{ .port = 51821, .endpoint = "home.example.org:51821" })).?.tunnel;
+    try std.testing.expectEqual(@as(u16, 51821), tr.port);
+    try std.testing.expectEqualStrings("home.example.org:51821", tr.endpoint.?);
+    try std.testing.expect(parseAny(try formatTunnel(&buf, .{ .port = 9, .endpoint = null })).?.tunnel.endpoint == null);
+    try std.testing.expect(parseTunnel(tunnel_header ++ "\nport=0\n") == null);
+    try std.testing.expect(parseTunnel(tunnel_header ++ "\nendpoint=h:1\n") == null);
+    try std.testing.expect(parseAny(try format(&buf, .{ .dir = "D:/x", .name = null })).? == .open);
 }

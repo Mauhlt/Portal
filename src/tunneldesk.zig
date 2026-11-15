@@ -174,6 +174,10 @@ pub const Options = struct {
     udp_port: u16 = tunnelnet.default_udp_port,
     /// Tests: bind the UDP socket to 127.0.0.1 only.
     loopback_only: bool = false,
+    /// A taken port starts the tunnel without a socket (Tunnel.bindError)
+    /// instead of failing, so the window stays usable and the owner can
+    /// choose another port (portmove.zig).
+    allow_busy_port: bool = false,
 };
 
 /// Starts the desk's tunnel with the paired devices as peers.
@@ -188,6 +192,7 @@ pub fn start(gpa: Allocator, io: Io, paths: devices.Paths, o: Options, st: *cons
         .loopback_only = o.loopback_only,
         .peers = peersFrom(st, &peers),
         .tcp_keepalive_idle_ns = keepalive_idle_ns,
+        .allow_busy_port = o.allow_busy_port,
     });
 }
 

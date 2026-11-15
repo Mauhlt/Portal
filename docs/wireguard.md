@@ -83,7 +83,8 @@ adapter (8420 exists only inside the tunnel).
 
 * this desktop's tunnel key and its check code (devices show and compare
   it after entering their pairing code);
-* **Tunnel UDP port** (default 51820; a change applies at the next start);
+* **Tunnel UDP port** (default 51820; a change applies when you save,
+  after a confirmation: see "Changing the port");
 * **Tunnel endpoint for devices**: `HOST:PORT` as devices reach the desk,
   e.g. `home.example.org:51820`. It goes into every pairing code; Portal
   cannot know your public address itself;
@@ -92,12 +93,45 @@ adapter (8420 exists only inside the tunnel).
 `settings.txt`: `tunnel_port = 51820`, `tunnel_endpoint = home.example.org:51820`.
 
 **Port clash with another WireGuard.** Portal claims its UDP port
-exclusively. If another WireGuard on this desktop (for example the
-official app) also uses 51820, whichever starts second cannot bind it.
-Give one of them a different port: e.g. keep Portal on 51820 and set the
-other tunnel's `ListenPort = 51821`, with its own router forward. (To do
-before go-live: Portal must say this plainly at the desk instead of just
-failing to start the tunnel.)
+exclusively. If another program holds it (often the official WireGuard
+client, which also likes 51820; its tunnels can show up as "System"),
+Portal still starts: the window works for local sessions, and Settings
+opens with a plain message: the port, the program holding it (Windows
+tells the owning process; the name is shown at the desk and in its log
+only, never sent to devices) and what to do, "Choose another port in
+Settings → Tunnel UDP port, and forward it on your router". The status
+line says so until the tunnel listens. Portal never picks another port
+by itself. Or give the other tunnel another port (its `ListenPort =
+51821`, with its own router forward).
+
+## Changing the port
+
+Only the desk changes the desk's port and endpoint (Settings, or
+`portalctl tunnel-port <port> [--endpoint HOST:PORT] --router-forwarded`).
+No device message can change, request or influence them.
+
+1. Forward the new UDP port on your router to the desktop (and allow it
+   in the firewall rule above) **before** switching. Portal never changes
+   the router: no UPnP, no NAT-PMP.
+2. Save Settings with the new port (and/or endpoint). The desk asks to
+   confirm ("Forward UDP <new port> on your router before switching").
+   If you left the endpoint as it was and its port was the old one, the
+   endpoint's port follows the new port.
+3. The desk tries the new port first (a taken port stops here, nothing
+   told). Then it tells every connected paired device, over its
+   authenticated WebSocket, `{"t":"endpoint","endpoint":"host:port","seq":N}`
+   (docs/protocol.md, 3i). Each saves it in its pairing code and
+   acknowledges; then the desk moves its UDP socket. Keys, addresses,
+   peers and sessions stay; devices follow to the new endpoint.
+4. Settings shows each paired device: moved, or not yet (offline). A
+   device that missed it shows "Desktop offline" with **Change where this
+   device finds the desktop**: enter the new port (or HOST:PORT). That
+   changes only where that device looks; no pairing again.
+
+The new port and endpoint are saved in `settings.txt` once they took
+effect (`--tunnel-port` on the command line still wins at the next start).
+On the iPhone with the packet tunnel extension the saved endpoint is used
+when the app next hands the tunnel to iOS (its next start).
 
 ## Tests
 

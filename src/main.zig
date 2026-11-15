@@ -33,6 +33,9 @@ const Allocator = std.mem.Allocator;
 
 const cmdline = @import("cmdline.zig");
 const tunneldesk = @import("tunneldesk.zig");
+const portmove = @import("portmove.zig");
+const portholder = @import("portholder.zig");
+const wgos = @import("WireGuard").device.os;
 const shared = @import("shared");
 const tunnelnet = shared.tunnelnet;
 const transport = shared.transport;
@@ -101,6 +104,14 @@ const usage =
     \\
     \\  portalctl devices
     \\      List paired devices: name, tunnel address, key and check code.
+    \\
+    \\  portalctl tunnel-port <port> [--endpoint HOST:PORT] --router-forwarded
+    \\      Move the running Portal's tunnel to UDP <port> (the window: Settings,
+    \\      Tunnel UDP port). Forward UDP <port> on your router first, then say
+    \\      so with --router-forwarded. Connected devices are told the new
+    \\      endpoint (--endpoint, or the saved one with its port changed) and
+    \\      follow; keys and pairings stay. Others: their "Desktop offline"
+    \\      screen changes where they find this desktop.
     \\
     \\  portalctl unpair <name>
     \\      Revoke a device immediately, even while Portal is running: its
@@ -288,6 +299,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "hooks")) std.process.exit(agenthooks.command(gpa, io, init.environ_map, args[1..]));
     if (std.mem.eql(u8, cmd, "pair")) return cmdPair(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "devices")) return cmdDevices(gpa, io, init.environ_map);
+    if (std.mem.eql(u8, cmd, "tunnel-port")) return cmdTunnelPort(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "unpair")) return cmdUnpair(gpa, io, init.environ_map, args[1..]);
     if (std.mem.eql(u8, cmd, "token")) fatal("access tokens were replaced by device pairing: run `portalctl pair <name>` (see `portalctl`)", .{});
     if (std.mem.eql(u8, cmd, "run")) return cmdRun(gpa, io, init.environ_map, args[1..]);
@@ -1116,8 +1128,11 @@ fn prepare(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, paths: d
     if (prepared_tunnel == null) {
         const st = devices.read(gpa, io, paths) catch |err|
             return fail_(err_buf, "Cannot read the device list: {s}.", .{devices.describeError(err)});
-        const tun = tunneldesk.start(gpa, io, paths, .{ .udp_port = cfg.tunnel_port, .loopback_only = opts.tunnel_loopback }, &st) catch |err|
-            return fail_(err_buf, "Cannot start Portal's WireGuard tunnel on UDP port {d}: {t}. Is another Portal (or WireGuard) using that port? Choose another tunnel port.", .{ cfg.tunnel_port, err });
+        // A taken port does not stop Portal: it runs for local sessions
+        // without a socket and says why (TunnelMove.problem), until the
+        // owner chooses another port (portmove.zig).
+        const tun = tunneldesk.start(gpa, io, paths, .{ .udp_port = cfg.tunnel_port, .loopback_only = opts.tunnel_loopback, .allow_busy_port = true }, &st) catch |err|
+            return fail_(err_buf, "Cannot start Portal's WireGuard tunnel on UDP port {d}: {t}.", .{ cfg.tunnel_port, err });
         const listener = tun.listen(tunnelnet.https_port) catch |err|
             return fail_(err_buf, "Cannot listen on {s} inside the tunnel: {t}.", .{ tunnelnet.desk_server, err });
         prepared_tunnel = .{ .tun = tun, .listener = listener, .store = st };
@@ -1331,15 +1346,158 @@ fn cmdStartable(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, arg
 
 /// `portal open` / `portalctl open` requests (openreq.zig) for the running
 /// Portal: each opens a tab.
+/// The desk's tunnel moves (portmove.zig): from Settings (gui.Desk.tunnel)
+/// and `portalctl tunnel-port` (openreq), one at a time; and the taken-port
+/// problem shown at the desk until the tunnel listens. Never reachable from
+/// a device.
+const TunnelMove = struct {
+    desk: portmove.Desk(web.Server, tunneldesk.tunnel.Tunnel),
+    /// One move at a time.
+    run_mutex: Io.Mutex = .init,
+    mutex: Io.Mutex = .init,
+    problem_buf: [700]u8 = undefined,
+    problem_len: usize = 0,
+    /// Where devices find this desk now (--tunnel-endpoint or Settings;
+    /// a move updates it). Guarded by run_mutex.
+    endpoint_buf: [shared.pairqr.max_endpoint]u8 = undefined,
+    endpoint_len: usize = 0,
+
+    fn setEndpoint(tm: *TunnelMove, e: []const u8) void {
+        const n = @min(e.len, tm.endpoint_buf.len);
+        @memcpy(tm.endpoint_buf[0..n], e[0..n]);
+        tm.endpoint_len = n;
+    }
+
+    fn probeAny(port: u16) anyerror!void {
+        var u = try wgos.Udp.openScoped(.v4, port, .any);
+        u.close();
+    }
+    fn probeLoopback(port: u16) anyerror!void {
+        var u = try wgos.Udp.openScoped(.v4, port, .loopback);
+        u.close();
+    }
+
+    /// The tunnel could not bind `port`: the plain message, with the
+    /// holder if Windows can tell (desk only, never sent to devices).
+    fn setBusy(tm: *TunnelMove, port: u16) void {
+        const holder = portholder.find(tm.desk.gpa, port);
+        tm.mutex.lockUncancelable(tm.desk.io);
+        defer tm.mutex.unlock(tm.desk.io);
+        tm.problem_len = portholder.busyMessage(&tm.problem_buf, port, if (holder) |*x| x else null).len;
+        tm.desk.log.print("ERROR: {s}", .{tm.problem_buf[0..tm.problem_len]});
+    }
+
+    fn problem(tm: *TunnelMove) ?[]const u8 {
+        tm.mutex.lockUncancelable(tm.desk.io);
+        defer tm.mutex.unlock(tm.desk.io);
+        if (tm.problem_len == 0) return null;
+        return tm.problem_buf[0..tm.problem_len];
+    }
+
+    /// Performs `plan`, then saves what took effect in settings.txt (the
+    /// next start uses it; command-line options still win).
+    fn run(tm: *TunnelMove, plan: portmove.Plan) portmove.Outcome {
+        tm.run_mutex.lockUncancelable(tm.desk.io);
+        defer tm.run_mutex.unlock(tm.desk.io);
+        const o = tm.desk.run(plan);
+        if (o.port_error == null and o.seq_error == null) if (plan.endpoint) |e| tm.setEndpoint(e);
+        if (tm.desk.tun.bindError() == null) {
+            tm.mutex.lockUncancelable(tm.desk.io);
+            tm.problem_len = 0;
+            tm.mutex.unlock(tm.desk.io);
+        } else if (o.port_error != null) tm.setBusy(plan.port);
+        if (o.port_error == null and o.seq_error == null) {
+            const gpa = tm.desk.gpa;
+            var s = settings.loadOrNull(gpa, tm.desk.io, tm.desk.dir) orelse settings.load(gpa, tm.desk.io, tm.desk.dir);
+            var pb: [8]u8 = undefined;
+            _ = s.tunnel_port.set(std.fmt.bufPrint(&pb, "{d}", .{plan.port}) catch "");
+            if (plan.endpoint) |e| _ = s.tunnel_endpoint.set(e);
+            settings.save(gpa, tm.desk.io, tm.desk.dir, &s) catch |err| tm.desk.log.print("could not save {s}\\{s}: {t}", .{ tm.desk.dir, settings.file_name, err });
+        }
+        tm.desk.srv.storeChanged(); // the window redraws its alert
+        return o;
+    }
+
+    /// `portalctl tunnel-port` (openreq): null when done, else why not.
+    fn request(tm: *TunnelMove, req: openreq.TunnelRequest) ?[]const u8 {
+        var ob: [shared.pairqr.max_endpoint]u8 = undefined;
+        tm.run_mutex.lockUncancelable(tm.desk.io);
+        @memcpy(ob[0..tm.endpoint_len], tm.endpoint_buf[0..tm.endpoint_len]);
+        const old_ep: ?[]const u8 = if (tm.endpoint_len > 0) ob[0..tm.endpoint_len] else null;
+        tm.run_mutex.unlock(tm.desk.io);
+        var eb: [shared.pairqr.max_endpoint]u8 = undefined;
+        const new_ep: ?[]const u8 = if (req.endpoint) |e| blk: {
+            if (!gui.validEndpoint(e)) return "the endpoint must be HOST:PORT";
+            break :blk if (old_ep != null and std.mem.eql(u8, old_ep.?, e)) null else e;
+        } else if (old_ep) |e| portmove.followPort(e, tm.desk.tun.udpPort(), req.port, &eb) else null;
+        const o = tm.run(.{ .port = req.port, .endpoint = new_ep, .old_endpoint = old_ep });
+        if (o.port_error != null) return "the new port could not be used (see the log); nothing moved";
+        if (o.seq_error != null) return "the announcement could not be stored (see the log); nothing moved";
+        return null;
+    }
+
+    // gui.Desk.TunnelHook
+    fn hookRun(ctx: *anyopaque, plan: portmove.Plan) portmove.Outcome {
+        return @as(*TunnelMove, @ptrCast(@alignCast(ctx))).run(plan);
+    }
+    fn hookProblem(ctx: *anyopaque) ?[]const u8 {
+        return @as(*TunnelMove, @ptrCast(@alignCast(ctx))).problem();
+    }
+    fn hookPort(ctx: *anyopaque) u16 {
+        return @as(*TunnelMove, @ptrCast(@alignCast(ctx))).desk.tun.udpPort();
+    }
+    fn hook(tm: *TunnelMove) gui.Desk.TunnelHook {
+        return .{ .ctx = tm, .run = hookRun, .problem = hookProblem, .port = hookPort };
+    }
+};
+
+/// `portalctl tunnel-port <port> [--endpoint HOST:PORT] --router-forwarded`:
+/// asks the running Portal on this desktop (openreq) to move its tunnel.
+fn cmdTunnelPort(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []const []const u8) !void {
+    const paths = devicePaths(gpa, io, env) catch |err| fatal("cannot find the data directory: {t}", .{err});
+    var port: ?u16 = null;
+    var endpoint: ?[]const u8 = null;
+    var forwarded = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--endpoint") and i + 1 < args.len) {
+            i += 1;
+            endpoint = args[i];
+        } else if (std.mem.eql(u8, args[i], "--router-forwarded")) {
+            forwarded = true;
+        } else if (port == null) {
+            port = settings.parsePort(args[i]) orelse fatal("the port must be 1-65535", .{});
+        } else fatal("usage: portalctl tunnel-port <port> [--endpoint HOST:PORT] --router-forwarded", .{});
+    }
+    const p = port orelse fatal("usage: portalctl tunnel-port <port> [--endpoint HOST:PORT] --router-forwarded", .{});
+    if (endpoint) |e| if (!gui.validEndpoint(e)) fatal("--endpoint must be HOST:PORT", .{});
+    if (!forwarded) fatal("forward UDP {d} on your router to this desktop first (Portal never changes the router), then run this again with --router-forwarded", .{p});
+    var bb: [600]u8 = undefined;
+    const body = openreq.formatTunnel(&bb, .{ .port = p, .endpoint = endpoint }) catch fatal("the endpoint is not usable", .{});
+    var ok: [160]u8 = undefined;
+    const say = struct {
+        fn f(text: []const u8) void {
+            std.debug.print("portalctl: {s}\n", .{text});
+        }
+    }.f;
+    std.process.exit(openreq.submit(gpa, io, paths.dir, body, std.fmt.bufPrint(&ok, "the tunnel now listens on UDP {d}", .{p}) catch "moved", "Portal did not move the tunnel", say));
+}
+
 const OpenWatch = struct {
     hub: *tabs.Hub,
     log: *Log,
     env: *const std.process.Environ.Map,
     gpa: Allocator,
 
-    fn open(ctx: *anyopaque, req: openreq.Request) ?[]const u8 {
+    /// The tunnel mover (`portalctl tunnel-port`).
+    tunnel: ?*TunnelMove = null,
+
+    fn open(ctx: *anyopaque, any: openreq.Any) ?[]const u8 {
         const ow: *OpenWatch = @ptrCast(@alignCast(ctx));
-        return openFolder(ow.gpa, ow.hub, ow.env, req.dir, req.name);
+        return switch (any) {
+            .open => |req| openFolder(ow.gpa, ow.hub, ow.env, req.dir, req.name),
+            .tunnel => |req| if (ow.tunnel) |tm| tm.request(req) else "this Portal has no tunnel",
+        };
     }
 
     fn lost(ctx: *anyopaque, err: anyerror) void {
@@ -1805,6 +1963,23 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     // logged and shown by reload; the next change retries).
     store_watch.reload() catch {};
 
+    // Moving the tunnel (Settings, `portalctl tunnel-port`): the desk only.
+    const tunnel_move = gpa.create(TunnelMove) catch fatal("out of memory", .{});
+    tunnel_move.* = .{ .desk = .{
+        .gpa = gpa,
+        .io = io,
+        .srv = &server,
+        .tun = prep.tun,
+        .dir = paths.dir,
+        .log = &log,
+        .probe = if (opts.tunnel_loopback) TunnelMove.probeLoopback else TunnelMove.probeAny,
+    } };
+    if (cfg.tunnel_endpoint) |e| tunnel_move.setEndpoint(e);
+    if (prep.tun.bindError() != null) {
+        tunnel_move.setBusy(cfg.tunnel_port);
+        std.debug.print("portal: {s}\n", .{tunnel_move.problem().?});
+    }
+
     // The window's desk panels (pairing, devices, settings with the
     // tunnel) use the device store directly; store changes wake it.
     if (host) |h| {
@@ -1820,6 +1995,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
             .env = env,
             .open_fn = deskOpen,
             .store = store_watch.hook(),
+            .tunnel = tunnel_move.hook(),
         });
         server.store_notify_ctx = h;
         server.store_notify_fn = gui.LocalHost.storeNotify;
@@ -1862,7 +2038,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         t.detach();
         // `portal open <dir>`: requests through the data directory.
         const ow = gpa.create(OpenWatch) catch fatal("out of memory", .{});
-        ow.* = .{ .hub = hub, .log = &log, .env = env, .gpa = gpa };
+        ow.* = .{ .hub = hub, .log = &log, .env = env, .gpa = gpa, .tunnel = tunnel_move };
         const owt = gpa.create(openreq.Watch) catch fatal("out of memory", .{});
         owt.* = .{
             .gpa = gpa,
@@ -1965,6 +2141,8 @@ test {
     _ = @import("keymap.zig");
     _ = @import("guard.zig");
     _ = @import("tunneldesk.zig");
+    _ = @import("portmove.zig");
+    _ = @import("portholder.zig");
     _ = @import("cmdline.zig");
     _ = @import("childenv.zig");
     _ = @import("console.zig");

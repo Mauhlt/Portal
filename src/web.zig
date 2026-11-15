@@ -74,6 +74,7 @@ const foryou_ws = @import("foryou_ws.zig");
 const projects_ws = @import("projects_ws.zig");
 const ratelimit = @import("ratelimit.zig");
 const speech_inbox = @import("speech").inbox;
+const portmove = @import("portmove.zig");
 
 /// Hard cap on simultaneous connections (each costs a supervisor thread and
 /// a worker thread, a WebSocket one more).
@@ -501,6 +502,10 @@ pub const Server = struct {
     sync_n: usize = 0,
     sync_gen: std.atomic.Value(u64) = .init(0),
 
+    /// The desk's endpoint announcement and its acknowledgements
+    /// (portmove.zig): set only by the desk (announceEndpoint).
+    move: portmove.Announce = .{},
+
     /// Each paired device's `p:start` / `p:stop` rate (projects_ws.zig).
     project_limits: projects_ws.Limits = .{},
 
@@ -664,6 +669,48 @@ pub const Server = struct {
         srv.hub.mutex.lockUncancelable(srv.io);
         srv.hub.mutex.unlock(srv.io);
         srv.hub.cond.broadcast(srv.io);
+    }
+
+    // ------------------------------------------------- endpoint moves
+
+    /// The desk announces where devices find it from now on (portmove.zig;
+    /// the desk's Settings and `portalctl tunnel-port` only): every
+    /// interactive WebSocket writer sends it.
+    pub fn announceEndpoint(srv: *Server, seq: u64, endpoint: []const u8) void {
+        srv.move.set(srv.io, seq, endpoint);
+        srv.hub.mutex.lockUncancelable(srv.io);
+        srv.hub.mutex.unlock(srv.io);
+        srv.hub.cond.broadcast(srv.io);
+    }
+
+    /// The paired devices with an interactive WebSocket open now.
+    pub fn connectedDevices(srv: *Server, out: []devices.DeviceId) []devices.DeviceId {
+        srv.conn_mutex.lockUncancelable(srv.io);
+        defer srv.conn_mutex.unlock(srv.io);
+        var n: usize = 0;
+        for (srv.conns.entries) |e| {
+            if (!e.used or !e.authed or e.evicted or e.channel != .interactive) continue;
+            const dup = for (out[0..n]) |x| {
+                if (std.mem.eql(u8, &x, &e.device)) break true;
+            } else false;
+            if (dup or n == out.len) continue;
+            out[n] = e.device;
+            n += 1;
+        }
+        return out[0..n];
+    }
+
+    /// The paired devices as last read from the store.
+    pub fn pairedDevices(srv: *Server, out: []portmove.PeerInfo) []portmove.PeerInfo {
+        srv.peer_mutex.lockUncancelable(srv.io);
+        defer srv.peer_mutex.unlock(srv.io);
+        var n: usize = 0;
+        for (srv.peers) |slot| if (slot) |p| {
+            if (n == out.len) break;
+            out[n] = .{ .id = p.id, .name = p.name };
+            n += 1;
+        };
+        return out[0..n];
     }
 
     fn syncDigestFor(srv: *Server, device: []const u8) [32]u8 {
@@ -1408,6 +1455,9 @@ pub const Server = struct {
         // changes (devices also look on every connect).
         const ws_device: []const u8 = ws.device.name.get();
         var sync_seen = srv.sync_gen.load(.acquire);
+        // The desk's endpoint announcement (portmove.zig): sent once per
+        // announcement, also to a device that connects after it.
+        var move_seen: u64 = 0;
         var sync_digest = srv.syncDigestFor(ws_device);
 
         // `ended` was sent for the tab shown (it closed while others run).
@@ -1467,7 +1517,7 @@ pub const Server = struct {
             if (usage_next != .now and !hub.finished and !screen.full and cur_gen == screen.sent_gen and !(cur_closed and !ended_sent) and !convo_changed and
                 hub.activity_gen == activity_seen and !sys_due and !fy.due(hub) and !proj.dueLocked(hub) and
                 ws.want == .none and ws.sub_want == .none and hub.gen == seen_gen and !ws.dead.load(.acquire) and !gone and
-                srv.sync_gen.load(.acquire) == sync_seen)
+                srv.sync_gen.load(.acquire) == sync_seen and srv.move.gen.load(.acquire) == move_seen)
             {
                 // Forever, or while an image blob waits for this viewer's
                 // byte budget: exactly until the budget has refilled
@@ -1672,6 +1722,12 @@ pub const Server = struct {
                     if (!ws.send(srv, "{\"t\":\"updates\"}", .text)) return;
                 }
             }
+            const move_now = srv.move.gen.load(.acquire);
+            if (move_now != move_seen) {
+                move_seen = move_now;
+                var mb: [portmove.Announce.max_message]u8 = undefined;
+                if (srv.move.message(srv.io, &mb)) |m| if (!ws.send(srv, m, .text)) return;
+            }
             // Every tab has ended: the last program's exit code, after
             // the final screen, then the closing handshake.
             if (!changed and finished) {
@@ -1775,6 +1831,14 @@ pub const Server = struct {
                 // A startable project (projects_ws.zig): a request, not
                 // typing, answered in every input mode.
                 if (known) |k| if (k.prefix == .project) return srv.projectRequest(ws, k.rest);
+                // "m:<seq>": the device saved the desk's own endpoint
+                // announcement. Only marks it moved (portmove.Announce.ack);
+                // no device frame can move, or ask to move, the desk.
+                if (known) |k| if (k.prefix == .moved) {
+                    if (srv.move.ack(srv.io, ws.device.id, k.rest))
+                        srv.log.print("device '{s}' saved the announced endpoint", .{ws.device.name.get()});
+                    return true;
+                };
                 // Switching tabs is not input: also in view-only mode.
                 if (payload[0] == 's') {
                     srv.subscribe(ws, payload[2..]);
@@ -2385,4 +2449,44 @@ test "peers: an unreadable store admits nobody and ends everyone without a logou
     try testing.expectEqual(Server.EndReason.store_unreadable, endReasonIn(&peers, true, &admitted).?);
     // Readable again: the same record is let in and nothing ends.
     try testing.expect(endReasonIn(&peers, false, &admitted) == null);
+}
+
+test "no device frame can move the desk: endpoint-like frames are ignored, m: only marks an acknowledgement" {
+    const io = std.testing.io;
+    var a: portmove.Announce = .{};
+    a.set(io, 1700000005, "home.example.org:51820");
+    var before: [portmove.Announce.max_message]u8 = undefined;
+    const want = try std.testing.allocator.dupe(u8, a.message(io, &before).?);
+    defer std.testing.allocator.free(want);
+    const gen = a.gen.load(.acquire);
+    const id: devices.DeviceId = @splat(9);
+    // What a device might send to try to move the desk.
+    const tries = [_][]const u8{
+        "{\"t\":\"endpoint\",\"endpoint\":\"evil.example.net:1\",\"seq\":1700000099}",
+        "e:evil.example.net:1",
+        "p:port 1",
+        "m:evil.example.net:1",
+        "m:1700000099",
+        "m:1700000005 evil.example.net:1",
+        "l:/tunnel-port 1",
+        "k:51821",
+        "s:00000000000000000000000000000000",
+    };
+    for (tries) |payload| {
+        // The reader's dispatch: unknown frames are ignored; the only
+        // move-related one is `m:`, which reaches Announce.ack and nothing else.
+        if (frames.classify(payload)) |k| if (k.prefix == .moved) {
+            _ = a.ack(io, id, k.rest);
+        };
+        var now: [portmove.Announce.max_message]u8 = undefined;
+        try std.testing.expectEqualStrings(want, a.message(io, &now).?);
+        try std.testing.expectEqual(gen, a.gen.load(.acquire));
+        try std.testing.expect(!a.hasAcked(io, id));
+    }
+    // An endpoint-shaped JSON message is not a device frame at all.
+    try std.testing.expect(frames.classify("{\"t\":\"endpoint\",\"endpoint\":\"x:1\",\"seq\":2}") == null);
+    // The right number only marks the device; the announcement is unchanged.
+    try std.testing.expect(a.ack(io, id, "1700000005"));
+    var after: [portmove.Announce.max_message]u8 = undefined;
+    try std.testing.expectEqualStrings(want, a.message(io, &after).?);
 }

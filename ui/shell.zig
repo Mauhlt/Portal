@@ -96,6 +96,9 @@ pub const ids = struct {
     pub const projects: u32 = 916;
     /// The plan-usage strip above the top bar (toggles its detail).
     pub const usage_strip: u32 = 917;
+    /// A device's "Desktop offline" screen: change where this device
+    /// finds the desktop (the glue opens panels/finddesk.zig).
+    pub const find_desk: u32 = 918;
     /// badge0 + position: that tab's background-task badge.
     pub const badge0: u32 = 1200;
     /// tab0 + position: show that tab; close0 + position: close it.
@@ -130,6 +133,8 @@ pub fn endedText(code: i64, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "Session ended on the desktop (exit code {d})", .{code}) catch "Session ended on the desktop";
 }
 pub const offline_text = "Desktop offline \u{2014} reconnects automatically";
+/// The offline screen's button (it changes only this device).
+pub const find_desk_label = "Change where this device finds the desktop";
 
 pub fn statusWord(st: Status) []const u8 {
     return switch (st) {
@@ -1158,6 +1163,14 @@ pub const Shell = struct {
                 else
                     "Portal is not answering on the desktop; this window resumes when it runs again.";
                 o.screen = .{ .message = .{ .title = t, .title_tone = .warn, .lines = b.lines[0..1] } };
+                // Offline: the desktop may have moved its tunnel port while
+                // this device was away. This device can only change where
+                // it looks; the desktop's port is changed at the desktop.
+                if (s == .desktop_offline) {
+                    b.lines[1] = "If the desktop's tunnel port was changed, this device can look for it at the new address.";
+                    o.screen.message.lines = b.lines[0..2];
+                    o.screen.message.button = .{ .label = find_desk_label, .id = ids.find_desk };
+                }
                 return o;
             },
             .connected => if (v.mode) |mode| {
@@ -1862,6 +1875,8 @@ test "viewer: session ended, then desktop offline, are explicit screens" {
     try testing.expectEqualStrings("desktop offline", off.status.label);
     try testing.expectEqualStrings("Session ended on the desktop (exit code 1)", off.screen.message.title);
     try testing.expectEqualStrings("Desktop offline \u{2014} reconnects automatically.", off.screen.message.lines[0]);
+    try testing.expectEqualStrings(find_desk_label, off.screen.message.button.?.label);
+    try testing.expectEqual(ids.find_desk, off.screen.message.button.?.id);
     const cold = sh.overlay(.{ .viewer = .{ .status = .desktop_offline, .host = "h" } });
     try testing.expectEqualStrings("Desktop offline \u{2014} reconnects automatically", cold.screen.message.title);
     const net_err = sh.overlay(.{ .viewer = .{ .status = .network_error, .detail = "Network error: network unreachable", .host = "h", .has_grid = true } });
