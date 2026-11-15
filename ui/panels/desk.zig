@@ -29,7 +29,7 @@ const pairqr = @import("shared").pairqr;
 
 pub fn Panels(comptime devices: type) type {
     return struct {
-        pub const Screen = enum { none, setup, pair_name, pair_check, pair_result, devices, dev_packages };
+        pub const Screen = enum { none, setup, pair_name, pair_check, pair_result, devices, dev_packages, move_confirm, move_result };
 
         /// Button and field ids (the frame reports clicks by id).
         pub const id = struct {
@@ -42,6 +42,8 @@ pub fn Panels(comptime devices: type) type {
             pub const ok: u32 = 1;
             pub const cancel: u32 = 2;
             pub const approve: u32 = 3;
+            /// "Switch now": the tunnel move was confirmed (move_confirm).
+            pub const move_go: u32 = 5;
             pub const deny: u32 = 4;
             pub const again: u32 = 6;
             pub const start: u32 = 8;
@@ -84,6 +86,9 @@ pub fn Panels(comptime devices: type) type {
             setup_cancel,
             /// Read the clipboard and call `paste`.
             paste,
+            /// The owner confirmed moving the tunnel to `ui.move` (the glue
+            /// runs it, then calls moveDone).
+            move_tunnel,
             /// "Claude Code integration": install Portal's hooks in the agent's
             /// settings.json, or remove them when installed
             /// (src/agenthooks.zig); the glue sets `ui.setup.agent`.
@@ -116,6 +121,22 @@ pub fn Panels(comptime devices: type) type {
         pub const max_pkgs = 16;
 
         pub const PairResult = enum { paired, failed };
+
+        /// A tunnel move as the desk proposes it (Settings: the port or the
+        /// endpoint changed), and its outcome per paired device.
+        pub const MoveState = enum { moved, offline, no_answer };
+        pub const MoveRow = struct { name: devices.Text = .{}, state: MoveState = .offline };
+        pub const Move = struct {
+            old_port: u16 = 0,
+            port: u16 = 0,
+            /// The endpoint to announce ("" none: devices keep theirs).
+            endpoint: form.TextField(259) = .{},
+            running: bool = false,
+            /// After the move: did the tunnel take the new port.
+            ok: bool = false,
+            rows: [devices.max_devices]MoveRow = undefined,
+            n_rows: usize = 0,
+        };
         /// shared/tunnelnet.zig checkCode.
         pub const check_len = @import("shared").tunnelnet.check_code_len;
         pub const key_text_len = 44;
@@ -156,6 +177,7 @@ pub fn Panels(comptime devices: type) type {
             note_tone: frame.Tone = .bad,
 
             setup: Setup = .{},
+            move: Move = .{},
 
             // ---- pairing
             name: form.TextField(devices.max_name) = .{},
@@ -224,6 +246,32 @@ pub fn Panels(comptime devices: type) type {
                 } else if (ui.setup.program.len == 0) {
                     ui.focus.index = 1;
                 }
+            }
+
+            /// Settings changed the tunnel: ask before moving it (the router
+            /// must forward the new port first).
+            pub fn openMoveConfirm(ui: *Ui, old_port: u16, port: u16, endpoint: []const u8) void {
+                ui.move = .{ .old_port = old_port, .port = port };
+                ui.move.endpoint.set(endpoint);
+                ui.show(.move_confirm);
+            }
+
+            /// The move is running (devices are told, the port moves).
+            pub fn moveStarted(ui: *Ui) void {
+                ui.move.running = true;
+                ui.move.n_rows = 0;
+                ui.show(.move_result);
+            }
+
+            /// The move's outcome: `ok` if the tunnel listens on the new
+            /// port; a row per paired device.
+            pub fn moveDone(ui: *Ui, ok: bool, rows: []const MoveRow) void {
+                ui.move.running = false;
+                ui.move.ok = ok;
+                const n = @min(rows.len, ui.move.rows.len);
+                @memcpy(ui.move.rows[0..n], rows[0..n]);
+                ui.move.n_rows = n;
+                if (ui.screen != .move_result) ui.show(.move_result);
             }
 
             /// "Pair a device…".
@@ -407,6 +455,11 @@ pub fn Panels(comptime devices: type) type {
                         },
                     },
                     .devices, .dev_packages => add(out, &n, id.ok),
+                    .move_confirm => {
+                        add(out, &n, id.cancel);
+                        add(out, &n, id.move_go);
+                    },
+                    .move_result => if (!ui.move.running) add(out, &n, id.ok),
                 }
                 return out[0..n];
             }
@@ -628,6 +681,7 @@ pub fn Panels(comptime devices: type) type {
                         ui.show(.pair_name);
                     },
                     id.approve => if (ui.screen == .pair_check) return .approve_pair,
+                    id.move_go => if (ui.screen == .move_confirm) return .move_tunnel,
                     id.deny => if (ui.screen == .pair_check) {
                         ui.show(.pair_name);
                         ui.setNote(.bad, "Not paired: the check codes did not match. Copy the key from the device again.", .{});
@@ -649,7 +703,7 @@ pub fn Panels(comptime devices: type) type {
             };
 
             pub const Bufs = struct {
-                lines: [14]frame.PanelText = undefined,
+                lines: [6 + devices.max_devices]frame.PanelText = undefined,
                 after: [8 + devices.max_devices]frame.PanelText = undefined,
                 rows: [@max(devices.max_devices, max_pkgs)]frame.PanelRow = undefined,
                 fields: [9]frame.PanelField = undefined,
@@ -690,13 +744,14 @@ pub fn Panels(comptime devices: type) type {
                     id.start => "Start",
                     id.save => "Save",
                     id.open_pair => "Check key",
+                    id.move_go => "Switch now",
                     else => "?",
                 };
             }
 
             fn tone(b: u32) frame.Tone {
                 return switch (b) {
-                    id.approve => .good,
+                    id.approve, id.move_go => .good,
                     id.deny => .bad,
                     else => .normal,
                 };
@@ -804,6 +859,42 @@ pub fn Panels(comptime devices: type) type {
                         }
                         p.rows = bufs.rows[0..ui.n_devs];
                     },
+                    .move_confirm => {
+                        const m = &ui.move;
+                        p.title = if (m.port != m.old_port) bufs.fmt("Move the tunnel to UDP {d}?", .{m.port}) else "Change where devices find this desktop?";
+                        p.title_tone = .warn;
+                        if (m.port != m.old_port) {
+                            L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("Portal's tunnel moves from UDP {d} to UDP {d} now, without a restart.", .{ m.old_port, m.port }), .tone = .normal });
+                            L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("Forward UDP {d} on your router before switching (to this desktop), and allow it in the firewall rule. Portal never changes the router.", .{m.port}), .tone = .warn, .bold = true });
+                        }
+                        if (m.endpoint.len > 0) {
+                            L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("Connected devices are told to find this desktop at {s} and follow. A device that is offline now: on its Desktop offline screen, Change where this device finds the desktop.", .{m.endpoint.text()}) });
+                        } else L.add(&bufs.lines, &nl, .{ .text = "Devices keep the address they have (the endpoint in Settings is unchanged)." });
+                        L.add(&bufs.lines, &nl, .{ .text = "Keys and pairings stay the same: no device needs pairing again." });
+                    },
+                    .move_result => {
+                        const m = &ui.move;
+                        if (m.running) {
+                            p.title = "Moving the tunnel\u{2026}";
+                            L.add(&bufs.lines, &nl, .{ .text = "Telling the connected devices, then switching the port." });
+                        } else if (m.ok) {
+                            p.title = bufs.fmt("The tunnel listens on UDP {d}", .{m.port});
+                            p.title_tone = .good;
+                            if (m.port != m.old_port) L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("Make sure your router forwards UDP {d} to this desktop.", .{m.port}), .tone = .warn });
+                        } else {
+                            p.title = "The tunnel was not moved";
+                            p.title_tone = .bad;
+                            L.add(&bufs.lines, &nl, .{ .text = "Nothing changed for devices (see the note and the log)." });
+                        }
+                        for (m.rows[0..m.n_rows]) |r| L.add(&bufs.lines, &nl, .{
+                            .text = bufs.fmt("{s: <16} {s}", .{ r.name.get(), switch (r.state) {
+                                .moved => "moved",
+                                .offline => "not yet (offline): change it on the device's Desktop offline screen",
+                                .no_answer => "not yet (no answer): change it on the device's Desktop offline screen",
+                            } }),
+                            .tone = if (r.state == .moved) .normal else .warn,
+                        });
+                    },
                     .dev_packages => {
                         const dev = if (ui.sub_dev < ui.n_devs) ui.devs[ui.sub_dev].name.get() else "?";
                         p.title = bufs.fmt("Packages for {s}", .{dev});
@@ -845,7 +936,7 @@ pub fn Panels(comptime devices: type) type {
                 }.f;
                 add(arr, n, .{ .text = "Tunnel", .tone = .normal, .bold = true });
                 add(arr, n, .{ .text = bufs.fmt("This desktop's key: {s}  (check code {s})", .{ c.desk_key, c.desk_check }), .tone = .normal });
-                add(arr, n, .{ .text = bufs.fmt("Listening on UDP {d}; devices reach 10.8.0.1 inside the tunnel. A changed port applies at the next start.", .{c.tunnel_port}) });
+                add(arr, n, .{ .text = bufs.fmt("Listening on UDP {d}; devices reach 10.8.0.1 inside the tunnel. A changed port or endpoint applies when you save, after a confirmation (forward the new port on your router first).", .{c.tunnel_port}) });
                 if (ui.n_devs == 0) add(arr, n, .{ .text = "Peers: none yet (Pair a device)." });
                 for (ui.devs[0..ui.n_devs]) |d| add(arr, n, .{ .text = bufs.fmt("Peer {s: <16} {s: <10} key {s}", .{ d.name.get(), d.ip.get(), d.key.get() }) });
             }

@@ -18,6 +18,7 @@ pub const max_pkgs = P.max_pkgs;
 pub const PairResult = P.PairResult;
 pub const Setup = P.Setup;
 pub const Ui = P.Ui;
+pub const MoveRow = P.MoveRow;
 pub const AgentHooks = P.AgentHooks;
 pub const cyclePolicy = P.cyclePolicy;
 pub const policyLabel = P.policyLabel;
@@ -285,4 +286,38 @@ test "setup: the button says Start on first run and Save in Settings" {
     const p2 = later.panel(&b, .{}).?;
     try testing.expectEqualStrings("Save", p2.buttons[p2.buttons.len - 1].label);
     try testing.expectEqual(Action.setup_submit, later.button(id.save));
+}
+
+test "moving the tunnel: confirm with the router warning, then per-device outcome" {
+    var ui: Ui = .{};
+    ui.openMoveConfirm(51820, 51821, "home.example.org:51821");
+    try testing.expectEqual(Screen.move_confirm, ui.screen);
+    var b: Ui.Bufs = .{};
+    const p = ui.panel(&b, .{}).?;
+    var warned = false;
+    for (p.lines) |l| warned = warned or std.mem.indexOf(u8, l.text, "Forward UDP 51821 on your router before switching") != null;
+    try testing.expect(warned);
+    // Nothing moves by default: Enter on the default (last) button is
+    // "Switch now" only after the owner reads it; Escape cancels.
+    try testing.expectEqual(@as(usize, 2), p.buttons.len);
+    try testing.expectEqualStrings("Switch now", p.buttons[1].label);
+    try testing.expectEqual(Action.move_tunnel, ui.button(id.move_go));
+    ui.moveStarted();
+    try testing.expectEqual(@as(usize, 0), ui.panel(&b, .{}).?.buttons.len);
+    var rows: [2]MoveRow = .{ .{ .state = .moved }, .{ .state = .offline } };
+    rows[0].name.set("laptop");
+    rows[1].name.set("iphone");
+    ui.moveDone(true, &rows);
+    const r = ui.panel(&b, .{}).?;
+    try testing.expectEqualStrings("The tunnel listens on UDP 51821", r.title);
+    var moved = false;
+    var offline = false;
+    for (r.lines) |l| {
+        moved = moved or (std.mem.indexOf(u8, l.text, "laptop") != null and std.mem.indexOf(u8, l.text, "moved") != null);
+        offline = offline or (std.mem.indexOf(u8, l.text, "iphone") != null and std.mem.indexOf(u8, l.text, "not yet (offline)") != null);
+    }
+    try testing.expect(moved and offline);
+    ui.openMoveConfirm(51820, 51821, "");
+    _ = ui.button(id.cancel);
+    try testing.expectEqual(Screen.none, ui.screen);
 }

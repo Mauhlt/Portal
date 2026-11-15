@@ -25,6 +25,8 @@ const client = @import("client.zig");
 const http = @import("http.zig");
 const Runner = @import("runner.zig").Runner;
 const Link = @import("link.zig").Link;
+/// The product's device code (devicelink: the endpoint announcement).
+const client_mod = @import("client");
 
 /// Text input into a shell (the latency check types into it).
 const run_args = [_][]const u8{ "--input", "text", "--allow-remote-shell", "--", "cmd.exe", "/q", "/k", "prompt READY$G" };
@@ -267,7 +269,95 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
         }
         _ = r.check("once it reads again the same pairing gets in (nothing to pair again)", back, "", .{});
     }
+    try movePort(r, inst, port);
     _ = r.ok("portal still running", inst.alive());
     inst.kill();
     killed = true;
+    try busyPort(h, r, port);
+}
+
+/// The desk moves its tunnel port with a device connected; the device
+/// follows the announcement and reconnects. Before that, a device tries
+/// every endpoint-like frame: the desk ignores them (only the desk can
+/// move the desk). Loopback ports only (the group's block: port + 1).
+fn movePort(r: *Runner, inst: *proc.Instance, port: u16) !void {
+    const link = try inst.pair("mover");
+    const v = try client.Viewer.open(inst, "mover");
+    defer v.deinit();
+    _ = v.waitFor("READY>", 10_000);
+
+    // A device can't move the desk.
+    for ([_][]const u8{
+        "{\"t\":\"endpoint\",\"endpoint\":\"127.0.0.1:1\",\"seq\":99999999999}",
+        "m:99999999999",
+        "m:127.0.0.1:1",
+        "e:127.0.0.1:1",
+    }) |f| v.send(f);
+    _ = r.check("endpoint-like frames from a device are ignored: the desk keeps its port and the session works", echoMs(v, "mv0") != null and !inst.logHas("now listening on UDP") and !inst.logHas("saved the announced endpoint"), "", .{});
+
+    // The desk moves (its own console command; the window's Settings does
+    // the same after its confirmation).
+    const new_port = port + 1;
+    var pb: [8]u8 = undefined;
+    var eb: [32]u8 = undefined;
+    const cli = try inst.liveCli(&.{ "tunnel-port", try std.fmt.bufPrint(&pb, "{d}", .{new_port}), "--endpoint", try std.fmt.bufPrint(&eb, "127.0.0.1:{d}", .{new_port}), "--router-forwarded" });
+    defer cli.deinit();
+    const told = v.waitFor("\"t\":\"endpoint\"", 15_000) or v.lastText("\"t\":\"endpoint\"") != null;
+    const msg = v.lastText("\"t\":\"endpoint\"") orelse "";
+    _ = r.check("the connected device is told the new endpoint with a sequence number", told and has(msg, "\"seq\":"), "{s}", .{msg});
+    // The device: validated, the code's endpoint (only) replaced, acked,
+    // then its tunnel follows (what devicelink.Follower does).
+    const m = client_mod.devicelink.parseEndpointMessage(msg) orelse return error.BadAnnouncement;
+    const moved = switch (client_mod.devicelink.acceptMove(&link.code, &m)) {
+        .moved => |c| c,
+        else => return error.AnnouncementRefused,
+    };
+    _ = r.check("the announcement changes only the endpoint (same keys and address)", std.mem.eql(u8, &moved.desk_key, &link.code.desk_key) and std.mem.eql(u8, &moved.device_ip, &link.code.device_ip), "", .{});
+    var ab: [24]u8 = undefined;
+    v.send(@import("shared").frames.movedFrame(m.seq, &ab));
+    v.pump(client_mod.devicelink.Follower.switch_delay_ms);
+    link.code = moved;
+    try link.tun.setPeers(&.{client_mod.devicelink.deskPeer(&link.code)});
+    const code = cli.wait(20_000);
+    _ = r.check("`portalctl tunnel-port` moves the running desk's tunnel", code == 0 and has(cli.output(), "now listens on UDP"), "code={?d} {s}", .{ code, cli.output() });
+    _ = r.check("the desk saw the device's acknowledgement before moving", inst.logHas("saved the announced endpoint"), "", .{});
+    var lb: [64]u8 = undefined;
+    _ = r.check("the desk listens on the new port, keys and peers unchanged", inst.logHas(try std.fmt.bufPrint(&lb, "now listening on UDP {d}", .{new_port})), "", .{});
+    // A replay of the same, or an older, announcement changes nothing.
+    _ = r.check("a replayed announcement is refused by the device", client_mod.devicelink.acceptMove(&link.code, &m) == .same and
+        client_mod.devicelink.acceptMove(&link.code, &.{ .seq = m.seq - 1, .endpoint_buf = m.endpoint_buf, .endpoint_len = m.endpoint_len }) == .stale, "", .{});
+    // The device reaches the desk at the new endpoint: the open viewer
+    // keeps working, or a new one connects.
+    var ok = echoMs(v, "mv1") != null;
+    if (!ok) {
+        const deadline = net.now() + 30_000;
+        while (!ok and net.now() < deadline) : (net.sleep(500)) {
+            const nv = client.Viewer.open(inst, "mover") catch continue;
+            nv.deinit();
+            ok = true;
+        }
+    }
+    _ = r.check("the device follows to the new port and reconnects (no pairing again)", ok, "", .{});
+    inst.udp_port = new_port;
+}
+
+/// The tunnel's UDP port is taken at start: Portal says so plainly (the
+/// port, the program holding it) and keeps running; moving the port then
+/// binds it.
+fn busyPort(h: *proc.Harness, r: *Runner, port: u16) !void {
+    const busy = port + 2;
+    // Another program holding it (here: a second tunnel in this process).
+    var hk = client_mod.tunnel.keys.KeyPair.generate(h.io);
+    defer hk.wipe();
+    const holder = try client_mod.tunnel.Tunnel.start(h.gpa, h.io, .{ .private_key = hk.private, .address = .{ 10, 9, 0, 1 }, .udp_port = busy, .loopback_only = true });
+    defer holder.destroy();
+    const dir = try h.dataDir("tunnel-busy");
+    const inst = try proc.Instance.start(h, dir, busy, &run_args);
+    defer inst.kill();
+    var mb: [64]u8 = undefined;
+    _ = r.check("a taken tunnel port is reported plainly with the program holding it", inst.logHas(try std.fmt.bufPrint(&mb, "UDP port {d} is already in use by ", .{busy})) and inst.logHas("Tunnel UDP port"), "", .{});
+    _ = r.check("...and Portal keeps running for local sessions", inst.alive(), "", .{});
+    var pb: [8]u8 = undefined;
+    const c = try inst.cli(&.{ "tunnel-port", try std.fmt.bufPrint(&pb, "{d}", .{port + 3}), "--router-forwarded" });
+    _ = r.check("choosing another port binds the tunnel without a restart", c.code == 0 and inst.logHas("now listening on UDP"), "{s}", .{c.out});
 }
