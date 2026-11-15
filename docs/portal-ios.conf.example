@@ -1,0 +1,54 @@
+# portal-ios.conf: the settings of portal-ios-sign (the Mac kit's signer).
+#
+# Copy this file to portal-ios.conf next to portal-ios-sign (or into the
+# directory you run it from, or pass --config <file>), fill in the two
+# required lines, then run:
+#
+#   ./portal-ios-sign --install
+#
+# Format: key = value, one per line; # starts a comment line; quotes
+# around a value are optional; an empty value means "not set". A flag of
+# the same name (--team-id, --account, ...) overrides a line here.
+
+# Required. Your Apple team id: 10 uppercase letters and digits.
+#   Paid account: developer.apple.com > Account > Membership details.
+#   Free account: Keychain Access > your "Apple Development" certificate >
+#   Organizational Unit.
+# (Not the code in brackets after your name in the certificate's name.)
+team_id =
+
+# Required. paid or free.
+#   paid: signs the app and, when the kit has it (built with
+#         -Dios-tunnel=true), the background tunnel extension.
+#   free: the app only; use a kit built without -Dios-tunnel. Its profiles
+#         last 7 days: run the signer again after that.
+account =
+
+# Optional. The signing identity: its name or its SHA-1, as listed by
+#   security find-identity -v -p codesigning
+# Leave it empty to use the Apple Development identity the profile was
+# made for.
+identity =
+
+# Optional. The app's development profile (.mobileprovision). Leave it
+# empty to pick the newest valid one from
+#   ~/Library/MobileDevice/Provisioning Profiles
+#   ~/Library/Developer/Xcode/UserData/Provisioning Profiles
+# Relative paths are taken from this file's directory; ~/ works.
+profile =
+
+# Optional, paid account with the tunnel extension only: the profile for
+# <bundle id>.tunnel. Empty: found the same way as profile.
+tunnel_profile =
+
+# Optional. The iPhone to install on: its identifier, UDID or name from
+#   xcrun devicectl list devices
+# Empty: the only iPhone that is connected.
+device =
+
+# Optional. yes: start Portal on the iPhone after --install.
+launch = no
+
+# Optional. The bundle id; empty takes the app's own (set at build time
+# with -Dios-bundle-id). When given, it must match the app.
+bundle_id =
