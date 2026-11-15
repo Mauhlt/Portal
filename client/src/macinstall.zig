@@ -12,6 +12,11 @@
 //!   settings (~/Library/Application Support/Portal) and this Mac's tunnel
 //!   key (Keychain). Dragging the app to the Trash removes the app alone.
 //!
+//! A newer copy already in ~/Applications is never replaced by an older
+//! download (CFBundleVersion); the copy started with PORTAL_MAC_INSTALLED=1
+//! never installs again, and the same folder reached by another path
+//! (realpath) is not copied onto itself.
+//!
 //! The bundle's layout and Info.plist are defined here once: the bundle
 //! tool (src/tools/mac_bundle.zig) writes them at build time. The rules
 //! are pure and tested on any OS; only `run` and `uninstall` touch a Mac.
@@ -121,24 +126,89 @@ pub fn removal(buf: *[2][1024]u8, home: []const u8, app: []const u8, delete_data
 
 const mac = builtin.os.tag == .macos;
 
+/// Set in the environment of the installed copy this start hands over to:
+/// that copy never installs again (no loop, whatever the paths say).
+pub const marker_env = "PORTAL_MAC_INSTALLED";
+
+/// The installed copy may not install itself again: `marker` is
+/// marker_env's value.
+pub fn handedOver(marker: ?[]const u8) bool {
+    const m = marker orelse return false;
+    return std.mem.eql(u8, m, "1");
+}
+
+/// CFBundleVersion in an Info.plist's text (as infoPlist writes it), or null.
+pub fn bundleVersion(plist: []const u8) ?[]const u8 {
+    const key = "<key>CFBundleVersion</key>";
+    const k = std.mem.indexOf(u8, plist, key) orelse return null;
+    const rest = plist[k + key.len ..];
+    const open = std.mem.indexOf(u8, rest, "<string>") orelse return null;
+    const close = std.mem.indexOf(u8, rest, "</string>") orelse return null;
+    if (close < open) return null;
+    return std.mem.trim(u8, rest[open + "<string>".len .. close], " ");
+}
+
+/// Dotted version order (1.10.0 > 1.9.3; a missing part is 0; anything
+/// not numeric counts as 0).
+pub fn versionOrder(a: []const u8, b: []const u8) std.math.Order {
+    var ia = std.mem.splitScalar(u8, a, '.');
+    var ib = std.mem.splitScalar(u8, b, '.');
+    while (true) {
+        const pa = ia.next();
+        const pb = ib.next();
+        if (pa == null and pb == null) return .eq;
+        const na = std.fmt.parseInt(u64, pa orelse "0", 10) catch 0;
+        const nb = std.fmt.parseInt(u64, pb orelse "0", 10) catch 0;
+        if (na != nb) return std.math.order(na, nb);
+    }
+}
+
+/// What to do with an installed copy of version `installed` (null: none)
+/// when this one is `mine`: replace it, or leave a newer one alone.
+pub fn shouldReplace(installed: ?[]const u8, mine: []const u8) bool {
+    const v = installed orelse return true;
+    return versionOrder(v, mine) != .gt;
+}
+
 /// Called first thing by portal-client on macOS: installs or upgrades the
 /// app in ~/Applications and starts it there (never returns then), or
 /// returns to run normally. Any failure: runs from where it is.
+///
+/// Gatekeeper: the copy is made file by file; Portal does not remove
+/// com.apple.quarantine on purpose. Whether macOS carries the attribute
+/// over depends on how it copies; if it does, the installed copy is
+/// checked once more on this start (README, "Setup").
 pub fn run(io: std.Io, args: []const []const u8) void {
     if (!mac) return;
-    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = std.process.executablePath(io, &exe_buf) catch return;
-    const exe = exe_buf[0..n];
+    if (handedOver(if (std.c.getenv(marker_env)) |m| std.mem.span(m) else null)) return;
+    const gpa = std.heap.page_allocator;
+    const exe = std.process.executablePathAlloc(io, gpa) catch return;
     const home = std.mem.span(std.c.getenv("HOME") orelse return);
     var to_buf: [1024]u8 = undefined;
-    const p = plan(exe, home, &to_buf);
-    switch (p) {
+    switch (plan(exe, home, &to_buf)) {
         .run => return,
         .install => |i| {
-            install(io, i.from, i.to) catch return;
-            startCopy(i.to, args);
+            // The same place under another spelling (a symlink, a case
+            // change): just run.
+            if (samePlace(io, gpa, i.from, i.to)) return;
+            const mine = readVersion(io, gpa, i.from) orelse "0";
+            if (shouldReplace(readVersion(io, gpa, i.to), mine)) install(io, i.from, i.to) catch return;
+            startCopy(gpa, i.to, args) catch return;
         },
     }
+}
+
+fn samePlace(io: std.Io, gpa: std.mem.Allocator, a: []const u8, b: []const u8) bool {
+    const ra = std.Io.Dir.cwd().realPathFileAlloc(io, a, gpa) catch return false;
+    const rb = std.Io.Dir.cwd().realPathFileAlloc(io, b, gpa) catch return false;
+    return std.mem.eql(u8, ra, rb);
+}
+
+/// A bundle's CFBundleVersion, or null (no bundle there).
+fn readVersion(io: std.Io, gpa: std.mem.Allocator, app: []const u8) ?[]const u8 {
+    const p = std.fmt.allocPrint(gpa, "{s}/" ++ paths.info_plist, .{app}) catch return null;
+    const text = std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(64 << 10)) catch return null;
+    return bundleVersion(text);
 }
 
 /// Copies the bundle next to `to`, then swaps it in (the old copy, if
@@ -179,26 +249,21 @@ fn copyTree(io: std.Io, from: []const u8, to: []const u8) !void {
     };
 }
 
-/// Replaces this process with the installed copy (same arguments).
-fn startCopy(app: []const u8, args: []const []const u8) void {
-    var eb: [1100:0]u8 = undefined;
-    const exe = printZ(&eb, "{s}/" ++ paths.executable, .{app}) orelse return;
-    var argv: [16:null]?[*:0]const u8 = @splat(null);
+/// Replaces this process with the installed copy: the same arguments
+/// (all of them, any length), the same environment plus marker_env=1.
+fn startCopy(gpa: std.mem.Allocator, app: []const u8, args: []const []const u8) !void {
+    const exe = try std.fmt.allocPrintSentinel(gpa, "{s}/" ++ paths.executable, .{app}, 0);
+    const argv = try gpa.allocSentinel(?[*:0]const u8, args.len + 1, null);
     argv[0] = exe.ptr;
-    var zb: [15][256:0]u8 = undefined;
-    for (args[0..@min(args.len, 14)], 0..) |a, i| {
-        const z = printZ(&zb[i], "{s}", .{a}) orelse return;
-        argv[i + 1] = z.ptr;
-    }
-    _ = std.c.execve(exe.ptr, &argv, std.c.environ);
+    for (args, 1..) |a, i| argv[i] = (try gpa.dupeSentinel(u8, a, 0)).ptr;
+    var n_env: usize = 0;
+    while (std.c.environ[n_env] != null) n_env += 1;
+    const envp = try gpa.allocSentinel(?[*:0]const u8, n_env + 1, null);
+    for (0..n_env) |i| envp[i] = std.c.environ[i];
+    envp[n_env] = marker_env ++ "=1";
+    _ = std.c.execve(exe.ptr, argv.ptr, envp.ptr);
+    return error.ExecFailed;
 }
-
-fn printZ(buf: anytype, comptime f: []const u8, args: anytype) ?[:0]u8 {
-    const s = std.fmt.bufPrint(buf[0 .. buf.len - 1], f, args) catch return null;
-    buf[s.len] = 0;
-    return buf[0..s.len :0];
-}
-
 /// `Portal uninstall`: asks on the terminal, then removes. `drop_key`
 /// deletes this Mac's tunnel key (the client's tunnel.keys.drop). Returns
 /// the exit code.
@@ -258,6 +323,42 @@ test "mac: a start from Downloads installs into ~/Applications; installed copies
     try testing.expectEqual(Plan.run, plan("/usr/local/bin/portal-client", "/Users/u", &b));
     try testing.expectEqual(Plan.run, plan("/x/Portal.app/Contents/Resources/Portal", "/Users/u", &b));
     try testing.expectEqual(Plan.run, plan("/x/Portal.app/Contents/MacOS/Portal", "", &b));
+}
+
+test "mac: the installed copy never installs again; a newer copy is kept" {
+    try testing.expect(handedOver("1"));
+    try testing.expect(!handedOver(null));
+    try testing.expect(!handedOver("0"));
+    var b: [4096]u8 = undefined;
+    const p = try infoPlist(&b, "v1.10.0");
+    try testing.expectEqualStrings("1.10.0", bundleVersion(p).?);
+    try testing.expect(bundleVersion("<plist/>") == null);
+    try testing.expectEqual(std.math.Order.gt, versionOrder("1.10.0", "1.9.3"));
+    try testing.expectEqual(std.math.Order.eq, versionOrder("1.2", "1.2.0"));
+    try testing.expectEqual(std.math.Order.lt, versionOrder("0.0.0", "0.1"));
+    try testing.expect(shouldReplace(null, "1.0"));
+    try testing.expect(shouldReplace("1.0", "1.0")); // the same: reinstalled
+    try testing.expect(shouldReplace("0.9", "1.0")); // older: upgraded
+    try testing.expect(!shouldReplace("1.1", "1.0")); // newer: kept
+}
+
+test "mac: the installed copy's path is the one plan compares (realpath on disk)" {
+    // samePlace resolves both paths: a folder reached through ".." is the
+    // same folder, so it is never copied onto itself.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.createDirPath(io, "Applications/Portal.app/Contents");
+    const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(base);
+    const a = try std.fs.path.join(testing.allocator, &.{ base, "Applications", "Portal.app" });
+    defer testing.allocator.free(a);
+    const b2 = try std.fs.path.join(testing.allocator, &.{ base, "Applications", "Portal.app", "Contents", "..", "" });
+    defer testing.allocator.free(b2);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expect(samePlace(io, arena.allocator(), a, b2));
+    try testing.expect(!samePlace(io, arena.allocator(), a, base));
 }
 
 test "mac: uninstall removes the app, and the data only when asked" {
