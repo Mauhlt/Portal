@@ -169,9 +169,9 @@ pub fn nativeArch() setup_lib.Arch {
 
 // ---------------------------------------------------------------- shortcut
 
-const CLSID_ShellLink: GUID = .{ .a = 0x00021401, .b = 0, .c = 0, .d = .{ 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
-const IID_IShellLinkW: GUID = .{ .a = 0x000214F9, .b = 0, .c = 0, .d = .{ 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
-const IID_IPersistFile: GUID = .{ .a = 0x0000010b, .b = 0, .c = 0, .d = .{ 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
+const CLSID_ShellLink = com.guid("00021401-0000-0000-c000-000000000046");
+const IID_IShellLinkW = com.guid("000214f9-0000-0000-c000-000000000046");
+const IID_IPersistFile = com.guid("0000010b-0000-0000-c000-000000000046");
 
 const SetW = *const fn (*anyopaque, [*:0]const u16) callconv(.winapi) HRESULT;
 
@@ -203,8 +203,9 @@ pub fn writeShortcut(gpa: Allocator, lnk: []const u8, target: []const u8, args: 
     if (method(*const fn (*anyopaque, [*:0]const u16, i32) callconv(.winapi) HRESULT, pf.?, 6)(pf.?, l, 1) < 0) return error.ShortcutSave; // Save
 }
 
+/// COM for the installer's thread, for its whole run.
 pub fn coInit() void {
-    _ = w.CoInitializeEx(null, 0x2); // apartment threaded
+    _ = com.Scope.init();
 }
 
 // ----------------------------------------------------------------- dialogs
