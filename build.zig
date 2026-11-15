@@ -234,7 +234,9 @@ pub fn build(b: *std.Build) void {
     addIos(b, optimize, test_step);
     addBrand(b, test_step);
     addPackage(b, test_step);
-    addInstaller(b, test_step);
+    const check = checkDist(b, test_step);
+    addInstaller(b, test_step, check);
+    addMacInstaller(b, test_step, check);
     addPin(b);
     addCheckZig(b);
 }
@@ -465,9 +467,8 @@ fn payloadModule(b: *std.Build, exes: []const [2][]const u8, sources: []const st
 /// architecture's Portal (stripped too) and checked by check-dist for
 /// paths of the machine that built them. `zig build test` compiles a
 /// setup with a tiny stand-in payload and runs its tests.
-fn addInstaller(b: *std.Build, test_step: *std.Build.Step) void {
+fn addInstaller(b: *std.Build, test_step: *std.Build.Step, check: *std.Build.Step.Compile) void {
     const step = b.step("installer", "Build the Windows installers (zig-out/installer/portal-setup-x64.exe, -arm64.exe), stripped and path-checked");
-    const check = checkDist(b, test_step);
     for ([_]struct { arch: std.Target.Cpu.Arch, asset: []const u8 }{
         .{ .arch = .x86_64, .asset = "portal-setup-x64" },
         .{ .arch = .aarch64, .asset = "portal-setup-arm64" },
@@ -515,6 +516,84 @@ fn addInstaller(b: *std.Build, test_step: *std.Build.Step) void {
     test_step.dependOn(&s.exe.step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = s.mod })).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = firewallModule(b, target, .Debug) })).step);
+}
+
+/// `zig build mac-installer`: zig-out/installer/Portal-mac.zip, the Mac's
+/// Portal.app (a device: `portal connect`), built here without Xcode or a
+/// Mac. Its executable is the laptop client for arm64 and x86_64 macOS,
+/// ReleaseSafe and stripped, joined into one universal binary (each slice
+/// keeps the ad-hoc signature Zig's linker gives it); Info.plist and the
+/// layout come from client/src/macinstall.zig, which also installs the app
+/// into ~/Applications on its first start. MoltenVK (the Mac's Vulkan) goes
+/// into Contents/Frameworks with -Dmoltenvk-macos=<libMoltenVK.dylib> (the
+/// release workflow passes the pinned one); without it the app asks for
+/// MoltenVK at first start. Checked by check-dist and machocheck.
+fn addMacInstaller(b: *std.Build, test_step: *std.Build.Step, check: *std.Build.Step.Compile) void {
+    const step = b.step("mac-installer", "Build zig-out/installer/Portal-mac.zip (universal Portal.app for macOS, unsigned; -Dmoltenvk-macos=<libMoltenVK.dylib>)");
+    const mvk = b.option([]const u8, "moltenvk-macos", "mac-installer: libMoltenVK.dylib (universal) to bundle in Portal.app");
+    const host = b.graph.host;
+    const mi = b.createModule(.{ .root_source_file = b.path("client/src/macinstall.zig"), .target = host, .optimize = .Debug });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mi })).step);
+    const tool_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/mac_bundle.zig"),
+        .target = host,
+        .optimize = .ReleaseSafe,
+        .imports = &.{.{ .name = "macinstall", .module = b.createModule(.{ .root_source_file = b.path("client/src/macinstall.zig"), .target = host, .optimize = .ReleaseSafe }) }},
+    });
+    const tool = b.addExecutable(.{ .name = "portal-mac-bundle", .root_module = tool_mod });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/mac_bundle.zig"),
+        .target = host,
+        .optimize = .Debug,
+        .imports = &.{.{ .name = "macinstall", .module = mi }},
+    }) })).step);
+
+    var thins: [2]*std.Build.Step.Compile = undefined;
+    for ([_]std.Target.Cpu.Arch{ .aarch64, .x86_64 }, 0..) |arch, i| {
+        const exe = laptopClient(b, b.resolveTargetQuery(.{ .cpu_arch = arch, .os_tag = .macos }), .ReleaseSafe, "Portal");
+        exe.root_module.strip = true;
+        thins[i] = exe;
+    }
+    const lipo = b.addRunArtifact(tool);
+    lipo.addArg("lipo");
+    const fat = lipo.addOutputFileArg("Portal");
+    for (thins) |t| lipo.addFileArg(t.getEmittedBin());
+    const plist = b.addRunArtifact(tool);
+    plist.addArg("plist");
+    const plist_out = plist.addOutputFileArg("Info.plist");
+    plist.addArg(setupVersion(b).version);
+    const icns = b.addRunArtifact(tool);
+    icns.addArg("icns");
+    const icns_out = icns.addOutputFileArg("Portal.icns");
+    for ([_][2][]const u8{ .{ "icp4", "16" }, .{ "icp5", "32" }, .{ "ic08", "256" }, .{ "ic10", "1024" } }) |e| {
+        icns.addPrefixedFileArg(b.fmt("{s}=", .{e[0]}), b.path(b.fmt("docs/brand/portal-icon-{s}.png", .{e[1]})));
+    }
+    const wf = b.addWriteFiles();
+    _ = wf.addCopyFile(fat, "Portal.app/Contents/MacOS/Portal");
+    _ = wf.addCopyFile(plist_out, "Portal.app/Contents/Info.plist");
+    _ = wf.addCopyFile(icns_out, "Portal.app/Contents/Resources/Portal.icns");
+    if (mvk) |p| _ = wf.addCopyFile(.{ .cwd_relative = p }, "Portal.app/Contents/Frameworks/libMoltenVK.dylib");
+    const zip = b.addRunArtifact(tool);
+    zip.addArg("zip");
+    const zip_out = zip.addOutputFileArg("Portal-mac.zip");
+    zip.addDirectoryArg(wf.getDirectory());
+
+    // No build-machine paths or names in any slice; the arm64 one also
+    // stripped (machocheck).
+    const paths = b.addRunArtifact(check);
+    paths.setCwd(b.path("."));
+    for (thins) |t| paths.addFileArg(t.getEmittedBin());
+    paths.addFileArg(fat);
+    const macho = b.addRunArtifact(b.addExecutable(.{ .name = "machocheck-mac", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/machocheck.zig"),
+        .target = host,
+        .optimize = .ReleaseSafe,
+    }) }));
+    macho.addFileArg(thins[0].getEmittedBin());
+    const install = b.addInstallFile(zip_out, "installer/Portal-mac.zip");
+    install.step.dependOn(&paths.step);
+    install.step.dependOn(&macho.step);
+    step.dependOn(&install.step);
 }
 
 /// The no-build-machine-paths check (src/tools/check_dist.zig, after
@@ -570,22 +649,26 @@ const hero_side = 768;
 
 /// The laptop client's executable (as client/build.zig builds it) for `t`.
 fn laptopClientCheck(b: *std.Build, t: std.Build.ResolvedTarget) *std.Build.Step.Compile {
-    const inputrules = inputrulesModule(b, t, .Debug);
-    const scratch = b.createModule(.{ .target = t, .optimize = .Debug });
-    const gui = addGuiModules(b, scratch, t, .Debug, inputrules);
+    return laptopClient(b, t, .Debug, b.fmt("portal-client-check-{t}", .{t.result.os.tag}));
+}
+
+fn laptopClient(b: *std.Build, t: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, name: []const u8) *std.Build.Step.Compile {
+    const inputrules = inputrulesModule(b, t, optimize);
+    const scratch = b.createModule(.{ .target = t, .optimize = optimize });
+    const gui = addGuiModules(b, scratch, t, optimize, inputrules);
     return b.addExecutable(.{
-        .name = b.fmt("portal-client-check-{t}", .{t.result.os.tag}),
+        .name = name,
         .root_module = b.createModule(.{
             .root_source_file = b.path("client/src/main.zig"),
             .target = t,
-            .optimize = .Debug,
+            .optimize = optimize,
             .link_libc = true, // Security.framework via dlopen
             .imports = &.{
                 .{ .name = "view", .module = gui.view },
                 .{ .name = "portal_ui", .module = gui.ui },
-                .{ .name = "shared", .module = sharedModule(b, t, .Debug) },
+                .{ .name = "shared", .module = sharedModule(b, t, optimize) },
                 .{ .name = "inputrules", .module = inputrules },
-                .{ .name = "WireGuard", .module = wireguardModule(b, t, .Debug) },
+                .{ .name = "WireGuard", .module = wireguardModule(b, t, optimize) },
                 .{ .name = "tunnel_options", .module = tunnelOptions(b) },
             },
         }),
