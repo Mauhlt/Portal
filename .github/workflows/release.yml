@@ -18,7 +18,13 @@
 #     SHA-256 checked.
 #   - Portal's dependencies: Zig URL packages in build.zig.zon, fetched and
 #     hash-checked by `zig build` itself.
-#   - No actions are used.
+#   - The only actions: the official upload-artifact and download-artifact,
+#     pinned by full commit SHA.
+#
+# Two jobs, so the write token never meets the build: `build` (contents:
+# read) tests, builds, checks and uploads the files as an artifact;
+# `publish` (contents: write) only downloads them and creates the release,
+# with GH_TOKEN on that one step.
 name: release
 
 on:
@@ -27,17 +33,17 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
     runs-on: windows-latest
+    permissions:
+      contents: read
     defaults:
       run:
         shell: bash
     env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
       # ZVC pinned to one release and its SHA-256 (as ios.yml). When ZVC
       # publishes a new release, bump the tag (its "+" written %2B) and the
       # hash together.
@@ -45,6 +51,8 @@ jobs:
       ZVC_SHA256: 0d8d355e67c90d2223b895878ca5c540f2539fd333dd14554f8677a1fa3020c2
       MOLTENVK_URL: https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos.tar
       MOLTENVK_SHA256: f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Check out the commit
         run: |
@@ -77,22 +85,53 @@ jobs:
       # A tag push releases that tag; a manual run makes a prerelease named
       # after the run.
       - name: Version
+        id: version
         run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then echo "VERSION=$GITHUB_REF_NAME" >> "$GITHUB_ENV"; else echo "VERSION=build-$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"; fi
+          if [ "$GITHUB_REF_TYPE" = tag ]; then v="$GITHUB_REF_NAME"; else v="build-$GITHUB_RUN_NUMBER"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
 
+      # Every published file goes through check-dist on the way (the
+      # installers and what they carry, the Mac's slices, MoltenVK, the
+      # zip and the notes).
       - name: Build the installers (stripped, path-checked) and the notes
         run: >-
           zig build installer mac-installer release-notes
-          -Dsetup-version="$VERSION" -Dsetup-commit="$GITHUB_SHA"
+          -Dsetup-version="${{ steps.version.outputs.version }}" -Dsetup-commit="$GITHUB_SHA"
           -Dmoltenvk-macos="$RUNNER_TEMP/mvk/MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib"
 
+      - name: Gather the release files
+        run: |
+          mkdir -p release
+          cp zig-out/installer/portal-setup-x64.exe zig-out/installer/portal-setup-arm64.exe zig-out/installer/Portal-mac.zip zig-out/release-notes.md release/
+      - name: Upload them
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: portal-release
+          path: release/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the release files
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: portal-release
+          path: release
       - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
         run: >-
           gh release create "$VERSION"
-          zig-out/installer/portal-setup-x64.exe
-          zig-out/installer/portal-setup-arm64.exe
-          zig-out/installer/Portal-mac.zip
+          release/portal-setup-x64.exe
+          release/portal-setup-arm64.exe
+          release/Portal-mac.zip
           --target "$GITHUB_SHA"
           --title "Portal $VERSION"
-          --notes-file zig-out/release-notes.md
+          --notes-file release/release-notes.md
           $([ "$GITHUB_REF_TYPE" = tag ] || echo --prerelease)

@@ -237,7 +237,7 @@ pub fn build(b: *std.Build) void {
     const check = checkDist(b, test_step);
     addInstaller(b, test_step, check);
     addMacInstaller(b, test_step, check);
-    addReleaseNotes(b);
+    addReleaseNotes(b, check);
     addPin(b);
     addCheckZig(b);
 }
@@ -579,12 +579,17 @@ fn addMacInstaller(b: *std.Build, test_step: *std.Build.Step, check: *std.Build.
     const zip_out = zip.addOutputFileArg("Portal-mac.zip");
     zip.addDirectoryArg(wf.getDirectory());
 
-    // No build-machine paths or names in any slice; the arm64 one also
-    // stripped (machocheck).
+    // No build-machine paths or names in any slice, in the zip as it is
+    // published (stored: every file in it is scanned) or in what went into
+    // it; the arm64 slice also stripped (machocheck).
     const paths = b.addRunArtifact(check);
     paths.setCwd(b.path("."));
     for (thins) |t| paths.addFileArg(t.getEmittedBin());
     paths.addFileArg(fat);
+    paths.addFileArg(plist_out);
+    paths.addFileArg(icns_out);
+    if (mvk) |p| paths.addFileArg(.{ .cwd_relative = p });
+    paths.addFileArg(zip_out);
     const macho = b.addRunArtifact(b.addExecutable(.{ .name = "machocheck-mac", .root_module = b.createModule(.{
         .root_source_file = b.path("src/tools/machocheck.zig"),
         .target = host,
@@ -599,7 +604,7 @@ fn addMacInstaller(b: *std.Build, test_step: *std.Build.Step, check: *std.Build.
 
 /// `zig build release-notes`: zig-out/release-notes.md for the GitHub
 /// Release the workflow creates (.github/workflows/release.yml).
-fn addReleaseNotes(b: *std.Build) void {
+fn addReleaseNotes(b: *std.Build, check: *std.Build.Step.Compile) void {
     const v = setupVersion(b);
     const wf = b.addWriteFiles();
     const notes = wf.add("release-notes.md", b.fmt(
@@ -626,7 +631,12 @@ fn addReleaseNotes(b: *std.Build) void {
         \\Setup and the manual fallback: README.md, "Setup".
         \\
     , .{ v.version, v.commit }));
-    b.step("release-notes", "Write zig-out/release-notes.md (-Dsetup-version, -Dsetup-commit)").dependOn(&b.addInstallFile(notes, "release-notes.md").step);
+    const scan = b.addRunArtifact(check);
+    scan.setCwd(b.path("."));
+    scan.addFileArg(notes);
+    const install = b.addInstallFile(notes, "release-notes.md");
+    install.step.dependOn(&scan.step);
+    b.step("release-notes", "Write zig-out/release-notes.md (-Dsetup-version, -Dsetup-commit), path-checked").dependOn(&install.step);
 }
 
 /// The no-build-machine-paths check (src/tools/check_dist.zig, after

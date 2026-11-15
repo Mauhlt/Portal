@@ -243,17 +243,22 @@ What it does, for your user only and without an administrator:
   to Settings → Apps (Uninstall is there). An installer for the other kind
   of PC refuses to install and names the right one.
   * **Desk**: adds the one Windows Firewall rule (inbound UDP on the
-    tunnel port, any profile) through **one administrator prompt**; if you
-    decline, it says how to add it later (Settings → Windows Firewall, or
-    the command under "Manual setup"). It installs the agent hooks, then
-    starts Portal; Settings then walks you through the router (forward the
+    tunnel port, any profile) through **one administrator prompt**: only
+    Windows' own `netsh.exe` from System32 runs as administrator, never a
+    Portal file. If you decline, it says how to add it later (Settings →
+    Windows Firewall, or the command under "Manual setup"). If the agent CLI
+    is installed it offers the agent hooks (default yes; never on a PC
+    without it), then starts Portal; Settings then walks you through the router (forward the
     port, DHCP reservation, UPnP off, the CGNAT check) and asks for your
     public address or dynamic-DNS name. Portal never looks it up on the
     internet.
   * **Device**: starts Portal on its pairing screen (`portal connect`);
     pair it at the desk ([docs/pairing.md](docs/pairing.md)).
 * **Mac**: Portal.app moves itself to `~/Applications` on its first start
-  and opens on the pairing screen. To remove it, drag it to the Trash, or
+  and opens on the pairing screen (a newer copy already there is kept and
+  started instead). Portal does not remove macOS's quarantine flag: if
+  macOS carries it over to the copy, it asks once more for that copy. To
+  remove it, drag it to the Trash, or
   run `~/Applications/Portal.app/Contents/MacOS/Portal uninstall` in
   Terminal, which also asks whether to delete your data and this Mac's
   tunnel key.
