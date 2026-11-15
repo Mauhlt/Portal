@@ -173,8 +173,10 @@ fn setPeers(peers: *[devices.max_devices]?Peer, st: *const devices.Store, refuse
     } else null;
 }
 
-/// The record admitted from address `ip`: none if refused.
-fn peerAt(peers: *const [devices.max_devices]?Peer, ip: tunnelnet.Ip4) ?Peer {
+/// The record admitted from address `ip`: none if refused, or while the
+/// store is `unreadable` (fail closed).
+fn peerAt(peers: *const [devices.max_devices]?Peer, unreadable: bool, ip: tunnelnet.Ip4) ?Peer {
+    if (unreadable) return null;
     for (peers) |slot| if (slot) |p| if (std.mem.eql(u8, &p.ip, &ip)) return if (p.refused) null else p;
     return null;
 }
@@ -182,7 +184,8 @@ fn peerAt(peers: *const [devices.max_devices]?Peer, ip: tunnelnet.Ip4) ?Peer {
 /// Null while record `p` is still the one at its address (and not
 /// refused); else why its connections end: `replaced` if its name is
 /// still paired (under another record), `unpaired` if not.
-fn endReasonIn(peers: *const [devices.max_devices]?Peer, p: *const Peer) ?Server.EndReason {
+fn endReasonIn(peers: *const [devices.max_devices]?Peer, unreadable: bool, p: *const Peer) ?Server.EndReason {
+    if (unreadable) return .store_unreadable;
     var replaced = false;
     for (peers) |slot| if (slot) |q| {
         if (std.mem.eql(u8, &q.id, &p.id) and std.mem.eql(u8, &q.ip, &p.ip) and !q.refused) return null;
@@ -441,6 +444,15 @@ pub const Server = struct {
     /// which tunnel address is which device.
     peer_mutex: Io.Mutex = .init,
     peers: [devices.max_devices]?Peer = @splat(null),
+    /// Guarded by peer_mutex: the store watcher's last read failed, so
+    /// no record is known to be current. Fail closed: nothing is
+    /// admitted and every connection ends (without a `logout`: the
+    /// devices keep their pairing and reconnect) until a read succeeds
+    /// (applyStore).
+    store_unreadable: bool = false,
+    /// Saving a device's last use failed (the last attempt): shown on the
+    /// desk. The running Portal still counts the connection (devices.Seen).
+    last_use_failing: std.atomic.Value(bool) = .init(false),
 
     conn_mutex: Io.Mutex = .init,
     /// Broadcast whenever a connection's slot is released (awaitGone).
@@ -458,6 +470,7 @@ pub const Server = struct {
     sync_log: LogLimiter = .{},
     sysmon_log: LogLimiter = .{},
     store_log: LogLimiter = .{},
+    last_use_log: LogLimiter = .{},
 
     /// The optional system monitor (sysmon.zig; null: none). `y:on` from a
     /// viewer subscribes only while the desk's setting is on.
@@ -492,8 +505,10 @@ pub const Server = struct {
     /// Why a device's connections end (docs/protocol.md, `logout`).
     /// `unpaired`: its record was removed at the desk; the device forgets
     /// this desktop. `replaced`: the name was paired again (a new key); the
-    /// old key is no longer let in either.
-    pub const EndReason = enum { unpaired, replaced };
+    /// old key is no longer let in either. `store_unreadable`: the device
+    /// list could not be read (no `logout`: the device keeps its pairing
+    /// and reconnects once it can be read again).
+    pub const EndReason = enum { unpaired, replaced, store_unreadable };
 
     fn nowUnix(srv: *const Server) i64 {
         return Io.Timestamp.now(srv.io, .real).toSeconds();
@@ -518,7 +533,7 @@ pub const Server = struct {
         };
         srv.peer_mutex.lockUncancelable(srv.io);
         defer srv.peer_mutex.unlock(srv.io);
-        return peerAt(&srv.peers, ip);
+        return peerAt(&srv.peers, srv.store_unreadable, ip);
     }
 
     /// Null while record `p` is still paired at its address (and not
@@ -526,18 +541,21 @@ pub const Server = struct {
     pub fn endReason(srv: *Server, p: *const Peer) ?EndReason {
         srv.peer_mutex.lockUncancelable(srv.io);
         defer srv.peer_mutex.unlock(srv.io);
-        return endReasonIn(&srv.peers, p);
+        return endReasonIn(&srv.peers, srv.store_unreadable, p);
     }
 
     /// Called by the store watcher (tunneldesk.Applier) with a freshly
-    /// read store (only a successful read gets here, so a store error
-    /// never ends anyone): refreshes the paired devices, marking those at
+    /// read store (a failed read goes to storeUnreadable instead):
+    /// refreshes the paired devices, marking those at
     /// `refused` addresses refused, then wakes every connection so those
     /// of removed, replaced or refused records say goodbye.
     pub fn applyStore(srv: *Server, st: *const devices.Store, refused: []const tunnelnet.Ip4) void {
         srv.peer_mutex.lockUncancelable(srv.io);
         setPeers(&srv.peers, st, refused);
+        const was_unreadable = srv.store_unreadable;
+        srv.store_unreadable = false;
         srv.peer_mutex.unlock(srv.io);
+        if (was_unreadable) srv.log.print("the device store is readable again; paired devices are let in", .{});
         srv.wakeViewers();
         srv.storeChanged();
     }
@@ -548,10 +566,42 @@ pub const Server = struct {
         if (srv.store_notify_fn) |f| if (srv.store_notify_ctx) |c| f(c);
     }
 
-    /// The store watcher could not read the store: say so (rate limited),
-    /// end nothing, keep the last known devices.
-    pub fn noteStoreError(srv: *Server, err: anyerror) void {
-        srv.notePeer(&srv.store_log, "device store unreadable ({t}): {s}", .{ err, devices.describeError(err) });
+    /// The store watcher could not read the store: no record is known to
+    /// be current, so fail closed (`store_unreadable`) until a read works
+    /// (the next change in the data folder retries it). Logged, rate
+    /// limited; the desk shows it (storeIsUnreadable).
+    pub fn storeUnreadable(srv: *Server, err: anyerror) void {
+        srv.notePeer(&srv.store_log, "ERROR: device store unreadable ({t}): {s}; no device is let in until it can be read", .{ err, devices.describeError(err) });
+        srv.peer_mutex.lockUncancelable(srv.io);
+        const was = srv.store_unreadable;
+        srv.store_unreadable = true;
+        srv.peer_mutex.unlock(srv.io);
+        if (was) return;
+        srv.wakeViewers();
+        srv.storeChanged();
+    }
+
+    pub fn storeIsUnreadable(srv: *Server) bool {
+        srv.peer_mutex.lockUncancelable(srv.io);
+        defer srv.peer_mutex.unlock(srv.io);
+        return srv.store_unreadable;
+    }
+
+    /// A device's connection: its last use is saved (devices.Desk.markSeen).
+    /// A failure is logged (rate limited) and shown on the desk until a
+    /// save works; the running Portal keeps the device from expiring
+    /// meanwhile (devices.Seen).
+    fn markLastUse(srv: *Server, p: *const Peer) void {
+        const desk: devices.Desk = .{ .gpa = srv.gpa, .io = srv.io, .paths = srv.cfg.devices };
+        if (desk.markSeen(p.id)) |_| {
+            if (srv.last_use_failing.swap(false, .acq_rel)) {
+                srv.log.print("device last use is saved again", .{});
+                srv.storeChanged();
+            }
+        } else |err| {
+            srv.notePeer(&srv.last_use_log, "ERROR: could not save the last use of device '{s}' ({t}): {s}; it does not expire while this Portal runs", .{ p.name.get(), err, devices.describeError(err) });
+            if (!srv.last_use_failing.swap(true, .acq_rel)) srv.storeChanged();
+        }
     }
 
     /// After any store change: every WebSocket writer and supervisor
@@ -563,10 +613,14 @@ pub const Server = struct {
         for (&srv.conn_wake) |*e| e.set(srv.io);
     }
 
-    fn logoutMessage(reason: EndReason) []const u8 {
-        return switch (reason) {
-            .unpaired => "{\"t\":\"logout\",\"reason\":\"unpaired\"}",
-            .replaced => "{\"t\":\"logout\",\"reason\":\"replaced\"}",
+    /// Ends a WebSocket for `reason`: the `logout` message, or (the store
+    /// unreadable) a close frame "try again later" (1013), after which the
+    /// device reconnects and keeps its pairing.
+    fn sayEnd(srv: *Server, ws: *WsConn, reason: EndReason) void {
+        _ = switch (reason) {
+            .unpaired => ws.send(srv, "{\"t\":\"logout\",\"reason\":\"unpaired\"}", .text),
+            .replaced => ws.send(srv, "{\"t\":\"logout\",\"reason\":\"replaced\"}", .text),
+            .store_unreadable => ws.send(srv, "\x03\xf5device list unreadable", .close),
         };
     }
 
@@ -775,11 +829,11 @@ pub const Server = struct {
                 } else if (revoked_since == null) {
                     revoked_since = now;
                 }
-            } else if (srv.endReason(&conn.device) != null) {
+            } else if (srv.endReason(&conn.device)) |r| {
                 // Not a WebSocket yet: there is no logout to deliver, so a
                 // connection whose record went (or whose address is
                 // refused) ends now, not at its head timeout.
-                reason = "unpaired";
+                reason = if (r == .store_unreadable) "device store unreadable" else "unpaired";
                 break;
             }
             if (revoked_since) |r| {
@@ -1137,8 +1191,12 @@ pub const Server = struct {
 
     fn webSocket(srv: *Server, conn: *Conn, w: *Io.Writer, req: *const http1.Request, channel: Channel, leftover: []const u8) !void {
         const peer = conn.peer();
-        if (srv.endReason(&conn.device) != null) {
-            _ = try srv.fail(conn, w, .forbidden, "not paired\n");
+        if (srv.endReason(&conn.device)) |r| {
+            // 403 tells the device to forget this desktop: never for a
+            // store that is only unreadable.
+            if (r == .store_unreadable) {
+                _ = try srv.fail(conn, w, .internal_server_error, "device list unreadable\n");
+            } else _ = try srv.fail(conn, w, .forbidden, "not paired\n");
             return;
         }
         if (!req.upgrade_websocket or !req.connection_upgrade) {
@@ -1163,10 +1221,9 @@ pub const Server = struct {
         srv.promote(conn, channel);
         conn.ws_active.store(true, .release);
         conn.wake.set(srv.io); // the supervisor now also watches the pairing
-        // A connection a day marks the device as in use (devices unused for
-        // 90 days are forgotten); at most one store write an hour.
-        const desk: devices.Desk = .{ .gpa = srv.gpa, .io = srv.io, .paths = srv.cfg.devices };
-        desk.markSeen(conn.device.id) catch {};
+        // A connection marks the device as in use (devices unused for 90
+        // days are forgotten); at most one store write an hour.
+        srv.markLastUse(&conn.device);
 
         if (channel == .bulk) {
             conn.stream.setPriority(.bulk);
@@ -1622,7 +1679,7 @@ pub const Server = struct {
             // `portalctl unpair` in another process: the store watcher then
             // wakes this loop) ends the stream. Checked on every wake.
             if (srv.endReason(&ws.device)) |r| {
-                _ = ws.send(srv, logoutMessage(r), .text);
+                srv.sayEnd(ws, r);
                 return;
             }
             // Coalesce bursts of output into at most ~30 frames per second.
@@ -1865,7 +1922,7 @@ pub const Server = struct {
             }) orelse return;
             ws.conn.setDeadline(no_deadline);
             if (srv.endReason(&ws.device)) |r| {
-                _ = ws.send(srv, logoutMessage(r), .text);
+                srv.sayEnd(ws, r);
                 return;
             }
             if (!srv.inputAllowed(ws.device.id, .bulk, f.payload.len)) {
@@ -2222,30 +2279,30 @@ test "peers: a refused address admits nothing, and a record replaced at its addr
     const old = (try st.pair("phone", k1, @splat(9), @splat(1), 0)).device;
     var peers: [devices.max_devices]?Peer = @splat(null);
     setPeers(&peers, &st, &.{});
-    const admitted = peerAt(&peers, old.ip).?;
-    try testing.expect(endReasonIn(&peers, &admitted) == null);
+    const admitted = peerAt(&peers, false, old.ip).?;
+    try testing.expect(endReasonIn(&peers, false, &admitted) == null);
 
     // Re-paired: the same name and address, a new record. While the
     // tunnel may still have the old key the address is refused.
     const new = (try st.pair("phone", k2, @splat(9), @splat(2), 0)).device;
     try testing.expectEqual(old.ip, new.ip);
     setPeers(&peers, &st, &.{new.ip});
-    try testing.expect(peerAt(&peers, new.ip) == null);
-    try testing.expectEqual(Server.EndReason.replaced, endReasonIn(&peers, &admitted).?);
+    try testing.expect(peerAt(&peers, false, new.ip) == null);
+    try testing.expectEqual(Server.EndReason.replaced, endReasonIn(&peers, false, &admitted).?);
     // A connection admitted as the new record during the refusal could
     // not exist (peerAt refused it); after it, the new record is let in.
     setPeers(&peers, &st, &.{});
-    const now_admitted = peerAt(&peers, new.ip).?;
-    try testing.expect(endReasonIn(&peers, &now_admitted) == null);
-    try testing.expectEqual(Server.EndReason.replaced, endReasonIn(&peers, &admitted).?);
+    const now_admitted = peerAt(&peers, false, new.ip).?;
+    try testing.expect(endReasonIn(&peers, false, &now_admitted) == null);
+    try testing.expectEqual(Server.EndReason.replaced, endReasonIn(&peers, false, &admitted).?);
     // A record id found at another address is not this connection's.
     var moved = now_admitted;
     moved.ip = .{ 10, 8, 0, 99 };
-    try testing.expect(endReasonIn(&peers, &moved) != null);
+    try testing.expect(endReasonIn(&peers, false, &moved) != null);
     // Unpaired: nothing of that name is left.
     _ = st.remove("phone");
     setPeers(&peers, &st, &.{});
-    try testing.expectEqual(Server.EndReason.unpaired, endReasonIn(&peers, &now_admitted).?);
+    try testing.expectEqual(Server.EndReason.unpaired, endReasonIn(&peers, false, &now_admitted).?);
 }
 
 test "screen out: a full snapshot first, then only what changed, nothing when nothing did" {
@@ -2263,4 +2320,17 @@ test "screen out: a full snapshot first, then only what changed, nothing when no
     so.full = true;
     try testing.expect(try so.encodeLocked(testing.allocator, &t));
     try testing.expectEqual(@as(usize, 5), so.rows.items.len);
+}
+
+test "peers: an unreadable store admits nobody and ends everyone without a logout reason" {
+    var st: devices.Store = .{};
+    const k: devices.Key = @splat(5);
+    const d = (try st.pair("laptop", k, @splat(9), @splat(1), 0)).device;
+    var peers: [devices.max_devices]?Peer = @splat(null);
+    setPeers(&peers, &st, &.{});
+    const admitted = peerAt(&peers, false, d.ip).?;
+    try testing.expect(peerAt(&peers, true, d.ip) == null);
+    try testing.expectEqual(Server.EndReason.store_unreadable, endReasonIn(&peers, true, &admitted).?);
+    // Readable again: the same record is let in and nothing ends.
+    try testing.expect(endReasonIn(&peers, false, &admitted) == null);
 }

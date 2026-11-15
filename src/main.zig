@@ -770,7 +770,9 @@ fn setupTls(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, log: *L
 /// changed or went are refused and their connections end (with a
 /// `logout` saying why) before the tunnel gets the new peer table (only
 /// paired keys get in, each only from its own address), and are let in
-/// again only once it took it. A failed read changes nothing.
+/// again only once it took it. A failed read fails closed: no device is
+/// let in (web.Server.storeUnreadable, shown on the desk) until a later
+/// read, on the next change in the data folder, succeeds.
 ///
 /// The window's own pairing and Unpair do not wait for the watch: they
 /// call `reload` themselves (gui.Desk.store) and report its result.
@@ -794,6 +796,9 @@ const StoreWatch = struct {
     /// The last apply could not update the tunnel's peer table (changed
     /// addresses stay refused).
     tunnel_failed: std.atomic.Value(bool) = .init(false),
+    /// settings.txt could not be read on its last change (SettingsWatch):
+    /// shown on the desk until a read works.
+    settings_unreadable: std.atomic.Value(bool) = .init(false),
 
     /// Re-reads the store and applies it. An error if the read or the
     /// tunnel's peer table failed (both logged; the latter also shown on
@@ -802,7 +807,7 @@ const StoreWatch = struct {
         sw.mutex.lockUncancelable(sw.io);
         defer sw.mutex.unlock(sw.io);
         const st = devices.read(sw.gpa, sw.io, sw.paths) catch |err| {
-            sw.srv.noteStoreError(err);
+            sw.srv.storeUnreadable(err);
             return err;
         };
         sw.applier.apply(sw.srv, sw.tun, &st) catch |err| {
@@ -837,7 +842,7 @@ const StoreWatch = struct {
             if (w.WaitForMultipleObjects(1, &[1]w.HANDLE{d.h}, 0, w.INFINITE) != w.WAIT_OBJECT_0) break;
             _ = sw.srv.pairwatch_wakes.fetchAdd(1, .monotonic);
             sw.rearm(); // before reading: a change made meanwhile signals again
-            sw.reload() catch {};
+            sw.reload() catch {}; // logged and shown on the desk by reload; the next change retries
         }
         // `portalctl pair`/`unpair` and devices forgetting this desktop
         // are not seen any more; the window's own actions still apply.
@@ -854,8 +859,11 @@ const StoreWatch = struct {
 
     fn hookProblem(ctx: *anyopaque) ?[]const u8 {
         const sw: *StoreWatch = @ptrCast(@alignCast(ctx));
+        if (sw.srv.storeIsUnreadable()) return "Device list unreadable: no device is let in until it can be read (see the log)";
         if (sw.tunnel_failed.load(.acquire)) return "Tunnel peer table not updated: changed devices are refused (see the log)";
         if (sw.lost.load(.acquire)) return "Not watching the device list: portalctl pair/unpair need a restart";
+        if (sw.srv.last_use_failing.load(.acquire)) return "Device last use not saved (see the log): devices stay paired while Portal runs";
+        if (sw.settings_unreadable.load(.acquire)) return "settings.txt unreadable: startable projects unchanged (see the log)";
         return null;
     }
 
@@ -1112,6 +1120,9 @@ fn prepare(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, paths: d
 }
 
 /// The tunnel `prepare` started (it lives until the process exits).
+/// The running Portal's memory of device connections (devices.expiry).
+var devices_seen: devices.Seen = .{};
+
 var prepared_tunnel: ?struct { tun: *tunneldesk.tunnel.Tunnel, listener: transport.Listener, store: devices.Store } = null;
 
 /// Suffix for the log line and banner when the remote side has full control.
@@ -1221,6 +1232,8 @@ const SettingsWatch = struct {
     dir: []const u8,
     io: Io,
     gpa: Allocator,
+    /// Where a read failure is shown on the desk (StoreWatch.hookProblem).
+    store_watch: *StoreWatch,
 
     fn watch(sw: *SettingsWatch) void {
         var dw = fsutil.DirWatch.open(sw.gpa, sw.dir, .{}) catch |err| {
@@ -1230,7 +1243,18 @@ const SettingsWatch = struct {
         while (true) {
             if (w.WaitForMultipleObjects(1, &[1]w.HANDLE{dw.h}, 0, w.INFINITE) != w.WAIT_OBJECT_0) return;
             dw.rearm() catch return; // before reading: a change made meanwhile signals again
-            const s = settings.loadOrNull(sw.gpa, sw.io, sw.dir) orelse continue;
+            const s = settings.loadOrNull(sw.gpa, sw.io, sw.dir) orelse {
+                // Logged and shown until a later change reads.
+                if (!sw.store_watch.settings_unreadable.swap(true, .acq_rel)) {
+                    sw.hub.log.print("ERROR: {s}\\{s} could not be read; the startable projects stay as they were until it can", .{ sw.dir, settings.file_name });
+                    sw.store_watch.srv.storeChanged();
+                }
+                continue;
+            };
+            if (sw.store_watch.settings_unreadable.swap(false, .acq_rel)) {
+                sw.hub.log.print("{s} is readable again", .{settings.file_name});
+                sw.store_watch.srv.storeChanged();
+            }
             sw.hub.setStartable(s.startableSlice());
         }
     }
@@ -1554,6 +1578,9 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
     }
 
     const paths = devicePaths(gpa, io, env) catch |err| fatal("cannot create the data directory: {t}", .{err});
+    // This process sees devices connect: it alone expires unused records,
+    // counting every connection it saw (devices.Seen).
+    devices.expiry = &devices_seen;
     // Portal sync: the release key devices pin at pairing (created on
     // first use, like the CA). Without it the /sync routes are off.
     const sync_key: ?[32]u8 = sync.ensureKey(gpa, io, .{ .dir = paths.dir }) catch null;
@@ -1763,7 +1790,8 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         .gpa = gpa,
     };
     // A change between prepare's read and the watch opening signalled
-    // nobody: read once more now that the watch is open.
+    // nobody: read once more now that the watch is open (a failure is
+    // logged and shown by reload; the next change retries).
     store_watch.reload() catch {};
 
     // The window's desk panels (pairing, devices, settings with the
@@ -1844,7 +1872,7 @@ fn cmdRun(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []c
         HookWatch.start(gpa, hub, &log, dir);
         // settings.txt: the startable projects follow the file.
         const setw = gpa.create(SettingsWatch) catch fatal("out of memory", .{});
-        setw.* = .{ .hub = hub, .dir = dir, .io = io, .gpa = gpa };
+        setw.* = .{ .hub = hub, .dir = dir, .io = io, .gpa = gpa, .store_watch = &store_watch };
         const swt = std.Thread.spawn(.{}, SettingsWatch.watch, .{setw}) catch |err|
             fatal("cannot start the settings watcher thread: {t}", .{err});
         swt.detach();

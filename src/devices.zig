@@ -29,7 +29,10 @@
 //!    after which the device forgets this desktop. A device that is
 //!    offline then only finds the desktop unreachable (its key is no
 //!    longer let in); the owner forgets it there.
-//!  * Devices unused for 90 days are forgotten.
+//!  * Devices unused for 90 days are forgotten, by the running Portal
+//!    only (`expiry`): it alone sees devices connect, and it counts a
+//!    connection it saw even when saving `last_seen` failed. `portalctl`
+//!    never forgets a device.
 //!
 //! The store is a small text file shared by the running Portal and the
 //! `portalctl pair/devices/unpair` commands; every change is a locked
@@ -54,6 +57,48 @@ pub const unused_expiry_s: i64 = 90 * 24 * 3600;
 /// `last_seen` is written at most this often (a connect writes the store
 /// only when the previous mark is older).
 pub const seen_granularity_s: i64 = 3600;
+
+/// The records that connected to the running Portal, with when, kept in
+/// memory whether or not saving `last_seen` worked (Desk.markSeen).
+pub const Seen = struct {
+    mutex: Io.Mutex = .init,
+    list: List = @splat(null),
+
+    pub const Entry = struct { id: DeviceId, at: i64 };
+    pub const List = [max_devices]?Entry;
+
+    /// Record `id` connected at `at` (unix seconds). A full list drops
+    /// its oldest entry (a store holds at most max_devices records).
+    pub fn note(s: *Seen, io: Io, id: DeviceId, at: i64) void {
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        const new: Entry = .{ .id = id, .at = at };
+        for (&s.list) |*e| if (e.*) |cur| if (std.mem.eql(u8, &cur.id, &id)) {
+            e.* = new;
+            return;
+        };
+        for (&s.list) |*e| if (e.* == null) {
+            e.* = new;
+            return;
+        };
+        var oldest: usize = 0;
+        for (s.list, 0..) |e, i| if (e.?.at < s.list[oldest].?.at) {
+            oldest = i;
+        };
+        s.list[oldest] = new;
+    }
+
+    pub fn snapshot(s: *Seen, io: Io) List {
+        s.mutex.lockUncancelable(io);
+        defer s.mutex.unlock(io);
+        return s.list;
+    }
+};
+
+/// Set by the running Portal (main.zig) before it first reads the store:
+/// the store's 90-day expiry runs only then, and counts what it saw. Null
+/// (`portalctl`): records are never expired.
+pub var expiry: ?*Seen = null;
 
 /// v4: devices are WireGuard keys. Earlier files (cookie credentials) hold
 /// nothing a tunnel can use: they read as an empty store and are rewritten
@@ -151,12 +196,19 @@ pub const Store = struct {
         return n;
     }
 
-    /// Forgets long-unused devices.
-    pub fn expire(s: *Store, now: i64) bool {
+    /// Forgets devices unused for unused_expiry_s: neither their saved
+    /// `last_seen` nor a connection in `seen` (Seen.snapshot) is recent.
+    pub fn expire(s: *Store, now: i64, seen: *const Seen.List) bool {
         var changed = false;
-        for (&s.devices) |*slot| if (slot.*) |d| if (now -| d.last_seen > unused_expiry_s) {
-            slot.* = null;
-            changed = true;
+        for (&s.devices) |*slot| if (slot.*) |d| {
+            var last = d.last_seen;
+            for (seen) |e| if (e) |x| if (std.mem.eql(u8, &x.id, &d.id)) {
+                last = @max(last, x.at);
+            };
+            if (now -| last > unused_expiry_s) {
+                slot.* = null;
+                changed = true;
+            }
         };
         return changed;
     }
@@ -315,9 +367,10 @@ pub const Paths = fsutil.DataDir;
 pub fn withStore(gpa: Allocator, io: Io, paths: Paths, now: i64, ctx: anytype, comptime op: anytype) !void {
     var lb: [1024]u8 = undefined;
     var pb: [1024]u8 = undefined;
-    const Ctx = struct { gpa: Allocator, now: i64, inner: @TypeOf(ctx) };
+    const Ctx = struct { gpa: Allocator, io: Io, now: i64, inner: @TypeOf(ctx) };
     fsutil.update(gpa, io, try lockPath(paths, &lb), try paths.join(&pb, &.{"devices.txt"}), 64 * 1024, Ctx{
         .gpa = gpa,
+        .io = io,
         .now = now,
         .inner = ctx,
     }, struct {
@@ -327,7 +380,11 @@ pub fn withStore(gpa: Allocator, io: Io, paths: Paths, now: i64, ctx: anytype, c
                 if (std.mem.startsWith(u8, text, h)) legacy = true;
             };
             var store: Store = if (old) |text| try Store.parse(text) else .{}; // corrupt file: fail closed
-            var dirty = store.expire(c.now) or legacy; // an old format is rewritten as v4
+            var dirty = legacy; // an old format is rewritten as v4
+            if (expiry) |e| {
+                const seen = e.snapshot(c.io);
+                if (store.expire(c.now, &seen)) dirty = true;
+            }
             if (try op(c.inner, &store)) dirty = true;
             if (!dirty) return false;
             try store.format(c.gpa, out);
@@ -417,8 +474,13 @@ pub const Desk = struct {
         return removed;
     }
 
+    /// A connection from record `id`: noted in `expiry` (the running
+    /// Portal's memory) first, then saved as `last_seen` (at most once per
+    /// seen_granularity_s). A failed save leaves the memory to keep the
+    /// device from expiring.
     pub fn markSeen(d: Desk, id: DeviceId) !void {
         const t = d.now();
+        if (expiry) |e| e.note(d.io, id, t);
         const Ctx = struct { id: DeviceId, now: i64 };
         try withStore(d.gpa, d.io, d.paths, t, Ctx{ .id = id, .now = t }, struct {
             fn op(c: Ctx, st: *Store) !bool {
@@ -519,11 +581,40 @@ test "expiry, last seen, forget by id" {
     const a = try s.pair("laptop", testKey(2), test_desk_key, @splat(1), 0);
     try testing.expect(!s.markSeen(a.device.id, 10)); // within the granularity
     try testing.expect(s.markSeen(a.device.id, seen_granularity_s + 1));
-    try testing.expect(!s.expire(unused_expiry_s));
-    try testing.expect(s.expire(seen_granularity_s + 2 + unused_expiry_s));
+    const none: Seen.List = @splat(null);
+    try testing.expect(!s.expire(unused_expiry_s, &none));
+    try testing.expect(s.expire(seen_granularity_s + 2 + unused_expiry_s, &none));
     try testing.expectEqual(@as(usize, 0), s.count());
+    // A connection the running Portal saw (its save may have failed)
+    // keeps the device: only a connection older than the expiry lets it go.
+    const c = try s.pair("laptop", testKey(2), test_desk_key, @splat(4), 0);
+    var seen: Seen = .{};
+    seen.note(testing.io, c.device.id, 10 * 24 * 3600);
+    const snap = seen.snapshot(testing.io);
+    try testing.expect(!s.expire(unused_expiry_s + 1, &snap));
+    try testing.expect(!s.expire(10 * 24 * 3600 + unused_expiry_s, &snap));
+    try testing.expect(s.expire(10 * 24 * 3600 + unused_expiry_s + 1, &snap));
     const b = try s.pair("laptop", testKey(2), test_desk_key, @splat(2), 0);
     _ = try s.pair("laptop", testKey(3), test_desk_key, @splat(3), 0); // re-paired
     try testing.expect(s.removeId(b.device.id) == null); // the old id is gone already
     try testing.expectEqual(@as(usize, 1), s.count());
+}
+
+test "seen: one entry per record, the oldest goes when full" {
+    var seen: Seen = .{};
+    for (0..max_devices) |i| seen.note(testing.io, @splat(@intCast(i)), @intCast(100 + i));
+    seen.note(testing.io, @splat(3), 500); // an update, not a new entry
+    seen.note(testing.io, @splat(200), 600); // full: record 0 (at 100) goes
+    const l = seen.snapshot(testing.io);
+    var has0 = false;
+    var at3: i64 = 0;
+    var has200 = false;
+    for (l) |e| {
+        const x = e.?;
+        if (x.id[0] == 0) has0 = true;
+        if (x.id[0] == 3) at3 = x.at;
+        if (x.id[0] == 200) has200 = true;
+    }
+    try testing.expect(!has0 and has200);
+    try testing.expectEqual(@as(i64, 500), at3);
 }

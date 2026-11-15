@@ -11,6 +11,9 @@
 //!     back by themselves;
 //!   * Forget from the device ("f:"): its record goes, both ways;
 //!   * Unpair at the desk: a `logout`, then the key is no longer let in;
+//!   * an unreadable device list fails closed: connections end without a
+//!     `logout` (the device keeps its pairing) and nothing is let in until
+//!     the list reads again;
 //!   * sync over the bulk WebSocket (a signed 50 MiB package) while a
 //!     viewer types: every keystroke's echo is timed and must stay fast;
 //!   * only /ws and /ws/bulk exist; nothing Portal sends names a path.
@@ -230,6 +233,39 @@ pub fn run(h: *proc.Harness, r: *Runner, port: u16) !void {
             break :blk false;
         } else |_| true;
         _ = r.check("...and its key is no longer let into the tunnel", refused, "", .{});
+    }
+
+    // ------------------------------------- an unreadable device list
+    {
+        _ = try inst.pair("tablet");
+        const tv = try client.Viewer.open(inst, "tablet");
+        defer tv.deinit();
+        const io = h.io;
+        const store = try std.fmt.allocPrint(h.gpa, "{s}\\Portal\\devices.txt", .{inst.data_dir});
+        const tmp = try std.fmt.allocPrint(h.gpa, "{s}\\Portal\\devices.e2e-tmp", .{inst.data_dir});
+        const good = try std.Io.Dir.cwd().readFileAlloc(io, store, h.gpa, .limited(64 * 1024));
+        // Replaced by rename, as every store write is (the watch sees it).
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = "not a device list\n" });
+        try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), store, io);
+        const ended = tv.waitClose(15_000);
+        _ = r.check("an unreadable device list ends the connection, without a logout", ended and !tv.got_logout, "closed {}, logout {}", .{ ended, tv.got_logout });
+        const in_meanwhile = if (client.Viewer.open(inst, "tablet")) |vv| blk: {
+            vv.deinit();
+            break :blk true;
+        } else |_| false;
+        _ = r.check("...and nothing is let in while it is unreadable", !in_meanwhile, "", .{});
+        _ = r.check("...and the desk logs why", inst.logHas("device store unreadable"), "", .{});
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = good });
+        try std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), store, io);
+        var back = false;
+        const deadline = net.now() + 15_000;
+        while (!back and net.now() < deadline) : (net.sleep(300)) {
+            if (client.Viewer.open(inst, "tablet")) |vv| {
+                vv.deinit();
+                back = true;
+            } else |_| {}
+        }
+        _ = r.check("once it reads again the same pairing gets in (nothing to pair again)", back, "", .{});
     }
     _ = r.ok("portal still running", inst.alive());
     inst.kill();

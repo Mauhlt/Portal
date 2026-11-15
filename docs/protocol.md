@@ -71,7 +71,10 @@ Sec-WebSocket-Version: 13
 ```
 
 `101 Switching Protocols` on success; `403` means this desktop no longer
-has the device (forget it). `GET /ws/bulk` opens the bulk channel
+has the device (forget it). A `500` (the desk cannot read its device list
+right now) is not a refusal: retry with backoff, keep the pairing. While
+the list is unreadable the desk also ends open WebSockets with a close
+frame 1013 ("try again later") and no `logout`. `GET /ws/bulk` opens the bulk channel
 (section 7) the same way. Every other request is a `404` and the
 connection closes. Client frames must be masked; no fragmentation; no
 extensions. The interactive connection is dialed with the transport's

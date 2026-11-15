@@ -88,6 +88,10 @@ on the desk, compare the desk's check code, and tap **Connect**.
   tells the desk through the tunnel, and its record goes there too.
 * A device keeps its own key across desktops and re-pairings; `portalctl
   sync-device --drop-key` deletes it (a device reset).
-* Devices unused for 90 days are forgotten.
+* Devices unused for 90 days are forgotten (by the running Portal, which
+  counts every connection it saw, even if saving the last use failed;
+  the desk shows that failure until a save works).
+* If the desk cannot read its device list, no device gets in (their
+  pairings are kept) and the desk says so until the list reads again.
 * One desktop per device for now (every desk is `10.8.0.1` inside its own
   tunnel).
