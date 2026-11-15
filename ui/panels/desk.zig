@@ -909,7 +909,7 @@ pub fn Panels(comptime devices: type) type {
                         } else if (m.ok) {
                             p.title = bufs.fmt("The tunnel listens on UDP {d}", .{m.port});
                             p.title_tone = .good;
-                            if (m.port != m.old_port) L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("Make sure your router forwards UDP {d} to this desktop.", .{m.port}), .tone = .warn });
+                            if (m.port != m.old_port) L.add(&bufs.lines, &nl, .{ .text = bufs.fmt("Make sure your router forwards UDP {d} to this desktop, and let it through Windows Firewall: Settings, Windows Firewall replaces the rule (one administrator prompt).", .{m.port}), .tone = .warn });
                         } else {
                             p.title = "The tunnel was not moved";
                             p.title_tone = .bad;

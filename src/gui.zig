@@ -327,6 +327,9 @@ pub const LocalHost = struct {
         h.shell.dictation = s.hooks();
         h.shell.headset_mic = .{ .ctx = s, .present = headsetPresent };
         h.showTunnelProblem();
+        // First-run desk guidance: until devices know where to reach this
+        // desk, Settings opens with the router steps (Esc closes it).
+        if (!h.ui.open() and d.tunnel != null and d.saved.tunnel_endpoint.get() == null) h.openSettings();
     }
 
     /// The tunnel's port is taken: Settings opens with the plain message
