@@ -68,6 +68,7 @@ pub const panels = struct {
     pub const status = @import("panels/status.zig");
     pub const audio = @import("panels/audio.zig");
     pub const projects = @import("panels/projects.zig");
+    pub const finddesk = @import("panels/finddesk.zig");
 };
 
 pub const Shell = shell.Shell;
@@ -96,5 +97,6 @@ test {
     _ = panels.status;
     _ = panels.audio;
     _ = panels.projects;
+    _ = panels.finddesk;
     _ = dictation;
 }

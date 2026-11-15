@@ -40,7 +40,37 @@ pub const Prefix = enum(u8) {
     item = 'i',
     /// `r:recap <tab id>`: ask a tab for a recap (recap.zig).
     recap = 'r',
+    /// `m:<seq>`: the device saved the desk's endpoint announcement
+    /// number <seq> (decimal digits only). An acknowledgement and nothing
+    /// else: it carries no endpoint, and the desk only marks that device
+    /// "moved" for an announcement it made itself (src/portmove.zig). No
+    /// device frame can change, request or influence the desk's port or
+    /// endpoint.
+    moved = 'm',
 };
+
+/// `m:<seq>` for announcement `seq`.
+pub fn movedFrame(seq: u64, buf: *[24]u8) []const u8 {
+    return std.fmt.bufPrint(buf, "m:{d}", .{seq}) catch unreachable;
+}
+
+/// The seq of an `m:` frame's rest: 1-20 decimal digits, nothing else.
+pub fn parseMoved(rest: []const u8) ?u64 {
+    if (rest.len == 0 or rest.len > 20) return null;
+    for (rest) |ch| if (ch < '0' or ch > '9') return null;
+    const v = std.fmt.parseInt(u64, rest, 10) catch return null;
+    return if (v == 0) null else v;
+}
+
+test "m: acknowledgements are only a number" {
+    var b: [24]u8 = undefined;
+    const f = movedFrame(1700000001, &b);
+    const fr = classify(f).?;
+    try std.testing.expectEqual(Prefix.moved, fr.prefix);
+    try std.testing.expectEqual(@as(?u64, 1700000001), parseMoved(fr.rest));
+    for ([_][]const u8{ "", "0", "1 x", "x", "12:51821", "home.example.org:51821", "-1", "99999999999999999999999" }) |r|
+        try std.testing.expect(parseMoved(r) == null);
+}
 
 pub const Frame = struct { prefix: Prefix, rest: []const u8 };
 

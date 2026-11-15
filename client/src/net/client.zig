@@ -43,6 +43,7 @@ const activity_wire = @import("shared").activity;
 const planusage = @import("shared").planusage;
 const projects_wire = @import("shared").projects;
 const sysinfo = @import("shared").sysinfo;
+const frames_wire = @import("shared").frames;
 const tlsconn = @import("tlsconn.zig");
 const x509check = @import("x509check.zig");
 const watchdog = @import("watchdog.zig");
@@ -290,6 +291,14 @@ pub const Client = struct {
     /// found by its fingerprint: the app saves it (connect.zig).
     on_pinned: ?*const fn (ctx: *anyopaque, ca_der: []const u8) void = null,
     on_pinned_ctx: ?*anyopaque = null,
+    /// Called (network thread) with the desk's `{"t":"endpoint",...}`
+    /// announcement as it arrived on this authenticated stream (TLS to the
+    /// pinned CA, inside the tunnel): the app validates it, saves it
+    /// durably and returns the number to acknowledge (`m:<seq>`), or null
+    /// to refuse it (devicelink.takeAnnouncement). Never the other way:
+    /// nothing here asks the desk to move.
+    on_endpoint: ?*const fn (ctx: *anyopaque, text: []const u8) ?u64 = null,
+    on_endpoint_ctx: ?*anyopaque = null,
 
     pub const TrustKind = enum { pinned, fingerprint, plain };
 
@@ -514,6 +523,12 @@ pub const Client = struct {
     pub fn setPaused(c: *Client, paused: bool) void {
         if (c.shared.paused.swap(paused, .acq_rel) == paused) return;
         if (paused) c.wd.poke(); // the stream's watchdog aborts on `paused`
+        c.shared.resume_wake.set(c.io);
+    }
+
+    /// Any thread: cut a retry's backoff sleep short (this device now looks
+    /// for the desktop elsewhere).
+    pub fn reconnectNow(c: *Client) void {
         c.shared.resume_wake.set(c.io);
     }
 
@@ -879,6 +894,16 @@ pub const Client = struct {
                 }
                 if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"item\"") or std.mem.startsWith(u8, frame.payload, "{\"t\":\"recap\"")) {
                     c.applyForYouResult(frame.payload);
+                    return null;
+                }
+                // The desk moves its endpoint (docs/protocol.md): saved by
+                // the app, then acknowledged.
+                if (std.mem.startsWith(u8, frame.payload, "{\"t\":\"endpoint\"")) {
+                    const f = c.on_endpoint orelse return null;
+                    if (f(c.on_endpoint_ctx.?, frame.payload)) |seq| {
+                        var ab: [24]u8 = undefined;
+                        _ = c.sendInput(frames_wire.movedFrame(seq, &ab));
+                    }
                     return null;
                 }
                 if (frame.payload.len > 8192) return null;
