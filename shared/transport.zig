@@ -53,6 +53,8 @@ pub const Ext = struct {
         close: *const fn (ptr: *anyopaque, io: Io) void,
         /// null: the transport has a single class.
         set_priority: ?*const fn (ptr: *anyopaque, p: Priority) void = null,
+        /// null: the transport has no unsent low-watermark.
+        set_unsent_lowat: ?*const fn (ptr: *anyopaque, n: ?u32) void = null,
     };
 };
 
@@ -94,6 +96,18 @@ pub const Stream = union(enum) {
         switch (s.*) {
             .os => {},
             .ext => |e| if (e.vtable.set_priority) |f| f(e.ptr, p),
+        }
+    }
+
+    /// Writes accept bytes only while fewer than `n` are unsent (like
+    /// TCP_NOTSENT_LOWAT); null: the priority's default. The server sets
+    /// it on the interactive WebSocket, so a screen update is never queued
+    /// behind more than about one part of a large message (parts.zig).
+    /// OS sockets (unit tests only) keep their own buffering.
+    pub fn setUnsentLowat(s: *const Stream, n: ?u32) void {
+        switch (s.*) {
+            .os => {},
+            .ext => |e| if (e.vtable.set_unsent_lowat) |f| f(e.ptr, n),
         }
     }
 

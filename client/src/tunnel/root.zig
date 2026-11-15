@@ -412,7 +412,7 @@ pub const Tunnel = struct {
         t: *Tunnel,
         s: ns.Stream,
 
-        const vtable: transport.Ext.VTable = .{ .read = read, .write = write, .close = close, .set_priority = setPriority };
+        const vtable: transport.Ext.VTable = .{ .read = read, .write = write, .close = close, .set_priority = setPriority, .set_unsent_lowat = setUnsentLowat };
 
         fn read(ptr: *anyopaque, io: Io, dest: []u8) transport.ReadError!usize {
             const self: *NsStream = @ptrCast(@alignCast(ptr));
@@ -452,6 +452,11 @@ pub const Tunnel = struct {
         fn setPriority(ptr: *anyopaque, p: transport.Priority) void {
             const self: *NsStream = @ptrCast(@alignCast(ptr));
             self.s.setPriority(nsPriority(p));
+        }
+
+        fn setUnsentLowat(ptr: *anyopaque, n: ?u32) void {
+            const self: *NsStream = @ptrCast(@alignCast(ptr));
+            self.s.setUnsentLowat(n);
         }
     };
 };

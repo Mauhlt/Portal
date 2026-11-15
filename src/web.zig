@@ -92,6 +92,9 @@ const max_pre_auth_per_ip = 8;
 pub const max_upgraded_per_device: std.EnumArray(Channel, usize) = .init(.{ .interactive = 4, .bulk = 2 });
 
 const max_requests_per_connection = 16;
+/// The interactive WebSocket's unsent low-watermark (transport.Stream
+/// .setUnsentLowat): one part plus framing headroom.
+const interactive_unsent_lowat: u32 = parts.max_part + 1024;
 const max_body = 0;
 const max_input_message = 4096;
 /// 'i' prefix + up to max_input_message bytes of keystrokes.
@@ -1226,6 +1229,10 @@ pub const Server = struct {
             return;
         }
         conn.stream.setPriority(.interactive);
+        // At most about one part (and its TLS and WebSocket framing) waits
+        // unsent in the tunnel's TCP buffer: the rest of a large message
+        // waits here, so a screen update between two parts goes out next.
+        conn.stream.setUnsentLowat(interactive_unsent_lowat);
 
         srv.hub.viewerSocketDelta(1);
         conn.viewer_socket = true;
