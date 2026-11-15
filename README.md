@@ -252,14 +252,28 @@ Installing and pairing each device, in order:
 
 Portal carries its own WireGuard (the owner's Zig WireGuard, in-process: no
 WireGuard app, adapter, driver or administrator rights). See
-[docs/wireguard.md](docs/wireguard.md). In short:
+[docs/wireguard.md](docs/wireguard.md). One-time desk setup:
 
-1. Router: forward **UDP 51820** to the desktop. Nothing else.
-2. Firewall: one inbound rule for UDP 51820 (an administrator adds it once;
-   [docs/wireguard.md](docs/wireguard.md), "Firewall").
-3. Settings: **Tunnel endpoint** = where devices reach that port (your
-   public IP or dynamic-DNS name, e.g. `home.example.org:51820`).
-4. Pair each device ([docs/pairing.md](docs/pairing.md)).
+1. **Firewall** (the only step that needs an administrator): in an
+   administrator PowerShell, once:
+   ```powershell
+   New-NetFirewallRule -DisplayName "Portal tunnel (WireGuard)" -Direction Inbound -Protocol UDP -LocalPort 51820 -Profile Any -Action Allow
+   ```
+   If Windows later shows its own prompt for Portal, choose **Allow**,
+   never Cancel (Cancel adds a Block rule that beats this one).
+2. **Router**: forward **UDP 51820** to the desktop and nothing else; give
+   the desktop a DHCP reservation; turn UPnP off. If the router's WAN
+   address starts with `100.64`-`100.127`, `10.`, `172.16`-`172.31` or
+   `192.168.`, you are behind CGNAT and forwarding cannot work (ask the ISP
+   for a public address).
+3. **Settings** (Ctrl+Shift+S): **Tunnel endpoint for devices** = where
+   devices reach that port: your public IP or, better, a dynamic-DNS name,
+   e.g. `home.example.org:51820`.
+4. **Agent hooks**: Settings → "Claude Code integration" → Install (or
+   `portalctl hooks install`); again after an update that adds hooks.
+5. **Check**: Settings shows the tunnel listening on UDP 51820 with no
+   port-in-use warning, and your endpoint.
+6. Pair each device ([docs/pairing.md](docs/pairing.md)).
 
 ### 3. Run
 
